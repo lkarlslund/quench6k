@@ -1,3 +1,5 @@
+mod bench;
+
 use std::path::PathBuf;
 
 use anyhow::{Result, ensure};
@@ -5,7 +7,38 @@ use clap::{Parser, Subcommand};
 use squash_engine::checkpoint::Checkpoint;
 use squash_engine::loader::{self, LoadOptions};
 use squash_engine::oracle;
+use squash_engine::model::{Model, Precision};
 use squash_engine::selection;
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PrecisionArg {
+    Bf16,
+    Fp8,
+    Int8,
+    Int8g,
+}
+
+impl From<PrecisionArg> for Precision {
+    fn from(p: PrecisionArg) -> Self {
+        match p {
+            PrecisionArg::Bf16 => Precision::Bf16,
+            PrecisionArg::Fp8 => Precision::Fp8,
+            PrecisionArg::Int8 => Precision::Int8,
+            PrecisionArg::Int8g => Precision::Int8Group,
+        }
+    }
+}
+
+/// Opens the checkpoint and loads the text model onto GPU 0.
+pub fn load(model_dir: &std::path::Path, precision: Precision) -> Result<(Model, squash_cuda::Stream)> {
+    squash_cuda::set_device(0)?;
+    let ckpt = Checkpoint::open(model_dir)?;
+    let stream = squash_cuda::Stream::new()?;
+    let (model, stats) = squash_engine::model::load_text(&ckpt, precision, LoadOptions::default(), &stream)?;
+    let (free, _) = squash_cuda::mem_info()?;
+    println!("loaded {precision:?}: {:.2} GiB read in {:.1}s; {:.1} GiB device memory free", stats.bytes as f64 / 1073741824.0, stats.seconds, free as f64 / 1073741824.0);
+    Ok((model, stream))
+}
 
 #[derive(Parser)]
 #[command(name = "squash", about = "Qwen3.8 Flash-Next inference engine")]
@@ -39,6 +72,9 @@ enum Command {
     Score {
         #[arg(long)]
         model: PathBuf,
+        /// Non-expert projection precision: bf16 (checkpoint), fp8, int8 (per row) or int8g (per 64 weights).
+        #[arg(long, value_enum, default_value_t = PrecisionArg::Int8g)]
+        precision: PrecisionArg,
         /// Fixture directories (each with sequence.json).
         #[arg(long, num_args = 1.., required = true)]
         fixture: Vec<PathBuf>,
@@ -58,11 +94,31 @@ enum Command {
     Generate {
         #[arg(long)]
         model: PathBuf,
+        /// Non-expert projection precision: bf16 (checkpoint), fp8, int8 (per row) or int8g (per 64 weights).
+        #[arg(long, value_enum, default_value_t = PrecisionArg::Int8g)]
+        precision: PrecisionArg,
         #[arg(long, num_args = 1.., required = true)]
         fixture: Vec<PathBuf>,
         /// Reference logit margin at or below which a divergence counts as a near-tie.
         #[arg(long, default_value_t = 0.5)]
         tie: f32,
+    },
+    /// Measure prefill and greedy decode throughput at the given prompt lengths.
+    Bench {
+        #[arg(long)]
+        model: PathBuf,
+        /// Non-expert projection precision: bf16 (checkpoint), fp8, int8 (per row) or int8g (per 64 weights).
+        #[arg(long, value_enum, default_value_t = PrecisionArg::Int8g)]
+        precision: PrecisionArg,
+        #[arg(long, num_args = 1.., default_values_t = [512usize])]
+        ctx: Vec<usize>,
+        #[arg(long, default_value_t = 256)]
+        generate: usize,
+        #[arg(long, default_value_t = 1024)]
+        chunk: usize,
+        /// Also print per-op GPU time for a few eager decode steps.
+        #[arg(long)]
+        profile: bool,
     },
     /// Apply the correctness gate (GOAL.md §1) to teacher-forced candidate distributions.
     Gate {
@@ -119,8 +175,9 @@ fn main() -> Result<()> {
                 println!("verified {checked} tensors byte-exact");
             }
         }
-        Command::Score { model, fixture, out, suffix, chunk, decode } => score(&model, &fixture, &out, &suffix, chunk, decode)?,
-        Command::Generate { model, fixture, tie } => generate(&model, &fixture, tie)?,
+        Command::Score { model, precision, fixture, out, suffix, chunk, decode } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode)?,
+        Command::Generate { model, precision, fixture, tie } => generate(&model, precision.into(), &fixture, tie)?,
+        Command::Bench { model, precision, ctx, generate, chunk, profile } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile)?,
         Command::Gate { fixtures, candidates, suffix } => {
             let mut all = true;
             let mut any = false;
@@ -162,9 +219,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn score(model_dir: &std::path::Path, fixtures: &[PathBuf], out: &std::path::Path, suffix: &str, chunk: usize, decode: bool) -> Result<()> {
+fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf], out: &std::path::Path, suffix: &str, chunk: usize, decode: bool) -> Result<()> {
     use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
-    use squash_engine::model::Model;
 
     #[derive(serde::Deserialize)]
     struct Sequence {
@@ -173,12 +229,7 @@ fn score(model_dir: &std::path::Path, fixtures: &[PathBuf], out: &std::path::Pat
     }
     const TOP_K: usize = 32;
 
-    squash_cuda::set_device(0)?;
-    let ckpt = Checkpoint::open(model_dir)?;
-    let (weights, stats) = loader::upload(&ckpt, selection::text, LoadOptions::default())?;
-    println!("loaded {:.2} GiB in {:.1}s", stats.bytes as f64 / 1073741824.0, stats.seconds);
-    let stream = squash_cuda::Stream::new()?;
-    let model = Model::bind(&ckpt, weights, &stream)?;
+    let (model, stream) = load(model_dir, precision)?;
     std::fs::create_dir_all(out)?;
 
     let seqs: Vec<(PathBuf, Sequence)> = fixtures
@@ -186,7 +237,7 @@ fn score(model_dir: &std::path::Path, fixtures: &[PathBuf], out: &std::path::Pat
         .map(|f| Ok((f.clone(), serde_json::from_slice(&std::fs::read(f.join("sequence.json"))?)?)))
         .collect::<Result<_>>()?;
     let capacity = seqs.iter().map(|(_, s)| s.tokens.len()).max().unwrap_or(0);
-    let ws = Workspace::new(chunk, capacity)?;
+    let mut ws = Workspace::new(chunk, capacity)?;
     let hw = HeadWorkspace::new(256, TOP_K)?;
     println!("workspace {:.2} GiB", ws.bytes() as f64 / 1073741824.0);
 
@@ -213,7 +264,7 @@ fn score(model_dir: &std::path::Path, fixtures: &[PathBuf], out: &std::path::Pat
             let step = if decode && c0 >= seq.prompt_len { 1 } else { chunk };
             let limit = if decode && c0 < seq.prompt_len { seq.prompt_len } else { seq.tokens.len() };
             let c1 = (c0 + step).min(limit);
-            forward::forward(&model, &mut state, &ws, &stream, &seq.tokens[c0..c1])?;
+            forward::forward(&model, &mut state, &mut ws, &stream, &seq.tokens[c0..c1])?;
             let rows = c1.min(positions) - c0.min(positions);
             if rows > 0 {
                 let h = forward::head_stats(&model, &hw, &stream, ws.out, &seq.tokens[c0 + 1..c0 + 1 + rows], TOP_K)?;
@@ -234,9 +285,8 @@ fn score(model_dir: &std::path::Path, fixtures: &[PathBuf], out: &std::path::Pat
     Ok(())
 }
 
-fn generate(model_dir: &std::path::Path, fixtures: &[PathBuf], tie: f32) -> Result<()> {
+fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf], tie: f32) -> Result<()> {
     use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
-    use squash_engine::model::Model;
 
     #[derive(serde::Deserialize)]
     struct Sequence {
@@ -244,17 +294,13 @@ fn generate(model_dir: &std::path::Path, fixtures: &[PathBuf], tie: f32) -> Resu
         prompt_len: usize,
     }
 
-    squash_cuda::set_device(0)?;
-    let ckpt = Checkpoint::open(model_dir)?;
-    let (weights, _) = loader::upload(&ckpt, selection::text, LoadOptions::default())?;
-    let stream = squash_cuda::Stream::new()?;
-    let model = Model::bind(&ckpt, weights, &stream)?;
+    let (model, stream) = load(model_dir, precision)?;
     let seqs: Vec<(PathBuf, Sequence)> = fixtures
         .iter()
         .map(|f| Ok((f.clone(), serde_json::from_slice(&std::fs::read(f.join("sequence.json"))?)?)))
         .collect::<Result<_>>()?;
     let capacity = seqs.iter().map(|(_, s)| s.tokens.len()).max().unwrap_or(0);
-    let ws = Workspace::new(1024, capacity)?;
+    let mut ws = Workspace::new(1024, capacity)?;
     let hw = HeadWorkspace::new(1, 1)?;
     let mut all_ok = true;
     for (dir, seq) in &seqs {
@@ -263,7 +309,7 @@ fn generate(model_dir: &std::path::Path, fixtures: &[PathBuf], tie: f32) -> Resu
         let mut state = SequenceState::new(seq.tokens.len())?;
         let prompt = &seq.tokens[..seq.prompt_len];
         for c in prompt.chunks(1024) {
-            forward::forward(&model, &mut state, &ws, &stream, c)?;
+            forward::forward(&model, &mut state, &mut ws, &stream, c)?;
         }
         let last = ws.out + ((prompt.len() - 1) % 1024 * squash_engine::model::D * 2) as u64;
         let mut next = forward::head_stats(&model, &hw, &stream, last, &[0], 1)?.top_ids[0];
@@ -293,7 +339,7 @@ fn generate(model_dir: &std::path::Path, fixtures: &[PathBuf], tie: f32) -> Resu
             if p + 1 == seq.tokens.len() {
                 break;
             }
-            forward::forward(&model, &mut state, &ws, &stream, &[want])?;
+            forward::forward(&model, &mut state, &mut ws, &stream, &[want])?;
             steps += 1;
             next = forward::head_stats(&model, &hw, &stream, ws.out, &[0], 1)?.top_ids[0];
         }

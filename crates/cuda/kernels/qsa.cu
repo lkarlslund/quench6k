@@ -39,8 +39,9 @@ SQ_DEVICE void rope_inplace(float* x, const int* pos3) {
 __global__ void qkv_prep_kernel(const float* __restrict__ qg, const float* __restrict__ kv,
                                 const __nv_bfloat16* __restrict__ q_norm, const __nv_bfloat16* __restrict__ k_norm,
                                 float* q, __nv_bfloat16* kcache, __nv_bfloat16* vcache, const int* __restrict__ pos3,
-                                int start) {
+                                const int* __restrict__ start_ptr) {
     __shared__ float x[HD];
+    const int start = *start_ptr;
     __shared__ float scratch[32];
     const int t = blockIdx.x / (QH + KVH), j = blockIdx.x % (QH + KVH), i = threadIdx.x;
     const int p = start + t;
@@ -62,7 +63,8 @@ __global__ void qkv_prep_kernel(const float* __restrict__ qg, const float* __res
 
 // Blocks (t, j): j < 4 normalizes/rotates indexer query head j into iq; j = 4 stores the raw key. 128 threads.
 __global__ void index_prep_kernel(const float* __restrict__ idx, const __nv_bfloat16* __restrict__ q_ln, float* iq,
-                                  __nv_bfloat16* raw, const int* __restrict__ pos3, int start) {
+                                  __nv_bfloat16* raw, const int* __restrict__ pos3, const int* __restrict__ start_ptr) {
+    const int start = *start_ptr;
     __shared__ float x[ID];
     __shared__ float scratch[32];
     const int t = blockIdx.x / (IH + 1), j = blockIdx.x % (IH + 1), i = threadIdx.x;
@@ -80,12 +82,16 @@ __global__ void index_prep_kernel(const float* __restrict__ idx, const __nv_bflo
     iq[(size_t)t * IH * ID + j * ID + i] = x[i];
 }
 
-// Pools every group g in [g_begin, g_end): mean of 4 raw keys (rounded to BF16), RMSNorm, RoPE at 4g.
+// Pools every group completed by this step's tokens (g in [start / 4, (start + T) / 4)): mean of 4 raw
+// keys (rounded to BF16), RMSNorm, RoPE at 4g. Launched with T / 4 + 1 blocks; extra blocks exit.
 __global__ void pool_kernel(const __nv_bfloat16* __restrict__ raw, const __nv_bfloat16* __restrict__ k_ln,
-                            __nv_bfloat16* pooled, const int* __restrict__ pos3, int g_begin) {
+                            __nv_bfloat16* pooled, const int* __restrict__ pos3, const int* __restrict__ start_ptr,
+                            int T) {
     __shared__ float x[ID];
     __shared__ float scratch[32];
-    const int g = g_begin + blockIdx.x, i = threadIdx.x;
+    const int start = *start_ptr;
+    const int g = start / GROUP + blockIdx.x, i = threadIdx.x;
+    if (g >= (start + T) / GROUP) return;
     float m = 0;
 #pragma unroll
     for (int j = 0; j < GROUP; ++j) m += bf2f(raw[(size_t)(g * GROUP + j) * ID + i]);
@@ -101,13 +107,15 @@ __global__ void pool_kernel(const __nv_bfloat16* __restrict__ raw, const __nv_bf
 // scores[t, g] = sum_h relu(iq[t, h] . pooled[g]) / sqrt(128) for complete groups g < (p + 1) / 4,
 // -inf for the rest of the row (row stride `ld`). Grid (T, ceil(ld / 256)), 256 threads.
 __global__ void index_score_kernel(const float* __restrict__ iq, const __nv_bfloat16* __restrict__ pooled, float* scores,
-                                   int ld, int start) {
+                                   int ld, const int* __restrict__ start_ptr) {
     __shared__ float q[IH * ID];
+    const int start = *start_ptr;
     const int t = blockIdx.x, g = blockIdx.y * blockDim.x + threadIdx.x;
+    const int complete = (start + t + 1) / GROUP;
+    if (complete <= TOPG || (int)(blockIdx.y * blockDim.x) >= complete) return;  // dense, or past the row
     for (int i = threadIdx.x; i < IH * ID; i += blockDim.x) q[i] = iq[(size_t)t * IH * ID + i];
     __syncthreads();
-    if (g >= ld) return;
-    const int complete = (start + t + 1) / GROUP;
+    if (g >= ld || g >= complete) return;
     float out = -INFINITY;
     if (g < complete) {
         float acc[IH] = {};
@@ -138,8 +146,8 @@ constexpr int ATT_THREADS = 256, KT = 32, QPG = QH / KVH;  // 12 query heads per
 __global__ void __launch_bounds__(ATT_THREADS) attention_kernel(const float* __restrict__ q, const float* __restrict__ qg,
                                                                  const __nv_bfloat16* __restrict__ kcache,
                                                                  const __nv_bfloat16* __restrict__ vcache,
-                                                                 const int* __restrict__ sel, int start,
-                                                                 __nv_bfloat16* out) {
+                                                                 const int* __restrict__ sel,
+                                                                 const int* __restrict__ start_ptr, __nv_bfloat16* out) {
     __shared__ float sq[QPG][HD];
     __shared__ __nv_bfloat16 sk[KT][HD], sv[KT][HD];
     __shared__ float sp[QPG][KT];
@@ -147,7 +155,7 @@ __global__ void __launch_bounds__(ATT_THREADS) attention_kernel(const float* __r
     __shared__ int keys[KT];
 
     const int t = blockIdx.x, kvh = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int p = start + t;
+    const int p = *start_ptr + t;
     const int complete = (p + 1) / GROUP;
     const bool dense = complete <= TOPG;
     const int tail_begin = complete * GROUP;
@@ -228,10 +236,133 @@ __global__ void __launch_bounds__(ATT_THREADS) attention_kernel(const float* __r
     }
 }
 
+
+// ---- split-key attention for small batches -------------------------------------------------
+// A query attends to at most 512 * 4 + 3 = 2051 keys, so SPLITS chunks of CHUNK keys always cover it.
+constexpr int CHUNK = 128, SPLITS = (TOPG * GROUP + GROUP - 1 + CHUNK - 1) / CHUNK;
+
+SQ_DEVICE int key_at(int i, bool dense, const int* sel_row, int tail_begin) {
+    return dense ? i : (i < TOPG * GROUP ? sel_row[i / GROUP] * GROUP + i % GROUP : tail_begin + i - TOPG * GROUP);
+}
+
+// Partial attention of one (query t, KV head, key chunk): writes the chunk's running max and sum per
+// head and the unnormalized output [12, 256] to part[(t, kvh, split)].
+__global__ void __launch_bounds__(ATT_THREADS) attention_split_kernel(const float* __restrict__ q,
+                                                                       const __nv_bfloat16* __restrict__ kcache,
+                                                                       const __nv_bfloat16* __restrict__ vcache,
+                                                                       const int* __restrict__ sel,
+                                                                       const int* __restrict__ start_ptr, float* part) {
+    __shared__ float sq[QPG][HD];
+    __shared__ __nv_bfloat16 sk[KT][HD], sv[KT][HD];
+    __shared__ float sp[QPG][KT];
+    __shared__ float smax[QPG], ssum[QPG], sscale[QPG];
+    __shared__ int keys[KT];
+
+    const int t = blockIdx.x, kvh = blockIdx.y, split = blockIdx.z;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int p = *start_ptr + t;
+    const int complete = (p + 1) / GROUP;
+    const bool dense = complete <= TOPG;
+    const int tail_begin = complete * GROUP;
+    const int nkeys = dense ? p + 1 : TOPG * GROUP + (p + 1 - tail_begin);
+    const int k_begin = split * CHUNK, k_end = min(nkeys, k_begin + CHUNK);
+    const int* sel_row = sel + (size_t)t * TOPG;
+    float* out = part + (((size_t)t * KVH + kvh) * SPLITS + split) * (2 * QPG + QPG * HD);
+
+    if (k_begin >= k_end) {
+        if (tid < QPG) {
+            out[tid] = -INFINITY;
+            out[QPG + tid] = 0;
+        }
+        return;
+    }
+    for (int i = tid; i < QPG * HD; i += ATT_THREADS)
+        sq[i / HD][i % HD] = q[(size_t)t * QH * HD + (kvh * QPG + i / HD) * HD + i % HD];
+    if (tid < QPG) {
+        smax[tid] = -INFINITY;
+        ssum[tid] = 0;
+    }
+    float acc[QPG] = {};
+    __syncthreads();
+    for (int k0 = k_begin; k0 < k_end; k0 += KT) {
+        const int nk = min(KT, k_end - k0);
+        if (tid < nk) keys[tid] = key_at(k0 + tid, dense, sel_row, tail_begin);
+        __syncthreads();
+        for (int i = tid; i < nk * HD / 8; i += ATT_THREADS) {
+            const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
+            const size_t src = ((size_t)keys[r] * KVH + kvh) * HD + c;
+            *reinterpret_cast<uint4*>(&sk[r][c]) = *reinterpret_cast<const uint4*>(kcache + src);
+            *reinterpret_cast<uint4*>(&sv[r][c]) = *reinterpret_cast<const uint4*>(vcache + src);
+        }
+        __syncthreads();
+        for (int r = warp; r < nk; r += ATT_THREADS / 32) {
+            float partv[QPG] = {};
+            for (int d = lane; d < HD; d += 32) {
+                const float kf = bf2f(sk[r][d]);
+#pragma unroll
+                for (int h = 0; h < QPG; ++h) partv[h] += sq[h][d] * kf;
+            }
+#pragma unroll
+            for (int h = 0; h < QPG; ++h) {
+                const float sc = warp_sum(partv[h]);
+                if (lane == 0) sp[h][r] = sc * (1.0f / 16.0f);
+            }
+        }
+        __syncthreads();
+        for (int h = warp; h < QPG; h += ATT_THREADS / 32) {
+            float m = lane < nk ? sp[h][lane] : -INFINITY;
+            m = warp_max(m);
+            const float new_max = fmaxf(smax[h], m);
+            const float e = lane < nk ? __expf(sp[h][lane] - new_max) : 0.0f;
+            if (lane < nk) sp[h][lane] = e;
+            const float sum = warp_sum(e);
+            if (lane == 0) {
+                const float scale = __expf(smax[h] - new_max);
+                sscale[h] = scale;
+                ssum[h] = ssum[h] * scale + sum;
+                smax[h] = new_max;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < QPG; ++h) acc[h] *= sscale[h];
+        for (int r = 0; r < nk; ++r) {
+            const float vf = bf2f(sv[r][tid]);
+#pragma unroll
+            for (int h = 0; h < QPG; ++h) acc[h] += sp[h][r] * vf;
+        }
+        __syncthreads();
+    }
+    if (tid < QPG) {
+        out[tid] = smax[tid];
+        out[QPG + tid] = ssum[tid];
+    }
+#pragma unroll
+    for (int h = 0; h < QPG; ++h) out[2 * QPG + h * HD + tid] = acc[h];
+}
+
+// Merges the splits of (t, head) in split order and applies the output gate. grid (T, 24), 256 threads.
+__global__ void attention_merge_kernel(const float* __restrict__ part, const float* __restrict__ qg,
+                                       __nv_bfloat16* out) {
+    const int t = blockIdx.x, head = blockIdx.y, kvh = head / QPG, h = head % QPG, d = threadIdx.x;
+    const float* base = part + ((size_t)t * KVH + kvh) * SPLITS * (2 * QPG + QPG * HD);
+    float m = -INFINITY;
+    for (int s = 0; s < SPLITS; ++s) m = fmaxf(m, base[s * (2 * QPG + QPG * HD) + h]);
+    float l = 0, o = 0;
+    for (int s = 0; s < SPLITS; ++s) {
+        const float* b = base + s * (2 * QPG + QPG * HD);
+        const float w = b[QPG + h] > 0 ? __expf(b[h] - m) : 0.0f;
+        l += w * b[QPG + h];
+        o += w * b[2 * QPG + h * HD + d];
+    }
+    const float gate = qg[(size_t)t * QH * 2 * HD + head * 2 * HD + HD + d];
+    out[(size_t)t * QH * HD + head * HD + d] = f2bf(o / l * sigmoidf(gate));
+}
+
 }  // namespace
 
 extern "C" cudaError_t squash_qsa_qkv_prep(const float* qg, const float* kv, const void* q_norm, const void* k_norm,
-                                           float* q, void* kcache, void* vcache, const int* pos3, int start, int T,
+                                           float* q, void* kcache, void* vcache, const int* pos3, const int* start, int T,
                                            cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     qkv_prep_kernel<<<T * (QH + KVH), HD, 0, st>>>(qg, kv, static_cast<const __nv_bfloat16*>(q_norm),
@@ -242,25 +373,25 @@ extern "C" cudaError_t squash_qsa_qkv_prep(const float* qg, const float* kv, con
 }
 
 extern "C" cudaError_t squash_qsa_index_prep(const float* idx, const void* q_ln, float* iq, void* raw, const int* pos3,
-                                             int start, int T, cudaStream_t st) {
+                                             const int* start, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     index_prep_kernel<<<T * (IH + 1), ID, 0, st>>>(idx, static_cast<const __nv_bfloat16*>(q_ln), iq,
                                                    static_cast<__nv_bfloat16*>(raw), pos3, start);
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_qsa_pool(const void* raw, const void* k_ln, void* pooled, const int* pos3, int start, int T,
-                                       cudaStream_t st) {
-    const int g_begin = start / GROUP, g_end = (start + T) / GROUP;
-    if (g_end <= g_begin) return cudaSuccess;
-    pool_kernel<<<g_end - g_begin, ID, 0, st>>>(static_cast<const __nv_bfloat16*>(raw),
-                                                static_cast<const __nv_bfloat16*>(k_ln),
-                                                static_cast<__nv_bfloat16*>(pooled), pos3, g_begin);
+extern "C" cudaError_t squash_qsa_pool(const void* raw, const void* k_ln, void* pooled, const int* pos3, const int* start,
+                                       int T, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    pool_kernel<<<T / GROUP + 1, ID, 0, st>>>(static_cast<const __nv_bfloat16*>(raw),
+                                              static_cast<const __nv_bfloat16*>(k_ln),
+                                              static_cast<__nv_bfloat16*>(pooled), pos3, start, T);
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_qsa_index_scores(const float* iq, const void* pooled, float* scores, int ld, int start,
-                                               int T, cudaStream_t st) {
+// Scores rows that need group selection; `ld` must cover the largest possible group count.
+extern "C" cudaError_t squash_qsa_index_scores(const float* iq, const void* pooled, float* scores, int ld,
+                                               const int* start, int T, cudaStream_t st) {
     if (T == 0 || ld == 0) return cudaSuccess;
     index_score_kernel<<<dim3(T, (ld + 255) / 256), 256, 0, st>>>(iq, static_cast<const __nv_bfloat16*>(pooled), scores,
                                                                   ld, start);
@@ -268,10 +399,40 @@ extern "C" cudaError_t squash_qsa_index_scores(const float* iq, const void* pool
 }
 
 extern "C" cudaError_t squash_qsa_attention(const float* q, const float* qg, const void* kcache, const void* vcache,
-                                            const int* sel, int start, int T, void* out, cudaStream_t st) {
+                                            const int* sel, const int* start, int T, void* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     attention_kernel<<<dim3(T, KVH), ATT_THREADS, 0, st>>>(q, qg, static_cast<const __nv_bfloat16*>(kcache),
                                                            static_cast<const __nv_bfloat16*>(vcache), sel, start,
                                                            static_cast<__nv_bfloat16*>(out));
+    SQ_RETURN_LAUNCH();
+}
+
+namespace {
+
+// Writes this step's T positions (3 axes each) into the sequence's position table at start ...
+__global__ void store_positions_kernel(const int* __restrict__ src, int* pos3, const int* __restrict__ start_ptr, int T) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < 3 * T) pos3[3 * *start_ptr + i] = src[i];
+}
+
+}  // namespace
+
+extern "C" cudaError_t squash_store_positions(const int* src, int* pos3, const int* start, int T, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    store_positions_kernel<<<(3 * T + 255) / 256, 256, 0, st>>>(src, pos3, start, T);
+    SQ_RETURN_LAUNCH();
+}
+
+extern "C" size_t squash_qsa_split_floats(int T) { return (size_t)T * KVH * SPLITS * (2 * QPG + QPG * HD); }
+
+// Attention for small batches: key-split partials into `part` (squash_qsa_split_floats(T) floats), then merge.
+extern "C" cudaError_t squash_qsa_attention_split(const float* q, const float* qg, const void* kcache, const void* vcache,
+                                                  const int* sel, const int* start, int T, float* part, void* out,
+                                                  cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    attention_split_kernel<<<dim3(T, KVH, SPLITS), ATT_THREADS, 0, st>>>(q, static_cast<const __nv_bfloat16*>(kcache),
+                                                                        static_cast<const __nv_bfloat16*>(vcache), sel,
+                                                                        start, part);
+    attention_merge_kernel<<<dim3(T, QH), HD, 0, st>>>(part, qg, static_cast<__nv_bfloat16*>(out));
     SQ_RETURN_LAUNCH();
 }

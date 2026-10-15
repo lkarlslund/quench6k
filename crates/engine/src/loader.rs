@@ -26,6 +26,8 @@ pub struct DeviceTensor {
     pub bytes: u64,
     pub dtype: DType,
     pub shape: Vec<usize>,
+    /// For FP8 tensors converted at load: per-row FP32 scales.
+    pub scale: u64,
 }
 
 pub struct DeviceWeights {
@@ -41,6 +43,69 @@ impl DeviceWeights {
     pub fn device_bytes(&self) -> usize {
         self.segments.iter().map(|s| s.bytes()).sum()
     }
+
+    pub fn merge(&mut self, other: DeviceWeights) {
+        self.segments.extend(other.segments);
+        self.tensors.extend(other.tensors);
+    }
+}
+
+/// Uploads the selected 2-D BF16 tensors and converts each to an 8-bit format (FP8 E4M3 or INT8) with
+/// per-row scales on the GPU, one file at a time, so only one file's BF16 copy is ever resident.
+pub fn upload_quantized(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, format: squash_cuda::kernels::WeightFormat, opts: LoadOptions, stream: &squash_cuda::Stream) -> Result<(DeviceWeights, LoadStats)> {
+    use squash_cuda::kernels::WeightFormat;
+    anyhow::ensure!(format != WeightFormat::Bf16, "upload_quantized needs an 8-bit format");
+    let start = Instant::now();
+    let mut per_file: Vec<Vec<&str>> = vec![Vec::new(); ckpt.files.len()];
+    for (name, info) in &ckpt.tensors {
+        if select(name) {
+            anyhow::ensure!(info.dtype == DType::BF16 && info.shape.len() == 2, "{name}: only 2-D BF16 tensors convert to FP8");
+            per_file[info.file].push(name.as_str());
+        }
+    }
+    let mut out = DeviceWeights { segments: Vec::new(), tensors: HashMap::new() };
+    let mut stats = LoadStats::default();
+    for names in per_file.iter_mut().filter(|n| !n.is_empty()) {
+        names.sort();
+        let (staged, s) = upload(ckpt, |n| names.binary_search(&n).is_ok(), opts)?;
+        stats.bytes += s.bytes;
+        let mut layout = Vec::with_capacity(names.len());
+        let mut total = 0usize;
+        for name in names.iter() {
+            let shape = &ckpt.tensors[*name].shape;
+            let scales = if format == WeightFormat::Int8Group { shape[0] * shape[1] / squash_cuda::kernels::int8_group() } else { shape[0] };
+            let (q, sc) = (total, total + (shape[0] * shape[1]).div_ceil(256) * 256);
+            total = sc + (scales * 4).div_ceil(256) * 256;
+            layout.push((q, sc));
+        }
+        let arena = DeviceBuffer::new(total)?;
+        for (name, (q, sc)) in names.iter().zip(layout) {
+            let src = staged.get(name)?;
+            let (n, k) = (src.shape[0], src.shape[1]);
+            let (qa, sa) = (arena.addr() + q as u64, arena.addr() + sc as u64);
+            let dtype = match format {
+                WeightFormat::Fp8 => {
+                    squash_cuda::kernels::quantize_fp8_rows(stream, src.addr, n, k, qa, sa)?;
+                    DType::F8E4M3
+                }
+                WeightFormat::Int8 => {
+                    squash_cuda::kernels::quantize_int8_rows(stream, src.addr, n, k, qa, sa)?;
+                    DType::I8
+                }
+                _ => {
+                    anyhow::ensure!(k % squash_cuda::kernels::int8_group() == 0, "{name}: K {k} is not a multiple of the INT8 group");
+                    squash_cuda::kernels::quantize_int8_groups(stream, src.addr, n, k, qa, sa)?;
+                    DType::I8G
+                }
+            };
+            out.tensors.insert(name.to_string(), DeviceTensor { addr: qa, bytes: (n * k) as u64, dtype, shape: src.shape.clone(), scale: sa });
+        }
+        stream.synchronize()?;
+        out.segments.push(arena);
+    }
+    stats.segments = out.segments.len();
+    stats.seconds = start.elapsed().as_secs_f64();
+    Ok((out, stats))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -110,7 +175,7 @@ pub fn upload(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, opts: LoadOption
                 let info = &ckpt.tensors[name];
                 tensors.insert(
                     name.to_string(),
-                    DeviceTensor { addr: buffer.addr() + (begin - seg_begin), bytes: end - begin, dtype: info.dtype, shape: info.shape.clone() },
+                    DeviceTensor { addr: buffer.addr() + (begin - seg_begin), bytes: end - begin, dtype: info.dtype, shape: info.shape.clone(), scale: 0 },
                 );
             }
             let mut offset = 0usize;

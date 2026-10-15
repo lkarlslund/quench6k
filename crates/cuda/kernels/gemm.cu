@@ -4,6 +4,8 @@
 // is exactly mma.sync's row.col form. 64x128x32 CTA tiles, 8 warps of 32x32, three cp.async stages.
 // K must be a multiple of 32 and rows 16-byte aligned; M and N are arbitrary.
 
+#include <cuda_fp8.h>
+
 #include "mma.cuh"
 
 namespace {
@@ -20,10 +22,16 @@ SQ_DEVICE void store_out<__nv_bfloat16>(__nv_bfloat16* p, float v, bool accumula
     *p = f2bf(accumulate ? bf2f(*p) + v : v);
 }
 
-template <typename OutT>
+// WF (weight format): 0 BF16; 1 FP8 E4M3 or 2 INT8 [N, K] (ldw in elements = bytes) with an FP32 scale
+// per row, converted exactly to BF16 while staging the tile, the row scale applied in the epilogue;
+// 3 INT8 with an FP32 scale per 64 weights of a row ([N, K / 64]), applied while staging.
+template <typename OutT, int WF>
 __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __restrict__ X, int ldx,
-                                                       const __nv_bfloat16* __restrict__ W, int ldw, OutT* Y, int ldy,
+                                                       const void* __restrict__ Wv, int ldw,
+                                                       const float* __restrict__ row_scale, OutT* Y, int ldy,
                                                        int M, int N, int K, float alpha, bool accumulate) {
+    const __nv_bfloat16* W = static_cast<const __nv_bfloat16*>(Wv);
+    const uint8_t* W8 = static_cast<const uint8_t*>(Wv);
     __shared__ __align__(16) __nv_bfloat16 sA[STAGES][BM * LDS];
     __shared__ __align__(16) __nv_bfloat16 sB[STAGES][BN * LDS];
 
@@ -40,13 +48,40 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
             const bool ok = gm < M;
             cp_async16(&sA[stage][r * LDS + c], X + (size_t)(ok ? gm : 0) * ldx + k + c, ok);
         }
+        if constexpr (WF == 0) {
 #pragma unroll
-        for (int i = 0; i < 2; ++i) {  // B: 128 rows x 4 chunks
-            const int idx = tid + i * THREADS;
-            const int r = idx >> 2, c = (idx & 3) * 8;
+            for (int i = 0; i < 2; ++i) {  // B: 128 rows x 4 chunks
+                const int idx = tid + i * THREADS;
+                const int r = idx >> 2, c = (idx & 3) * 8;
+                const int gn = n0 + r;
+                const bool ok = gn < N;
+                cp_async16(&sB[stage][r * LDS + c], W + (size_t)(ok ? gn : 0) * ldw + k + c, ok);
+            }
+        } else {  // B: 128 rows x 2 chunks of 16 8-bit values, converted to BF16
+            const int r = tid >> 1, c = (tid & 1) * 16;
             const int gn = n0 + r;
-            const bool ok = gn < N;
-            cp_async16(&sB[stage][r * LDS + c], W + (size_t)(ok ? gn : 0) * ldw + k + c, ok);
+            __nv_bfloat16* dst = &sB[stage][r * LDS + c];
+            if (gn < N) {
+                const uint4 v = __ldg(reinterpret_cast<const uint4*>(W8 + (size_t)gn * ldw + k + c));
+                if constexpr (WF == 1) {
+                    const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&v);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(p[i], __NV_E4M3);
+                        const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+                        dst[2 * i] = f2bf(f.x);
+                        dst[2 * i + 1] = f2bf(f.y);
+                    }
+                } else {
+                    const int8_t* p = reinterpret_cast<const int8_t*>(&v);
+                    const float gs = WF == 3 ? row_scale[(size_t)gn * (K / 64) + (k + c) / 64] : 1.0f;
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) dst[i] = f2bf((float)p[i] * gs);
+                }
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) dst[i] = f2bf(0.0f);
+            }
         }
     };
 
@@ -100,31 +135,43 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
                 const int m = m0 + warp_m * 32 + i * 16 + g + h * 8;
                 const int n = n0 + warp_n * 32 + j * 8 + t4 * 2;
                 if (m >= M) continue;
-                if (n < N) store_out(&Y[(size_t)m * ldy + n], alpha * acc[i][j][h * 2], accumulate);
-                if (n + 1 < N) store_out(&Y[(size_t)m * ldy + n + 1], alpha * acc[i][j][h * 2 + 1], accumulate);
+                const float s0 = (WF == 1 || WF == 2) && n < N ? row_scale[n] : 1.0f;
+                const float s1 = (WF == 1 || WF == 2) && n + 1 < N ? row_scale[n + 1] : 1.0f;
+                if (n < N) store_out(&Y[(size_t)m * ldy + n], alpha * s0 * acc[i][j][h * 2], accumulate);
+                if (n + 1 < N) store_out(&Y[(size_t)m * ldy + n + 1], alpha * s1 * acc[i][j][h * 2 + 1], accumulate);
             }
 }
 
 template <typename OutT>
-cudaError_t launch(const void* X, int ldx, const void* W, int ldw, void* Y, int ldy, int M, int N, int K, float alpha,
-                   int accumulate, cudaStream_t stream) {
-    if (K % BK != 0 || ldx % 8 != 0 || ldw % 8 != 0) return cudaErrorInvalidValue;
+cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale, void* Y, int ldy, int M,
+                   int N, int K, float alpha, int accumulate, cudaStream_t stream) {
+    if (K % BK != 0 || ldx % 8 != 0 || ldw % 16 != 0) return cudaErrorInvalidValue;
     if (M == 0 || N == 0) return cudaSuccess;
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    gemm_kernel<OutT><<<grid, THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(X), ldx,
-                                                    static_cast<const __nv_bfloat16*>(W), ldw, static_cast<OutT*>(Y),
-                                                    ldy, M, N, K, alpha, accumulate != 0);
+    const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
+    OutT* y = static_cast<OutT*>(Y);
+    if (fmt == 1)
+        gemm_kernel<OutT, 1><<<grid, THREADS, 0, stream>>>(x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0);
+    else if (fmt == 2)
+        gemm_kernel<OutT, 2><<<grid, THREADS, 0, stream>>>(x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0);
+    else if (fmt == 3)
+        gemm_kernel<OutT, 3><<<grid, THREADS, 0, stream>>>(x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0);
+    else
+        gemm_kernel<OutT, 0><<<grid, THREADS, 0, stream>>>(x, ldx, W, ldw, nullptr, y, ldy, M, N, K, alpha, accumulate != 0);
     SQ_RETURN_LAUNCH();
 }
 
 }  // namespace
 
-extern "C" cudaError_t squash_gemm_bf16_f32(const void* X, int ldx, const void* W, int ldw, float* Y, int ldy, int M,
-                                            int N, int K, float alpha, int accumulate, cudaStream_t stream) {
-    return launch<float>(X, ldx, W, ldw, Y, ldy, M, N, K, alpha, accumulate, stream);
+// fmt 0: BF16 weights; 1: FP8 E4M3 and 2: INT8 weights with per-row FP32 scales.
+extern "C" cudaError_t squash_gemm_bf16_f32(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
+                                            float* Y, int ldy, int M, int N, int K, float alpha, int accumulate,
+                                            cudaStream_t stream) {
+    return launch<float>(fmt, X, ldx, W, ldw, scale, Y, ldy, M, N, K, alpha, accumulate, stream);
 }
 
-extern "C" cudaError_t squash_gemm_bf16_bf16(const void* X, int ldx, const void* W, int ldw, void* Y, int ldy, int M,
-                                             int N, int K, float alpha, int accumulate, cudaStream_t stream) {
-    return launch<__nv_bfloat16>(X, ldx, W, ldw, Y, ldy, M, N, K, alpha, accumulate, stream);
+extern "C" cudaError_t squash_gemm_bf16_bf16(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
+                                             void* Y, int ldy, int M, int N, int K, float alpha, int accumulate,
+                                             cudaStream_t stream) {
+    return launch<__nv_bfloat16>(fmt, X, ldx, W, ldw, scale, Y, ldy, M, N, K, alpha, accumulate, stream);
 }

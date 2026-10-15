@@ -15,8 +15,15 @@ SQ_DEVICE unsigned order_key(float f) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
+// With `start_ptr` set (QSA group selection), row r covers n = (start + r + 1) / group values and is
+// skipped when n <= k: such queries attend densely.
 __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__ x, int n, size_t ld, int k,
-                                                       int sort_by_index, int* out_idx, float* out_val) {
+                                                       int sort_by_index, int* out_idx, float* out_val,
+                                                       const int* __restrict__ start_ptr, int group) {
+    if (start_ptr) {
+        n = (*start_ptr + (int)blockIdx.x + 1) / group;
+        if (n <= k) return;
+    }
     __shared__ unsigned hist[256];
     __shared__ unsigned s_prefix, s_mask, s_remaining, s_gt, s_eq;
     __shared__ int pick_idx[MAXK];
@@ -114,7 +121,7 @@ extern "C" cudaError_t squash_topk(const float* x, int rows, int n, size_t ld, i
                                    float* out_val, cudaStream_t st) {
     if (k > MAXK || k > n || k <= 0) return cudaErrorInvalidValue;
     if (rows == 0) return cudaSuccess;
-    topk_kernel<<<rows, THREADS, 0, st>>>(x, n, ld, k, sort_by_index, out_idx, out_val);
+    topk_kernel<<<rows, THREADS, 0, st>>>(x, n, ld, k, sort_by_index, out_idx, out_val, nullptr, 0);
     SQ_RETURN_LAUNCH();
 }
 
@@ -143,5 +150,12 @@ extern "C" cudaError_t squash_row_lse(const float* x, int rows, int n, size_t ld
                                       float* target_logit, cudaStream_t st) {
     if (rows == 0) return cudaSuccess;
     lse_kernel<<<rows, 1024, 0, st>>>(x, n, ld, targets, lse, target_logit);
+    SQ_RETURN_LAUNCH();
+}
+
+extern "C" cudaError_t squash_qsa_select(const float* scores, int T, size_t ld, const int* start, int* sel,
+                                         cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    topk_kernel<<<T, THREADS, 0, st>>>(scores, 0, ld, MAXK, 1, sel, nullptr, start, 4);
     SQ_RETURN_LAUNCH();
 }

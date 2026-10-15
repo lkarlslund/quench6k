@@ -1,9 +1,11 @@
 //! Eager forward pass of the text model over a chunk of new tokens for one sequence.
 
 use anyhow::{Result, ensure};
-use squash_cuda::{DeviceBuffer, Stream, kernels as k};
+use squash_cuda::{DeviceBuffer, PinnedBuffer, Stream, kernels as k};
 
-use crate::model::{Block, D, EOS, EXPERT_WIDTH, EXPERTS, H, HC_RANK, Hc, LAYERS, Model, PleTable, S, TOP_K, VOCAB, is_attention};
+use crate::profile::Profiler;
+
+use crate::model::{Block, D, EOS, EXPERT_WIDTH, EXPERTS, H, HC_RANK, Hc, LAYERS, Linear, Model, S, TOP_K, VOCAB, is_attention};
 
 const QSA_HEADS: usize = 24;
 const QSA_KV: usize = 2;
@@ -84,7 +86,6 @@ pub struct Workspace {
     pub max_tokens: usize,
     score_cols: usize,
     bufs: Vec<DeviceBuffer>,
-    pub tokens: u64,
     pub h: u64,
     n: u64,
     low: u64,
@@ -134,13 +135,20 @@ pub struct Workspace {
     sact: u64,
     sh: u64,
     // PLE
-    e: u64,
     kp: u64,
     pv: u64,
     gv: u64,
     xn: u64,
     /// Final mixer output, BF16 [T, D].
     pub out: u64,
+    partial: u64,
+    active: u64,
+    num_active: u64,
+    row_token: u64,
+    att_part: u64,
+    /// Device copy of the step block, and its pinned host staging.
+    step: u64,
+    step_host: PinnedBuffer,
 }
 
 impl Workspace {
@@ -159,7 +167,6 @@ impl Workspace {
         Ok(Self {
             max_tokens,
             score_cols,
-            tokens: alloc(t * 4)?,
             h: alloc(t * H * 4)?,
             n: alloc(t * H * 2)?,
             low: alloc(t * HC_RANK * 4)?,
@@ -205,12 +212,18 @@ impl Workspace {
             sup: alloc(t * EXPERT_WIDTH * 4)?,
             sact: alloc(t * EXPERT_WIDTH * 2)?,
             sh: alloc(t * D * 4)?,
-            e: alloc(t * D * 2)?,
             kp: alloc(t * H * 4)?,
             pv: alloc(t * D * 4)?,
             gv: alloc(t * H * 4)?,
             xn: alloc(t * H * 4)?,
             out: alloc(t * D * 2)?,
+            partial: alloc(PARTIAL_FLOATS * 4)?,
+            active: alloc(EXPERTS * 4)?,
+            num_active: alloc(4)?,
+            row_token: alloc(k::moe_small_tokens() * TOP_K * 4)?,
+            att_part: alloc(k::qsa_split_floats(k::gemv_max_m()) * 4)?,
+            step: alloc(StepLayout::new(t).bytes)?,
+            step_host: PinnedBuffer::new(StepLayout::new(t).bytes)?,
             bufs,
         })
     }
@@ -224,17 +237,34 @@ impl Workspace {
     }
 }
 
-fn gemm(s: &Stream, x: u64, w: u64, y: u64, m: usize, n: usize, kk: usize) -> Result<()> {
-    k::gemm_f32(s, x, kk, w, kk, y, n, m, n, kk, 1.0, false)
+/// SMs on the target GPU; skinny GEMMs aim for at least two CTAs per SM.
+const TARGET_CTAS: usize = 2 * 188;
+const PARTIAL_FLOATS: usize = 1 << 22;
+
+/// y[t, n] = x[t, k] · Wᵀ with row strides `ldx`/`ldy`: skinny GEMM for decode-sized `t`, tensor-core
+/// GEMM otherwise.
+#[allow(clippy::too_many_arguments)]
+fn linear_ld(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, ldy: usize, t: usize) -> Result<()> {
+    if t <= k::gemv_max_m() {
+        let ctas = w.n.div_ceil(16);
+        let splits = TARGET_CTAS.div_ceil(ctas).clamp(1, w.k.div_ceil(256)).min(PARTIAL_FLOATS / (t * w.n)).max(1);
+        k::gemv(s, t, x, ldx, w.fmt, w.addr, w.scale, y, ldy, partial, w.n, w.k, splits, 1.0, false)
+    } else {
+        k::gemm_f32(s, x, ldx, w.fmt, w.addr, w.k, w.scale, y, ldy, t, w.n, w.k, 1.0, false)
+    }
+}
+
+fn linear(s: &Stream, ws: &Workspace, x: u64, w: &Linear, y: u64, t: usize) -> Result<()> {
+    linear_ld(s, ws.partial, x, w.k, w, y, w.n, t)
 }
 
 /// Mixes the residual through a HyperConnection: writes the BF16 block input to `ws.m` (or `out`)
 /// and, when the HC injects, the injection weights to `ws.inj`.
 fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, out: u64) -> Result<()> {
     k::grouped_rmsnorm(s, ws.h, hc.norm, ws.n, t)?;
-    gemm(s, ws.n, hc.down, ws.low, t, HC_RANK, H)?;
+    linear(s, ws, ws.n, &hc.down, ws.low, t)?;
     k::hc_low_rank_act(s, ws.low, ws.low_bf, t * HC_RANK)?;
-    gemm(s, ws.low_bf, hc.up, ws.up, t, H, HC_RANK)?;
+    linear(s, ws, ws.low_bf, &hc.up, ws.up, t)?;
     k::hc_mix(s, ws.up, ws.n, out, t)?;
     if let Some(inject) = hc.inject {
         k::hc_inject(s, ws.n, inject, ws.inj, t)?;
@@ -255,101 +285,212 @@ pub fn ple_rows(tokens: &[i32], p: usize, mult: &[i64; 3], sizes: &[i64; 16], of
     })
 }
 
-fn gather_ple(table: &PleTable, tokens: &[i32], start: usize, t: usize, ple: &crate::model::Ple) -> Vec<u16> {
-    let mut e = Vec::with_capacity(t * D);
-    for p in start..start + t {
-        for r in ple_rows(tokens, p, &ple.multipliers, &ple.sizes, &ple.offsets) {
-            table.gather(r, &mut e);
+/// Runs `$call` (a `Result<()>` expression) on stream `$s`, timed under `$name` when profiling.
+macro_rules! op {
+    ($prof:ident, $name:expr, $s:expr, $call:expr) => {
+        match $prof.as_deref_mut() {
+            Some(p) => p.time($name, $s, || $call)?,
+            None => $call?,
         }
-    }
-    e
+    };
 }
 
-/// Runs `new_tokens` (appended at the end of `state`) through the model. Afterwards `ws.out` holds the
-/// final mixer output, BF16 [T, D], for the new tokens.
-pub fn forward(model: &Model, state: &mut SequenceState, ws: &Workspace, s: &Stream, new_tokens: &[i32]) -> Result<()> {
+/// Byte offsets inside the step block: [start: i32 | pad][tokens: i32 x max][pos3: i32 x 3 x max][PLE rows: BF16 x D x max].
+struct StepLayout {
+    tokens: usize,
+    pos: usize,
+    ple: usize,
+    bytes: usize,
+}
+
+impl StepLayout {
+    fn new(max_tokens: usize) -> Self {
+        let tokens = 16;
+        let pos = tokens + 4 * max_tokens;
+        let ple = (pos + 12 * max_tokens).div_ceil(16) * 16;
+        Self { tokens, pos, ple, bytes: ple + 2 * D * max_tokens }
+    }
+
+    /// Bytes to transfer for a step of `t` tokens.
+    fn used(&self, t: usize) -> usize {
+        self.ple + 2 * D * t
+    }
+}
+
+/// Fills the pinned step block for `new_tokens` (appending them to `state`): start position, token
+/// IDs, positions, and the PLE rows gathered from the host table. Returns the bytes to transfer.
+pub fn prepare(model: &Model, state: &mut SequenceState, ws: &mut Workspace, new_tokens: &[i32]) -> Result<usize> {
     let t = new_tokens.len();
     let start = state.len();
     ensure!(t > 0 && t <= ws.max_tokens, "step of {t} tokens exceeds the workspace ({})", ws.max_tokens);
     ensure!(start + t <= state.capacity, "sequence would exceed its capacity of {}", state.capacity);
     state.tokens.extend_from_slice(new_tokens);
+    let layout = StepLayout::new(ws.max_tokens);
+    let block = ws.step_host.as_mut_slice();
+    block[0..4].copy_from_slice(&(start as i32).to_le_bytes());
+    for (j, tok) in new_tokens.iter().enumerate() {
+        block[layout.tokens + 4 * j..layout.tokens + 4 * j + 4].copy_from_slice(&tok.to_le_bytes());
+        for a in 0..3 {
+            let o = layout.pos + 12 * j + 4 * a;
+            block[o..o + 4].copy_from_slice(&((start + j) as i32).to_le_bytes());
+        }
+    }
+    let ple = model.layers[1].ple.as_ref().expect("layer 1 has PLE");
+    let mut rows = Vec::with_capacity(D);
+    for j in 0..t {
+        rows.clear();
+        for r in ple_rows(&state.tokens, start + j, &ple.multipliers, &ple.sizes, &ple.offsets) {
+            model.ple_table.gather(r, &mut rows);
+        }
+        let o = layout.ple + 2 * D * j;
+        for (d, v) in rows.iter().enumerate() {
+            block[o + 2 * d..o + 2 * d + 2].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    Ok(layout.used(t))
+}
 
-    s.upload_to(ws.tokens, new_tokens)?;
-    let pos: Vec<i32> = (start..start + t).flat_map(|p| [p as i32; 3]).collect();
-    s.upload_to(state.pos3.addr() + (start * 12) as u64, &pos)?;
+/// Runs the step prepared by [`prepare`] (`t` tokens, `bytes` of step block) entirely on the device:
+/// no host synchronization, so it can be captured into a CUDA graph. Afterwards `ws.out` holds the final
+/// mixer output, BF16 [T, D].
+pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, bytes: usize, mut prof: Option<&mut Profiler>) -> Result<()> {
+    let layout = StepLayout::new(ws.max_tokens);
+    unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? };
+    let start = ws.step;
+    let tokens = ws.step + layout.tokens as u64;
     let pos3 = state.pos3.addr();
+    op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, pos3, start, t));
 
-    k::embed(s, ws.tokens, t, model.embed, ws.h)?;
+    op!(prof, "embed", s, k::embed(s, tokens, t, model.embed, ws.h));
     for (i, layer) in model.layers.iter().enumerate() {
         if let Some(ple) = &layer.ple {
-            let e = gather_ple(&model.ple_table, &state.tokens, start, t, ple);
-            s.upload_to(ws.e, &e)?;
-            gemm(s, ws.e, ple.key, ws.kp, t, H, D)?;
-            gemm(s, ws.e, ple.value, ws.pv, t, D, D)?;
-            k::ple_gate(s, ws.kp, ws.h, ws.pv, ple.norm_key, ple.norm_query, ple.norm_conv, ws.gv, ws.xn, t)?;
-            k::ple_conv(s, ws.gv, ws.xn, ple.conv, state.ple_conv.addr(), ws.h, t)?;
+            let e = ws.step + layout.ple as u64;
+            op!(prof, "ple.key", s, linear(s, ws, e, &ple.key, ws.kp, t));
+            op!(prof, "ple.value", s, linear(s, ws, e, &ple.value, ws.pv, t));
+            op!(prof, "ple_gate", s, k::ple_gate(s, ws.kp, ws.h, ws.pv, ple.norm_key, ple.norm_query, ple.norm_conv, ws.gv, ws.xn, t));
+            op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv, ws.xn, ple.conv, state.ple_conv.addr(), ws.h, t));
         }
 
-        hyper_connection(s, ws, &layer.attn_hc, t, ws.m)?;
+        op!(prof, "hc attn_hc", s, hyper_connection(s, ws, &layer.attn_hc, t, ws.m));
         match &layer.block {
             Block::Gdn(g) => {
                 let st = state.gdn[i].as_ref().unwrap();
-                gemm(s, ws.m, g.qkv, ws.qkv, t, GDN_CONV, D)?;
-                gemm(s, ws.m, g.z, ws.z, t, GDN_Z, D)?;
-                gemm(s, ws.m, g.a, ws.ga, t, GDN_HEADS, D)?;
-                gemm(s, ws.m, g.b, ws.gb, t, GDN_HEADS, D)?;
-                k::gdn_conv(s, ws.qkv, ws.conv, st.conv.addr(), g.conv, t)?;
-                k::gdn_prep(s, ws.conv, ws.ga, ws.gb, g.a_log, g.dt_bias, ws.beta, ws.g, t)?;
-                k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st.recurrent.addr(), ws.o, t)?;
-                k::gdn_gated_norm(s, ws.o, ws.z, g.norm, ws.o_bf, t)?;
-                gemm(s, ws.o_bf, g.out, ws.y, t, D, GDN_Z)?;
+                op!(prof, "g.qkv", s, linear(s, ws, ws.m, &g.qkv, ws.qkv, t));
+                op!(prof, "g.z", s, linear(s, ws, ws.m, &g.z, ws.z, t));
+                op!(prof, "g.a", s, linear(s, ws, ws.m, &g.a, ws.ga, t));
+                op!(prof, "g.b", s, linear(s, ws, ws.m, &g.b, ws.gb, t));
+                op!(prof, "gdn_conv", s, k::gdn_conv(s, ws.qkv, ws.conv, st.conv.addr(), g.conv, t));
+                op!(prof, "gdn_prep", s, k::gdn_prep(s, ws.conv, ws.ga, ws.gb, g.a_log, g.dt_bias, ws.beta, ws.g, t));
+                op!(prof, "gdn_recurrent", s, k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st.recurrent.addr(), ws.o, t));
+                op!(prof, "gdn_gated_norm", s, k::gdn_gated_norm(s, ws.o, ws.z, g.norm, ws.o_bf, t));
+                op!(prof, "g.out", s, linear(s, ws, ws.o_bf, &g.out, ws.y, t));
             }
             Block::Qsa(q) => {
                 let c = state.qsa[i].as_ref().unwrap();
-                gemm(s, ws.m, q.q, ws.qg, t, QSA_HEADS * 2 * QSA_DIM, D)?;
-                k::gemm_f32(s, ws.m, D, q.k, D, ws.kv, 2 * QSA_KV * QSA_DIM, t, QSA_KV * QSA_DIM, D, 1.0, false)?;
-                k::gemm_f32(s, ws.m, D, q.v, D, ws.kv + (QSA_KV * QSA_DIM * 4) as u64, 2 * QSA_KV * QSA_DIM, t, QSA_KV * QSA_DIM, D, 1.0, false)?;
-                k::qsa_qkv_prep(s, ws.qg, ws.kv, q.q_norm, q.k_norm, ws.q, c.k.addr(), c.v.addr(), pos3, start, t)?;
-                gemm(s, ws.m, q.index_qk, ws.idx, t, 5 * INDEX_DIM, D)?;
-                k::qsa_index_prep(s, ws.idx, q.index_q_norm, ws.iq, c.raw.addr(), pos3, start, t)?;
-                k::qsa_pool(s, c.raw.addr(), q.index_k_norm, c.pooled.addr(), pos3, start, t)?;
-                // Group selection is needed only once some query has more than 512 complete groups.
-                let max_groups = (start + t) / 4;
-                if max_groups > TOP_GROUPS {
-                    ensure!(max_groups <= ws.score_cols, "context exceeds the workspace's score columns");
-                    k::qsa_index_scores(s, ws.iq, c.pooled.addr(), ws.scores, max_groups, start, t)?;
-                    k::topk(s, ws.scores, t, max_groups, max_groups, TOP_GROUPS, true, ws.sel, 0)?;
+                op!(prof, "q.q", s, linear(s, ws, ws.m, &q.q, ws.qg, t));
+                op!(prof, "q.k", s, linear_ld(s, ws.partial, ws.m, D, &q.k, ws.kv, 2 * QSA_KV * QSA_DIM, t));
+                op!(prof, "q.v", s, linear_ld(s, ws.partial, ws.m, D, &q.v, ws.kv + (QSA_KV * QSA_DIM * 4) as u64, 2 * QSA_KV * QSA_DIM, t));
+                op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, ws.qg, ws.kv, q.q_norm, q.k_norm, ws.q, c.k.addr(), c.v.addr(), pos3, start, t));
+                op!(prof, "q.index_qk", s, linear(s, ws, ws.m, &q.index_qk, ws.idx, t));
+                op!(prof, "qsa_index_prep", s, k::qsa_index_prep(s, ws.idx, q.index_q_norm, ws.iq, c.raw.addr(), pos3, start, t));
+                op!(prof, "qsa_pool", s, k::qsa_pool(s, c.raw.addr(), q.index_k_norm, c.pooled.addr(), pos3, start, t));
+                // Rows whose query sees at most 512 complete groups attend densely and skip selection.
+                if state.capacity / 4 > TOP_GROUPS {
+                    op!(prof, "qsa_index_scores", s, k::qsa_index_scores(s, ws.iq, c.pooled.addr(), ws.scores, ws.score_cols, start, t));
+                    op!(prof, "qsa_select", s, k::qsa_select(s, ws.scores, t, ws.score_cols, start, ws.sel));
                 }
-                k::qsa_attention(s, ws.q, ws.qg, c.k.addr(), c.v.addr(), ws.sel, start, t, ws.att)?;
-                gemm(s, ws.att, q.o, ws.y, t, D, QSA_HEADS * QSA_DIM)?;
+                if t <= k::gemv_max_m() {
+                    op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, ws.q, ws.qg, c.k.addr(), c.v.addr(), ws.sel, start, t, ws.att_part, ws.att));
+                } else {
+                    op!(prof, "qsa_attention", s, k::qsa_attention(s, ws.q, ws.qg, c.k.addr(), c.v.addr(), ws.sel, start, t, ws.att));
+                }
+                op!(prof, "q.o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
             }
         }
-        k::hc_combine(s, ws.h, ws.y, ws.inj, t)?;
+        op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, ws.y, ws.inj, t));
 
-        hyper_connection(s, ws, &layer.mlp_hc, t, ws.m)?;
+        op!(prof, "hc mlp_hc", s, hyper_connection(s, ws, &layer.mlp_hc, t, ws.m));
         let moe = &layer.moe;
-        gemm(s, ws.m, moe.router, ws.logits, t, EXPERTS, D)?;
-        k::moe_route(s, ws.logits, t, ws.top_i, ws.top_w)?;
-        k::moe_plan(s, ws.top_i, t, ws.counts, ws.cursor, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
-        k::moe_gather(s, ws.m, ws.pair_row, t, ws.xs)?;
-        let tiles = ws.max_tiles().min((t * TOP_K).div_ceil(k::moe_tile_rows()) + EXPERTS);
-        let grouped = |proj: &crate::model::ExpertProj, x: u64, y: u64, n: usize, kk: usize| {
-            k::moe_nvfp4_gemm(s, x, proj.weights, proj.scales, proj.scale2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, y, n, kk)
-        };
-        grouped(&moe.gate, ws.xs, ws.eg, EXPERT_WIDTH, D)?;
-        grouped(&moe.up, ws.xs, ws.eu, EXPERT_WIDTH, D)?;
-        k::swiglu(s, ws.eg, ws.eu, ws.act, t * TOP_K * EXPERT_WIDTH)?;
-        grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH)?;
-        gemm(s, ws.m, moe.shared_gate, ws.sgate, t, EXPERT_WIDTH, D)?;
-        gemm(s, ws.m, moe.shared_up, ws.sup, t, EXPERT_WIDTH, D)?;
-        k::swiglu(s, ws.sgate, ws.sup, ws.sact, t * EXPERT_WIDTH)?;
-        gemm(s, ws.sact, moe.shared_down, ws.sh, t, D, EXPERT_WIDTH)?;
-        gemm(s, ws.m, moe.shared_expert_gate, ws.sg, t, 1, D)?;
-        k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, ws.sg, ws.sh, ws.y, t)?;
-        k::hc_combine(s, ws.h, ws.y, ws.inj, t)?;
+        op!(prof, "moe.router", s, linear(s, ws, ws.m, &moe.router, ws.logits, t));
+        if t <= k::moe_small_tokens() {
+            let max_active = (t * TOP_K).min(EXPERTS);
+            let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
+            op!(prof, "moe_route_small", s, k::moe_route_small(s, ws.logits, t, ws.top_i, ws.top_w, ws.offsets, ws.pair_row, ws.row_token, ws.active, ws.num_active));
+            op!(prof, "experts gate_up", s, k::moe_gate_up_small(s, ws.m, ws.row_token, tables(&moe.gate), tables(&moe.up), ws.offsets, ws.active, ws.num_active, max_active, ws.act));
+            op!(prof, "experts down", s, k::moe_down_small(s, ws.act, tables(&moe.down), ws.offsets, ws.active, ws.num_active, max_active, ws.yd));
+        } else {
+            op!(prof, "moe_route", s, k::moe_route(s, ws.logits, t, ws.top_i, ws.top_w));
+            op!(prof, "moe_plan", s, k::moe_plan(s, ws.top_i, t, ws.counts, ws.cursor, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row));
+            op!(prof, "moe_gather", s, k::moe_gather(s, ws.m, ws.pair_row, t, ws.xs));
+            let tiles = ws.max_tiles().min((t * TOP_K).div_ceil(k::moe_tile_rows()) + EXPERTS);
+            let grouped = |proj: &crate::model::ExpertProj, x: u64, y: u64, n: usize, kk: usize| {
+                k::moe_nvfp4_gemm(s, x, proj.weights, proj.scales, proj.scale2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, y, n, kk)
+            };
+            op!(prof, "experts gate", s, grouped(&moe.gate, ws.xs, ws.eg, EXPERT_WIDTH, D));
+            op!(prof, "experts up", s, grouped(&moe.up, ws.xs, ws.eu, EXPERT_WIDTH, D));
+            op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, ws.act, t * TOP_K * EXPERT_WIDTH));
+            op!(prof, "experts down", s, grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH));
+        }
+        op!(prof, "moe.shared_gate", s, linear(s, ws, ws.m, &moe.shared_gate, ws.sgate, t));
+        op!(prof, "moe.shared_up", s, linear(s, ws, ws.m, &moe.shared_up, ws.sup, t));
+        op!(prof, "swiglu", s, k::swiglu(s, ws.sgate, ws.sup, ws.sact, t * EXPERT_WIDTH));
+        op!(prof, "moe.shared_down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
+        op!(prof, "moe.shared_expert_gate", s, linear(s, ws, ws.m, &moe.shared_expert_gate, ws.sg, t));
+        op!(prof, "moe_combine", s, k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, ws.sg, ws.sh, ws.y, t));
+        op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, ws.y, ws.inj, t));
     }
-    hyper_connection(s, ws, &model.final_hc, t, ws.out)?;
+    op!(prof, "hc final_hc", s, hyper_connection(s, ws, &model.final_hc, t, ws.out));
     Ok(())
+}
+
+/// Eager step with per-op GPU timing collected into `prof`.
+pub fn forward_profiled(model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, new_tokens: &[i32], prof: &mut Profiler) -> Result<()> {
+    let bytes = prepare(model, state, ws, new_tokens)?;
+    forward_device(model, state, ws, s, new_tokens.len(), bytes, Some(prof))?;
+    s.synchronize()?;
+    prof.collect()
+}
+
+/// Eager step: [`prepare`] then [`forward_device`].
+pub fn forward(model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, new_tokens: &[i32]) -> Result<()> {
+    let bytes = prepare(model, state, ws, new_tokens)?;
+    forward_device(model, state, ws, s, new_tokens.len(), bytes, None)?;
+    // The pinned step block may be overwritten by the next prepare only after this step consumed it.
+    s.synchronize()
+}
+
+/// A one-token decode step captured as a CUDA graph for a given sequence: forward pass, LM head and
+/// greedy argmax, with the chosen token copied to pinned host memory.
+pub struct DecodeGraph {
+    graph: squash_cuda::Graph,
+    bytes: usize,
+}
+
+impl DecodeGraph {
+    pub fn capture(model: &Model, state: &SequenceState, ws: &Workspace, hw: &HeadWorkspace, s: &Stream) -> Result<Self> {
+        let bytes = StepLayout::new(ws.max_tokens).used(1);
+        let graph = squash_cuda::Graph::capture(s, |s| {
+            forward_device(model, state, ws, s, 1, bytes, None)?;
+            head_argmax(model, hw, s, ws.out)
+        })?;
+        Ok(Self { graph, bytes })
+    }
+
+    /// Decodes `token` (appended to `state`) and returns the greedy next token.
+    pub fn step(&self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, hw: &HeadWorkspace, s: &Stream, token: i32) -> Result<i32> {
+        let bytes = prepare(model, state, ws, &[token])?;
+        debug_assert_eq!(bytes, self.bytes);
+        self.graph.launch(s)?;
+        s.synchronize()?;
+        Ok(i32::from_le_bytes(hw.token_host.as_slice()[..4].try_into().unwrap()))
+    }
+}
+
+/// Greedy next token for one hidden state: LM head, argmax, and a copy of the token to `hw.token_host`.
+pub fn head_argmax(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64) -> Result<()> {
+    linear_ld(s, hw.partial.addr(), hidden, D, &model.lm_head, hw.logits.addr(), VOCAB, 1)?;
+    k::topk(s, hw.logits.addr(), 1, VOCAB, VOCAB, 1, false, hw.top_ids.addr(), 0)?;
+    unsafe { s.copy_d2h(hw.token_host.as_ptr(), hw.top_ids.addr(), 4) }
 }
 
 /// LM-head statistics for `rows` final hidden states at `hidden` (BF16 [rows, D]): log-sum-exp,
@@ -363,6 +504,8 @@ pub struct HeadStats {
 
 pub struct HeadWorkspace {
     rows: usize,
+    partial: DeviceBuffer,
+    token_host: PinnedBuffer,
     logits: DeviceBuffer,
     targets: DeviceBuffer,
     lse: DeviceBuffer,
@@ -375,6 +518,8 @@ impl HeadWorkspace {
     pub fn new(rows: usize, top_k: usize) -> Result<Self> {
         Ok(Self {
             rows,
+            partial: DeviceBuffer::new(PARTIAL_FLOATS * 4)?,
+            token_host: PinnedBuffer::new(4)?,
             logits: DeviceBuffer::new(rows * VOCAB * 4)?,
             targets: DeviceBuffer::new(rows * 4)?,
             lse: DeviceBuffer::new(rows * 4)?,
@@ -389,7 +534,7 @@ pub fn head_stats(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64, ta
     let mut out = HeadStats { lse: vec![], target: vec![], top_ids: vec![], top_logits: vec![] };
     for r0 in (0..targets.len()).step_by(hw.rows) {
         let n = hw.rows.min(targets.len() - r0);
-        gemm(s, hidden + (r0 * D * 2) as u64, model.lm_head, hw.logits.addr(), n, VOCAB, D)?;
+        linear_ld(s, hw.partial.addr(), hidden + (r0 * D * 2) as u64, D, &model.lm_head, hw.logits.addr(), VOCAB, n)?;
         s.upload_to(hw.targets.addr(), &targets[r0..r0 + n])?;
         k::row_lse(s, hw.logits.addr(), n, VOCAB, VOCAB, hw.targets.addr(), hw.lse.addr(), hw.target.addr())?;
         k::topk(s, hw.logits.addr(), n, VOCAB, VOCAB, top_k, false, hw.top_ids.addr(), hw.top_logits.addr())?;

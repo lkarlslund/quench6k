@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, ensure};
 use memmap2::Mmap;
+use squash_cuda::kernels::WeightFormat;
 use squash_cuda::{DeviceBuffer, Stream};
 
 use crate::checkpoint::{Checkpoint, DType};
@@ -22,34 +23,44 @@ pub fn is_attention(layer: usize) -> bool {
     layer % 4 == 3
 }
 
+/// A projection weight `[n, k]`: BF16, or an 8-bit format with per-row FP32 scales at `scale`.
+#[derive(Clone, Copy, Debug)]
+pub struct Linear {
+    pub fmt: WeightFormat,
+    pub addr: u64,
+    pub scale: u64,
+    pub n: usize,
+    pub k: usize,
+}
+
 /// A HyperConnection's weights (SPEC §4); `inject` is absent in the final mixers.
 pub struct Hc {
     pub norm: u64,
-    pub down: u64,
-    pub up: u64,
+    pub down: Linear,
+    pub up: Linear,
     pub inject: Option<u64>,
 }
 
 pub struct Gdn {
-    pub qkv: u64,
-    pub z: u64,
-    pub a: u64,
-    pub b: u64,
+    pub qkv: Linear,
+    pub z: Linear,
+    pub a: Linear,
+    pub b: Linear,
     pub conv: u64,
     pub a_log: u64,
     pub dt_bias: u64,
     pub norm: u64,
-    pub out: u64,
+    pub out: Linear,
 }
 
 pub struct Qsa {
-    pub q: u64,
-    pub k: u64,
-    pub v: u64,
-    pub o: u64,
+    pub q: Linear,
+    pub k: Linear,
+    pub v: Linear,
+    pub o: Linear,
     pub q_norm: u64,
     pub k_norm: u64,
-    pub index_qk: u64,
+    pub index_qk: Linear,
     pub index_q_norm: u64,
     pub index_k_norm: u64,
 }
@@ -67,11 +78,11 @@ pub struct ExpertProj {
 }
 
 pub struct Moe {
-    pub router: u64,
-    pub shared_gate: u64,
-    pub shared_up: u64,
-    pub shared_down: u64,
-    pub shared_expert_gate: u64,
+    pub router: Linear,
+    pub shared_gate: Linear,
+    pub shared_up: Linear,
+    pub shared_down: Linear,
+    pub shared_expert_gate: Linear,
     pub gate: ExpertProj,
     pub up: ExpertProj,
     pub down: ExpertProj,
@@ -79,8 +90,8 @@ pub struct Moe {
 }
 
 pub struct Ple {
-    pub key: u64,
-    pub value: u64,
+    pub key: Linear,
+    pub value: Linear,
     pub norm_key: u64,
     pub norm_query: u64,
     pub norm_conv: u64,
@@ -142,7 +153,7 @@ impl PleTable {
 pub struct Model {
     pub weights: DeviceWeights,
     pub embed: u64,
-    pub lm_head: u64,
+    pub lm_head: Linear,
     pub final_hc: Hc,
     pub layers: Vec<Layer>,
     pub ple_table: PleTable,
@@ -157,11 +168,23 @@ fn read_i64s<const N: usize>(ckpt: &Checkpoint, name: &str) -> Result<[i64; N]> 
 impl Model {
     pub fn bind(ckpt: &Checkpoint, weights: DeviceWeights, stream: &Stream) -> Result<Self> {
         let w = |name: &str| -> Result<u64> { Ok(weights.get(name)?.addr) };
+        let lin = |name: &str| -> Result<Linear> {
+            let t = weights.get(name)?;
+            ensure!(t.shape.len() == 2, "{name}: not a 2-D projection");
+            let fmt = match t.dtype {
+                DType::BF16 => WeightFormat::Bf16,
+                DType::F8E4M3 => WeightFormat::Fp8,
+                DType::I8 => WeightFormat::Int8,
+                DType::I8G => WeightFormat::Int8Group,
+                other => anyhow::bail!("{name}: {other:?} is not a projection weight format"),
+            };
+            Ok(Linear { fmt, addr: t.addr, scale: t.scale, n: t.shape[0], k: t.shape[1] })
+        };
         let hc = |prefix: &str, inject: bool| -> Result<Hc> {
             Ok(Hc {
                 norm: w(&format!("{prefix}.hc_norm.weight"))?,
-                down: w(&format!("{prefix}.input_mix_weight_down.weight"))?,
-                up: w(&format!("{prefix}.input_mix_weight_up.weight"))?,
+                down: lin(&format!("{prefix}.input_mix_weight_down.weight"))?,
+                up: lin(&format!("{prefix}.input_mix_weight_up.weight"))?,
                 inject: if inject { Some(w(&format!("{prefix}.block_inject_weight.weight"))?) } else { None },
             })
         };
@@ -172,28 +195,28 @@ impl Model {
             let block = if is_attention(i) {
                 let a = format!("{p}.self_attn");
                 Block::Qsa(Qsa {
-                    q: w(&format!("{a}.q_proj.weight"))?,
-                    k: w(&format!("{a}.k_proj.weight"))?,
-                    v: w(&format!("{a}.v_proj.weight"))?,
-                    o: w(&format!("{a}.o_proj.weight"))?,
+                    q: lin(&format!("{a}.q_proj.weight"))?,
+                    k: lin(&format!("{a}.k_proj.weight"))?,
+                    v: lin(&format!("{a}.v_proj.weight"))?,
+                    o: lin(&format!("{a}.o_proj.weight"))?,
                     q_norm: w(&format!("{a}.q_norm.weight"))?,
                     k_norm: w(&format!("{a}.k_norm.weight"))?,
-                    index_qk: w(&format!("{a}.indexer.index_qk_proj.weight"))?,
+                    index_qk: lin(&format!("{a}.indexer.index_qk_proj.weight"))?,
                     index_q_norm: w(&format!("{a}.indexer.q_layernorm.weight"))?,
                     index_k_norm: w(&format!("{a}.indexer.k_layernorm.weight"))?,
                 })
             } else {
                 let g = format!("{p}.linear_attn");
                 Block::Gdn(Gdn {
-                    qkv: w(&format!("{g}.in_proj_qkv.weight"))?,
-                    z: w(&format!("{g}.in_proj_z.weight"))?,
-                    a: w(&format!("{g}.in_proj_a.weight"))?,
-                    b: w(&format!("{g}.in_proj_b.weight"))?,
+                    qkv: lin(&format!("{g}.in_proj_qkv.weight"))?,
+                    z: lin(&format!("{g}.in_proj_z.weight"))?,
+                    a: lin(&format!("{g}.in_proj_a.weight"))?,
+                    b: lin(&format!("{g}.in_proj_b.weight"))?,
                     conv: w(&format!("{g}.conv1d.weight"))?,
                     a_log: w(&format!("{g}.A_log"))?,
                     dt_bias: w(&format!("{g}.dt_bias"))?,
                     norm: w(&format!("{g}.norm.weight"))?,
-                    out: w(&format!("{g}.out_proj.weight"))?,
+                    out: lin(&format!("{g}.out_proj.weight"))?,
                 })
             };
 
@@ -217,11 +240,11 @@ impl Model {
             let s2 = |j: usize| tables.addr() + (addrs.len() * 8 + j * EXPERTS * 4) as u64;
             let m = format!("{p}.mlp");
             let moe = Moe {
-                router: w(&format!("{m}.gate.weight"))?,
-                shared_gate: w(&format!("{m}.shared_expert.gate_proj.weight"))?,
-                shared_up: w(&format!("{m}.shared_expert.up_proj.weight"))?,
-                shared_down: w(&format!("{m}.shared_expert.down_proj.weight"))?,
-                shared_expert_gate: w(&format!("{m}.shared_expert_gate.weight"))?,
+                router: lin(&format!("{m}.gate.weight"))?,
+                shared_gate: lin(&format!("{m}.shared_expert.gate_proj.weight"))?,
+                shared_up: lin(&format!("{m}.shared_expert.up_proj.weight"))?,
+                shared_down: lin(&format!("{m}.shared_expert.down_proj.weight"))?,
+                shared_expert_gate: lin(&format!("{m}.shared_expert_gate.weight"))?,
                 gate: ExpertProj { weights: t(0), scales: t(1), scale2: s2(0) },
                 up: ExpertProj { weights: t(2), scales: t(3), scale2: s2(1) },
                 down: ExpertProj { weights: t(4), scales: t(5), scale2: s2(2) },
@@ -231,8 +254,8 @@ impl Model {
             let ple = if i == 1 {
                 let q = format!("{p}.ple");
                 Some(Ple {
-                    key: w(&format!("{q}.key_proj.weight"))?,
-                    value: w(&format!("{q}.value_proj.weight"))?,
+                    key: lin(&format!("{q}.key_proj.weight"))?,
+                    value: lin(&format!("{q}.value_proj.weight"))?,
                     norm_key: w(&format!("{q}.norm_key.weight"))?,
                     norm_query: w(&format!("{q}.norm_query.weight"))?,
                     norm_conv: w(&format!("{q}.norm_conv.weight"))?,
@@ -256,11 +279,45 @@ impl Model {
 
         Ok(Self {
             embed: w("model.language_model.embed_tokens.weight")?,
-            lm_head: w("lm_head.weight")?,
+            lm_head: lin("lm_head.weight")?,
             final_hc: hc("model.language_model.hyper_connection_mixer", false)?,
             layers,
             ple_table: PleTable::open(ckpt)?,
             weights,
         })
     }
+}
+
+/// Weight precision profile for the non-expert projections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precision {
+    /// Checkpoint BF16 everywhere except the NVFP4 experts.
+    Bf16,
+    /// FP8 E4M3 (per-row scales) for the large projections, see `selection::eight_bit`.
+    Fp8,
+    /// INT8 (per-row scales) for the same projections.
+    Int8,
+    /// INT8 with a scale per 64 weights of a row, for the same projections.
+    Int8Group,
+}
+
+/// Uploads the text model in the given precision and binds it.
+pub fn load_text(ckpt: &Checkpoint, precision: Precision, opts: crate::loader::LoadOptions, stream: &Stream) -> Result<(Model, crate::loader::LoadStats)> {
+    use crate::{loader, selection};
+    let format = match precision {
+        Precision::Bf16 => WeightFormat::Bf16,
+        Precision::Fp8 => WeightFormat::Fp8,
+        Precision::Int8 => WeightFormat::Int8,
+        Precision::Int8Group => WeightFormat::Int8Group,
+    };
+    let quantized = |n: &str| format != WeightFormat::Bf16 && selection::eight_bit(n);
+    let (mut weights, mut stats) = loader::upload(ckpt, |n| selection::text(n) && !quantized(n), opts)?;
+    if format != WeightFormat::Bf16 {
+        let (converted, s) = loader::upload_quantized(ckpt, |n| selection::text(n) && quantized(n), format, opts, stream)?;
+        stats.bytes += s.bytes;
+        stats.seconds += s.seconds;
+        stats.segments += s.segments;
+        weights.merge(converted);
+    }
+    Ok((Model::bind(ckpt, weights, stream)?, stats))
 }

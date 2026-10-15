@@ -42,10 +42,26 @@ pub mod ffi {
         pub fn cudaEventDestroy(event: Event) -> Error;
         pub fn cudaEventRecord(event: Event, stream: Stream) -> Error;
         pub fn cudaEventSynchronize(event: Event) -> Error;
+        pub fn cudaEventElapsedTime(ms: *mut f32, start: Event, end: Event) -> Error;
+
+        pub fn cudaStreamBeginCapture(stream: Stream, mode: c_int) -> Error;
+        pub fn cudaStreamEndCapture(stream: Stream, graph: *mut *mut c_void) -> Error;
+        pub fn cudaGraphInstantiateWithFlags(exec: *mut *mut c_void, graph: *mut c_void, flags: u64) -> Error;
+        pub fn cudaGraphLaunch(exec: *mut c_void, stream: Stream) -> Error;
+        pub fn cudaGraphExecDestroy(exec: *mut c_void) -> Error;
+        pub fn cudaGraphDestroy(graph: *mut c_void) -> Error;
 
         pub fn squash_checksum(data: *const c_void, bytes: usize, out: *mut u64, stream: Stream) -> Error;
-        pub fn squash_gemm_bf16_f32(x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, y: *mut f32, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
-        pub fn squash_gemm_bf16_bf16(x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, y: *mut c_void, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
+        pub fn squash_gemm_bf16_f32(fmt: c_int, x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, scale: *const f32, y: *mut f32, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
+        pub fn squash_gemm_bf16_bf16(fmt: c_int, x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, scale: *const f32, y: *mut c_void, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
+        pub fn squash_gemv_max_m() -> c_int;
+        pub fn squash_gemv(fmt: c_int, m: c_int, x: *const c_void, ldx: c_int, w: *const c_void, scale: *const f32, y: *mut f32, ldy: c_int, partial: *mut f32, n: c_int, k: c_int, splits: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
+        pub fn squash_quantize_int8_rows(w: *const c_void, n: c_int, k: c_int, q: *mut c_void, scale: *mut f32, stream: Stream) -> Error;
+        pub fn squash_int8_group() -> c_int;
+        pub fn squash_quantize_int8_groups(w: *const c_void, n: c_int, k: c_int, q: *mut c_void, scale: *mut f32, stream: Stream) -> Error;
+        pub fn squash_quantize_fp8_rows(w: *const c_void, n: c_int, k: c_int, q: *mut c_void, scale: *mut f32, stream: Stream) -> Error;
+        pub fn squash_moe_active(counts: *const i32, active: *mut i32, num_active: *mut i32, stream: Stream) -> Error;
+        pub fn squash_moe_nvfp4_gemv(xs: *const c_void, w_ptr: *const u64, s_ptr: *const u64, ws2: *const f32, offsets: *const i32, active: *const i32, num_active: *const i32, max_active: c_int, y: *mut f32, n: c_int, k: c_int, stream: Stream) -> Error;
         pub fn squash_topk(x: *const f32, rows: c_int, n: c_int, ld: usize, k: c_int, sort_by_index: c_int, out_idx: *mut i32, out_val: *mut f32, stream: Stream) -> Error;
         pub fn squash_row_lse(x: *const f32, rows: c_int, n: c_int, ld: usize, targets: *const i32, lse: *mut f32, target_logit: *mut f32, stream: Stream) -> Error;
         pub fn squash_embed(tokens: *const i32, t: c_int, table: *const c_void, h: *mut f32, stream: Stream) -> Error;
@@ -60,12 +76,20 @@ pub mod ffi {
         pub fn squash_gdn_prep(qkv: *mut f32, a: *const f32, b: *const f32, a_log: *const c_void, dt_bias: *const c_void, beta: *mut f32, g: *mut f32, t: c_int, stream: Stream) -> Error;
         pub fn squash_gdn_recurrent(qkv: *const f32, beta: *const f32, g: *const f32, state: *mut f32, out: *mut f32, t: c_int, stream: Stream) -> Error;
         pub fn squash_gdn_gated_norm(o: *const f32, z: *const f32, w: *const c_void, y: *mut c_void, t: c_int, stream: Stream) -> Error;
-        pub fn squash_qsa_qkv_prep(qg: *const f32, kv: *const f32, q_norm: *const c_void, k_norm: *const c_void, q: *mut f32, kcache: *mut c_void, vcache: *mut c_void, pos3: *const i32, start: c_int, t: c_int, stream: Stream) -> Error;
-        pub fn squash_qsa_index_prep(idx: *const f32, q_ln: *const c_void, iq: *mut f32, raw: *mut c_void, pos3: *const i32, start: c_int, t: c_int, stream: Stream) -> Error;
-        pub fn squash_qsa_pool(raw: *const c_void, k_ln: *const c_void, pooled: *mut c_void, pos3: *const i32, start: c_int, t: c_int, stream: Stream) -> Error;
-        pub fn squash_qsa_index_scores(iq: *const f32, pooled: *const c_void, scores: *mut f32, ld: c_int, start: c_int, t: c_int, stream: Stream) -> Error;
-        pub fn squash_qsa_attention(q: *const f32, qg: *const f32, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: c_int, t: c_int, out: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_qsa_qkv_prep(qg: *const f32, kv: *const f32, q_norm: *const c_void, k_norm: *const c_void, q: *mut f32, kcache: *mut c_void, vcache: *mut c_void, pos3: *const i32, start: *const i32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_qsa_index_prep(idx: *const f32, q_ln: *const c_void, iq: *mut f32, raw: *mut c_void, pos3: *const i32, start: *const i32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_qsa_pool(raw: *const c_void, k_ln: *const c_void, pooled: *mut c_void, pos3: *const i32, start: *const i32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_qsa_index_scores(iq: *const f32, pooled: *const c_void, scores: *mut f32, ld: c_int, start: *const i32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_qsa_select(scores: *const f32, t: c_int, ld: usize, start: *const i32, sel: *mut i32, stream: Stream) -> Error;
+        pub fn squash_store_positions(src: *const i32, pos3: *mut i32, start: *const i32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_qsa_attention(q: *const f32, qg: *const f32, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: *const i32, t: c_int, out: *mut c_void, stream: Stream) -> Error;
         pub fn squash_moe_tile_rows() -> c_int;
+        pub fn squash_moe_small_tokens() -> c_int;
+        pub fn squash_moe_route_small(logits: *const f32, t: c_int, top_i: *mut i32, top_w: *mut f32, offsets: *mut i32, pair_row: *mut i32, row_token: *mut i32, active: *mut i32, num_active: *mut i32, stream: Stream) -> Error;
+        pub fn squash_moe_gate_up_small(m: *const c_void, row_token: *const i32, gw: *const u64, gs: *const u64, g2: *const f32, uw: *const u64, us: *const u64, u2: *const f32, offsets: *const i32, active: *const i32, num_active: *const i32, max_active: c_int, act: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_moe_down_small(act: *const c_void, dw: *const u64, ds: *const u64, d2: *const f32, offsets: *const i32, active: *const i32, num_active: *const i32, max_active: c_int, yd: *mut f32, stream: Stream) -> Error;
+        pub fn squash_qsa_split_floats(t: c_int) -> usize;
+        pub fn squash_qsa_attention_split(q: *const f32, qg: *const f32, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: *const i32, t: c_int, part: *mut f32, out: *mut c_void, stream: Stream) -> Error;
         pub fn squash_moe_route(logits: *const f32, t: c_int, top_i: *mut i32, top_w: *mut f32, stream: Stream) -> Error;
         pub fn squash_moe_plan(top_i: *const i32, t: c_int, counts: *mut i32, cursor: *mut i32, offsets: *mut i32, tile_expert: *mut i32, tile_row: *mut i32, num_tiles: *mut i32, pair_row: *mut i32, stream: Stream) -> Error;
         pub fn squash_moe_gather(m: *const c_void, pair_row: *const i32, t: c_int, xs: *mut c_void, stream: Stream) -> Error;
@@ -167,6 +191,18 @@ impl PinnedBuffer {
         unsafe { std::slice::from_raw_parts(self.ptr, self.bytes) }
     }
 
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.bytes) }
     }
@@ -264,9 +300,65 @@ impl Event {
     }
 }
 
+impl Event {
+    /// An event that records timestamps.
+    pub fn timing() -> Result<Self> {
+        let mut event = null_mut();
+        check(unsafe { ffi::cudaEventCreateWithFlags(&mut event, 0) }, "cudaEventCreate")?;
+        Ok(Self(event))
+    }
+
+    /// Milliseconds between two recorded timing events.
+    pub fn elapsed_ms(start: &Event, end: &Event) -> Result<f32> {
+        let mut ms = 0f32;
+        check(unsafe { ffi::cudaEventElapsedTime(&mut ms, start.0, end.0) }, "cudaEventElapsedTime")?;
+        Ok(ms)
+    }
+}
+
 impl Drop for Event {
     fn drop(&mut self) {
         unsafe { ffi::cudaEventDestroy(self.0) };
+    }
+}
+
+/// An instantiated CUDA graph captured from work enqueued on a stream.
+pub struct Graph {
+    graph: *mut c_void,
+    exec: *mut c_void,
+}
+
+unsafe impl Send for Graph {}
+
+impl Graph {
+    /// Captures everything `body` enqueues on `stream` (which must not synchronize) into a graph.
+    pub fn capture(stream: &Stream, body: impl FnOnce(&Stream) -> Result<()>) -> Result<Self> {
+        const THREAD_LOCAL: c_int = 1;
+        check(unsafe { ffi::cudaStreamBeginCapture(stream.raw(), THREAD_LOCAL) }, "cudaStreamBeginCapture")?;
+        let result = body(stream);
+        let mut graph = null_mut();
+        let end = check(unsafe { ffi::cudaStreamEndCapture(stream.raw(), &mut graph) }, "cudaStreamEndCapture");
+        result?;
+        end?;
+        let mut exec = null_mut();
+        if let Err(e) = check(unsafe { ffi::cudaGraphInstantiateWithFlags(&mut exec, graph, 0) }, "cudaGraphInstantiate") {
+            unsafe { ffi::cudaGraphDestroy(graph) };
+            return Err(e);
+        }
+        Ok(Self { graph, exec })
+    }
+
+    pub fn launch(&self, stream: &Stream) -> Result<()> {
+        check(unsafe { ffi::cudaGraphLaunch(self.exec, stream.raw()) }, "cudaGraphLaunch")
+    }
+}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::cudaGraphExecDestroy(self.exec);
+            ffi::cudaGraphDestroy(self.graph);
+        }
     }
 }
 
