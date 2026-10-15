@@ -97,3 +97,50 @@ SQ_DEVICE void load16(const uint8_t* row, int k, float* w) {
         }
     }
 }
+
+// Raw storage of 16 consecutive weights: one 16-byte vector for 8-bit formats, two for BF16.
+template <WFmt F>
+struct Raw16 {
+    uint4 v[F == WFmt::BF16 ? 2 : 1];
+};
+
+template <WFmt F>
+SQ_DEVICE Raw16<F> load_raw16(const uint8_t* row, int k) {
+    Raw16<F> r;
+    if constexpr (F == WFmt::BF16) {
+        r.v[0] = __ldg(reinterpret_cast<const uint4*>(row + (size_t)k * 2));
+        r.v[1] = __ldg(reinterpret_cast<const uint4*>(row + (size_t)k * 2 + 16));
+    } else {
+        r.v[0] = __ldg(reinterpret_cast<const uint4*>(row + k));
+    }
+    return r;
+}
+
+template <WFmt F>
+SQ_DEVICE void decode_raw16(const Raw16<F>& r, float* w) {
+    if constexpr (F == WFmt::BF16) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&r.v[h]);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 f = __bfloat1622float2(p[i]);
+                w[8 * h + 2 * i] = f.x;
+                w[8 * h + 2 * i + 1] = f.y;
+            }
+        }
+    } else if constexpr (F == WFmt::FP8) {
+        const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&r.v[0]);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(p[i], __NV_E4M3);
+            const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+            w[2 * i] = f.x;
+            w[2 * i + 1] = f.y;
+        }
+    } else {
+        const int8_t* p = reinterpret_cast<const int8_t*>(&r.v[0]);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) w[i] = (float)p[i];
+    }
+}

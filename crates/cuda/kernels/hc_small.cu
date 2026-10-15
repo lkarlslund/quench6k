@@ -58,12 +58,26 @@ SQ_DEVICE float row_scale(const float* scales, int row) {
 template <WFmt F, int MAXT>
 __global__ void __launch_bounds__(WARPS * 32) hc_small_kernel(Args a) {
     pdl_launch_dependents();
-    pdl_wait();
     cg::grid_group grid = cg::this_grid();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, T = a.T;
     const int N = a.wi ? RANK + S : RANK;
     constexpr int ROWS = WARPS * 2;
     const int row_blocks = (N + ROWS - 1) / ROWS;
+    // The first phase-1 item's weight chunks are static: loaded raw before the PDL wait.
+    Raw16<F> first[2];
+    float first_gs[2] = {1.0f, 1.0f};
+    if ((int)blockIdx.x < row_blocks * SPLITS) {
+        const int rb = blockIdx.x / SPLITS, sp = blockIdx.x % SPLITS, k = sp * SPLIT + lane * 16;
+#pragma unroll
+        for (int rr = 0; rr < 2; ++rr) {
+            const int row = min(rb * ROWS + warp * 2 + rr, N - 1);
+            const bool down = row < RANK;
+            const int wr = down ? row : row - RANK;
+            first[rr] = load_raw16<F>((down ? a.wd : a.wi) + (size_t)wr * H * elem_bytes<F>(), k);
+            if constexpr (F == WFmt::INT8G) first_gs[rr] = __ldg((down ? a.sd : a.si) + (size_t)wr * (H / GROUP) + k / GROUP);
+        }
+    }
+    pdl_wait();
 
     // ---- phase 1: partial down/injection dot products and sums of squares
     for (int item = blockIdx.x; item < row_blocks * SPLITS; item += gridDim.x) {
@@ -104,8 +118,15 @@ __global__ void __launch_bounds__(WARPS * 32) hc_small_kernel(Args a) {
             const float* sc = down ? a.sd : a.si;
             const int wr = down ? row : row - RANK;
             float w[16];
-            load16<F>(w8 + (size_t)wr * H * elem_bytes<F>(), k, w);
-            group_scale<F>(sc, wr, H, k, w);
+            if (item == (int)blockIdx.x) {
+                decode_raw16<F>(first[rr], w);
+                if constexpr (F == WFmt::INT8G)
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) w[i] *= first_gs[rr];
+            } else {
+                load16<F>(w8 + (size_t)wr * H * elem_bytes<F>(), k, w);
+                group_scale<F>(sc, wr, H, k, w);
+            }
             const float rs = row_scale<F>(sc, wr);
 #pragma unroll
             for (int t = 0; t < MAXT; ++t) {

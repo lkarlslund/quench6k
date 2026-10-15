@@ -156,7 +156,6 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
                                                          const __nv_bfloat16* __restrict__ norm_w, int z_col, int a_col,
                                                          int b_col, __nv_bfloat16* y) {
     pdl_launch_dependents();
-    pdl_wait();
     __shared__ float sq[DK], sk[DK], sv[DV], so[DV];
     __shared__ float scratch[32];
     __shared__ float s_beta, s_decay;
@@ -178,6 +177,8 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
 #pragma unroll
     for (int j = 0; j < 32; ++j) s[j] = st[(part * 32 + j) * DV + col];
     const float A = -__expf(bf2f(a_log[vh])), bias = bf2f(dt_bias[vh]);
+    // State, conv history and weights come from earlier steps or are static: loaded before the wait.
+    pdl_wait();
 
     for (int t = 0; t < T; ++t) {
         const float* row = proj + (size_t)t * ld;

@@ -16,18 +16,19 @@ namespace {
 
 constexpr int WARPS = 8, THREADS = WARPS * 32;
 
-// grid (ceil(N / 16), splits). Each split covers k_per_split columns (a multiple of 512). A warp owns
-// ROWS_PER_WARP rows and walks them together: per step every lane loads two 16-weight chunks of each
-// row (all in flight at once) and one activation chunk per token, reused across the rows. When `xsq`
-// is set, blocks with blockIdx.x == 0 also write each token's sum of squared activations over their
-// K range to xsq[split * M + m].
+// grid (ceil(N / (8 R)), splits). Each split covers k_per_split columns (a multiple of 512). A warp owns
+// R rows; lane l handles the 16-weight chunks at columns k_begin + 16 l + 512 c. The first PRE chunks
+// of every row (all of them for K <= 2560 per split) are loaded raw before the PDL wait, so the weight
+// stream overlaps the previous kernel; activations are read only after it. When `xsq` is set, blocks
+// with blockIdx.x == 0 also write each token's sum of squared activations over their K range to
+// xsq[split * M + m].
 template <WFmt F, int M, typename XT, int R>
 __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X, int ldx,
                                                        const uint8_t* __restrict__ W, const float* __restrict__ row_scale,
                                                        float* Y, int ldy, float* partial, int ldp, float* xsq, int N,
                                                        int K, int k_per_split, float alpha, int accumulate) {
     pdl_launch_dependents();
-    constexpr int U = 2;
+    constexpr int PRE = 5;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int k_begin = blockIdx.y * k_per_split, k_end = min(K, k_begin + k_per_split);
     const size_t row_bytes = (size_t)K * elem_bytes<F>();
@@ -39,45 +40,65 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X,
         row_live[r] = n0 + r < N;
         rows[r] = W + (size_t)min(n0 + r, N - 1) * row_bytes;
     }
+    Raw16<F> pre[R][PRE];
+    float pre_gs[R][PRE];
+#pragma unroll
+    for (int c = 0; c < PRE; ++c) {
+        const int k = k_begin + lane * 16 + c * 512;
+        if (k < k_end)
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                pre[r][c] = load_raw16<F>(rows[r], k);
+                if constexpr (F == WFmt::INT8G)
+                    pre_gs[r][c] = __ldg(row_scale + (size_t)min(n0 + r, N - 1) * (K / GROUP) + k / GROUP);
+            }
+    }
     pdl_wait();
+
     float acc[R][M] = {};
     float sq[M] = {};
-    for (int k0 = k_begin + lane * 16; k0 < k_end; k0 += U * 512) {
-        float w[R][U][16];
+    auto consume = [&](int k, float (&w)[R][16]) {
 #pragma unroll
-        for (int u = 0; u < U; ++u) {
-            const int k = k0 + u * 512;
-            if (k < k_end)
+        for (int m = 0; m < M; ++m) {
+            float xf[16];
+            load_x8(X + (size_t)m * ldx + k, xf);
+            load_x8(X + (size_t)m * ldx + k + 8, xf + 8);
+            if (xsq) {
 #pragma unroll
-                for (int r = 0; r < R; ++r) load16<F>(rows[r], k, w[r][u]);
+                for (int i = 0; i < 16; ++i) sq[m] = fmaf(xf[i], xf[i], sq[m]);
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int i = 0; i < 16; ++i) acc[r][m] = fmaf(w[r][i], xf[i], acc[r][m]);
         }
+    };
 #pragma unroll
-        for (int u = 0; u < U; ++u) {
-            const int k = k0 + u * 512;
-            if (k >= k_end) continue;
+    for (int c = 0; c < PRE; ++c) {
+        const int k = k_begin + lane * 16 + c * 512;
+        if (k >= k_end) break;
+        float w[R][16];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            decode_raw16<F>(pre[r][c], w[r]);
+            if constexpr (F == WFmt::INT8G)
+#pragma unroll
+                for (int i = 0; i < 16; ++i) w[r][i] *= pre_gs[r][c];
+        }
+        consume(k, w);
+    }
+    for (int k = k_begin + lane * 16 + PRE * 512; k < k_end; k += 512) {
+        float w[R][16];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            decode_raw16<F>(load_raw16<F>(rows[r], k), w[r]);
             if constexpr (F == WFmt::INT8G) {
+                const float gs = __ldg(row_scale + (size_t)min(n0 + r, N - 1) * (K / GROUP) + k / GROUP);
 #pragma unroll
-                for (int r = 0; r < R; ++r) {
-                    const float gs = __ldg(row_scale + (size_t)min(n0 + r, N - 1) * (K / GROUP) + k / GROUP);
-#pragma unroll
-                    for (int i = 0; i < 16; ++i) w[r][u][i] *= gs;
-                }
-            }
-#pragma unroll
-            for (int m = 0; m < M; ++m) {
-                float xf[16];
-                load_x8(X + (size_t)m * ldx + k, xf);
-                load_x8(X + (size_t)m * ldx + k + 8, xf + 8);
-                if (xsq) {
-#pragma unroll
-                    for (int i = 0; i < 16; ++i) sq[m] = fmaf(xf[i], xf[i], sq[m]);
-                }
-#pragma unroll
-                for (int r = 0; r < R; ++r)
-#pragma unroll
-                    for (int i = 0; i < 16; ++i) acc[r][m] = fmaf(w[r][u][i], xf[i], acc[r][m]);
+                for (int i = 0; i < 16; ++i) w[r][i] *= gs;
             }
         }
+        consume(k, w);
     }
     if (xsq && blockIdx.x == 0 && warp == 0) {
 #pragma unroll
