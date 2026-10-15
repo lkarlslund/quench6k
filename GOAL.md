@@ -61,8 +61,14 @@ Required:
 - Direction-removal activation steering: load a pack at runtime and apply it per request with a
   strength in [0, 1]. Zero strength must be bit-identical to an unsteered run. Activation capture
   for building packs.
-- A flexible context cache: prefix reuse across requests and conversations, with more retention and
-  placement options than NInfer (to be specified).
+- A flexible context cache:
+  - many conversations' contexts resident at once, not only the most recent;
+  - tiered placement: GPU memory, then pinned host RAM, then disk, with eviction across the tiers;
+  - persistence across service restarts;
+  - reuse of any cached prefix at any boundary, not only whole-conversation continuations.
+
+  A snapshot covers all model state at a token boundary: QSA K/V and index keys, GDN convolution
+  and recurrent state, and PLE and HyperConnection state.
 - Loads the ModelOpt NVFP4 safetensors checkpoint directly, with no repacked format, and restarts
   fast.
 - OpenAI- and Anthropic-compatible HTTP serving, including streaming and tool calls.
