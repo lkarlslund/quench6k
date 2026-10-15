@@ -44,8 +44,13 @@ pub mod ffi {
         pub fn cudaEventSynchronize(event: Event) -> Error;
 
         pub fn squash_checksum(data: *const c_void, bytes: usize, out: *mut u64, stream: Stream) -> Error;
+        pub fn squash_gemm_bf16_f32(x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, y: *mut f32, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
+        pub fn squash_gemm_bf16_bf16(x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, y: *mut c_void, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
     }
 }
+
+pub mod bf16;
+pub mod kernels;
 
 /// Converts a CUDA error code into a `Result`.
 pub fn check(err: ffi::Error, what: &str) -> Result<()> {
@@ -162,6 +167,20 @@ impl Stream {
             unsafe { ffi::cudaMemcpyAsync(dst as *mut c_void, src.cast(), bytes, ffi::MEMCPY_HOST_TO_DEVICE, self.0) },
             "cudaMemcpyAsync H2D",
         )
+    }
+
+    pub fn upload<T: Copy>(&self, dst: &DeviceBuffer, src: &[T]) -> Result<()> {
+        let bytes = std::mem::size_of_val(src);
+        anyhow::ensure!(bytes <= dst.bytes(), "upload of {bytes} bytes into a {}-byte buffer", dst.bytes());
+        unsafe { self.copy_h2d(dst.addr(), src.as_ptr().cast(), bytes)? };
+        self.synchronize()
+    }
+
+    pub fn download<T: Copy + Default>(&self, src: u64, count: usize) -> Result<Vec<T>> {
+        let mut out = vec![T::default(); count];
+        unsafe { self.copy_d2h(out.as_mut_ptr().cast(), src, count * std::mem::size_of::<T>())? };
+        self.synchronize()?;
+        Ok(out)
     }
 
     /// Enqueues a device-to-host copy. The caller keeps `dst` alive until the copy completes.
