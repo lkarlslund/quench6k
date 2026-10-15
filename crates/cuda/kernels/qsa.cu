@@ -146,6 +146,51 @@ __global__ void index_score_kernel(const float* __restrict__ iq, const __nv_bflo
     scores[(size_t)t * ld + g] = out;
 }
 
+// Small batches (T <= 16): one thread per group g scores every row t from a single read of pooled[g],
+// with the same per-row arithmetic as index_score_kernel. Grid ceil(ld / 256), 256 threads.
+constexpr int SCORE_MAXT = 16;
+__global__ void __launch_bounds__(256) index_score_small_kernel(const float* __restrict__ iq,
+                                                                const __nv_bfloat16* __restrict__ pooled, float* scores,
+                                                                int ld, const int* __restrict__ start_ptr, int T) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ float q[SCORE_MAXT][IH * ID];
+    const int start = *start_ptr;
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    const int last = (start + T) / GROUP;  // complete groups of the last row
+    if (last <= TOPG || (int)(blockIdx.x * blockDim.x) >= last) return;
+    for (int i = threadIdx.x; i < T * IH * ID; i += blockDim.x) q[i / (IH * ID)][i % (IH * ID)] = iq[i];
+    __syncthreads();
+    if (g >= ld) return;
+    uint4 packed[ID / 8];
+    if (g < last)
+#pragma unroll
+        for (int c = 0; c < ID / 8; ++c) packed[c] = *reinterpret_cast<const uint4*>(pooled + (size_t)g * ID + c * 8);
+    for (int t = 0; t < T; ++t) {
+        const int complete = (start + t + 1) / GROUP;
+        if (complete <= TOPG) continue;  // dense row
+        float out = -INFINITY;
+        if (g < complete) {
+            float acc[IH] = {};
+#pragma unroll
+            for (int c = 0; c < ID / 8; ++c) {
+                const __nv_bfloat16* kv = reinterpret_cast<const __nv_bfloat16*>(&packed[c]);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const float kf = bf2f(kv[e]);
+#pragma unroll
+                    for (int h = 0; h < IH; ++h) acc[h] += q[t][h * ID + c * 8 + e] * kf;
+                }
+            }
+            out = 0;
+#pragma unroll
+            for (int h = 0; h < IH; ++h) out += fmaxf(acc[h], 0.0f);
+            out *= rsqrtf((float)ID);
+        }
+        scores[(size_t)t * ld + g] = out;
+    }
+}
+
 constexpr int ATT_THREADS = 256, KT = 32, QPG = QH / KVH;  // 12 query heads per KV head
 
 // Selected attention for one (query t, KV head). Keys: every position 0..p when the query has at most
@@ -424,6 +469,11 @@ extern "C" cudaError_t squash_qsa_pool(const void* raw, const void* k_ln, void* 
 extern "C" cudaError_t squash_qsa_index_scores(const float* iq, const void* pooled, float* scores, int ld,
                                                const int* start, int T, cudaStream_t st) {
     if (T == 0 || ld == 0) return cudaSuccess;
+    if (T <= SCORE_MAXT) {
+        SQ_CHECK_LAUNCH(sq_launch(index_score_small_kernel, (ld + 255) / 256, 256, 0, st, iq,
+                                  static_cast<const __nv_bfloat16*>(pooled), scores, ld, start, T));
+        SQ_RETURN_LAUNCH();
+    }
     SQ_CHECK_LAUNCH(sq_launch(index_score_kernel, dim3(T, (ld + 255) / 256), 256, 0, st, iq, static_cast<const __nv_bfloat16*>(pooled), scores,
                                                                   ld, start));
     SQ_RETURN_LAUNCH();

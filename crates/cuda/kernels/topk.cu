@@ -4,6 +4,8 @@
 // keys; all larger values and enough copies of the k-th are collected, then the k picks are
 // bitonic-sorted either by value (descending, ties by lower index) or by index (ascending).
 
+#include <cooperative_groups.h>
+
 #include "common.cuh"
 
 namespace {
@@ -383,6 +385,152 @@ __global__ void __launch_bounds__(SEL_THREADS) qsa_select_kernel(const float* __
     (void)lane;
 }
 
+// Cluster variant: CL blocks per row, block r owning the contiguous slice [r per, (r + 1) per) of the
+// row as order keys in shared memory (one global read). Each pass histograms the slices locally,
+// sums the histograms over the cluster through distributed shared memory (block r sums bins
+// [r 256, r 256 + 256)), and every block makes the same threshold decision. Compaction offsets come
+// from the lower-ranked blocks' counts, so the output equals qsa_select_kernel's exactly.
+namespace cg = cooperative_groups;
+constexpr int CL = 8, CL_THREADS = 512, CL_SLICE_BINS = SEL_BINS / CL;
+
+__global__ void __launch_bounds__(CL_THREADS) qsa_select_cluster_kernel(const float* __restrict__ scores, size_t ld,
+                                                                        const int* __restrict__ start_ptr, int group,
+                                                                        int* out) {
+    pdl_launch_dependents();
+    pdl_wait();
+    cg::cluster_group cluster = cg::this_cluster();
+    extern __shared__ unsigned keys[];
+    __shared__ int hist[SEL_BINS];
+    __shared__ int gsum[CL_SLICE_BINS];
+    __shared__ int scratch[32];
+    __shared__ int s_counts[2];
+    __shared__ unsigned s_prefix, s_mask;
+    __shared__ int s_remaining;
+    __shared__ bool s_done;
+    const int rank = (int)cluster.block_rank(), r = blockIdx.x / CL;
+    const int n = (*start_ptr + r + 1) / group;
+    if (n <= SEL_K) return;  // dense row (the whole cluster returns)
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, warps = CL_THREADS / 32;
+    const float* row = scores + (size_t)r * ld;
+    const int per = ((n + CL - 1) / CL + 3) / 4 * 4, b0 = min(n, rank * per), m = min(n, b0 + per) - b0;
+    for (int i = tid * 4; i < m; i += CL_THREADS * 4) {
+        const float4 v = *reinterpret_cast<const float4*>(row + b0 + i);
+        keys[i] = order_key(v.x);
+        if (i + 1 < m) keys[i + 1] = order_key(v.y);
+        if (i + 2 < m) keys[i + 2] = order_key(v.z);
+        if (i + 3 < m) keys[i + 3] = order_key(v.w);
+    }
+    if (tid == 0) {
+        s_prefix = 0;
+        s_mask = 0;
+        s_remaining = SEL_K;
+        s_done = false;
+    }
+    const int shifts[3] = {21, 10, 0}, widths[3] = {11, 11, 10};
+    for (int pass = 0; pass < 3; ++pass) {
+        const int shift = shifts[pass], bins = 1 << widths[pass];
+        for (int b = tid; b < SEL_BINS; b += CL_THREADS) hist[b] = 0;
+        __syncthreads();
+        const unsigned prefix = s_prefix, mask = s_mask;
+        for (int i = tid; i < m; i += CL_THREADS) {
+            const unsigned u = keys[i];
+            if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & (bins - 1)], 1);
+        }
+        cluster.sync();
+        for (int b = tid; b < CL_SLICE_BINS; b += CL_THREADS) {
+            int sum = 0;
+#pragma unroll
+            for (int q = 0; q < CL; ++q) sum += cluster.map_shared_rank(hist, q)[rank * CL_SLICE_BINS + b];
+            gsum[b] = sum;
+        }
+        cluster.sync();
+        for (int b = tid; b < SEL_BINS; b += CL_THREADS) hist[b] = cluster.map_shared_rank(gsum, b / CL_SLICE_BINS)[b % CL_SLICE_BINS];
+        __syncthreads();
+        // Find the bin holding the remaining-th largest key (warp 0: warp sums, then the chosen warp's
+        // bins, four per lane, as suffix sums and ballots).
+        constexpr int per_warp = SEL_BINS / (CL_THREADS / 32), BPL = per_warp / 32;
+        int wsum = 0;
+#pragma unroll
+        for (int j = 0; j < BPL; ++j) wsum += hist[warp * per_warp + lane * BPL + j];
+        wsum = __reduce_add_sync(0xffffffff, wsum);
+        if (lane == 0) scratch[warp] = wsum;
+        __syncthreads();
+        if (warp == 0) {
+            const int rem = s_remaining;
+            const int ws = lane < warps ? scratch[lane] : 0;
+            int sw = ws;  // sum over warps >= lane
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int v = __shfl_down_sync(0xffffffff, sw, o);
+                if (lane + o < 32) sw += v;
+            }
+            const int w = 31 - __clz(__ballot_sync(0xffffffff, lane < warps && sw >= rem) | 1u);
+            const int above_w = __shfl_sync(0xffffffff, sw - ws, w);
+            const int base = w * per_warp + lane * BPL;
+            int hb[BPL], lt = 0;
+#pragma unroll
+            for (int j = 0; j < BPL; ++j) lt += hb[j] = hist[base + j];
+            int sl = lt;  // sum over this warp's lanes >= lane
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int v = __shfl_down_sync(0xffffffff, sl, o);
+                if (lane + o < 32) sl += v;
+            }
+            const int L = 31 - __clz(__ballot_sync(0xffffffff, above_w + sl >= rem) | 1u);
+            if (lane == L) {
+                int above = above_w + sl - lt, j = BPL - 1;
+                for (; j > 0; --j) {
+                    if (above + hb[j] >= rem) break;
+                    above += hb[j];
+                }
+                s_remaining = rem - above;
+                s_done = hb[j] == rem - above;  // the whole bin is taken: no ties to break
+                s_prefix |= (unsigned)(base + j) << shift;
+                s_mask |= (unsigned)(bins - 1) << shift;
+            }
+        }
+        __syncthreads();
+        if (s_done) break;
+    }
+    // Keys compare on the resolved bits only (all of them unless a pass ended the search early).
+    const unsigned threshold = s_prefix, rmask = s_mask;
+    const int take_equal = s_remaining;
+    // Per-thread contiguous ranges of the slice.
+    const int tper = (m + CL_THREADS - 1) / CL_THREADS, t0 = min(m, tid * tper), t1 = min(m, t0 + tper);
+    int gt = 0, eq = 0;
+    for (int i = t0; i < t1; ++i) {
+        const unsigned u = keys[i] & rmask;
+        gt += u > threshold;
+        eq += u == threshold;
+    }
+    const int eq_in = block_inclusive_scan(eq, scratch);
+    const int gt_in = block_inclusive_scan(gt, scratch);
+    if (tid == CL_THREADS - 1) {
+        s_counts[0] = gt_in;
+        s_counts[1] = eq_in;
+    }
+    cluster.sync();
+    int gt_below = 0, eq_below = 0;
+    for (int q = 0; q < rank; ++q) {
+        const int* c = cluster.map_shared_rank(s_counts, q);
+        gt_below += c[0];
+        eq_below += c[1];
+    }
+    // Lower ranks' takes of threshold ties: min(their ties, what was left for them).
+    const int eq_taken_below = min(eq_below, take_equal);
+    cluster.sync();  // no block leaves while others read its counts
+    const int eq_before = eq_below + eq_in - eq;
+    const int eq_take = max(0, min(eq, take_equal - eq_before));
+    const int mine = gt + eq_take;
+    int pos = gt_below + eq_taken_below + block_inclusive_scan(mine, scratch) - mine;
+    int eq_seen = 0;
+    int* dst = out + (size_t)r * SEL_K;
+    for (int i = t0; i < t1; ++i) {
+        const unsigned u = keys[i] & rmask;
+        if (u > threshold || (u == threshold && eq_seen++ < eq_take)) dst[pos++] = b0 + i;
+    }
+}
+
 }  // namespace
 
 // `ld` must be a multiple of 4 (rows are read as float4).
@@ -390,6 +538,32 @@ extern "C" cudaError_t squash_qsa_select(const float* scores, int T, size_t ld, 
                                             cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     if (ld % 4 != 0) return cudaErrorInvalidValue;
+    // Cluster variant while a row slice fits in shared memory.
+    const size_t smem = ((ld + CL - 1) / CL + 3) / 4 * 4 * sizeof(unsigned);
+    if (smem <= 96 * 1024) {
+        static size_t configured = 0;
+        if (smem > configured) {
+            const cudaError_t e = cudaFuncSetAttribute(qsa_select_cluster_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+            if (e != cudaSuccess) return e;
+            configured = smem;
+        }
+        cudaLaunchAttribute attr[2];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        attr[1].id = cudaLaunchAttributeClusterDimension;
+        attr[1].val.clusterDim.x = CL;
+        attr[1].val.clusterDim.y = 1;
+        attr[1].val.clusterDim.z = 1;
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3(T * CL);
+        cfg.blockDim = dim3(CL_THREADS);
+        cfg.dynamicSmemBytes = smem;
+        cfg.stream = st;
+        cfg.attrs = attr;
+        cfg.numAttrs = 2;
+        SQ_CHECK_LAUNCH(cudaLaunchKernelEx(&cfg, qsa_select_cluster_kernel, scores, ld, start, 4, sel));
+        SQ_RETURN_LAUNCH();
+    }
     SQ_CHECK_LAUNCH(sq_launch(qsa_select_kernel, T, SEL_THREADS, 0, st, scores, ld, start, 4, sel));
     SQ_RETURN_LAUNCH();
 }

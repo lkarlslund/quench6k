@@ -269,3 +269,31 @@ fn hc_small_is_batch_invariant() {
     }
     }
 }
+
+/// QSA group selection: the 512 highest scores of each row's first n = (start + r + 1) / 4 entries,
+/// ties to the lowest index, in ascending index order.
+#[test]
+fn qsa_select_matches_cpu() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0xa11c_e5e1_ec7);
+    for &(start, ld, coarse) in &[(8_000usize, 2048usize, true), (131_000, 32_768, true), (262_000, 65_536, true), (40_000, 65_536, true), (131_000, 32_768, false), (262_000, 65_536, false)] {
+        let t = 4;
+        // Coarse values give the threshold many ties; continuous ones usually end the search early.
+        let scores: Vec<f32> = (0..t * ld).map(|_| if coarse { (rng.next() * 40.0).round() / 8.0 } else { rng.next() * 3.0 }).collect();
+        let ds = upload(&s, &scores);
+        let dstart = upload(&s, &[start as i32]);
+        let sel = DeviceBuffer::new(t * 512 * 4).unwrap();
+        kernels::qsa_select(&s, ds.addr(), t, ld, dstart.addr(), sel.addr()).unwrap();
+        let got: Vec<i32> = s.download(sel.addr(), t * 512).unwrap();
+        for r in 0..t {
+            let n = ((start + r + 1) / 4).min(ld);
+            let row = &scores[r * ld..r * ld + n];
+            let mut idx: Vec<usize> = (0..n).collect();
+            idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
+            let mut want: Vec<i32> = idx[..512].iter().map(|&i| i as i32).collect();
+            want.sort();
+            assert_eq!(&got[r * 512..(r + 1) * 512], &want[..], "start {start} ld {ld} row {r}");
+        }
+    }
+}
