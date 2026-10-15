@@ -24,3 +24,4 @@ previous one stopped.
 
 - 2026-10-15: repo created; GOAL.md agreed; oracle fixtures imported.
 - 2026-10-15: M0 done: SPEC.md written from HF qwen4_exp and llama.cpp qwen4exp. Open details, deferred to their milestones: MTP K/V positions (M5), vision preprocessing and multimodal positions (M10). Next: M1.
+- 2026-10-15: M1 done. Cargo workspace (`squash-cuda` with nvcc `build.rs` for sm_120a and a hand-written cudart FFI; `squash-engine`; `squash` CLI). The loader indexes all 81 safetensors files in 0.4 s and uploads the 296,013 text + MTP tensors (77.35 GiB) as 50 byte-exact segments with no repacking, verified by device checksums. Measured: 23.3 s, 3.3 GiB/s, identical for buffered and O_DIRECT reads and for 8-32 threads. The limit is the GPU's PCIe link, which trained at Gen 3 x4 (pinned H2D 3.61 GB/s; GPU supports Gen 5, host slot reports Gen 4); the drive alone reads ~8.9 GB/s. Restart time is therefore PCIe-bound on this machine. Next: M2.

@@ -1,0 +1,10 @@
+[package]
+name = "squash-cuda"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+links = "squash_kernels"
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
