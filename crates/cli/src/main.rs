@@ -50,6 +50,19 @@ enum Command {
         /// Tokens per forward step.
         #[arg(long, default_value_t = 1024)]
         chunk: usize,
+        /// Run the completion one token per step (decode) after prefilling the prompt.
+        #[arg(long)]
+        decode: bool,
+    },
+    /// Greedy generation from each fixture prompt, checked against the fixture sequence (GOAL.md §1).
+    Generate {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, num_args = 1.., required = true)]
+        fixture: Vec<PathBuf>,
+        /// Reference logit margin at or below which a divergence counts as a near-tie.
+        #[arg(long, default_value_t = 0.5)]
+        tie: f32,
     },
     /// Apply the correctness gate (GOAL.md §1) to teacher-forced candidate distributions.
     Gate {
@@ -106,7 +119,8 @@ fn main() -> Result<()> {
                 println!("verified {checked} tensors byte-exact");
             }
         }
-        Command::Score { model, fixture, out, suffix, chunk } => score(&model, &fixture, &out, &suffix, chunk)?,
+        Command::Score { model, fixture, out, suffix, chunk, decode } => score(&model, &fixture, &out, &suffix, chunk, decode)?,
+        Command::Generate { model, fixture, tie } => generate(&model, &fixture, tie)?,
         Command::Gate { fixtures, candidates, suffix } => {
             let mut all = true;
             let mut any = false;
@@ -148,7 +162,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn score(model_dir: &std::path::Path, fixtures: &[PathBuf], out: &std::path::Path, suffix: &str, chunk: usize) -> Result<()> {
+fn score(model_dir: &std::path::Path, fixtures: &[PathBuf], out: &std::path::Path, suffix: &str, chunk: usize, decode: bool) -> Result<()> {
     use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
     use squash_engine::model::Model;
 
@@ -194,8 +208,11 @@ fn score(model_dir: &std::path::Path, fixtures: &[PathBuf], out: &std::path::Pat
             top_ids: vec![],
             top_logits: vec![],
         };
-        for c0 in (0..seq.tokens.len()).step_by(chunk) {
-            let c1 = (c0 + chunk).min(seq.tokens.len());
+        let mut c0 = 0;
+        while c0 < seq.tokens.len() {
+            let step = if decode && c0 >= seq.prompt_len { 1 } else { chunk };
+            let limit = if decode && c0 < seq.prompt_len { seq.prompt_len } else { seq.tokens.len() };
+            let c1 = (c0 + step).min(limit);
             forward::forward(&model, &mut state, &ws, &stream, &seq.tokens[c0..c1])?;
             let rows = c1.min(positions) - c0.min(positions);
             if rows > 0 {
@@ -205,6 +222,7 @@ fn score(model_dir: &std::path::Path, fixtures: &[PathBuf], out: &std::path::Pat
                 d.top_ids.extend(h.top_ids);
                 d.top_logits.extend(h.top_logits);
             }
+            c0 = c1;
         }
         stream.synchronize()?;
         let secs = t0.elapsed().as_secs_f64();
@@ -212,6 +230,79 @@ fn score(model_dir: &std::path::Path, fixtures: &[PathBuf], out: &std::path::Pat
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         d.save(&out.join(format!("{name}{suffix}")))?;
         println!("{name}: {} tokens in {secs:.2}s ({:.0} tok/s)", seq.tokens.len(), seq.tokens.len() as f64 / secs);
+    }
+    Ok(())
+}
+
+fn generate(model_dir: &std::path::Path, fixtures: &[PathBuf], tie: f32) -> Result<()> {
+    use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
+    use squash_engine::model::Model;
+
+    #[derive(serde::Deserialize)]
+    struct Sequence {
+        tokens: Vec<i32>,
+        prompt_len: usize,
+    }
+
+    squash_cuda::set_device(0)?;
+    let ckpt = Checkpoint::open(model_dir)?;
+    let (weights, _) = loader::upload(&ckpt, selection::text, LoadOptions::default())?;
+    let stream = squash_cuda::Stream::new()?;
+    let model = Model::bind(&ckpt, weights, &stream)?;
+    let seqs: Vec<(PathBuf, Sequence)> = fixtures
+        .iter()
+        .map(|f| Ok((f.clone(), serde_json::from_slice(&std::fs::read(f.join("sequence.json"))?)?)))
+        .collect::<Result<_>>()?;
+    let capacity = seqs.iter().map(|(_, s)| s.tokens.len()).max().unwrap_or(0);
+    let ws = Workspace::new(1024, capacity)?;
+    let hw = HeadWorkspace::new(1, 1)?;
+    let mut all_ok = true;
+    for (dir, seq) in &seqs {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let refs = [oracle::Distributions::load(&dir.join("llama-w4a4"))?, oracle::Distributions::load(&dir.join("llama-q8"))?];
+        let mut state = SequenceState::new(seq.tokens.len())?;
+        let prompt = &seq.tokens[..seq.prompt_len];
+        for c in prompt.chunks(1024) {
+            forward::forward(&model, &mut state, &ws, &stream, c)?;
+        }
+        let last = ws.out + ((prompt.len() - 1) % 1024 * squash_engine::model::D * 2) as u64;
+        let mut next = forward::head_stats(&model, &hw, &stream, last, &[0], 1)?.top_ids[0];
+        let t0 = std::time::Instant::now();
+        let mut steps = 0;
+        let mut verdict = String::from("identical");
+        for p in seq.prompt_len..seq.tokens.len() {
+            let want = seq.tokens[p];
+            if next != want {
+                // Margin each reference gives its own choice over ours at position p - 1.
+                let margin = refs
+                    .iter()
+                    .map(|r| {
+                        let pos = p - 1;
+                        let k = r.meta.top_k;
+                        let ids = &r.top_ids[pos * k..pos * k + k];
+                        let logits = &r.top_logits[pos * k..pos * k + k];
+                        let ours = ids.iter().position(|&i| i == next).map(|j| logits[j]).unwrap_or(f32::NEG_INFINITY);
+                        r.target[pos] - ours
+                    })
+                    .fold(f32::INFINITY, f32::min);
+                let near = margin <= tie;
+                all_ok &= near;
+                verdict = format!("{} at completion token {} (margin {margin:.3})", if near { "near-tie" } else { "DIVERGED" }, p - seq.prompt_len);
+                break;
+            }
+            if p + 1 == seq.tokens.len() {
+                break;
+            }
+            forward::forward(&model, &mut state, &ws, &stream, &[want])?;
+            steps += 1;
+            next = forward::head_stats(&model, &hw, &stream, ws.out, &[0], 1)?.top_ids[0];
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        println!("{name:14} {verdict}; {steps} decode steps, {:.1} tok/s", steps as f64 / secs.max(1e-9));
+    }
+    println!("generation: {}", if all_ok { "PASS" } else { "FAIL" });
+    if !all_ok {
+        std::process::exit(1);
     }
     Ok(())
 }
