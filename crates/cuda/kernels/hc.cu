@@ -111,6 +111,20 @@ __global__ void add_f32_kernel(float* y, const float* __restrict__ x, size_t cou
     if (i < count) y[i] += x[i];
 }
 
+// out[r, :] = bf16(rms(x[r, :D]) * (1 + w)); x rows at stride ldx. One block per row.
+__global__ void rmsnorm_rows_kernel(const float* __restrict__ x, int ldx, const __nv_bfloat16* __restrict__ w,
+                                    __nv_bfloat16* out) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ float scratch[32];
+    const float* row = x + (size_t)blockIdx.x * ldx;
+    float ss = 0;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) ss += row[d] * row[d];
+    const float r = rsqrtf(block_sum(ss, scratch) / D + EPS);
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
+        out[(size_t)blockIdx.x * D + d] = f2bf(row[d] * r * (1.0f + bf2f(w[d])));
+}
+
 int blocks(size_t n, int threads) { return (int)((n + threads - 1) / threads); }
 
 }  // namespace
@@ -162,5 +176,12 @@ extern "C" cudaError_t squash_f32_to_bf16(const float* x, void* y, size_t count,
 extern "C" cudaError_t squash_add_f32(float* y, const float* x, size_t count, cudaStream_t st) {
     if (count == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(add_f32_kernel, blocks(count, 256), 256, 0, st, y, x, count));
+    SQ_RETURN_LAUNCH();
+}
+
+extern "C" cudaError_t squash_rmsnorm_rows(const float* x, int ldx, const void* w, void* out, int rows, cudaStream_t st) {
+    if (rows == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(rmsnorm_rows_kernel, rows, 256, 0, st, x, ldx, static_cast<const __nv_bfloat16*>(w),
+                              static_cast<__nv_bfloat16*>(out)));
     SQ_RETURN_LAUNCH();
 }

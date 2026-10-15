@@ -98,7 +98,7 @@ pub struct Moe {
     pub gate: ExpertProj,
     pub up: ExpertProj,
     pub down: ExpertProj,
-    _tables: DeviceBuffer,
+    _buffers: Vec<DeviceBuffer>,
 }
 
 pub struct Ple {
@@ -170,8 +170,48 @@ impl PleTable {
     }
 }
 
+/// The MTP drafter (SPEC §10): one QSA decoder layer with its own mixer, sharing the embedding and LM head.
+pub struct Mtp {
+    pub fc_embedding: Linear,
+    pub fc_hidden: Linear,
+    pub norm_embedding: u64,
+    pub norm_hidden: u64,
+    pub layer: Layer,
+    pub final_hc: Hc,
+}
+
+/// Device pointer tables over the 512 experts of one MoE block, plus any buffers they point into.
+pub struct ExpertTables {
+    pub gate: ExpertProj,
+    pub up: ExpertProj,
+    pub down: ExpertProj,
+    pub buffers: Vec<DeviceBuffer>,
+}
+
+impl ExpertTables {
+    /// `addrs`: [gate codes, gate scales, up codes, up scales, down codes, down scales][expert];
+    /// `scale2`: [gate, up, down][expert].
+    pub fn upload(addrs: &[[u64; EXPERTS]; 6], scale2: &[[f32; EXPERTS]; 3], mut buffers: Vec<DeviceBuffer>, stream: &Stream) -> Result<Self> {
+        let flat_a: Vec<u64> = addrs.iter().flatten().copied().collect();
+        let flat_s: Vec<f32> = scale2.iter().flatten().copied().collect();
+        let tables = DeviceBuffer::new(flat_a.len() * 8 + flat_s.len() * 4)?;
+        stream.upload_to(tables.addr(), &flat_a)?;
+        stream.upload_to(tables.addr() + (flat_a.len() * 8) as u64, &flat_s)?;
+        let t = |k: usize| tables.addr() + (k * EXPERTS * 8) as u64;
+        let s2 = |j: usize| tables.addr() + (flat_a.len() * 8 + j * EXPERTS * 4) as u64;
+        let (gate, up, down) = (
+            ExpertProj { weights: t(0), scales: t(1), scale2: s2(0) },
+            ExpertProj { weights: t(2), scales: t(3), scale2: s2(1) },
+            ExpertProj { weights: t(4), scales: t(5), scale2: s2(2) },
+        );
+        buffers.push(tables);
+        Ok(Self { gate, up, down, buffers })
+    }
+}
+
 pub struct Model {
     pub weights: DeviceWeights,
+    pub mtp: Option<Mtp>,
     pub embed: u64,
     pub lm_head: Linear,
     pub final_hc: Hc,
@@ -186,7 +226,7 @@ fn read_i64s<const N: usize>(ckpt: &Checkpoint, name: &str) -> Result<[i64; N]> 
 }
 
 impl Model {
-    pub fn bind(ckpt: &Checkpoint, weights: DeviceWeights, stream: &Stream) -> Result<Self> {
+    pub fn bind(ckpt: &Checkpoint, weights: DeviceWeights, mtp_experts: Option<ExpertTables>, stream: &Stream) -> Result<Self> {
         let w = |name: &str| -> Result<u64> { Ok(weights.get(name)?.addr) };
         let lin = |name: &str| -> Result<Linear> {
             let t = weights.get(name)?;
@@ -224,13 +264,11 @@ impl Model {
             })
         };
 
-        let mut layers = Vec::with_capacity(LAYERS);
-        for i in 0..LAYERS {
-            let p = format!("model.language_model.layers.{i}");
-            let block = if is_attention(i) {
+        let block = |p: &str, attention: bool| -> Result<Block> {
+            Ok(if attention {
                 let a = format!("{p}.self_attn");
                 Block::Qsa(Qsa {
-                    proj: proj(qsa_group(&p))?,
+                    proj: proj(qsa_group(p))?,
                     o: lin(&format!("{a}.o_proj.weight"))?,
                     q_norm: w(&format!("{a}.q_norm.weight"))?,
                     k_norm: w(&format!("{a}.k_norm.weight"))?,
@@ -240,42 +278,43 @@ impl Model {
             } else {
                 let g = format!("{p}.linear_attn");
                 Block::Gdn(Gdn {
-                    proj: proj(gdn_group(&p))?,
+                    proj: proj(gdn_group(p))?,
                     conv: w(&format!("{g}.conv1d.weight"))?,
                     a_log: w(&format!("{g}.A_log"))?,
                     dt_bias: w(&format!("{g}.dt_bias"))?,
                     norm: w(&format!("{g}.norm.weight"))?,
                     out: lin(&format!("{g}.out_proj.weight"))?,
                 })
-            };
+            })
+        };
+        let moe = |p: &str, tables: ExpertTables| -> Result<Moe> {
+            let m = format!("{p}.mlp");
+            Ok(Moe {
+                proj: proj(moe_group(p))?,
+                shared_down: lin(&format!("{m}.shared_expert.down_proj.weight"))?,
+                gate: tables.gate,
+                up: tables.up,
+                down: tables.down,
+                _buffers: tables.buffers,
+            })
+        };
 
-            // Expert tables: [gate codes, gate scales, up codes, up scales, down codes, down scales] x 512 u64,
-            // then [gate, up, down] weight_scale_2 x 512 f32.
-            let mut addrs = vec![0u64; 6 * EXPERTS];
-            let mut scale2 = vec![0f32; 3 * EXPERTS];
+        let mut layers = Vec::with_capacity(LAYERS);
+        for i in 0..LAYERS {
+            let p = format!("model.language_model.layers.{i}");
+            // Expert codes, scales and weight_scale_2 as stored per expert in the checkpoint.
+            let mut addrs = [[0u64; EXPERTS]; 6];
+            let mut scale2 = [[0f32; EXPERTS]; 3];
             for e in 0..EXPERTS {
                 for (j, proj) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
                     let base = format!("{p}.mlp.experts.{e}.{proj}");
-                    addrs[(2 * j) * EXPERTS + e] = w(&format!("{base}.weight"))?;
-                    addrs[(2 * j + 1) * EXPERTS + e] = w(&format!("{base}.weight_scale"))?;
+                    addrs[2 * j][e] = w(&format!("{base}.weight"))?;
+                    addrs[2 * j + 1][e] = w(&format!("{base}.weight_scale"))?;
                     let s2 = ckpt.read(&format!("{base}.weight_scale_2"))?;
-                    scale2[j * EXPERTS + e] = f32::from_le_bytes(s2[..4].try_into()?);
+                    scale2[j][e] = f32::from_le_bytes(s2[..4].try_into()?);
                 }
             }
-            let tables = DeviceBuffer::new(addrs.len() * 8 + scale2.len() * 4)?;
-            stream.upload_to(tables.addr(), &addrs)?;
-            stream.upload_to(tables.addr() + (addrs.len() * 8) as u64, &scale2)?;
-            let t = |k: usize| tables.addr() + (k * EXPERTS * 8) as u64;
-            let s2 = |j: usize| tables.addr() + (addrs.len() * 8 + j * EXPERTS * 4) as u64;
-            let m = format!("{p}.mlp");
-            let moe = Moe {
-                proj: proj(moe_group(&p))?,
-                shared_down: lin(&format!("{m}.shared_expert.down_proj.weight"))?,
-                gate: ExpertProj { weights: t(0), scales: t(1), scale2: s2(0) },
-                up: ExpertProj { weights: t(2), scales: t(3), scale2: s2(1) },
-                down: ExpertProj { weights: t(4), scales: t(5), scale2: s2(2) },
-                _tables: tables,
-            };
+            let tables = ExpertTables::upload(&addrs, &scale2, Vec::new(), stream)?;
 
             let ple = if i == 1 {
                 let q = format!("{p}.ple");
@@ -297,17 +336,36 @@ impl Model {
             layers.push(Layer {
                 attn_hc: hc(&format!("{p}.attn_hyper_connection"), true)?,
                 mlp_hc: hc(&format!("{p}.mlp_hyper_connection"), true)?,
-                block,
-                moe,
+                block: block(&p, is_attention(i))?,
+                moe: moe(&p, tables)?,
                 ple,
             });
         }
+
+        let mtp = match mtp_experts {
+            None => None,
+            Some(tables) => Some(Mtp {
+                fc_embedding: lin("mtp.fc_embedding.weight")?,
+                fc_hidden: lin("mtp.fc_hidden.weight")?,
+                norm_embedding: w("mtp.pre_fc_norm_embedding.weight")?,
+                norm_hidden: w("mtp.pre_fc_norm_hidden.weight")?,
+                layer: Layer {
+                    attn_hc: hc("mtp.layers.0.attn_hyper_connection", true)?,
+                    mlp_hc: hc("mtp.layers.0.mlp_hyper_connection", true)?,
+                    block: block("mtp.layers.0", true)?,
+                    moe: moe("mtp.layers.0", tables)?,
+                    ple: None,
+                },
+                final_hc: hc("mtp.hyper_connection_mixer", false)?,
+            }),
+        };
 
         Ok(Self {
             embed: w("model.language_model.embed_tokens.weight")?,
             lm_head: lin("lm_head.weight")?,
             final_hc: hc("model.language_model.hyper_connection_mixer", false)?,
             layers,
+            mtp,
             ple_table: PleTable::open(ckpt)?,
             weights,
         })
@@ -338,7 +396,7 @@ fn moe_group(layer: &str) -> (String, Vec<String>) {
 }
 
 /// Every multi-member projection group of the text model; quantized profiles store each contiguously.
-pub fn projection_groups() -> Vec<(String, Vec<String>)> {
+pub fn projection_groups(mtp: bool) -> Vec<(String, Vec<String>)> {
     let mut groups = Vec::new();
     for i in 0..LAYERS {
         let p = format!("model.language_model.layers.{i}");
@@ -347,7 +405,46 @@ pub fn projection_groups() -> Vec<(String, Vec<String>)> {
         groups.push(if is_attention(i) { qsa_group(&p) } else { gdn_group(&p) });
         groups.push(moe_group(&p));
     }
+    if mtp {
+        let p = "mtp.layers.0";
+        groups.push(hc_group(&format!("{p}.attn_hyper_connection"), true));
+        groups.push(hc_group(&format!("{p}.mlp_hyper_connection"), true));
+        groups.push(qsa_group(p));
+        groups.push(moe_group(p));
+    }
     groups
+}
+
+/// Uploads the MTP layer's BF16 experts one tensor at a time and NVFP4-quantizes them into the layout
+/// of the main model's experts (gate_up [512, 1280, 2560] holds gate rows 0..640 then up rows per expert).
+fn load_mtp_experts(ckpt: &Checkpoint, opts: crate::loader::LoadOptions, stream: &Stream) -> Result<ExpertTables> {
+    use squash_cuda::kernels as k;
+    let mut addrs = [[0u64; EXPERTS]; 6];
+    let mut scale2 = [[0f32; EXPERTS]; 3];
+    let mut buffers = Vec::new();
+    // (tensor, matrices per expert, rows, cols, first projection index)
+    for (name, per_expert, n, kk, proj) in [("mtp.layers.0.mlp.experts.gate_up_proj", 2, EXPERT_WIDTH, D, 0), ("mtp.layers.0.mlp.experts.down_proj", 1, D, EXPERT_WIDTH, 2)] {
+        let (staged, _) = crate::loader::upload(ckpt, |t| t == name, opts)?;
+        let src = staged.get(name)?;
+        let count = EXPERTS * per_expert;
+        let codes = DeviceBuffer::new(count * n * kk / 2)?;
+        let scales = DeviceBuffer::new(count * n * kk / 16)?;
+        let s2 = DeviceBuffer::new(count * 4)?;
+        let amax = DeviceBuffer::new(count * 4)?;
+        k::quantize_nvfp4(stream, src.addr, count, n, kk, codes.addr(), scales.addr(), s2.addr(), amax.addr())?;
+        let s2_host: Vec<f32> = stream.download(s2.addr(), count)?;
+        for e in 0..EXPERTS {
+            for j in 0..per_expert {
+                let m = e * per_expert + j;
+                addrs[2 * (proj + j)][e] = codes.addr() + (m * n * kk / 2) as u64;
+                addrs[2 * (proj + j) + 1][e] = scales.addr() + (m * n * kk / 16) as u64;
+                scale2[proj + j][e] = s2_host[m];
+            }
+        }
+        buffers.push(codes);
+        buffers.push(scales);
+    }
+    ExpertTables::upload(&addrs, &scale2, buffers, stream)
 }
 
 /// Weight precision profile for the non-expert projections.
@@ -360,15 +457,16 @@ pub enum Precision {
     Int8Group,
 }
 
-/// Uploads the text model in the given precision and binds it.
-pub fn load_text(ckpt: &Checkpoint, precision: Precision, opts: crate::loader::LoadOptions, stream: &Stream) -> Result<(Model, crate::loader::LoadStats)> {
+/// Uploads the text model (and with `mtp`, the MTP drafter) in the given precision and binds it.
+pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate::loader::LoadOptions, stream: &Stream) -> Result<(Model, crate::loader::LoadStats)> {
     use crate::{loader, selection};
     let format = match precision {
         Precision::Bf16 => WeightFormat::Bf16,
         Precision::Int8Group => WeightFormat::Int8Group,
     };
+    let wanted = |n: &str| selection::text(n) || (mtp && selection::mtp(n) && !n.contains(".experts."));
     let quantized = |n: &str| format != WeightFormat::Bf16 && selection::eight_bit(n);
-    let (mut weights, mut stats) = loader::upload(ckpt, |n| selection::text(n) && !quantized(n), opts)?;
+    let (mut weights, mut stats) = loader::upload(ckpt, |n| wanted(n) && !quantized(n), opts)?;
     // Fold each HyperConnection's (1 + w) norm weight into its down and injection projections (SPEC §4),
     // so small batches can project the raw residual and apply the per-stream RMS factor afterwards.
     let fold = |name: &str, addr: u64, n: usize, k: usize| -> Result<()> {
@@ -386,11 +484,12 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, opts: crate::loader::L
         }
         stream.synchronize()?;
     } else {
-        let (converted, s) = loader::upload_quantized(ckpt, |n| selection::text(n) && quantized(n), format, &projection_groups(), &fold, opts, stream)?;
+        let (converted, s) = loader::upload_quantized(ckpt, |n| wanted(n) && quantized(n), format, &projection_groups(mtp), &fold, opts, stream)?;
         stats.bytes += s.bytes;
         stats.seconds += s.seconds;
         stats.segments += s.segments;
         weights.merge(converted);
     }
-    Ok((Model::bind(ckpt, weights, stream)?, stats))
+    let mtp_experts = if mtp { Some(load_mtp_experts(ckpt, opts, stream)?) } else { None };
+    Ok((Model::bind(ckpt, weights, mtp_experts, stream)?, stats))
 }

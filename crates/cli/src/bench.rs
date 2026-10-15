@@ -19,7 +19,7 @@ fn prompt(len: usize) -> Result<Vec<i32>> {
 }
 
 pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, profile: bool, ncu_steps: usize) -> Result<()> {
-    let (model, stream) = crate::load(model_dir, precision)?;
+    let (model, stream) = crate::load(model_dir, precision, false)?;
     let capacity = contexts.iter().max().copied().unwrap_or(0) + generate + 16 + ncu_steps;
     let mut ws = Workspace::new(chunk, capacity)?;
     let hw = HeadWorkspace::new(1, 1)?;

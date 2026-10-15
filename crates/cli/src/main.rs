@@ -1,4 +1,5 @@
 mod bench;
+mod mtp;
 
 use std::path::PathBuf;
 
@@ -26,11 +27,11 @@ impl From<PrecisionArg> for Precision {
 }
 
 /// Opens the checkpoint and loads the text model onto GPU 0.
-pub fn load(model_dir: &std::path::Path, precision: Precision) -> Result<(Model, squash_cuda::Stream)> {
+pub fn load(model_dir: &std::path::Path, precision: Precision, mtp: bool) -> Result<(Model, squash_cuda::Stream)> {
     squash_cuda::set_device(0)?;
     let ckpt = Checkpoint::open(model_dir)?;
     let stream = squash_cuda::Stream::new()?;
-    let (model, stats) = squash_engine::model::load_text(&ckpt, precision, LoadOptions::default(), &stream)?;
+    let (model, stats) = squash_engine::model::load_text(&ckpt, precision, mtp, LoadOptions::default(), &stream)?;
     let (free, _) = squash_cuda::mem_info()?;
     println!("loaded {precision:?}: {:.2} GiB read in {:.1}s; {:.1} GiB device memory free", stats.bytes as f64 / 1073741824.0, stats.seconds, free as f64 / 1073741824.0);
     Ok((model, stream))
@@ -120,6 +121,19 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         ncu_steps: usize,
     },
+    /// Measure MTP draft acceptance on a fixture (drafts are compared with the target's greedy tokens).
+    MtpProbe {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, value_enum, default_value_t = PrecisionArg::Int8g)]
+        precision: PrecisionArg,
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long, default_value_t = 200)]
+        steps: usize,
+        #[arg(long, default_value_t = 1024)]
+        chunk: usize,
+    },
     /// Apply the correctness gate (GOAL.md §1) to teacher-forced candidate distributions.
     Gate {
         /// Fixture root containing one directory per fixture.
@@ -177,6 +191,7 @@ fn main() -> Result<()> {
         }
         Command::Score { model, precision, fixture, out, suffix, chunk, decode } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode)?,
         Command::Generate { model, precision, fixture, tie } => generate(&model, precision.into(), &fixture, tie)?,
+        Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
         Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps)?,
         Command::Gate { fixtures, candidates, suffix } => {
             let mut all = true;
@@ -229,7 +244,7 @@ fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf]
     }
     const TOP_K: usize = 32;
 
-    let (model, stream) = load(model_dir, precision)?;
+    let (model, stream) = load(model_dir, precision, false)?;
     std::fs::create_dir_all(out)?;
 
     let seqs: Vec<(PathBuf, Sequence)> = fixtures
@@ -294,7 +309,7 @@ fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathB
         prompt_len: usize,
     }
 
-    let (model, stream) = load(model_dir, precision)?;
+    let (model, stream) = load(model_dir, precision, false)?;
     let seqs: Vec<(PathBuf, Sequence)> = fixtures
         .iter()
         .map(|f| Ok((f.clone(), serde_json::from_slice(&std::fs::read(f.join("sequence.json"))?)?)))

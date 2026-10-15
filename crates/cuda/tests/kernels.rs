@@ -106,3 +106,46 @@ fn gemv_and_int8_group_paths_match_cpu() {
         }
     }
 }
+
+const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+fn fp8_e4m3(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let e = ((b >> 3) & 0xf) as i32;
+    let m = (b & 7) as f32;
+    if e == 0 { sign * m / 8.0 * 2f32.powi(-6) } else { sign * (1.0 + m / 8.0) * 2f32.powi(e - 7) }
+}
+
+#[test]
+fn nvfp4_quantization_round_trips() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x0dd_ba11);
+    let (count, n, k) = (3, 64, 256);
+    let w: Vec<f32> = rng.vec(count * n * k).iter().enumerate().map(|(i, &v)| bf16::round(v * if i % 97 == 0 { 8.0 } else { 1.0 })).collect();
+    let dw = upload(&s, &to_bf16(&w));
+    let codes = DeviceBuffer::new(count * n * k / 2).unwrap();
+    let scales = DeviceBuffer::new(count * n * k / 16).unwrap();
+    let scale2 = DeviceBuffer::new(count * 4).unwrap();
+    let amax = DeviceBuffer::new(count * 4).unwrap();
+    kernels::quantize_nvfp4(&s, dw.addr(), count, n, k, codes.addr(), scales.addr(), scale2.addr(), amax.addr()).unwrap();
+    let c: Vec<u8> = s.download(codes.addr(), count * n * k / 2).unwrap();
+    let sc: Vec<u8> = s.download(scales.addr(), count * n * k / 16).unwrap();
+    let s2: Vec<f32> = s.download(scale2.addr(), count).unwrap();
+    for m in 0..count {
+        let per = n * k;
+        let amax = w[m * per..(m + 1) * per].iter().fold(0f32, |a, &v| a.max(v.abs()));
+        assert!((s2[m] - amax / (6.0 * 448.0)).abs() <= 1e-6 * s2[m], "scale2 {m}");
+        for b in 0..per / 16 {
+            let bs = fp8_e4m3(sc[m * per / 16 + b]) * s2[m];
+            for i in 0..16 {
+                let idx = m * per + b * 16 + i;
+                let byte = c[idx / 2];
+                let code = if idx % 2 == 0 { byte & 15 } else { byte >> 4 };
+                let q = E2M1[(code & 7) as usize] * if code & 8 != 0 { -1.0 } else { 1.0 } * bs;
+                // Nearest grid point: error at most half the largest grid step (1.0) times the scale.
+                assert!((q - w[idx]).abs() <= 1.0 * bs + 1e-6, "value {idx}: {} vs {}", q, w[idx]);
+            }
+        }
+    }
+}

@@ -26,7 +26,9 @@ pub mod selection {
         if name.contains(".experts.") || name.contains(".ngram_embedding.") {
             return false;
         }
-        const SUFFIXES: [&str; 20] = [
+        const SUFFIXES: [&str; 22] = [
+            "mtp.fc_embedding.weight",
+            "mtp.fc_hidden.weight",
             "linear_attn.in_proj_a.weight",
             "linear_attn.in_proj_b.weight",
             "block_inject_weight.weight",

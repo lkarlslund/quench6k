@@ -333,3 +333,15 @@ pub fn moe_experts_t1(s: &Stream, m: u64, logits: u64, gate: (u64, u64, u64), up
         ffi::squash_moe_experts_t1(p(m), f(logits), t(gate.0), t(gate.1), f(gate.2), t(up.0), t(up.1), f(up.2), t(down.0), t(down.1), f(down.2), im(top_i), fm(top_w), im(pair_row), pm(act), fm(yd), s.raw())
     )
 }
+
+/// NVFP4-quantizes `count` consecutive BF16 matrices of `n` x `k` (checkpoint layout: codes, FP8 block
+/// scales per 16, FP32 global scale per matrix). `amax` is scratch for `count` u32.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_nvfp4(s: &Stream, w: u64, count: usize, n: usize, k: usize, codes: u64, scales: u64, scale2: u64, amax: u64) -> Result<()> {
+    launch!("quantize_nvfp4", ffi::squash_quantize_nvfp4(p(w), n32(count), n32(n), n32(k), pm(codes), pm(scales), fm(scale2), amax as *mut u32, s.raw()))
+}
+
+/// out[r] = bf16(rms(x[r, :2560]) · (1 + w)) for `rows` rows of FP32 at stride `ldx`.
+pub fn rmsnorm_rows(s: &Stream, x: u64, ldx: usize, w: u64, out: u64, rows: usize) -> Result<()> {
+    launch!("rmsnorm_rows", ffi::squash_rmsnorm_rows(f(x), n32(ldx), p(w), pm(out), n32(rows), s.raw()))
+}
