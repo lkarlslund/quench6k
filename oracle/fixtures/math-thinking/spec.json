@@ -1,0 +1,5 @@
+{
+ "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nA bakery sells muffins for $3 each and cookies for $1.25 each. On Monday it sold 48 muffins and three times as many cookies. On Tuesday it sold 20% fewer muffins and 15 more cookies than on Monday. What was the total revenue over both days?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+ "generate": 512,
+ "enable_thinking": true
+}

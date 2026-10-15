@@ -1,0 +1,11 @@
+{
+ "engine": "llama.cpp",
+ "format": "oracle.distributions/1",
+ "mmq_prec": "q8",
+ "mode": "teacher_forced",
+ "model": "/storage/ai/models/swift-1.5-qwen3.8-flash-next-nvfp4.gguf",
+ "positions": 405,
+ "prompt_len": 313,
+ "seconds": 0.646945008,
+ "top_k": 32
+}

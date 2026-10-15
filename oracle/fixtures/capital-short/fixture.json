@@ -1,0 +1,28 @@
+{
+ "name": "capital-short",
+ "prompt_ids": [
+  248045,
+  846,
+  198,
+  3710,
+  369,
+  279,
+  6511,
+  314,
+  9338,
+  30,
+  21134,
+  25899,
+  13,
+  248046,
+  198,
+  248045,
+  74455,
+  198,
+  248068,
+  271,
+  248069,
+  271
+ ],
+ "tokenizer": "/home/lak/github-repos/ninfer/out/v3/swift_1_5_qwen3_8_flash_next_nvfp4.ninfer"
+}

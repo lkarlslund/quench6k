@@ -1,0 +1,5 @@
+{
+ "text": "<|im_start|>user\nWrite a Python function that merges overlapping intervals given as a list of [start, end] pairs, then add three pytest test cases.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+ "generate": 384,
+ "enable_thinking": false
+}

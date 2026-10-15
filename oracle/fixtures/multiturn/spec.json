@@ -1,0 +1,5 @@
+{
+ "text": "<|im_start|>system\nYou are a concise assistant for a hardware team.<|im_end|>\n<|im_start|>user\nWhat does HBM stand for?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHigh Bandwidth Memory.<|im_end|>\n<|im_start|>user\nHow does it differ from GDDR7 for a workstation GPU, in four bullet points?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+ "generate": 256,
+ "enable_thinking": false
+}

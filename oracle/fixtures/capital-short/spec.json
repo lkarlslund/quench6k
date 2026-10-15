@@ -1,0 +1,5 @@
+{
+ "text": "<|im_start|>user\nWhat is the capital of France? Answer briefly.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+ "generate": 64,
+ "enable_thinking": false
+}
