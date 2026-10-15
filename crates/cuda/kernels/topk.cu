@@ -309,9 +309,25 @@ __global__ void __launch_bounds__(SEL_THREADS) qsa_select_kernel(const float* __
         for (int b = tid; b < SEL_BINS; b += SEL_THREADS) hist[b] = 0;
         __syncthreads();
         const unsigned prefix = s_prefix, mask = s_mask;
-        for (int i = tid; i < n; i += SEL_THREADS) {
-            const unsigned u = order_key(row[i]);
-            if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & (bins - 1)], 1);
+        // float4 loads, four per step: 16 scores per thread in flight.
+        for (int i0 = tid * 4; i0 < n; i0 += SEL_THREADS * 16) {
+            float4 v[4];
+#pragma unroll
+            for (int u4 = 0; u4 < 4; ++u4) {
+                const int i = i0 + u4 * SEL_THREADS * 4;
+                v[u4] = i < n ? *reinterpret_cast<const float4*>(row + i) : make_float4(0, 0, 0, 0);
+            }
+#pragma unroll
+            for (int u4 = 0; u4 < 4; ++u4) {
+                const int i = i0 + u4 * SEL_THREADS * 4;
+                const float e[4] = {v[u4].x, v[u4].y, v[u4].z, v[u4].w};
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    if (i + c >= n) break;
+                    const unsigned u = order_key(e[c]);
+                    if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & (bins - 1)], 1);
+                }
+            }
         }
         __syncthreads();
         // Find the bin holding the remaining-th largest key: warp w sums bins [64 w, 64 w + 64).
@@ -340,13 +356,19 @@ __global__ void __launch_bounds__(SEL_THREADS) qsa_select_kernel(const float* __
     }
     const unsigned threshold = s_prefix;
     const int take_equal = s_remaining;
-    // Compaction over contiguous per-thread ranges.
-    const int per = (n + SEL_THREADS - 1) / SEL_THREADS, b0 = min(n, tid * per), b1 = min(n, b0 + per);
+    // Compaction over contiguous per-thread ranges (multiples of 4, read as float4).
+    const int per = ((n + SEL_THREADS - 1) / SEL_THREADS + 3) / 4 * 4, b0 = min(n, tid * per), b1 = min(n, b0 + per);
     int gt = 0, eq = 0;
-    for (int i = b0; i < b1; ++i) {
-        const unsigned u = order_key(row[i]);
-        gt += u > threshold;
-        eq += u == threshold;
+    for (int i = b0; i < b1; i += 4) {
+        const float4 v = *reinterpret_cast<const float4*>(row + i);
+        const float e[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            if (i + c >= b1) break;
+            const unsigned u = order_key(e[c]);
+            gt += u > threshold;
+            eq += u == threshold;
+        }
     }
     const int eq_before = block_inclusive_scan(eq, scratch) - eq;
     const int eq_take = max(0, min(eq, take_equal - eq_before));
@@ -363,9 +385,11 @@ __global__ void __launch_bounds__(SEL_THREADS) qsa_select_kernel(const float* __
 
 }  // namespace
 
+// `ld` must be a multiple of 4 (rows are read as float4).
 extern "C" cudaError_t squash_qsa_select(const float* scores, int T, size_t ld, const int* start, int* sel,
                                             cudaStream_t st) {
     if (T == 0) return cudaSuccess;
+    if (ld % 4 != 0) return cudaErrorInvalidValue;
     SQ_CHECK_LAUNCH(sq_launch(qsa_select_kernel, T, SEL_THREADS, 0, st, scores, ld, start, 4, sel));
     SQ_RETURN_LAUNCH();
 }

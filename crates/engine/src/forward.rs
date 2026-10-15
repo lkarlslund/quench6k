@@ -161,7 +161,7 @@ impl Workspace {
         let t = max_tokens;
         let pairs = t * TOP_K;
         let max_tiles = pairs.div_ceil(k::moe_tile_rows()) + EXPERTS;
-        let score_cols = (capacity / 4).max(TOP_GROUPS);
+        let score_cols = (capacity / 4).max(TOP_GROUPS).div_ceil(64) * 64;
         let mut bufs = Vec::new();
         let mut alloc = |bytes: usize| -> Result<u64> {
             let b = DeviceBuffer::new(bytes)?;
