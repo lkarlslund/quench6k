@@ -163,9 +163,14 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
                                                          int b_col, __nv_bfloat16* y, float* rec, const int* ctl,
                                                          int defer) {
     pdl_launch_dependents();
-    extern __shared__ float xs[];  // [steps][384] raw channel inputs
-    __shared__ float sq[2][DK], sk[2][DK], sv[2][DV], so[DV];
-    __shared__ float red[2][8], red2[4];
+    // Dynamic shared memory: xs [steps][384] raw channel inputs (v replaced in place by its conv
+    // output), qk [steps][256] conv outputs of q and k stored interleaved (row part * 32 + j at
+    // 4 j + part, so the four parts of a column read four different banks), so [T][128] head outputs.
+    extern __shared__ float smem[];
+    float* xs = smem;
+    float* qk = xs + MAX_STEPS * 3 * DK;
+    float* so = qk + MAX_STEPS * 2 * DK;
+    __shared__ float red[MAX_STEPS][8], red2[REC_TOKENS][4];
     __shared__ float s_beta[MAX_STEPS], s_decay[MAX_STEPS];
     const int vh = blockIdx.x, kh = vh / 3, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int col = tid >> 2, part = tid & 3;
@@ -192,10 +197,19 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
     const int replay = rec ? ctl[0] : 0, parity = rec ? ctl[1] : 0;
     const float* prev = rec ? rec + (size_t)parity * REC_TOKENS * REC : nullptr;
     const int steps = replay + T;
-    for (int i = 0; i < steps; ++i) {
-        const float* row = i < replay ? prev + (size_t)i * REC : proj + (size_t)(i - replay) * ld;
-        if (owns_channel) xs[i * 3 * DK + tid] = row[ch];
-    }
+    // Eight steps' loads in flight at a time.
+    if (owns_channel)
+        for (int i0 = 0; i0 < steps; i0 += 8) {
+            float v[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int i = i0 + j;
+                if (i < steps) v[j] = (i < replay ? prev + (size_t)i * REC : proj + (size_t)(i - replay) * ld)[ch];
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                if (i0 + j < steps) xs[(i0 + j) * 3 * DK + tid] = v[j];
+        }
     if (tid < steps) {
         const int i = tid;
         const float* row = i < replay ? prev + (size_t)i * REC : proj + (size_t)(i - replay) * ld;
@@ -214,79 +228,89 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
                 next[(size_t)t * REC + C + VH + vh] = row[b_col + vh];
             }
         }
-    __syncthreads();
 
-    auto commit = [&]() {
-        if (writes_conv)
-#pragma unroll
-            for (int j = 0; j < 3; ++j) conv_state[j * C + ch] = hist[j];
-#pragma unroll
-        for (int j = 0; j < 32; ++j) st[(part * 32 + j) * DV + col] = s[j];
-    };
-
-    for (int i = 0; i < steps; ++i) {
-        const int b = i & 1;
-        const bool out = i >= replay;
-        if (owns_channel) {
+    // Causal conv + SiLU of every step (each thread reads and writes only its own channel), and the
+    // per-warp q / k sums of squares (warps 0-3 hold q, 4-7 hold k).
+    if (owns_channel) {
+        const int qki = tid < 2 * DK ? (tid & ~(DK - 1)) + (((tid & 31) << 2) | ((tid & (DK - 1)) >> 5)) : 0;
+        for (int i = 0; i < steps; ++i) {
             const float x = xs[i * 3 * DK + tid];
             const float c = silu(cw[0] * hist[0] + cw[1] * hist[1] + cw[2] * hist[2] + cw[3] * x);
             hist[0] = hist[1];
             hist[1] = hist[2];
             hist[2] = x;
-            if (tid < DK) sq[b][tid] = c;
-            else if (tid < 2 * DK) sk[b][tid - DK] = c;
-            else sv[b][tid - 2 * DK] = c;
-            // q / k sums of squares per warp (warps 0-3 hold q, 4-7 hold k)
             if (tid < 2 * DK) {
+                qk[i * 2 * DK + qki] = c;
                 const float sum = warp_sum(c * c);
-                if (lane == 0) red[b][warp] = sum;
+                if (lane == 0) red[i][warp] = sum;
+            } else {
+                xs[i * 3 * DK + tid] = c;
             }
+            if (i == replay - 1 && defer && writes_conv)
+#pragma unroll
+                for (int j = 0; j < 3; ++j) conv_state[j * C + ch] = hist[j];
         }
-        __syncthreads();
-        const float qn = rsqrtf(red[b][0] + red[b][1] + red[b][2] + red[b][3] + EPS) * rsqrtf((float)DK);
-        const float kn = rsqrtf(red[b][4] + red[b][5] + red[b][6] + red[b][7] + EPS);
+        if (!defer && writes_conv)
+#pragma unroll
+            for (int j = 0; j < 3; ++j) conv_state[j * C + ch] = hist[j];
+    }
+    __syncthreads();
+
+    // The recurrence: registers only, no block barriers.
+    for (int i = 0; i < steps; ++i) {
+        const float* sq = qk + i * 2 * DK;
+        const float* sk = sq + DK;
+        const bool out = i >= replay;
+        const float qn = rsqrtf(red[i][0] + red[i][1] + red[i][2] + red[i][3] + EPS) * rsqrtf((float)DK);
+        const float kn = rsqrtf(red[i][4] + red[i][5] + red[i][6] + red[i][7] + EPS);
         const float decay = s_decay[i], beta = s_beta[i];
         float kvm = 0;
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
             s[j] *= decay;
-            kvm += s[j] * sk[b][part * 32 + j];
+            kvm += s[j] * sk[4 * j + part];
         }
         kvm *= kn;
         kvm += __shfl_xor_sync(0xffffffff, kvm, 1);
         kvm += __shfl_xor_sync(0xffffffff, kvm, 2);
-        const float delta = beta * (sv[b][col] - kvm);
+        const float delta = beta * (xs[i * 3 * DK + 2 * DK + col] - kvm);
         float o = 0;
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
-            s[j] += sk[b][part * 32 + j] * kn * delta;
-            if (out) o += s[j] * sq[b][part * 32 + j];
+            s[j] += sk[4 * j + part] * kn * delta;
+            if (out) o += s[j] * sq[4 * j + part];
         }
-        if (i == replay - 1 && defer) commit();  // the replayed prefix is the new committed state
+        // The replayed prefix is the new committed state.
+        if (i == replay - 1 && defer)
+#pragma unroll
+            for (int j = 0; j < 32; ++j) st[(part * 32 + j) * DV + col] = s[j];
         if (out) {
             o *= qn;
             o += __shfl_xor_sync(0xffffffff, o, 1);
             o += __shfl_xor_sync(0xffffffff, o, 2);
-            if (part == 0) so[col] = o;
-            __syncthreads();
-            // gated RMSNorm over the head's 128 outputs (warps 0-3)
-            float ov = 0;
-            if (tid < DV) {
-                ov = so[tid];
-                const float sum = warp_sum(ov * ov);
-                if (lane == 0) red2[warp] = sum;
-            }
-            __syncthreads();
-            if (tid < DV) {
-                const int t = i - replay;
-                const float r = rsqrtf((red2[0] + red2[1] + red2[2] + red2[3]) / DV + EPS);
-                y[(size_t)t * VH * DV + vh * DV + tid] =
-                    f2bf(ov * r * bf2f(norm_w[tid]) * sigmoidf(proj[(size_t)t * ld + z_col + vh * DV + tid]));
-            }
+            if (part == 0) so[(i - replay) * DV + col] = o;
         }
     }
     // Plain steps commit everything; deferred steps leave this step's tokens to the next replay.
-    if (!defer) commit();
+    if (!defer)
+#pragma unroll
+        for (int j = 0; j < 32; ++j) st[(part * 32 + j) * DV + col] = s[j];
+    __syncthreads();
+
+    // Gated RMSNorm over each token's 128 outputs: warp w sums columns 32 (w & 3) .. + 31 of token
+    // w / 4 (+ 4 per pass), the same lanes and order for every batch size.
+    const int q4 = warp & 3, oc = q4 * 32 + lane;
+    for (int t = warp >> 2; t < T; t += FT / 32 / 4) {
+        const float ov = so[t * DV + oc];
+        const float sum = warp_sum(ov * ov);
+        if (lane == 0) red2[t][q4] = sum;
+    }
+    __syncthreads();
+    for (int t = warp >> 2; t < T; t += FT / 32 / 4) {
+        const float r = rsqrtf((red2[t][0] + red2[t][1] + red2[t][2] + red2[t][3]) / DV + EPS);
+        y[(size_t)t * VH * DV + vh * DV + oc] =
+            f2bf(so[t * DV + oc] * r * bf2f(norm_w[oc]) * sigmoidf(proj[(size_t)t * ld + z_col + vh * DV + oc]));
+    }
 }
 
 }  // namespace
@@ -305,7 +329,7 @@ extern "C" cudaError_t squash_gdn_fused_small(const float* proj, int ld, int T, 
     if (T > REC_TOKENS && rec && defer) return cudaErrorInvalidValue;
     if (T == 0 && !rec) return cudaSuccess;
     // Dynamic shared memory holds the raw inputs of every processed token (replay + new).
-    const size_t smem = (size_t)MAX_STEPS * 3 * DK * sizeof(float);
+    const size_t smem = ((size_t)MAX_STEPS * 5 * DK + (size_t)REC_TOKENS * DV) * sizeof(float);
     static bool configured = false;
     if (!configured) {
         cudaFuncSetAttribute(fused_small_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
