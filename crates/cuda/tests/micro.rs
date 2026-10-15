@@ -241,3 +241,32 @@ fn gemv_latency() {
         println!("{line}");
     }
 }
+
+/// QSA group selection for four rows at several context lengths (continuous and tied scores).
+#[test]
+#[ignore]
+fn select_latency() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = 0x1234_5678_9abc_def1u64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let t = 4;
+    for &ctx in &[8192usize, 65536, 131072, 262144] {
+        let ld = ctx / 4;
+        for coarse in [false, true] {
+            let v: Vec<f32> = (0..t * ld).map(|_| if coarse { (next() * 64.0).round() / 4.0 } else { next() * 3.0 }).collect();
+            let scores = DeviceBuffer::new(v.len() * 4).unwrap();
+            s.upload(&scores, &v).unwrap();
+            let start = DeviceBuffer::new(4).unwrap();
+            s.upload(&start, &[(ctx - t) as i32]).unwrap();
+            let sel = DeviceBuffer::new(t * 512 * 4).unwrap();
+            let g = Graph::capture(&s, |s| (0..CALLS).try_for_each(|_| kernels::qsa_select(s, scores.addr(), t, ld, start.addr(), sel.addr()))).unwrap();
+            println!("ctx {ctx} coarse {coarse}: {:.2} us", time_graph(&s, &g, CALLS));
+        }
+    }
+}

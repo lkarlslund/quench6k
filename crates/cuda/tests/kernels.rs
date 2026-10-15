@@ -277,7 +277,7 @@ fn qsa_select_matches_cpu() {
     squash_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0xa11c_e5e1_ec7);
-    for &(start, ld, coarse) in &[(8_000usize, 2048usize, true), (131_000, 32_768, true), (262_000, 65_536, true), (40_000, 65_536, true), (131_000, 32_768, false), (262_000, 65_536, false)] {
+    for &(start, ld, coarse) in &[(8_000usize, 2048usize, true), (131_000, 32_768, true), (262_000, 65_536, true), (40_000, 65_536, true), (131_000, 32_768, false), (262_000, 65_536, false), (20_000, 65_536, false), (30_000, 65_536, true)] {
         let t = 4;
         // Coarse values give the threshold many ties; continuous ones usually end the search early.
         let scores: Vec<f32> = (0..t * ld).map(|_| if coarse { (rng.next() * 40.0).round() / 8.0 } else { rng.next() * 3.0 }).collect();

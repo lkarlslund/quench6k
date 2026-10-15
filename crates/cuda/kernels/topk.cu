@@ -4,6 +4,7 @@
 // keys; all larger values and enough copies of the k-th are collected, then the k picks are
 // bitonic-sorted either by value (descending, ties by lower index) or by index (ascending).
 
+#include <algorithm>
 #include <cooperative_groups.h>
 
 #include "common.cuh"
@@ -392,6 +393,8 @@ __global__ void __launch_bounds__(SEL_THREADS) qsa_select_kernel(const float* __
 // from the lower-ranked blocks' counts, so the output equals qsa_select_kernel's exactly.
 namespace cg = cooperative_groups;
 constexpr int CL = 8, CL_THREADS = 512, CL_SLICE_BINS = SEL_BINS / CL;
+// Rows up to SOLO_N groups are selected by the cluster's first block alone (no cluster barriers).
+constexpr int SOLO_N = 8192;
 
 __global__ void __launch_bounds__(CL_THREADS) qsa_select_cluster_kernel(const float* __restrict__ scores, size_t ld,
                                                                         const int* __restrict__ start_ptr, int group,
@@ -410,9 +413,11 @@ __global__ void __launch_bounds__(CL_THREADS) qsa_select_cluster_kernel(const fl
     const int rank = (int)cluster.block_rank(), r = blockIdx.x / CL;
     const int n = (*start_ptr + r + 1) / group;
     if (n <= SEL_K) return;  // dense row (the whole cluster returns)
+    const bool solo = n <= SOLO_N;
+    if (solo && rank != 0) return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, warps = CL_THREADS / 32;
     const float* row = scores + (size_t)r * ld;
-    const int per = ((n + CL - 1) / CL + 3) / 4 * 4, b0 = min(n, rank * per), m = min(n, b0 + per) - b0;
+    const int per = solo ? n : ((n + CL - 1) / CL + 3) / 4 * 4, b0 = min(n, rank * per), m = min(n, b0 + per) - b0;
     for (int i = tid * 4; i < m; i += CL_THREADS * 4) {
         const float4 v = *reinterpret_cast<const float4*>(row + b0 + i);
         keys[i] = order_key(v.x);
@@ -436,15 +441,18 @@ __global__ void __launch_bounds__(CL_THREADS) qsa_select_cluster_kernel(const fl
             const unsigned u = keys[i];
             if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & (bins - 1)], 1);
         }
-        cluster.sync();
-        for (int b = tid; b < CL_SLICE_BINS; b += CL_THREADS) {
-            int sum = 0;
+        if (!solo) {
+            // Block q sums bins [q 256, q 256 + 256) over the cluster, then every block gathers them.
+            cluster.sync();
+            for (int b = tid; b < CL_SLICE_BINS; b += CL_THREADS) {
+                int sum = 0;
 #pragma unroll
-            for (int q = 0; q < CL; ++q) sum += cluster.map_shared_rank(hist, q)[rank * CL_SLICE_BINS + b];
-            gsum[b] = sum;
+                for (int q = 0; q < CL; ++q) sum += cluster.map_shared_rank(hist, q)[rank * CL_SLICE_BINS + b];
+                gsum[b] = sum;
+            }
+            cluster.sync();
+            for (int b = tid; b < SEL_BINS; b += CL_THREADS) hist[b] = cluster.map_shared_rank(gsum, b / CL_SLICE_BINS)[b % CL_SLICE_BINS];
         }
-        cluster.sync();
-        for (int b = tid; b < SEL_BINS; b += CL_THREADS) hist[b] = cluster.map_shared_rank(gsum, b / CL_SLICE_BINS)[b % CL_SLICE_BINS];
         __syncthreads();
         // Find the bin holding the remaining-th largest key (warp 0: warp sums, then the chosen warp's
         // bins, four per lane, as suffix sums and ballots).
@@ -509,16 +517,18 @@ __global__ void __launch_bounds__(CL_THREADS) qsa_select_cluster_kernel(const fl
         s_counts[0] = gt_in;
         s_counts[1] = eq_in;
     }
-    cluster.sync();
     int gt_below = 0, eq_below = 0;
-    for (int q = 0; q < rank; ++q) {
-        const int* c = cluster.map_shared_rank(s_counts, q);
-        gt_below += c[0];
-        eq_below += c[1];
+    if (!solo) {
+        cluster.sync();
+        for (int q = 0; q < rank; ++q) {
+            const int* c = cluster.map_shared_rank(s_counts, q);
+            gt_below += c[0];
+            eq_below += c[1];
+        }
+        cluster.sync();  // no block leaves while others read its counts
     }
     // Lower ranks' takes of threshold ties: min(their ties, what was left for them).
     const int eq_taken_below = min(eq_below, take_equal);
-    cluster.sync();  // no block leaves while others read its counts
     const int eq_before = eq_below + eq_in - eq;
     const int eq_take = max(0, min(eq, take_equal - eq_before));
     const int mine = gt + eq_take;
@@ -539,7 +549,7 @@ extern "C" cudaError_t squash_qsa_select(const float* scores, int T, size_t ld, 
     if (T == 0) return cudaSuccess;
     if (ld % 4 != 0) return cudaErrorInvalidValue;
     // Cluster variant while a row slice fits in shared memory.
-    const size_t smem = ((ld + CL - 1) / CL + 3) / 4 * 4 * sizeof(unsigned);
+    const size_t smem = std::max(((ld + CL - 1) / CL + 3) / 4 * 4, std::min(ld, (size_t)SOLO_N)) * sizeof(unsigned);
     if (smem <= 96 * 1024) {
         static size_t configured = 0;
         if (smem > configured) {
