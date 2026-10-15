@@ -151,6 +151,7 @@ pub struct Workspace {
     row_token: u64,
     att_part: u64,
     hc_r: u64,
+    hc_xsq: u64,
     /// Device copy of the step block, and its pinned host staging.
     step: u64,
     step_host: PinnedBuffer,
@@ -216,6 +217,7 @@ impl Workspace {
             num_active: alloc(4)?,
             row_token: alloc(k::moe_small_tokens() * TOP_K * 4)?,
             hc_r: alloc(t * S * 4)?,
+            hc_xsq: alloc(HC_SPLITS * t.min(k::gemv_max_m()) * 4)?,
             att_part: alloc(k::qsa_split_floats(k::gemv_max_m()) * 4)?,
             step: alloc(StepLayout::new(t).bytes)?,
             step_host: PinnedBuffer::new(StepLayout::new(t).bytes)?,
@@ -278,9 +280,12 @@ fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, out: u64, mut
                 Some(w) => vec![(*w, 0)],
                 None => hc.down.parts.clone(),
             };
-            parts.iter().try_for_each(|(w, col)| k::gemv_partials_f32(s, t, ws.h, H, w.fmt, w.addr, w.scale, ws.partial + (*col * 4) as u64, hc.down.n, w.n, H, HC_SPLITS))
+            parts.iter().enumerate().try_for_each(|(i, (w, col))| {
+                let xsq = if i == 0 { ws.hc_xsq } else { 0 };
+                k::gemv_partials_f32(s, t, ws.h, H, w.fmt, w.addr, w.scale, ws.partial + (*col * 4) as u64, hc.down.n, xsq, w.n, H, HC_SPLITS)
+            })
         });
-        op!(prof, "hc finish", s, k::hc_finish(s, ws.partial, HC_SPLITS, t, hc.down.n, ws.h, ws.low_bf, inj, ws.hc_r));
+        op!(prof, "hc finish", s, k::hc_finish(s, ws.partial, ws.hc_xsq, HC_SPLITS, t, hc.down.n, ws.low_bf, inj, ws.hc_r));
         op!(prof, "hc up", s, linear(s, ws, ws.low_bf, &hc.up, ws.up, t));
         op!(prof, "hc mix", s, k::hc_mix_small(s, ws.up, ws.h, ws.hc_r, hc.norm, out, t));
     } else {

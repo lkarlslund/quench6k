@@ -63,16 +63,17 @@ pub fn gemv_max_m() -> usize {
 /// `splits` > 1 the K range is split across CTAs and `partial` must hold `splits * M * N` floats.
 #[allow(clippy::too_many_arguments)]
 pub fn gemv(s: &Stream, m: usize, x: u64, ldx: usize, fmt: WeightFormat, w: u64, scale: u64, y: u64, ldy: usize, partial: u64, n: usize, k: usize, splits: usize, alpha: f32, accumulate: bool) -> Result<()> {
-    let err = unsafe { ffi::squash_gemv(fmt as i32, m as i32, p(x), 0, ldx as i32, p(w), opt_f(scale), y as *mut f32, ldy as i32, partial as *mut f32, n as i32, n as i32, k as i32, splits as i32, alpha, accumulate as i32, 1, s.raw()) };
+    let err = unsafe { ffi::squash_gemv(fmt as i32, m as i32, p(x), 0, ldx as i32, p(w), opt_f(scale), y as *mut f32, ldy as i32, partial as *mut f32, n as i32, std::ptr::null_mut(), n as i32, k as i32, splits as i32, alpha, accumulate as i32, 1, s.raw()) };
     check(err, "gemv")
 }
 
 /// Split-K partial sums only, over FP32 activations: partial[(split · M + m) · ldp + n] for exactly
-/// `splits` splits (K / splits must be a multiple of 512).
+/// `splits` splits (K / splits must be a multiple of 512); with `xsq` non-zero, also the per-split sums
+/// of squared activations xsq[split · M + m].
 #[allow(clippy::too_many_arguments)]
-pub fn gemv_partials_f32(s: &Stream, m: usize, x: u64, ldx: usize, fmt: WeightFormat, w: u64, scale: u64, partial: u64, ldp: usize, n: usize, k: usize, splits: usize) -> Result<()> {
+pub fn gemv_partials_f32(s: &Stream, m: usize, x: u64, ldx: usize, fmt: WeightFormat, w: u64, scale: u64, partial: u64, ldp: usize, xsq: u64, n: usize, k: usize, splits: usize) -> Result<()> {
     anyhow::ensure!(k % splits == 0 && (k / splits) % 512 == 0, "gemv_partials_f32: K {k} does not split into {splits} multiples of 512");
-    let err = unsafe { ffi::squash_gemv(fmt as i32, m as i32, p(x), 1, ldx as i32, p(w), opt_f(scale), std::ptr::null_mut(), 0, partial as *mut f32, ldp as i32, n as i32, k as i32, splits as i32, 1.0, 0, 0, s.raw()) };
+    let err = unsafe { ffi::squash_gemv(fmt as i32, m as i32, p(x), 1, ldx as i32, p(w), opt_f(scale), std::ptr::null_mut(), 0, partial as *mut f32, ldp as i32, if xsq == 0 { std::ptr::null_mut() } else { xsq as *mut f32 }, n as i32, k as i32, splits as i32, 1.0, 0, 0, s.raw()) };
     check(err, "gemv_partials_f32")
 }
 
@@ -154,9 +155,9 @@ pub fn hc_mix(s: &Stream, u: u64, n: u64, g: u64, m: u64, t: usize) -> Result<()
 
 /// Reduces the HC down-projection split partials with per-stream RMS factors (see the kernel).
 #[allow(clippy::too_many_arguments)]
-pub fn hc_finish(s: &Stream, partial: u64, splits: usize, t: usize, n: usize, h: u64, z: u64, inj: u64, r: u64) -> Result<()> {
+pub fn hc_finish(s: &Stream, partial: u64, xsq: u64, splits: usize, t: usize, n: usize, z: u64, inj: u64, r: u64) -> Result<()> {
     let inj = if inj == 0 { std::ptr::null_mut() } else { fm(inj) };
-    launch!("hc_finish", ffi::squash_hc_finish(f(partial), n32(splits), n32(t), n32(n), f(h), pm(z), inj, fm(r), s.raw()))
+    launch!("hc_finish", ffi::squash_hc_finish(f(partial), f(xsq), n32(splits), n32(t), n32(n), pm(z), inj, fm(r), s.raw()))
 }
 
 pub fn hc_mix_small(s: &Stream, u: u64, h: u64, r: u64, g: u64, m: u64, t: usize) -> Result<()> {
