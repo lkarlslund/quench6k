@@ -64,7 +64,6 @@ pub mod ffi {
         pub fn squash_int8_group() -> c_int;
         pub fn squash_quantize_int8_groups(w: *const c_void, n: c_int, k: c_int, q: *mut c_void, scale: *mut f32, stream: Stream) -> Error;
         pub fn squash_moe_active(counts: *const i32, active: *mut i32, num_active: *mut i32, stream: Stream) -> Error;
-        pub fn squash_moe_nvfp4_gemv(xs: *const c_void, w_ptr: *const u64, s_ptr: *const u64, ws2: *const f32, offsets: *const i32, active: *const i32, num_active: *const i32, max_active: c_int, y: *mut f32, n: c_int, k: c_int, stream: Stream) -> Error;
         pub fn squash_topk(x: *const f32, rows: c_int, n: c_int, ld: usize, k: c_int, sort_by_index: c_int, out_idx: *mut i32, out_val: *mut f32, stream: Stream) -> Error;
         pub fn squash_argmax_scratch(rows: c_int, n: c_int) -> usize;
         pub fn squash_argmax(x: *const f32, rows: c_int, n: c_int, ld: usize, scratch: *mut c_void, out: *mut i32, stream: Stream) -> Error;

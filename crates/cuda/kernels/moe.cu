@@ -131,9 +131,6 @@ __global__ void gather_kernel(const __nv_bfloat16* __restrict__ m, const int* __
 
 constexpr int BM = 64, BN = 128, BK = 32, STAGES = 2, THREADS = 256, LDS = BK + 8;
 
-__constant__ float kE2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-                                -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
-
 SQ_DEVICE float fp8_to_float(uint8_t v) {
     __nv_fp8_e4m3 f;
     f.__x = v;
@@ -173,15 +170,22 @@ __global__ void __launch_bounds__(THREADS) nvfp4_gemm_kernel(const __nv_bfloat16
             __nv_bfloat16* dst = &sB[stage][tid * LDS];
             if (n < N) {
                 const uint4 codes = *reinterpret_cast<const uint4*>(W + (size_t)n * (K / 2) + k / 2);
-                const float s0 = fp8_to_float(Sc[(size_t)n * (K / 16) + k / 16]);
-                const float s1 = fp8_to_float(Sc[(size_t)n * (K / 16) + k / 16 + 1]);
+                const uint16_t sc = *reinterpret_cast<const uint16_t*>(Sc + (size_t)n * (K / 16) + k / 16);
+                // FP4 x FP8 products are exact in FP16 and then in BF16 (hardware conversions).
+                const __half h0 = __float2half(fp8_to_float(sc & 0xff)), h1 = __float2half(fp8_to_float(sc >> 8));
+                const __half2 s0 = __halves2half2(h0, h0), s1 = __halves2half2(h1, h1);
                 const uint8_t* b = reinterpret_cast<const uint8_t*>(&codes);
+                uint32_t packed[16];
 #pragma unroll
                 for (int i = 0; i < 16; ++i) {
-                    const float s = i < 8 ? s0 : s1;
-                    dst[2 * i] = f2bf(kE2M1[b[i] & 15] * s);
-                    dst[2 * i + 1] = f2bf(kE2M1[b[i] >> 4] * s);
+                    const __half2_raw r = __nv_cvt_fp4x2_to_halfraw2(b[i], __NV_E2M1);
+                    const float2 f = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&r), i < 8 ? s0 : s1));
+                    const __nv_bfloat162 v = __floats2bfloat162_rn(f.x, f.y);
+                    packed[i] = *reinterpret_cast<const uint32_t*>(&v);
                 }
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    *reinterpret_cast<uint4*>(dst + 8 * i) = make_uint4(packed[4 * i], packed[4 * i + 1], packed[4 * i + 2], packed[4 * i + 3]);
             } else {
 #pragma unroll
                 for (int i = 0; i < BK; ++i) dst[i] = f2bf(0.0f);
@@ -278,75 +282,6 @@ __global__ void active_kernel(const int* __restrict__ counts, int* active, int* 
     if (flag) active[s[e] - 1] = e;
     if (e == E - 1) *num_active = s[e];
 }
-
-constexpr int GV_WARPS = 8, GV_ROWS_PER_WARP = 2, GV_ROWS = GV_WARPS * GV_ROWS_PER_WARP, GV_MAX_M = 16;
-
-// Decode-sized expert GEMV, W4A16. grid (row blocks of 16 output features, active-expert slots);
-// each CTA applies one expert's rows n to all (<= 16) gathered inputs routed to that expert.
-__global__ void __launch_bounds__(GV_WARPS * 32) nvfp4_gemv_kernel(const __nv_bfloat16* __restrict__ X,
-                                                                   const uint64_t* __restrict__ w_ptr,
-                                                                   const uint64_t* __restrict__ s_ptr,
-                                                                   const float* __restrict__ ws2,
-                                                                   const int* __restrict__ offsets,
-                                                                   const int* __restrict__ active,
-                                                                   const int* __restrict__ num_active, float* Y, int N,
-                                                                   int K) {
-    pdl_launch_dependents();
-    pdl_wait();
-    if ((int)blockIdx.y >= *num_active) return;
-    const int e = active[blockIdx.y];
-    const int r0 = offsets[e], rows = min(offsets[e + 1] - r0, GV_MAX_M);
-    const uint8_t* W = reinterpret_cast<const uint8_t*>(w_ptr[e]);
-    const uint8_t* Sc = reinterpret_cast<const uint8_t*>(s_ptr[e]);
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const float alpha = ws2[e];
-#pragma unroll
-    for (int rr = 0; rr < GV_ROWS_PER_WARP; ++rr) {
-        const int n = blockIdx.x * GV_ROWS + warp * GV_ROWS_PER_WARP + rr;
-        if (n >= N) break;
-        float acc[GV_MAX_M] = {};
-        for (int k = lane * 32; k < K; k += 32 * 32) {
-            const uint4 codes = __ldg(reinterpret_cast<const uint4*>(W + (size_t)n * (K / 2) + k / 2));
-            const uint16_t sc = __ldg(reinterpret_cast<const uint16_t*>(Sc + (size_t)n * (K / 16) + k / 16));
-            const float s0 = fp8_to_float(sc & 0xff), s1 = fp8_to_float(sc >> 8);
-            const uint8_t* b = reinterpret_cast<const uint8_t*>(&codes);
-            float w[32];
-#pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                const float s = i < 8 ? s0 : s1;
-                w[2 * i] = kE2M1[b[i] & 15] * s;
-                w[2 * i + 1] = kE2M1[b[i] >> 4] * s;
-            }
-#pragma unroll
-            for (int m = 0; m < GV_MAX_M; ++m) {
-                if (m < rows) {
-                    const uint4* xp = reinterpret_cast<const uint4*>(X + (size_t)(r0 + m) * K + k);
-#pragma unroll
-                    for (int c = 0; c < 4; ++c) {
-                        const uint4 xv = __ldg(xp + c);
-                        const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(&xv);
-#pragma unroll
-                        for (int i = 0; i < 4; ++i) {
-                            const float2 xf = __bfloat1622float2(x2[i]);
-                            acc[m] = fmaf(w[c * 8 + 2 * i], xf.x, acc[m]);
-                            acc[m] = fmaf(w[c * 8 + 2 * i + 1], xf.y, acc[m]);
-                        }
-                    }
-                }
-            }
-        }
-#pragma unroll
-        for (int m = 0; m < GV_MAX_M; ++m) {
-            if (m < rows) {
-                const float v = warp_sum(acc[m]);
-                if (lane == 0) Y[(size_t)(r0 + m) * N + n] = alpha * v;
-            }
-        }
-    }
-}
-
-
-// ---- decode-sized path (T <= 16) -----------------------------------------------------------
 
 constexpr int SMALL_T = 16, SMALL_PAIRS = SMALL_T * TOPK;
 
@@ -1006,17 +941,6 @@ extern "C" cudaError_t squash_moe_combine(const float* yd, const int* pair_row, 
 
 extern "C" cudaError_t squash_moe_active(const int* counts, int* active, int* num_active, cudaStream_t st) {
     SQ_CHECK_LAUNCH(sq_launch(active_kernel, 1, E, 0, st, counts, active, num_active));
-    SQ_RETURN_LAUNCH();
-}
-
-// max_active bounds the grid (<= min(512, 10 * tokens)); every expert must have <= 16 rows.
-extern "C" cudaError_t squash_moe_nvfp4_gemv(const void* xs, const uint64_t* w_ptr, const uint64_t* s_ptr,
-                                             const float* ws2, const int* offsets, const int* active,
-                                             const int* num_active, int max_active, float* y, int N, int K,
-                                             cudaStream_t st) {
-    if (K % 32 != 0 || max_active == 0) return max_active == 0 ? cudaSuccess : cudaErrorInvalidValue;
-    SQ_CHECK_LAUNCH(sq_launch(nvfp4_gemv_kernel, dim3((N + GV_ROWS - 1) / GV_ROWS, max_active), GV_WARPS * 32, 0, st, 
-        static_cast<const __nv_bfloat16*>(xs), w_ptr, s_ptr, ws2, offsets, active, num_active, y, N, K));
     SQ_RETURN_LAUNCH();
 }
 

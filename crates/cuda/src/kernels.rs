@@ -264,11 +264,6 @@ pub fn moe_active(s: &Stream, counts: u64, active: u64, num_active: u64) -> Resu
     launch!("moe_active", ffi::squash_moe_active(i(counts), im(active), im(num_active), s.raw()))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn moe_nvfp4_gemv(s: &Stream, xs: u64, w_ptr: u64, s_ptr: u64, ws2: u64, offsets: u64, active: u64, num_active: u64, max_active: usize, y: u64, n: usize, k: usize) -> Result<()> {
-    launch!("moe_nvfp4_gemv", ffi::squash_moe_nvfp4_gemv(p(xs), w_ptr as *const u64, s_ptr as *const u64, f(ws2), i(offsets), i(active), i(num_active), n32(max_active), fm(y), n32(n), n32(k), s.raw()))
-}
-
 pub fn moe_small_tokens() -> usize {
     unsafe { ffi::squash_moe_small_tokens() as usize }
 }

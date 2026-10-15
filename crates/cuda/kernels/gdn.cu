@@ -10,25 +10,43 @@ namespace {
 constexpr int C = 10240, KH = 16, VH = 48, DK = 128, DV = 128, TAPS = 4;
 constexpr float EPS = 1e-6f;
 
-// out[t, c] = silu(sum_j w[c, j] * x[t + j - 3, c]); history from `state`, which is then advanced.
-__global__ void conv_kernel(const float* __restrict__ x, int ldx, float* out, float* state,
+// out[t, c] = silu(sum_j w[c, j] * x[t + j - 3, c]); history from `state`. A filter over the inputs
+// only, so every (t, c) is independent: grid (C / 256, ceil(T / CONV_TT)), each thread CONV_TT tokens
+// of one channel. advance_conv_kernel then moves the state to the last three inputs.
+constexpr int CONV_TT = 16;
+__global__ void conv_kernel(const float* __restrict__ x, int ldx, float* out, const float* __restrict__ state,
                             const __nv_bfloat16* __restrict__ w, int T) {
     pdl_launch_dependents();
     pdl_wait();
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t0 = blockIdx.y * CONV_TT;
     if (c >= C) return;
-    float w0 = bf2f(w[c * TAPS]), w1 = bf2f(w[c * TAPS + 1]), w2 = bf2f(w[c * TAPS + 2]), w3 = bf2f(w[c * TAPS + 3]);
-    float p0 = state[c], p1 = state[C + c], p2 = state[2 * C + c];  // x[t-3], x[t-2], x[t-1]
-    for (int t = 0; t < T; ++t) {
+    const float w0 = bf2f(w[c * TAPS]), w1 = bf2f(w[c * TAPS + 1]), w2 = bf2f(w[c * TAPS + 2]), w3 = bf2f(w[c * TAPS + 3]);
+    auto input = [&](int t) { return t >= 0 ? x[(size_t)t * ldx + c] : state[(3 + t) * C + c]; };
+    float p0 = input(t0 - 3), p1 = input(t0 - 2), p2 = input(t0 - 1);
+    const int t1 = min(T, t0 + CONV_TT);
+    for (int t = t0; t < t1; ++t) {
         const float cur = x[(size_t)t * ldx + c];
         out[(size_t)t * C + c] = silu(w0 * p0 + w1 * p1 + w2 * p2 + w3 * cur);
         p0 = p1;
         p1 = p2;
         p2 = cur;
     }
-    state[c] = p0;
-    state[C + c] = p1;
-    state[2 * C + c] = p2;
+}
+
+// state <- the last three inputs (from x, or the old state when T < 3). Runs after conv_kernel.
+__global__ void advance_conv_kernel(const float* __restrict__ x, int ldx, float* state, int T) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float h[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int t = T - 3 + j;
+        h[j] = t >= 0 ? x[(size_t)t * ldx + c] : state[(3 + t) * C + c];
+    }
+#pragma unroll
+    for (int j = 0; j < 3; ++j) state[j * C + c] = h[j];
 }
 
 // In place on the conv output: l2-normalize q and k per key head (q also / sqrt(128)); and
@@ -115,7 +133,10 @@ __global__ void gated_norm_kernel(const float* __restrict__ o, const float* __re
 
 extern "C" cudaError_t squash_gdn_conv(const float* x, int ldx, float* out, float* state, const void* w, int T,
                                        cudaStream_t st) {
-    SQ_CHECK_LAUNCH(sq_launch(conv_kernel, C / 256, 256, 0, st, x, ldx, out, state, static_cast<const __nv_bfloat16*>(w), T));
+    if (T == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(conv_kernel, dim3(C / 256, (T + CONV_TT - 1) / CONV_TT), 256, 0, st, x, ldx, out,
+                              static_cast<const float*>(state), static_cast<const __nv_bfloat16*>(w), T));
+    SQ_CHECK_LAUNCH(sq_launch(advance_conv_kernel, C / 256, 256, 0, st, x, ldx, state, T));
     SQ_RETURN_LAUNCH();
 }
 
