@@ -315,3 +315,10 @@ pub fn hc_small(s: &Stream, h: u64, t: usize, y: u64, inj_prev: u64, down: Weigh
     let y = if y == 0 { std::ptr::null() } else { f(y) };
     launch!("hc_small", ffi::squash_hc_small(down.0 as i32, fm(h), n32(t), y, f(inj_prev), p(down.1), f(down.2), wi, si, p(up.1), f(up.2), p(g), fm(scratch), pm(z), fm(r), inj, pm(m), s.raw()))
 }
+
+/// Small batches: shared-expert down projection over swiglu(gate, up) taken from the fused MoE
+/// projection rows `proj` (row stride `ld`), plus the weighted routed outputs: the MoE block output y.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_shared_combine(s: &Stream, proj: u64, ld: usize, t: usize, down: Weight, yd: u64, pair_row: u64, top_w: u64, y: u64) -> Result<()> {
+    launch!("moe_shared_combine", ffi::squash_moe_shared_combine(down.0 as i32, f(proj), n32(ld), n32(t), p(down.1), opt_f(down.2), f(yd), i(pair_row), f(top_w), fm(y), s.raw()))
+}

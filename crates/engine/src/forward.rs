@@ -470,9 +470,14 @@ pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &
             op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, t * TOP_K));
             op!(prof, "experts down", s, grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH));
         }
-        op!(prof, "shared swiglu", s, k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
-        op!(prof, "shared down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
-        op!(prof, "moe_combine", s, k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
+        if t <= k::moe_small_tokens() {
+            let down = (moe.shared_down.fmt, moe.shared_down.addr, moe.shared_down.scale);
+            op!(prof, "moe_shared_combine", s, k::moe_shared_combine(s, x, ld, t, down, ws.yd, ws.pair_row, ws.top_w, ws.y));
+        } else {
+            op!(prof, "shared swiglu", s, k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
+            op!(prof, "shared down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
+            op!(prof, "moe_combine", s, k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
+        }
         if small {
             pending = Some(ws.y);
         } else {

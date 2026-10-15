@@ -9,6 +9,7 @@
 #include <cuda_fp8.h>
 
 #include "mma.cuh"
+#include "wfmt.cuh"
 
 namespace {
 
@@ -507,7 +508,6 @@ __global__ void __launch_bounds__(EW * 32) gate_up_kernel(const __nv_bfloat16* _
                                                           const uint64_t* __restrict__ us, const float* __restrict__ u2,
                                                           const int* __restrict__ offsets, const int* __restrict__ active,
                                                           const int* __restrict__ num_active, __nv_bfloat16* act) {
-    pdl_launch_dependents();
     pdl_wait();
     constexpr int N = 640, K = D, CHUNKS = K / 32 / 16, FEAT = 2;
     if ((int)blockIdx.y >= *num_active) return;
@@ -544,6 +544,7 @@ __global__ void __launch_bounds__(EW * 32) gate_up_kernel(const __nv_bfloat16* _
         }
     }
     const float sg = g2[e], su = u2[e];
+    pdl_launch_dependents();
 #pragma unroll
     for (int f = 0; f < FEAT; ++f)
 #pragma unroll
@@ -566,7 +567,6 @@ __global__ void __launch_bounds__(EW * 32) down_kernel(const __nv_bfloat16* __re
                                                        const float* __restrict__ d2, const int* __restrict__ offsets,
                                                        const int* __restrict__ active, const int* __restrict__ num_active,
                                                        float* yd) {
-    pdl_launch_dependents();
     pdl_wait();
     constexpr int K = 640, CHUNKS = K / 32 / 4;  // 5 chunks per lane
     if ((int)blockIdx.y >= *num_active) return;
@@ -594,6 +594,7 @@ __global__ void __launch_bounds__(EW * 32) down_kernel(const __nv_bfloat16* __re
         for (int mm = 0; mm < MAXR; ++mm)
             if (mm < rows) chunk_dot(w, act + (size_t)(r0 + mm) * K + k, acc[mm]);
     }
+    pdl_launch_dependents();
     const float s = d2[e];
 #pragma unroll
     for (int mm = 0; mm < MAXR; ++mm) {
@@ -604,6 +605,65 @@ __global__ void __launch_bounds__(EW * 32) down_kernel(const __nv_bfloat16* __re
             if (q == 0) yd[(size_t)(r0 + mm) * D + n] = v * s;
         }
     }
+}
+
+
+// Small batches: the shared expert's down projection with its SwiGLU input computed on the fly from
+// the fused MoE projection rows (gate at column 512, up at 1152, shared-expert gate logit at 1792),
+// and the routed combine in the epilogue:
+//   y[t, n] = sum_k w[t, k] * yd[pair_row[t, k], n] + sigmoid(sg[t]) * (down_s[n] . swiglu(t)).
+// One warp per output feature n; K = 640 = 40 chunks of 16, two per lane, loaded before the PDL wait.
+template <WFmt F, int MAXT>
+__global__ void __launch_bounds__(256) shared_combine_kernel(const float* __restrict__ proj, int ld, int T,
+                                                              const uint8_t* __restrict__ W,
+                                                              const float* __restrict__ scale,
+                                                              const float* __restrict__ yd,
+                                                              const int* __restrict__ pair_row,
+                                                              const float* __restrict__ top_w, float* y) {
+    constexpr int K = 640, GATE = 512, UP = 1152, SG = 1792;
+    const int lane = threadIdx.x & 31, n = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const uint8_t* row = W + (size_t)n * K * elem_bytes<F>();
+    Raw16<F> pre[2];
+    float gs[2] = {1.0f, 1.0f};
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        const int k = (lane + 32 * c) * 16;
+        if (k < K) {
+            pre[c] = load_raw16<F>(row, k);
+            if constexpr (F == WFmt::INT8G) gs[c] = __ldg(scale + (size_t)n * (K / GROUP) + k / GROUP);
+        }
+    }
+    pdl_wait();
+    float acc[MAXT] = {};
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        const int k = (lane + 32 * c) * 16;
+        if (k >= K) break;
+        float w[16];
+        decode_raw16<F>(pre[c], w);
+#pragma unroll
+        for (int t = 0; t < MAXT; ++t) {
+            if (t >= T) break;
+            const float* pr = proj + (size_t)t * ld;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const float x = bf2f(f2bf(silu(pr[GATE + k + i]) * pr[UP + k + i]));
+                acc[t] = fmaf(w[i] * gs[c], x, acc[t]);
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MAXT; ++t) {
+        if (t >= T) break;
+        const float v = warp_sum(acc[t]);
+        // lanes 0..9 fetch one routed contribution each
+        float routed = lane < TOPK ? top_w[t * TOPK + lane] * yd[(size_t)pair_row[t * TOPK + lane] * D + n] : 0.0f;
+        routed = warp_sum(routed);
+        if (lane == 0) y[(size_t)t * D + n] = routed + sigmoidf(proj[(size_t)t * ld + SG]) * v;
+    }
+    // The successor is the cooperative HyperConnection kernel, which needs every SM's resources at
+    // once: let it launch only as this kernel's blocks finish.
+    pdl_launch_dependents();
 }
 
 }  // namespace
@@ -720,5 +780,31 @@ extern "C" cudaError_t squash_moe_down_small(const void* act, const uint64_t* dw
     else if (T <= 8) SQ_DN(8);
     else SQ_DN(16);
 #undef SQ_DN
+    SQ_RETURN_LAUNCH();
+}
+
+// fmt 0 BF16 or 3 INT8 (scale per 64) shared-expert down weights [2560, 640].
+extern "C" cudaError_t squash_moe_shared_combine(int fmt, const float* proj, int ld, int T, const void* w,
+                                                 const float* scale, const float* yd, const int* pair_row,
+                                                 const float* top_w, float* y, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    if (T > SMALL_T) return cudaErrorInvalidValue;
+    const auto* w8 = static_cast<const uint8_t*>(w);
+#define SQ_SC(FMT, R) SQ_CHECK_LAUNCH(sq_launch(shared_combine_kernel<FMT, R>, D / 8, 256, 0, st, proj, ld, T, w8, scale, yd, pair_row, top_w, y))
+#define SQ_SC_T(FMT) \
+    if (T <= 1) SQ_SC(FMT, 1); \
+    else if (T <= 2) SQ_SC(FMT, 2); \
+    else if (T <= 4) SQ_SC(FMT, 4); \
+    else if (T <= 8) SQ_SC(FMT, 8); \
+    else SQ_SC(FMT, 16);
+    if (fmt == 0) {
+        SQ_SC_T(WFmt::BF16)
+    } else if (fmt == 3) {
+        SQ_SC_T(WFmt::INT8G)
+    } else {
+        return cudaErrorInvalidValue;
+    }
+#undef SQ_SC_T
+#undef SQ_SC
     SQ_RETURN_LAUNCH();
 }
