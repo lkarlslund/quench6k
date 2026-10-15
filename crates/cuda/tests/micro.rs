@@ -143,3 +143,101 @@ fn hc_latency() {
         );
     }
 }
+
+/// Routed experts for small batches: route + gate/up + down over 40 layers of random routing across
+/// 512 distinct NVFP4 experts (1.4 GB, far beyond L2). Reports time per layer and the bandwidth of the
+/// distinct experts' weights.
+#[test]
+#[ignore]
+fn expert_latency() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    const E: usize = 512;
+    const W: usize = 640;
+    const LAYERS: usize = 40;
+    const TOPK: usize = 10;
+    // Codes 0x22 (small FP4 values) and FP8 scales 0x38 (1.0) everywhere.
+    let gate_codes: Vec<DeviceBuffer> = (0..E).map(|_| filled(&s, W * D / 2, 0x22)).collect();
+    let gate_scales: Vec<DeviceBuffer> = (0..E).map(|_| filled(&s, W * D / 16, 0x38)).collect();
+    let up_codes: Vec<DeviceBuffer> = (0..E).map(|_| filled(&s, W * D / 2, 0x22)).collect();
+    let up_scales: Vec<DeviceBuffer> = (0..E).map(|_| filled(&s, W * D / 16, 0x38)).collect();
+    let down_codes: Vec<DeviceBuffer> = (0..E).map(|_| filled(&s, D * W / 2, 0x22)).collect();
+    let down_scales: Vec<DeviceBuffer> = (0..E).map(|_| filled(&s, D * W / 16, 0x38)).collect();
+    let table = |v: &[DeviceBuffer]| {
+        let b = DeviceBuffer::new(E * 8).unwrap();
+        s.upload(&b, &v.iter().map(|x| x.addr()).collect::<Vec<u64>>()).unwrap();
+        b
+    };
+    let ones = {
+        let b = DeviceBuffer::new(E * 4).unwrap();
+        s.upload(&b, &vec![1.0f32; E]).unwrap();
+        b
+    };
+    let (gc, gs, uc, us, dc, ds) = (table(&gate_codes), table(&gate_scales), table(&up_codes), table(&up_scales), table(&down_codes), table(&down_scales));
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let t_max = 16;
+    let logits: Vec<DeviceBuffer> = (0..LAYERS)
+        .map(|_| {
+            let b = DeviceBuffer::new(t_max * E * 4).unwrap();
+            s.upload(&b, &(0..t_max * E).map(|_| next() * 8.0).collect::<Vec<f32>>()).unwrap();
+            b
+        })
+        .collect();
+    let m = filled(&s, t_max * D * 2, 0);
+    let pairs = t_max * TOPK;
+    let (top_i, top_w, pair_row, row_token) = (filled(&s, pairs * 4, 0), filled(&s, pairs * 4, 0), filled(&s, pairs * 4, 0), filled(&s, pairs * 4, 0));
+    let (offsets, active, num_active) = (filled(&s, (E + 1) * 4, 0), filled(&s, E * 4, 0), filled(&s, 4, 0));
+    let act = filled(&s, pairs * W * 2, 0);
+    let yd = filled(&s, pairs * D * 4, 0);
+    for t in [1usize, 2, 4, 5] {
+        let max_active = (t * TOPK).min(E);
+        let layer = |s: &Stream, l: usize| -> anyhow::Result<()> {
+            kernels::moe_route_small(s, logits[l].addr(), E, t, top_i.addr(), top_w.addr(), offsets.addr(), pair_row.addr(), row_token.addr(), active.addr(), num_active.addr())?;
+            kernels::moe_gate_up_small(s, m.addr(), row_token.addr(), (gc.addr(), gs.addr(), ones.addr()), (uc.addr(), us.addr(), ones.addr()), offsets.addr(), active.addr(), num_active.addr(), max_active, t, act.addr())?;
+            kernels::moe_down_small(s, act.addr(), (dc.addr(), ds.addr(), ones.addr()), offsets.addr(), active.addr(), num_active.addr(), max_active, t, yd.addr())
+        };
+        let mut distinct = 0usize;
+        for l in 0..LAYERS {
+            layer(&s, l).unwrap();
+            distinct += s.download::<i32>(num_active.addr(), 1).unwrap()[0] as usize;
+        }
+        let g = Graph::capture(&s, |s| (0..LAYERS).try_for_each(|l| layer(s, l))).unwrap();
+        let us_layer = time_graph(&s, &g, LAYERS);
+        let bytes = distinct as f64 / LAYERS as f64 * (3 * W * D) as f64 * (0.5 + 1.0 / 16.0);
+        println!("T={t}: {us_layer:.2} us per layer, {:.1} experts, {:.2} TB/s", distinct as f64 / LAYERS as f64, bytes / us_layer / 1e6);
+    }
+}
+
+/// INT8G GEMV chains (96 distinct weights each) for the decode projection shapes; splits > 1 adds
+/// the partial-sum reduction kernel.
+#[test]
+#[ignore]
+fn gemv_latency() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let fmt = WeightFormat::Int8Group;
+    let x = filled(&s, 16 * 16480 * 2, 0);
+    let out = filled(&s, 16 * 16480 * 4, 0);
+    let partial = filled(&s, 1 << 24, 0);
+    for &(n, k, splits) in &[(2560usize, 6144usize, 1usize), (2560, 6144, 2), (2560, 640, 1), (16480, 2560, 1), (13952, 2560, 1), (3600, 2560, 1)] {
+        let ws: Vec<(DeviceBuffer, DeviceBuffer)> =
+            (0..CALLS).map(|_| (filled(&s, n * k, 3), scales(&s, n * k / kernels::int8_group()))).collect();
+        let mut line = format!("N={n} K={k} splits={splits}:");
+        for t in [1usize, 4] {
+            let g = Graph::capture(&s, |s| {
+                ws.iter().try_for_each(|(w, sc)| kernels::gemv(s, t, x.addr(), k, fmt, w.addr(), sc.addr(), out.addr(), n, partial.addr(), n, k, splits, 1.0, false))
+            })
+            .unwrap();
+            let us = time_graph(&s, &g, CALLS);
+            let bytes = (n * k) as f64 * (1.0 + 4.0 / kernels::int8_group() as f64);
+            line += &format!("  T={t} {us:.2} us {:.2} TB/s", bytes / us / 1e6);
+        }
+        println!("{line}");
+    }
+}
