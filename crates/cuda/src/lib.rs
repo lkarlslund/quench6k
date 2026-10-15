@@ -46,6 +46,34 @@ pub mod ffi {
         pub fn squash_checksum(data: *const c_void, bytes: usize, out: *mut u64, stream: Stream) -> Error;
         pub fn squash_gemm_bf16_f32(x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, y: *mut f32, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
         pub fn squash_gemm_bf16_bf16(x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, y: *mut c_void, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
+        pub fn squash_topk(x: *const f32, rows: c_int, n: c_int, ld: usize, k: c_int, sort_by_index: c_int, out_idx: *mut i32, out_val: *mut f32, stream: Stream) -> Error;
+        pub fn squash_row_lse(x: *const f32, rows: c_int, n: c_int, ld: usize, targets: *const i32, lse: *mut f32, target_logit: *mut f32, stream: Stream) -> Error;
+        pub fn squash_embed(tokens: *const i32, t: c_int, table: *const c_void, h: *mut f32, stream: Stream) -> Error;
+        pub fn squash_grouped_rmsnorm(h: *const f32, w: *const c_void, n: *mut c_void, t: c_int, stream: Stream) -> Error;
+        pub fn squash_hc_inject(n: *const c_void, w: *const c_void, inj: *mut f32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_hc_low_rank_act(x: *const f32, z: *mut c_void, count: c_int, stream: Stream) -> Error;
+        pub fn squash_hc_mix(u: *const f32, n: *const c_void, m: *mut c_void, t: c_int, stream: Stream) -> Error;
+        pub fn squash_hc_combine(h: *mut f32, y: *const f32, inj: *const f32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_f32_to_bf16(x: *const f32, y: *mut c_void, count: usize, stream: Stream) -> Error;
+        pub fn squash_add_f32(y: *mut f32, x: *const f32, count: usize, stream: Stream) -> Error;
+        pub fn squash_gdn_conv(x: *const f32, out: *mut f32, state: *mut f32, w: *const c_void, t: c_int, stream: Stream) -> Error;
+        pub fn squash_gdn_prep(qkv: *mut f32, a: *const f32, b: *const f32, a_log: *const c_void, dt_bias: *const c_void, beta: *mut f32, g: *mut f32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_gdn_recurrent(qkv: *const f32, beta: *const f32, g: *const f32, state: *mut f32, out: *mut f32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_gdn_gated_norm(o: *const f32, z: *const f32, w: *const c_void, y: *mut c_void, t: c_int, stream: Stream) -> Error;
+        pub fn squash_qsa_qkv_prep(qg: *const f32, kv: *const f32, q_norm: *const c_void, k_norm: *const c_void, q: *mut f32, kcache: *mut c_void, vcache: *mut c_void, pos3: *const i32, start: c_int, t: c_int, stream: Stream) -> Error;
+        pub fn squash_qsa_index_prep(idx: *const f32, q_ln: *const c_void, iq: *mut f32, raw: *mut c_void, pos3: *const i32, start: c_int, t: c_int, stream: Stream) -> Error;
+        pub fn squash_qsa_pool(raw: *const c_void, k_ln: *const c_void, pooled: *mut c_void, pos3: *const i32, start: c_int, t: c_int, stream: Stream) -> Error;
+        pub fn squash_qsa_index_scores(iq: *const f32, pooled: *const c_void, scores: *mut f32, ld: c_int, start: c_int, t: c_int, stream: Stream) -> Error;
+        pub fn squash_qsa_attention(q: *const f32, qg: *const f32, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: c_int, t: c_int, out: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_moe_tile_rows() -> c_int;
+        pub fn squash_moe_route(logits: *const f32, t: c_int, top_i: *mut i32, top_w: *mut f32, stream: Stream) -> Error;
+        pub fn squash_moe_plan(top_i: *const i32, t: c_int, counts: *mut i32, cursor: *mut i32, offsets: *mut i32, tile_expert: *mut i32, tile_row: *mut i32, num_tiles: *mut i32, pair_row: *mut i32, stream: Stream) -> Error;
+        pub fn squash_moe_gather(m: *const c_void, pair_row: *const i32, t: c_int, xs: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_moe_nvfp4_gemm(xs: *const c_void, w_ptr: *const u64, s_ptr: *const u64, ws2: *const f32, offsets: *const i32, tile_expert: *const i32, tile_row: *const i32, num_tiles: *const i32, max_tiles: c_int, y: *mut f32, n: c_int, k: c_int, stream: Stream) -> Error;
+        pub fn squash_swiglu(gate: *const f32, up: *const f32, act: *mut c_void, count: usize, stream: Stream) -> Error;
+        pub fn squash_moe_combine(yd: *const f32, pair_row: *const i32, top_w: *const f32, sg: *const f32, sh: *const f32, y: *mut f32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_ple_gate(kp: *const f32, h: *const f32, v: *const f32, wk: *const c_void, wq: *const c_void, wc: *const c_void, gv: *mut f32, xn: *mut f32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_ple_conv(gv: *const f32, xn: *const f32, w: *const c_void, state: *mut f32, h: *mut f32, t: c_int, stream: Stream) -> Error;
     }
 }
 
@@ -91,6 +119,14 @@ impl DeviceBuffer {
         check(unsafe { ffi::cudaMalloc(&mut ptr, bytes.max(1)) }, "cudaMalloc")
             .map_err(|e| e.context(format!("allocating {bytes} device bytes")))?;
         Ok(Self { ptr, bytes })
+    }
+
+    /// Allocates and zero-fills.
+    pub fn zeroed(bytes: usize) -> Result<Self> {
+        let b = Self::new(bytes)?;
+        check(unsafe { ffi::cudaMemsetAsync(b.ptr, 0, bytes, null_mut()) }, "cudaMemset")?;
+        synchronize()?;
+        Ok(b)
     }
 
     pub fn ptr(&self) -> *mut c_void {
@@ -159,6 +195,16 @@ impl Stream {
 
     pub fn synchronize(&self) -> Result<()> {
         check(unsafe { ffi::cudaStreamSynchronize(self.0) }, "cudaStreamSynchronize")
+    }
+
+    pub fn memset(&self, dst: u64, value: u8, bytes: usize) -> Result<()> {
+        check(unsafe { ffi::cudaMemsetAsync(dst as *mut c_void, value as c_int, bytes, self.0) }, "cudaMemsetAsync")
+    }
+
+    /// Enqueues a host-to-device copy from pageable memory (synchronous with respect to `src`).
+    pub fn upload_to<T: Copy>(&self, dst: u64, src: &[T]) -> Result<()> {
+        unsafe { self.copy_h2d(dst, src.as_ptr().cast(), std::mem::size_of_val(src))? };
+        self.synchronize()
     }
 
     /// Enqueues a host-to-device copy. The caller keeps `src` alive and unmodified until the copy completes.

@@ -1,0 +1,266 @@
+//! The text model's weights, bound to device addresses (SPEC §2–§9).
+
+use anyhow::{Context, Result, ensure};
+use memmap2::Mmap;
+use squash_cuda::{DeviceBuffer, Stream};
+
+use crate::checkpoint::{Checkpoint, DType};
+use crate::loader::DeviceWeights;
+
+pub const LAYERS: usize = 48;
+pub const D: usize = 2560;
+pub const S: usize = 4;
+pub const H: usize = S * D;
+pub const VOCAB: usize = 248_320;
+pub const EXPERTS: usize = 512;
+pub const TOP_K: usize = 10;
+pub const EXPERT_WIDTH: usize = 640;
+pub const HC_RANK: usize = 320;
+pub const EOS: i32 = 248_044;
+
+pub fn is_attention(layer: usize) -> bool {
+    layer % 4 == 3
+}
+
+/// A HyperConnection's weights (SPEC §4); `inject` is absent in the final mixers.
+pub struct Hc {
+    pub norm: u64,
+    pub down: u64,
+    pub up: u64,
+    pub inject: Option<u64>,
+}
+
+pub struct Gdn {
+    pub qkv: u64,
+    pub z: u64,
+    pub a: u64,
+    pub b: u64,
+    pub conv: u64,
+    pub a_log: u64,
+    pub dt_bias: u64,
+    pub norm: u64,
+    pub out: u64,
+}
+
+pub struct Qsa {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub o: u64,
+    pub q_norm: u64,
+    pub k_norm: u64,
+    pub index_qk: u64,
+    pub index_q_norm: u64,
+    pub index_k_norm: u64,
+}
+
+pub enum Block {
+    Gdn(Gdn),
+    Qsa(Qsa),
+}
+
+/// Per-projection device tables over the 512 experts: code and scale addresses, and `weight_scale_2`.
+pub struct ExpertProj {
+    pub weights: u64,
+    pub scales: u64,
+    pub scale2: u64,
+}
+
+pub struct Moe {
+    pub router: u64,
+    pub shared_gate: u64,
+    pub shared_up: u64,
+    pub shared_down: u64,
+    pub shared_expert_gate: u64,
+    pub gate: ExpertProj,
+    pub up: ExpertProj,
+    pub down: ExpertProj,
+    _tables: DeviceBuffer,
+}
+
+pub struct Ple {
+    pub key: u64,
+    pub value: u64,
+    pub norm_key: u64,
+    pub norm_query: u64,
+    pub norm_conv: u64,
+    pub conv: u64,
+    pub multipliers: [i64; 3],
+    pub sizes: [i64; 16],
+    pub offsets: [i64; 16],
+}
+
+pub struct Layer {
+    pub attn_hc: Hc,
+    pub mlp_hc: Hc,
+    pub block: Block,
+    pub moe: Moe,
+    pub ple: Option<Ple>,
+}
+
+/// The host-resident PLE table: 128 memory-mapped shards of `[rows, 160]` BF16.
+pub struct PleTable {
+    maps: Vec<(Mmap, usize)>,
+    rows_per_shard: usize,
+}
+
+impl PleTable {
+    pub const WIDTH: usize = 160;
+
+    fn open(ckpt: &Checkpoint) -> Result<Self> {
+        let prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_";
+        let mut shards: Vec<(usize, &str)> = ckpt
+            .tensors
+            .keys()
+            .filter_map(|n| n.strip_prefix(prefix).and_then(|r| r.strip_suffix(".weight")).map(|i| (i.parse().unwrap(), n.as_str())))
+            .collect();
+        shards.sort();
+        ensure!(!shards.is_empty(), "checkpoint has no PLE table");
+        let mut maps = Vec::with_capacity(shards.len());
+        let mut rows_per_shard = 0;
+        for (i, (index, name)) in shards.iter().enumerate() {
+            ensure!(*index == i, "PLE shard {i} missing");
+            let info = ckpt.get(name)?;
+            ensure!(info.dtype == DType::BF16 && info.shape[1] == Self::WIDTH, "{name}: unexpected PLE shard layout");
+            rows_per_shard = info.shape[0];
+            let file = &ckpt.files[info.file];
+            let map = unsafe { Mmap::map(&file.file) }.with_context(|| format!("mapping {}", file.path.display()))?;
+            maps.push((map, info.offset as usize));
+        }
+        Ok(Self { maps, rows_per_shard })
+    }
+
+    /// Appends row `r` (160 BF16 values) to `out`.
+    pub fn gather(&self, r: usize, out: &mut Vec<u16>) {
+        let (map, base) = &self.maps[r / self.rows_per_shard];
+        let start = base + (r % self.rows_per_shard) * Self::WIDTH * 2;
+        let bytes = &map[start..start + Self::WIDTH * 2];
+        out.extend(bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])));
+    }
+}
+
+pub struct Model {
+    pub weights: DeviceWeights,
+    pub embed: u64,
+    pub lm_head: u64,
+    pub final_hc: Hc,
+    pub layers: Vec<Layer>,
+    pub ple_table: PleTable,
+}
+
+fn read_i64s<const N: usize>(ckpt: &Checkpoint, name: &str) -> Result<[i64; N]> {
+    let bytes = ckpt.read(name)?;
+    ensure!(bytes.len() == 8 * N, "{name}: expected {N} I64 values");
+    Ok(std::array::from_fn(|i| i64::from_le_bytes(bytes[8 * i..8 * i + 8].try_into().unwrap())))
+}
+
+impl Model {
+    pub fn bind(ckpt: &Checkpoint, weights: DeviceWeights, stream: &Stream) -> Result<Self> {
+        let w = |name: &str| -> Result<u64> { Ok(weights.get(name)?.addr) };
+        let hc = |prefix: &str, inject: bool| -> Result<Hc> {
+            Ok(Hc {
+                norm: w(&format!("{prefix}.hc_norm.weight"))?,
+                down: w(&format!("{prefix}.input_mix_weight_down.weight"))?,
+                up: w(&format!("{prefix}.input_mix_weight_up.weight"))?,
+                inject: if inject { Some(w(&format!("{prefix}.block_inject_weight.weight"))?) } else { None },
+            })
+        };
+
+        let mut layers = Vec::with_capacity(LAYERS);
+        for i in 0..LAYERS {
+            let p = format!("model.language_model.layers.{i}");
+            let block = if is_attention(i) {
+                let a = format!("{p}.self_attn");
+                Block::Qsa(Qsa {
+                    q: w(&format!("{a}.q_proj.weight"))?,
+                    k: w(&format!("{a}.k_proj.weight"))?,
+                    v: w(&format!("{a}.v_proj.weight"))?,
+                    o: w(&format!("{a}.o_proj.weight"))?,
+                    q_norm: w(&format!("{a}.q_norm.weight"))?,
+                    k_norm: w(&format!("{a}.k_norm.weight"))?,
+                    index_qk: w(&format!("{a}.indexer.index_qk_proj.weight"))?,
+                    index_q_norm: w(&format!("{a}.indexer.q_layernorm.weight"))?,
+                    index_k_norm: w(&format!("{a}.indexer.k_layernorm.weight"))?,
+                })
+            } else {
+                let g = format!("{p}.linear_attn");
+                Block::Gdn(Gdn {
+                    qkv: w(&format!("{g}.in_proj_qkv.weight"))?,
+                    z: w(&format!("{g}.in_proj_z.weight"))?,
+                    a: w(&format!("{g}.in_proj_a.weight"))?,
+                    b: w(&format!("{g}.in_proj_b.weight"))?,
+                    conv: w(&format!("{g}.conv1d.weight"))?,
+                    a_log: w(&format!("{g}.A_log"))?,
+                    dt_bias: w(&format!("{g}.dt_bias"))?,
+                    norm: w(&format!("{g}.norm.weight"))?,
+                    out: w(&format!("{g}.out_proj.weight"))?,
+                })
+            };
+
+            // Expert tables: [gate codes, gate scales, up codes, up scales, down codes, down scales] x 512 u64,
+            // then [gate, up, down] weight_scale_2 x 512 f32.
+            let mut addrs = vec![0u64; 6 * EXPERTS];
+            let mut scale2 = vec![0f32; 3 * EXPERTS];
+            for e in 0..EXPERTS {
+                for (j, proj) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
+                    let base = format!("{p}.mlp.experts.{e}.{proj}");
+                    addrs[(2 * j) * EXPERTS + e] = w(&format!("{base}.weight"))?;
+                    addrs[(2 * j + 1) * EXPERTS + e] = w(&format!("{base}.weight_scale"))?;
+                    let s2 = ckpt.read(&format!("{base}.weight_scale_2"))?;
+                    scale2[j * EXPERTS + e] = f32::from_le_bytes(s2[..4].try_into()?);
+                }
+            }
+            let tables = DeviceBuffer::new(addrs.len() * 8 + scale2.len() * 4)?;
+            stream.upload_to(tables.addr(), &addrs)?;
+            stream.upload_to(tables.addr() + (addrs.len() * 8) as u64, &scale2)?;
+            let t = |k: usize| tables.addr() + (k * EXPERTS * 8) as u64;
+            let s2 = |j: usize| tables.addr() + (addrs.len() * 8 + j * EXPERTS * 4) as u64;
+            let m = format!("{p}.mlp");
+            let moe = Moe {
+                router: w(&format!("{m}.gate.weight"))?,
+                shared_gate: w(&format!("{m}.shared_expert.gate_proj.weight"))?,
+                shared_up: w(&format!("{m}.shared_expert.up_proj.weight"))?,
+                shared_down: w(&format!("{m}.shared_expert.down_proj.weight"))?,
+                shared_expert_gate: w(&format!("{m}.shared_expert_gate.weight"))?,
+                gate: ExpertProj { weights: t(0), scales: t(1), scale2: s2(0) },
+                up: ExpertProj { weights: t(2), scales: t(3), scale2: s2(1) },
+                down: ExpertProj { weights: t(4), scales: t(5), scale2: s2(2) },
+                _tables: tables,
+            };
+
+            let ple = if i == 1 {
+                let q = format!("{p}.ple");
+                Some(Ple {
+                    key: w(&format!("{q}.key_proj.weight"))?,
+                    value: w(&format!("{q}.value_proj.weight"))?,
+                    norm_key: w(&format!("{q}.norm_key.weight"))?,
+                    norm_query: w(&format!("{q}.norm_query.weight"))?,
+                    norm_conv: w(&format!("{q}.norm_conv.weight"))?,
+                    conv: w(&format!("{q}.conv1d.weight"))?,
+                    multipliers: read_i64s(ckpt, &format!("{q}.ple_embedding.layer_multipliers"))?,
+                    sizes: read_i64s(ckpt, &format!("{q}.ple_embedding.ngram_heads_vocab_sizes"))?,
+                    offsets: read_i64s(ckpt, &format!("{q}.ple_embedding.ngram_heads_offsets"))?,
+                })
+            } else {
+                None
+            };
+
+            layers.push(Layer {
+                attn_hc: hc(&format!("{p}.attn_hyper_connection"), true)?,
+                mlp_hc: hc(&format!("{p}.mlp_hyper_connection"), true)?,
+                block,
+                moe,
+                ple,
+            });
+        }
+
+        Ok(Self {
+            embed: w("model.language_model.embed_tokens.weight")?,
+            lm_head: w("lm_head.weight")?,
+            final_hc: hc("model.language_model.hyper_connection_mixer", false)?,
+            layers,
+            ple_table: PleTable::open(ckpt)?,
+            weights,
+        })
+    }
+}

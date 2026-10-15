@@ -1,5 +1,7 @@
 pub mod checkpoint;
+pub mod forward;
 pub mod loader;
+pub mod model;
 pub mod oracle;
 
 /// Which checkpoint tensors belong on the GPU.

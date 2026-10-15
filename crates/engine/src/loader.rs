@@ -17,8 +17,6 @@ use squash_cuda::{DeviceBuffer, Event, PinnedBuffer, Stream};
 
 use crate::checkpoint::{Checkpoint, DType};
 
-/// Segment base alignment relative to the file's data section; tensors keep their relative alignment.
-const SEGMENT_ALIGN: u64 = 256;
 /// Unselected bytes tolerated inside a segment instead of splitting it.
 const MAX_GAP: u64 = 1 << 20;
 
@@ -73,6 +71,11 @@ struct Chunk {
     dst: u64,
 }
 
+fn required_alignment(ckpt: &Checkpoint, name: &str) -> u64 {
+    let info = &ckpt.tensors[name];
+    if info.bytes >= 16 { 16 } else { info.dtype.size() as u64 }
+}
+
 /// Uploads every tensor for which `select` returns true.
 pub fn upload(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, opts: LoadOptions) -> Result<(DeviceWeights, LoadStats)> {
     let start = Instant::now();
@@ -90,13 +93,14 @@ pub fn upload(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, opts: LoadOption
     let mut total = 0u64;
     for (file, mut list) in by_file.into_iter().enumerate() {
         list.sort_by_key(|&(_, begin, _)| begin);
-        let data_start = ckpt.files[file].data_start;
         let mut i = 0;
         while i < list.len() {
-            let seg_begin = data_start + (list[i].1 - data_start) / SEGMENT_ALIGN * SEGMENT_ALIGN;
+            // The segment starts at its first tensor, which lands on the (256-byte aligned) allocation
+            // base; a later tensor joins only if it stays aligned (16 bytes, or its dtype size if smaller).
+            let seg_begin = list[i].1;
             let mut seg_end = list[i].2;
             let mut j = i + 1;
-            while j < list.len() && list[j].1 <= seg_end + MAX_GAP {
+            while j < list.len() && list[j].1 <= seg_end + MAX_GAP && (list[j].1 - seg_begin) % required_alignment(ckpt, list[j].0) == 0 {
                 seg_end = seg_end.max(list[j].2);
                 j += 1;
             }

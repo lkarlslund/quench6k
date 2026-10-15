@@ -9,3 +9,4 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 squash-cuda.workspace = true
+memmap2 = "0.9"
