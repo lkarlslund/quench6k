@@ -81,6 +81,7 @@ pub mod ffi {
         pub fn squash_gdn_conv(x: *const f32, ldx: c_int, out: *mut f32, state: *mut f32, w: *const c_void, t: c_int, stream: Stream) -> Error;
         pub fn squash_gdn_prep(qkv: *mut f32, a: *const f32, b: *const f32, ldab: c_int, a_log: *const c_void, dt_bias: *const c_void, beta: *mut f32, g: *mut f32, t: c_int, stream: Stream) -> Error;
         pub fn squash_gdn_recurrent(qkv: *const f32, beta: *const f32, g: *const f32, state: *mut f32, out: *mut f32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_gdn_conv_tickets() -> usize;
         pub fn squash_gdn_fused_small(proj: *const f32, ld: c_int, t: c_int, conv_w: *const c_void, conv_state: *mut f32, state: *mut f32, a_log: *const c_void, dt_bias: *const c_void, norm_w: *const c_void, z_col: c_int, a_col: c_int, b_col: c_int, y: *mut c_void, rec: *mut f32, ctl: *const i32, defer: c_int, stream: Stream) -> Error;
         pub fn squash_gdn_record_floats() -> usize;
         pub fn squash_ple_record_floats() -> usize;

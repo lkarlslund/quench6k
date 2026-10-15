@@ -1,6 +1,7 @@
 // Gated DeltaNet (SPEC §5): causal conv, gating, the delta-rule recurrence and the gated norm.
 //
-// Per-sequence state: conv [3, 10240] FP32 (oldest first) and recurrent [48, 128(k), 128(v)] FP32.
+// Per-sequence state: conv [3, 10240] FP32 (oldest first) followed by squash_gdn_conv_tickets() zeroed
+// u32 for the small-batch kernel, and recurrent [48, 128(k), 128(v)] FP32.
 
 #include "common.cuh"
 
@@ -177,7 +178,6 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
     // Channels handled by this block: q[kh], k[kh], v[vh] (384); threads 0..383 own one each.
     const int ch = tid < DK ? kh * DK + tid : tid < 2 * DK ? KH * DK + kh * DK + (tid - DK) : 2 * KH * DK + vh * DV + (tid - 2 * DK);
     const bool owns_channel = tid < 3 * DK;
-    const bool writes_conv = owns_channel && (tid >= 2 * DK || vh % 3 == 0);
     float hist[3] = {}, cw[4] = {};
     if (owns_channel) {
 #pragma unroll
@@ -185,6 +185,19 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
 #pragma unroll
         for (int j = 0; j < 4; ++j) cw[j] = bf2f(conv_w[ch * TAPS + j]);
     }
+    // The q / k conv history is shared by the three value heads of key head kh: it is written back
+    // only by the last of the three blocks to have read it (a ticket per key head, after the history
+    // conv_state[0, 3 C), which the last block resets).
+    __shared__ bool s_qk_writer;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        unsigned* ticket = reinterpret_cast<unsigned*>(conv_state + 3 * C) + kh;
+        s_qk_writer = atomicAdd(ticket, 1u) == 2;
+        if (s_qk_writer) atomicExch(ticket, 0u);
+    }
+    __syncthreads();
+    const bool writes_conv = owns_channel && (tid >= 2 * DK || s_qk_writer);
     float s[32];
     float* st = state + (size_t)vh * DK * DV;
 #pragma unroll
@@ -314,6 +327,8 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
 }
 
 }  // namespace
+
+extern "C" size_t squash_gdn_conv_tickets() { return KH; }
 
 // proj: the fused GDN projection rows [T, ld] (qkv at column 0, z/a/b at the given columns).
 extern "C" size_t squash_gdn_record_floats() { return (size_t)2 * REC_TOKENS * REC; }

@@ -98,7 +98,7 @@ impl SequenceState {
             } else {
                 qsa.push(None);
                 gdn.push(Some(GdnState {
-                    conv: DeviceBuffer::zeroed(3 * GDN_CONV * 4)?,
+                    conv: DeviceBuffer::zeroed((3 * GDN_CONV + k::gdn_conv_tickets()) * 4)?,
                     recurrent: DeviceBuffer::zeroed(GDN_HEADS * GDN_DIM * GDN_DIM * 4)?,
                 }));
             }

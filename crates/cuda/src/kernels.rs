@@ -303,6 +303,11 @@ pub fn qsa_attention_split(s: &Stream, q: u64, qg: u64, ld: usize, kcache: u64, 
     launch!("qsa_attention_split", ffi::squash_qsa_attention_split(f(q), f(qg), n32(ld), p(kcache), p(vcache), i(sel), i(start), n32(t), fm(part), pm(out), s.raw()))
 }
 
+/// Zeroed u32 words the small-batch GDN kernel needs after the conv history [3, 10240] FP32.
+pub fn gdn_conv_tickets() -> usize {
+    unsafe { ffi::squash_gdn_conv_tickets() }
+}
+
 /// Fused small-batch GDN: conv, gating, delta rule and gated norm in one kernel (one block per value head).
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_fused_small(s: &Stream, proj: u64, ld: usize, t: usize, conv_w: u64, conv_state: u64, state: u64, a_log: u64, dt_bias: u64, norm_w: u64, z_col: usize, a_col: usize, b_col: usize, y: u64, spec: Option<Deferral>) -> Result<()> {
