@@ -302,6 +302,15 @@ const PARTIAL_FLOATS: usize = 1 << 22;
 /// GEMM otherwise.
 #[allow(clippy::too_many_arguments)]
 fn linear_ld(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, ldy: usize, t: usize) -> Result<()> {
+    // A few rows over 16 (MTP catch-up projects 4 stream rows per token) stay on the GEMV path in
+    // 16-row slices; each row's arithmetic is the same either way.
+    if t > k::gemv_max_m() && t <= 4 * k::gemv_max_m() {
+        let m = k::gemv_max_m();
+        for r0 in (0..t).step_by(m) {
+            linear_ld(s, partial, x + (r0 * ldx * 2) as u64, ldx, w, y + (r0 * ldy * 4) as u64, ldy, m.min(t - r0))?;
+        }
+        return Ok(());
+    }
     if t <= k::gemv_max_m() {
         // Split K only when even one row per warp leaves fewer CTAs than SMs.
         let ctas = w.n.div_ceil(8);

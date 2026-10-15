@@ -27,7 +27,9 @@ and region (prompt, completion), using teacher-forced scoring of the fixture seq
 | greedy generation | identical to the reference sequence, or its first divergence is a near-tie: in at least one reference, the logit of the sequence token exceeds the logit of squash's token by at most 0.5 |
 
 Every speed configuration that ships must pass the gate: each KV-cache precision, MTP draft length,
-CUDA Graphs on and off, and batch sizes 1 and 2. Individual kernels are also tested against an
+CUDA Graphs on and off, and batch sizes 1 and 2. In addition, greedy MTP speculative decoding must
+produce exactly the tokens of plain greedy decoding (`squash spec-check`): every multi-token kernel
+path computes each token with the same arithmetic, in the same order, as the single-token path. Individual kernels are also tested against an
 FP32/FP64 reference of their mathematical contract; the end-to-end gate does not replace that.
 
 Mathematical source of truth: HF transformers `qwen4_exp`. Second implementation:

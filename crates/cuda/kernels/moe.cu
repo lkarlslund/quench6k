@@ -659,10 +659,13 @@ __global__ void __launch_bounds__(256) shared_combine_kernel(const float* __rest
     for (int t = 0; t < MAXT; ++t) {
         if (t >= T) break;
         const float v = warp_sum(acc[t]);
-        // lanes 0..9 fetch one routed contribution each
-        float routed = lane < TOPK ? top_w[t * TOPK + lane] * yd[(size_t)pair_row[t * TOPK + lane] * D + n] : 0.0f;
-        routed = warp_sum(routed);
-        if (lane == 0) y[(size_t)t * D + n] = routed + sigmoidf(proj[(size_t)t * ld + SG]) * v;
+        // Same arithmetic and order as combine_kernel, so every batch size gives identical results.
+        if (lane == 0) {
+            float routed = 0;
+#pragma unroll
+            for (int k = 0; k < TOPK; ++k) routed += top_w[t * TOPK + k] * yd[(size_t)pair_row[t * TOPK + k] * D + n];
+            y[(size_t)t * D + n] = routed + sigmoidf(proj[(size_t)t * ld + SG]) * v;
+        }
     }
 }
 
