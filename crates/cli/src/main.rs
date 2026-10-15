@@ -13,8 +13,6 @@ use squash_engine::selection;
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum PrecisionArg {
     Bf16,
-    Fp8,
-    Int8,
     Int8g,
 }
 
@@ -22,8 +20,6 @@ impl From<PrecisionArg> for Precision {
     fn from(p: PrecisionArg) -> Self {
         match p {
             PrecisionArg::Bf16 => Precision::Bf16,
-            PrecisionArg::Fp8 => Precision::Fp8,
-            PrecisionArg::Int8 => Precision::Int8,
             PrecisionArg::Int8g => Precision::Int8Group,
         }
     }
@@ -72,7 +68,7 @@ enum Command {
     Score {
         #[arg(long)]
         model: PathBuf,
-        /// Non-expert projection precision: bf16 (checkpoint), fp8, int8 (per row) or int8g (per 64 weights).
+        /// Non-expert projection precision: bf16 (checkpoint) or int8g (INT8, a scale per 64 weights).
         #[arg(long, value_enum, default_value_t = PrecisionArg::Int8g)]
         precision: PrecisionArg,
         /// Fixture directories (each with sequence.json).
@@ -94,7 +90,7 @@ enum Command {
     Generate {
         #[arg(long)]
         model: PathBuf,
-        /// Non-expert projection precision: bf16 (checkpoint), fp8, int8 (per row) or int8g (per 64 weights).
+        /// Non-expert projection precision: bf16 (checkpoint) or int8g (INT8, a scale per 64 weights).
         #[arg(long, value_enum, default_value_t = PrecisionArg::Int8g)]
         precision: PrecisionArg,
         #[arg(long, num_args = 1.., required = true)]
@@ -107,7 +103,7 @@ enum Command {
     Bench {
         #[arg(long)]
         model: PathBuf,
-        /// Non-expert projection precision: bf16 (checkpoint), fp8, int8 (per row) or int8g (per 64 weights).
+        /// Non-expert projection precision: bf16 (checkpoint) or int8g (INT8, a scale per 64 weights).
         #[arg(long, value_enum, default_value_t = PrecisionArg::Int8g)]
         precision: PrecisionArg,
         #[arg(long, num_args = 1.., default_values_t = [512usize])]

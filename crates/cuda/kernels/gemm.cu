@@ -152,20 +152,18 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
     const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
     OutT* y = static_cast<OutT*>(Y);
-    if (fmt == 1)
-        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 1>, grid, THREADS, 0, stream, x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0));
-    else if (fmt == 2)
-        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 2>, grid, THREADS, 0, stream, x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0));
-    else if (fmt == 3)
+    if (fmt == 3)
         SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 3>, grid, THREADS, 0, stream, x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0));
-    else
+    else if (fmt == 0)
         SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 0>, grid, THREADS, 0, stream, x, ldx, W, ldw, nullptr, y, ldy, M, N, K, alpha, accumulate != 0));
+    else
+        return cudaErrorInvalidValue;
     SQ_RETURN_LAUNCH();
 }
 
 }  // namespace
 
-// fmt 0: BF16 weights; 1: FP8 E4M3 and 2: INT8 weights with per-row FP32 scales.
+// fmt 0: BF16 weights; 3: INT8 weights with an FP32 scale per 64 weights of a row.
 extern "C" cudaError_t squash_gemm_bf16_f32(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
                                             float* Y, int ldy, int M, int N, int K, float alpha, int accumulate,
                                             cudaStream_t stream) {

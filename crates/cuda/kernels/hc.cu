@@ -87,50 +87,6 @@ __global__ void hc_mix_kernel(const float* __restrict__ u, const __nv_bfloat16* 
     m[i] = f2bf(acc / S);
 }
 
-// Small batches, after the down GEMV over the raw residual with norm-folded weights left `splits`
-// partials [splits, T, N] (splits / 4 per stream, in stream order) and per-split sums of squared
-// residual values xsq [splits, T]: r[t, s] = rsqrt(mean h[t, s]^2 + eps); x = sum_split r * partial;
-// z = bf16(silu(x[:320] / 4)); inj = 2 sigmoid(x[320:324] / 4) when N = 324. grid (T, ceil(N / 64)).
-__global__ void hc_finish_kernel(const float* __restrict__ partial, const float* __restrict__ xsq, int splits, int T,
-                                 int N, __nv_bfloat16* z, float* inj, float* r) {
-    pdl_launch_dependents();
-    pdl_wait();
-    const int t = blockIdx.x, per_stream = splits / S;
-    float rs[S];
-#pragma unroll
-    for (int s = 0; s < S; ++s) {
-        float ss = 0;
-        for (int j = 0; j < per_stream; ++j) ss += xsq[(s * per_stream + j) * T + t];
-        rs[s] = rsqrtf(ss / D + EPS);
-    }
-    if (blockIdx.y == 0 && threadIdx.x < S) r[t * S + threadIdx.x] = rs[threadIdx.x];
-    const int j = blockIdx.y * blockDim.x + threadIdx.x;
-    if (j >= N) return;
-    float x = 0;
-    for (int sp = 0; sp < splits; ++sp) x += rs[sp / per_stream] * partial[((size_t)sp * T + t) * N + j];
-    x /= S;
-    if (j < RANK) z[t * RANK + j] = f2bf(silu(x));
-    else if (inj) inj[t * S + j - RANK] = 2.0f * sigmoidf(x);
-}
-
-// m[t, d] = mean_s sigmoid(u[t, s, d]) * h[t, s, d] * r[t, s] * (1 + g[s, d]), FP32 residual input.
-__global__ void hc_mix_small_kernel(const float* __restrict__ u, const float* __restrict__ h,
-                                    const float* __restrict__ r, const __nv_bfloat16* __restrict__ g,
-                                    __nv_bfloat16* m, int T) {
-    pdl_launch_dependents();
-    pdl_wait();
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= T * D) return;
-    const int t = i / D, d = i % D;
-    float acc = 0;
-#pragma unroll
-    for (int s = 0; s < S; ++s) {
-        const size_t j = (size_t)t * H + s * D + d;
-        acc += sigmoidf(u[j]) * h[j] * r[t * S + s] * (1.0f + bf2f(g[s * D + d]));
-    }
-    m[i] = f2bf(acc / S);
-}
-
 // h[t, s, d] += y[t, d] * inj[t, s]
 __global__ void hc_combine_kernel(float* h, const float* __restrict__ y, const float* __restrict__ inj, int T) {
     pdl_launch_dependents();
@@ -188,22 +144,6 @@ extern "C" cudaError_t squash_hc_mix(const float* u, const void* n, const void* 
     SQ_CHECK_LAUNCH(sq_launch(hc_mix_kernel, blocks((size_t)T * D, 256), 256, 0, st, u, static_cast<const __nv_bfloat16*>(n),
                                                                static_cast<const __nv_bfloat16*>(g),
                                                                static_cast<__nv_bfloat16*>(m), T));
-    SQ_RETURN_LAUNCH();
-}
-
-extern "C" cudaError_t squash_hc_finish(const float* partial, const float* xsq, int splits, int T, int N, void* z,
-                                        float* inj, float* r, cudaStream_t st) {
-    if (T == 0) return cudaSuccess;
-    if (splits % S != 0) return cudaErrorInvalidValue;
-    SQ_CHECK_LAUNCH(sq_launch(hc_finish_kernel, dim3(T, (N + 63) / 64), 64, 0, st, partial, xsq, splits, T, N, static_cast<__nv_bfloat16*>(z), inj, r));
-    SQ_RETURN_LAUNCH();
-}
-
-extern "C" cudaError_t squash_hc_mix_small(const float* u, const float* h, const float* r, const void* g, void* m, int T,
-                                           cudaStream_t st) {
-    if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(hc_mix_small_kernel, blocks((size_t)T * D, 256), 256, 0, st, u, h, r, static_cast<const __nv_bfloat16*>(g),
-                                                                     static_cast<__nv_bfloat16*>(m), T));
     SQ_RETURN_LAUNCH();
 }
 

@@ -193,8 +193,6 @@ impl Model {
             ensure!(t.shape.len() == 2, "{name}: not a 2-D projection");
             let fmt = match t.dtype {
                 DType::BF16 => WeightFormat::Bf16,
-                DType::F8E4M3 => WeightFormat::Fp8,
-                DType::I8 => WeightFormat::Int8,
                 DType::I8G => WeightFormat::Int8Group,
                 other => anyhow::bail!("{name}: {other:?} is not a projection weight format"),
             };
@@ -357,11 +355,8 @@ pub fn projection_groups() -> Vec<(String, Vec<String>)> {
 pub enum Precision {
     /// Checkpoint BF16 everywhere except the NVFP4 experts.
     Bf16,
-    /// FP8 E4M3 (per-row scales) for the large projections, see `selection::eight_bit`.
-    Fp8,
-    /// INT8 (per-row scales) for the same projections.
-    Int8,
-    /// INT8 with a scale per 64 weights of a row, for the same projections.
+    /// INT8 with a scale per 64 weights of a row for the projections in `selection::eight_bit`.
+    /// (FP8 E4M3 and per-row INT8 were measured and fail the correctness gate.)
     Int8Group,
 }
 
@@ -370,8 +365,6 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, opts: crate::loader::L
     use crate::{loader, selection};
     let format = match precision {
         Precision::Bf16 => WeightFormat::Bf16,
-        Precision::Fp8 => WeightFormat::Fp8,
-        Precision::Int8 => WeightFormat::Int8,
         Precision::Int8Group => WeightFormat::Int8Group,
     };
     let quantized = |n: &str| format != WeightFormat::Bf16 && selection::eight_bit(n);

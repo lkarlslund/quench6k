@@ -50,8 +50,7 @@ impl DeviceWeights {
     }
 }
 
-/// Uploads the selected 2-D BF16 tensors and converts each to an 8-bit format (FP8 E4M3, INT8 or
-/// group-scaled INT8) with per-row or per-group scales on the GPU, one file at a time, so only one file's
+/// Uploads the selected 2-D BF16 tensors and converts each to INT8 with one scale per 64 weights on the GPU, one file at a time, so only one file's
 /// BF16 copy is ever resident.
 ///
 /// `prep(name, addr, n, k)` may transform each staged BF16 tensor in place before it is quantized.
@@ -69,9 +68,9 @@ pub fn upload_quantized(
     stream: &squash_cuda::Stream,
 ) -> Result<(DeviceWeights, LoadStats)> {
     use squash_cuda::kernels::{self as k, WeightFormat};
-    anyhow::ensure!(format != WeightFormat::Bf16, "upload_quantized needs an 8-bit format");
+    anyhow::ensure!(format == WeightFormat::Int8Group, "upload_quantized produces group-scaled INT8 only");
     let start = Instant::now();
-    let scales_per_row = |kk: usize| if format == WeightFormat::Int8Group { kk / k::int8_group() } else { 1 };
+    let scales_per_row = |kk: usize| kk / k::int8_group();
 
     // Units of contiguous placement: a group's members, or a single tensor.
     let mut grouped = std::collections::HashSet::new();
@@ -121,11 +120,7 @@ pub fn upload_quantized(
         for (u, q, sc, rows, kk) in placements {
             let (group, members) = &unit_list[u];
             let (mut qa, mut sa) = (arena.addr() + q as u64, arena.addr() + sc as u64);
-            let dtype = match format {
-                WeightFormat::Fp8 => DType::F8E4M3,
-                WeightFormat::Int8 => DType::I8,
-                _ => DType::I8G,
-            };
+            let dtype = DType::I8G;
             if let Some(g) = group {
                 out.tensors.insert(g.to_string(), DeviceTensor { addr: qa, bytes: (rows * kk) as u64, dtype, shape: vec![rows, kk], scale: sa });
             }
@@ -133,14 +128,8 @@ pub fn upload_quantized(
                 let src = staged.get(name)?;
                 let n = src.shape[0];
                 prep(name, src.addr, n, kk)?;
-                match format {
-                    WeightFormat::Fp8 => k::quantize_fp8_rows(stream, src.addr, n, kk, qa, sa)?,
-                    WeightFormat::Int8 => k::quantize_int8_rows(stream, src.addr, n, kk, qa, sa)?,
-                    _ => {
-                        anyhow::ensure!(kk % k::int8_group() == 0, "{name}: K {kk} is not a multiple of the INT8 group");
-                        k::quantize_int8_groups(stream, src.addr, n, kk, qa, sa)?
-                    }
-                }
+                anyhow::ensure!(kk % k::int8_group() == 0, "{name}: K {kk} is not a multiple of the INT8 group");
+                k::quantize_int8_groups(stream, src.addr, n, kk, qa, sa)?;
                 out.tensors.insert(name.to_string(), DeviceTensor { addr: qa, bytes: (n * kk) as u64, dtype, shape: src.shape.clone(), scale: sa });
                 qa += (n * kk) as u64;
                 sa += (n * scales_per_row(kk) * 4) as u64;

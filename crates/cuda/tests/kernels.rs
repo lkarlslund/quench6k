@@ -52,13 +52,6 @@ fn gemm_matches_cpu() {
     }
 }
 
-fn fp8_e4m3_to_f32(b: u8) -> f32 {
-    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
-    let e = ((b >> 3) & 0xf) as i32;
-    let m = (b & 7) as f32;
-    if e == 0 { sign * m / 8.0 * 2f32.powi(-6) } else { sign * (1.0 + m / 8.0) * 2f32.powi(e - 7) }
-}
-
 fn cpu_matmul(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f64> {
     let mut y = vec![0f64; m * n];
     for i in 0..m {
@@ -74,7 +67,7 @@ fn max_rel(got: &[f32], want: &[f64], k: usize) -> f64 {
 }
 
 #[test]
-fn gemv_and_fp8_paths_match_cpu() {
+fn gemv_and_int8_group_paths_match_cpu() {
     squash_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -91,41 +84,7 @@ fn gemv_and_fp8_paths_match_cpu() {
         let e = max_rel(&got, &cpu_matmul(&x, &w, m, n, k), k);
         assert!(e < 1e-4, "bf16 gemv {m}x{n}x{k}/{splits}: {e}");
 
-        // FP8 quantization, then GEMV and tensor-core GEMM on the FP8 weights
         let dq = DeviceBuffer::new(n * k).unwrap();
-        let dsc = DeviceBuffer::new(n * 4).unwrap();
-        kernels::quantize_fp8_rows(&s, dw.addr(), n, k, dq.addr(), dsc.addr()).unwrap();
-        let q: Vec<u8> = s.download(dq.addr(), n * k).unwrap();
-        let sc: Vec<f32> = s.download(dsc.addr(), n).unwrap();
-        let wq: Vec<f32> = (0..n * k).map(|i| fp8_e4m3_to_f32(q[i]) * sc[i / k]).collect();
-        let quant_err = w.iter().zip(&wq).map(|(a, b)| (a - b).abs() / sc[0].max(1e-9)).fold(0f32, f32::max);
-        assert!(quant_err.is_finite());
-        let want = cpu_matmul(&x, &wq, m, n, k);
-        kernels::gemv(&s, m, dx.addr(), k, WeightFormat::Fp8, dq.addr(), dsc.addr(), dy.addr(), n, partial.addr(), n, k, splits, 1.0, false).unwrap();
-        let got: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
-        let e = max_rel(&got, &want, k);
-        assert!(e < 1e-4, "fp8 gemv {m}x{n}x{k}/{splits}: {e}");
-        kernels::gemm_f32(&s, dx.addr(), k, WeightFormat::Fp8, dq.addr(), k, dsc.addr(), dy.addr(), n, m, n, k, 1.0, false).unwrap();
-        let got: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
-        // The tensor-core path rounds dequantized weights to BF16 (exact for E4M3 values) before the MMA.
-        let e = max_rel(&got, &want, k);
-        assert!(e < 1e-4, "fp8 gemm {m}x{n}x{k}: {e}");
-
-        // INT8 quantization through both paths
-        kernels::quantize_int8_rows(&s, dw.addr(), n, k, dq.addr(), dsc.addr()).unwrap();
-        let q: Vec<u8> = s.download(dq.addr(), n * k).unwrap();
-        let sc: Vec<f32> = s.download(dsc.addr(), n).unwrap();
-        let wq: Vec<f32> = (0..n * k).map(|i| q[i] as i8 as f32 * sc[i / k]).collect();
-        let want = cpu_matmul(&x, &wq, m, n, k);
-        kernels::gemv(&s, m, dx.addr(), k, WeightFormat::Int8, dq.addr(), dsc.addr(), dy.addr(), n, partial.addr(), n, k, splits, 1.0, false).unwrap();
-        let got: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
-        let e = max_rel(&got, &want, k);
-        assert!(e < 1e-4, "int8 gemv {m}x{n}x{k}/{splits}: {e}");
-        kernels::gemm_f32(&s, dx.addr(), k, WeightFormat::Int8, dq.addr(), k, dsc.addr(), dy.addr(), n, m, n, k, 1.0, false).unwrap();
-        let got: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
-        let e = max_rel(&got, &want, k);
-        assert!(e < 1e-4, "int8 gemm {m}x{n}x{k}: {e}");
-
         // Group-scaled INT8 through both paths
         if k % kernels::int8_group() == 0 {
             let g = kernels::int8_group();

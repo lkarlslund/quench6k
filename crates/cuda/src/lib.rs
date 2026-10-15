@@ -57,16 +57,12 @@ pub mod ffi {
         pub fn squash_gemm_bf16_f32(fmt: c_int, x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, scale: *const f32, y: *mut f32, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
         pub fn squash_gemm_bf16_bf16(fmt: c_int, x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, scale: *const f32, y: *mut c_void, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
         pub fn squash_gemv_max_m() -> c_int;
-        pub fn squash_gemv(fmt: c_int, m: c_int, x: *const c_void, x_f32: c_int, ldx: c_int, w: *const c_void, scale: *const f32, y: *mut f32, ldy: c_int, partial: *mut f32, ldp: c_int, xsq: *mut f32, n: c_int, k: c_int, splits: c_int, alpha: f32, accumulate: c_int, reduce: c_int, stream: Stream) -> Error;
+        pub fn squash_gemv(fmt: c_int, m: c_int, x: *const c_void, ldx: c_int, w: *const c_void, scale: *const f32, y: *mut f32, ldy: c_int, partial: *mut f32, n: c_int, k: c_int, splits: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
         pub fn squash_fold_norm(w: *mut c_void, g: *const c_void, n: c_int, k: c_int, stream: Stream) -> Error;
-        pub fn squash_hc_finish(partial: *const f32, xsq: *const f32, splits: c_int, t: c_int, n: c_int, z: *mut c_void, inj: *mut f32, r: *mut f32, stream: Stream) -> Error;
         pub fn squash_hc_small_scratch_floats(t: c_int) -> usize;
         pub fn squash_hc_small(fmt: c_int, h: *mut f32, t: c_int, y: *const f32, inj_prev: *const f32, wd: *const c_void, sd: *const f32, wi: *const c_void, si: *const f32, wu: *const c_void, su: *const f32, g: *const c_void, scratch: *mut f32, z: *mut c_void, r: *mut f32, inj: *mut f32, m: *mut c_void, stream: Stream) -> Error;
-        pub fn squash_hc_mix_small(u: *const f32, h: *const f32, r: *const f32, g: *const c_void, m: *mut c_void, t: c_int, stream: Stream) -> Error;
-        pub fn squash_quantize_int8_rows(w: *const c_void, n: c_int, k: c_int, q: *mut c_void, scale: *mut f32, stream: Stream) -> Error;
         pub fn squash_int8_group() -> c_int;
         pub fn squash_quantize_int8_groups(w: *const c_void, n: c_int, k: c_int, q: *mut c_void, scale: *mut f32, stream: Stream) -> Error;
-        pub fn squash_quantize_fp8_rows(w: *const c_void, n: c_int, k: c_int, q: *mut c_void, scale: *mut f32, stream: Stream) -> Error;
         pub fn squash_moe_active(counts: *const i32, active: *mut i32, num_active: *mut i32, stream: Stream) -> Error;
         pub fn squash_moe_nvfp4_gemv(xs: *const c_void, w_ptr: *const u64, s_ptr: *const u64, ws2: *const f32, offsets: *const i32, active: *const i32, num_active: *const i32, max_active: c_int, y: *mut f32, n: c_int, k: c_int, stream: Stream) -> Error;
         pub fn squash_topk(x: *const f32, rows: c_int, n: c_int, ld: usize, k: c_int, sort_by_index: c_int, out_idx: *mut i32, out_val: *mut f32, stream: Stream) -> Error;

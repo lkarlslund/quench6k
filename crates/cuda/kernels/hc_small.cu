@@ -271,8 +271,7 @@ extern "C" cudaError_t squash_hc_small(int fmt, float* h, int T, const float* y,
            static_cast<__nv_bfloat16*>(m)};
     switch (fmt) {
         case 0: return dispatch_t<WFmt::BF16>(a, st);
-        case 1: return dispatch_t<WFmt::FP8>(a, st);
-        case 2: return dispatch_t<WFmt::INT8>(a, st);
-        default: return dispatch_t<WFmt::INT8G>(a, st);
+        case 3: return dispatch_t<WFmt::INT8G>(a, st);
+        default: return cudaErrorInvalidValue;
     }
 }

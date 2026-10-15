@@ -19,10 +19,6 @@ fn pm(addr: u64) -> *mut c_void {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeightFormat {
     Bf16 = 0,
-    /// FP8 E4M3 with a per-row FP32 scale.
-    Fp8 = 1,
-    /// INT8 with a per-row FP32 scale.
-    Int8 = 2,
     /// INT8 with an FP32 scale per [`int8_group`] consecutive weights of a row.
     Int8Group = 3,
 }
@@ -63,33 +59,13 @@ pub fn gemv_max_m() -> usize {
 /// `splits` > 1 the K range is split across CTAs and `partial` must hold `splits * M * N` floats.
 #[allow(clippy::too_many_arguments)]
 pub fn gemv(s: &Stream, m: usize, x: u64, ldx: usize, fmt: WeightFormat, w: u64, scale: u64, y: u64, ldy: usize, partial: u64, n: usize, k: usize, splits: usize, alpha: f32, accumulate: bool) -> Result<()> {
-    let err = unsafe { ffi::squash_gemv(fmt as i32, m as i32, p(x), 0, ldx as i32, p(w), opt_f(scale), y as *mut f32, ldy as i32, partial as *mut f32, n as i32, std::ptr::null_mut(), n as i32, k as i32, splits as i32, alpha, accumulate as i32, 1, s.raw()) };
+    let err = unsafe { ffi::squash_gemv(fmt as i32, m as i32, p(x), ldx as i32, p(w), opt_f(scale), y as *mut f32, ldy as i32, partial as *mut f32, n as i32, k as i32, splits as i32, alpha, accumulate as i32, s.raw()) };
     check(err, "gemv")
-}
-
-/// Split-K partial sums only, over FP32 activations: partial[(split · M + m) · ldp + n] for exactly
-/// `splits` splits (K / splits must be a multiple of 512); with `xsq` non-zero, also the per-split sums
-/// of squared activations xsq[split · M + m].
-#[allow(clippy::too_many_arguments)]
-pub fn gemv_partials_f32(s: &Stream, m: usize, x: u64, ldx: usize, fmt: WeightFormat, w: u64, scale: u64, partial: u64, ldp: usize, xsq: u64, n: usize, k: usize, splits: usize) -> Result<()> {
-    anyhow::ensure!(k % splits == 0 && (k / splits) % 512 == 0, "gemv_partials_f32: K {k} does not split into {splits} multiples of 512");
-    let err = unsafe { ffi::squash_gemv(fmt as i32, m as i32, p(x), 1, ldx as i32, p(w), opt_f(scale), std::ptr::null_mut(), 0, partial as *mut f32, ldp as i32, if xsq == 0 { std::ptr::null_mut() } else { xsq as *mut f32 }, n as i32, k as i32, splits as i32, 1.0, 0, 0, s.raw()) };
-    check(err, "gemv_partials_f32")
 }
 
 /// W[n, k] *= 1 + g[k] in place (BF16).
 pub fn fold_norm(s: &Stream, w: u64, g: u64, n: usize, k: usize) -> Result<()> {
     check(unsafe { ffi::squash_fold_norm(pm(w), p(g), n as i32, k as i32, s.raw()) }, "fold_norm")
-}
-
-/// BF16 [N, K] -> INT8 [N, K] with per-row scales absmax / 127.
-pub fn quantize_int8_rows(s: &Stream, w: u64, n: usize, k: usize, q: u64, scale: u64) -> Result<()> {
-    check(unsafe { ffi::squash_quantize_int8_rows(p(w), n as i32, k as i32, pm(q), scale as *mut f32, s.raw()) }, "quantize_int8_rows")
-}
-
-/// BF16 [N, K] -> FP8 E4M3 [N, K] with per-row scales absmax / 448.
-pub fn quantize_fp8_rows(s: &Stream, w: u64, n: usize, k: usize, q: u64, scale: u64) -> Result<()> {
-    check(unsafe { ffi::squash_quantize_fp8_rows(p(w), n as i32, k as i32, pm(q), scale as *mut f32, s.raw()) }, "quantize_fp8_rows")
 }
 
 fn f(addr: u64) -> *const f32 {
@@ -151,17 +127,6 @@ pub fn hc_act(s: &Stream, x: u64, ld: usize, z: u64, inj: u64, t: usize) -> Resu
 /// m = mean over streams of sigmoid(u) · n · (1 + g); `g` 0 omits the norm weight.
 pub fn hc_mix(s: &Stream, u: u64, n: u64, g: u64, m: u64, t: usize) -> Result<()> {
     launch!("hc_mix", ffi::squash_hc_mix(f(u), p(n), p(g), pm(m), n32(t), s.raw()))
-}
-
-/// Reduces the HC down-projection split partials with per-stream RMS factors (see the kernel).
-#[allow(clippy::too_many_arguments)]
-pub fn hc_finish(s: &Stream, partial: u64, xsq: u64, splits: usize, t: usize, n: usize, z: u64, inj: u64, r: u64) -> Result<()> {
-    let inj = if inj == 0 { std::ptr::null_mut() } else { fm(inj) };
-    launch!("hc_finish", ffi::squash_hc_finish(f(partial), f(xsq), n32(splits), n32(t), n32(n), pm(z), inj, fm(r), s.raw()))
-}
-
-pub fn hc_mix_small(s: &Stream, u: u64, h: u64, r: u64, g: u64, m: u64, t: usize) -> Result<()> {
-    launch!("hc_mix_small", ffi::squash_hc_mix_small(f(u), f(h), f(r), p(g), pm(m), n32(t), s.raw()))
 }
 
 pub fn hc_combine(s: &Stream, h: u64, y: u64, inj: u64, t: usize) -> Result<()> {

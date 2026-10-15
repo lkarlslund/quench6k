@@ -27,8 +27,6 @@ const GDN_HEADS: usize = 48;
 const GDN_DIM: usize = 128;
 const GDN_Z: usize = GDN_HEADS * GDN_DIM;
 const PLE_HIST: usize = 9;
-/// K splits of the small-batch HC down projection: 5 per 2560-wide stream (512 columns each).
-const HC_SPLITS: usize = 20;
 /// Widest projection group: GDN in_proj (10240 + 6144 + 48 + 48).
 const PROJ_WIDTH: usize = GDN_CONV + GDN_Z + 2 * GDN_HEADS;
 
@@ -151,7 +149,6 @@ pub struct Workspace {
     row_token: u64,
     att_part: u64,
     hc_r: u64,
-    hc_xsq: u64,
     inj2: u64,
     hc_scratch: u64,
     /// Device copy of the step block, and its pinned host staging.
@@ -219,7 +216,6 @@ impl Workspace {
             num_active: alloc(4)?,
             row_token: alloc(k::moe_small_tokens() * TOP_K * 4)?,
             hc_r: alloc(t * S * 4)?,
-            hc_xsq: alloc(HC_SPLITS * t.min(k::gemv_max_m()) * 4)?,
             inj2: alloc(t * S * 4)?,
             hc_scratch: alloc(k::hc_small_scratch_floats(t.min(k::gemv_max_m())) * 4)?,
             att_part: alloc(k::qsa_split_floats(k::gemv_max_m()) * 4)?,
@@ -277,23 +273,7 @@ fn project(s: &Stream, ws: &Workspace, x: u64, proj: &Proj, out: u64, t: usize) 
 /// injects, the injection weights to `ws.inj`.
 fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, out: u64, mut prof: Option<&mut Profiler>) -> Result<()> {
     let inj = if hc.injects { ws.inj } else { 0 };
-    if t <= k::gemv_max_m() {
-        // Project the raw FP32 residual with stream-aligned K splits; the finish kernel applies each
-        // stream's RMS factor while reducing them.
-        op!(prof, "hc down", s, {
-            let parts: Vec<(Linear, usize)> = match &hc.down.fused {
-                Some(w) => vec![(*w, 0)],
-                None => hc.down.parts.clone(),
-            };
-            parts.iter().enumerate().try_for_each(|(i, (w, col))| {
-                let xsq = if i == 0 { ws.hc_xsq } else { 0 };
-                k::gemv_partials_f32(s, t, ws.h, H, w.fmt, w.addr, w.scale, ws.partial + (*col * 4) as u64, hc.down.n, xsq, w.n, H, HC_SPLITS)
-            })
-        });
-        op!(prof, "hc finish", s, k::hc_finish(s, ws.partial, ws.hc_xsq, HC_SPLITS, t, hc.down.n, ws.low_bf, inj, ws.hc_r));
-        op!(prof, "hc up", s, linear(s, ws, ws.low_bf, &hc.up, ws.up, t));
-        op!(prof, "hc mix", s, k::hc_mix_small(s, ws.up, ws.h, ws.hc_r, hc.norm, out, t));
-    } else {
+    {
         op!(prof, "hc norm", s, k::grouped_rmsnorm(s, ws.h, 0, ws.n, t));
         op!(prof, "hc down", s, project(s, ws, ws.n, &hc.down, ws.proj, t));
         op!(prof, "hc act", s, k::hc_act(s, ws.proj, hc.down.n, ws.low_bf, inj, t));
