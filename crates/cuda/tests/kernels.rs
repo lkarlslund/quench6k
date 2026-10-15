@@ -149,3 +149,73 @@ fn nvfp4_quantization_round_trips() {
         }
     }
 }
+
+fn nvfp4_value(code: u8) -> f32 {
+    E2M1[(code & 7) as usize] * if code & 8 != 0 { -1.0 } else { 1.0 }
+}
+
+/// Small-batch expert gate/up (+SwiGLU) against the CPU, two tokens routed to overlapping experts.
+#[test]
+fn expert_gate_up_small_matches_cpu() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0xfeed_beef);
+    const E: usize = 512;
+    let (n, k) = (640usize, 2560usize);
+    for t in [2usize, 4, 8] {
+    let mut rng = Rng(0xfeed_beef + t as u64);
+    // Two experts with random NVFP4 weights for gate and up.
+    let mut make = |rng: &mut Rng| -> (Vec<u8>, Vec<u8>, f32) {
+        let codes: Vec<u8> = (0..n * k / 2).map(|_| ((rng.next() * 127.0 + 128.0) as u32 & 0xff) as u8).collect();
+        let scales: Vec<u8> = (0..n * k / 16).map(|_| 0x30 + ((rng.next().abs() * 8.0) as u8)).collect();
+        (codes, scales, 0.01)
+    };
+    let experts: Vec<[(Vec<u8>, Vec<u8>, f32); 2]> = (0..2).map(|_| [make(&mut rng), make(&mut rng)]).collect();
+    let dev: Vec<[(DeviceBuffer, DeviceBuffer); 2]> = experts.iter().map(|e| [(upload(&s, &e[0].0), upload(&s, &e[0].1)), (upload(&s, &e[1].0), upload(&s, &e[1].1))]).collect();
+    let ids = [7usize, 300];
+    let mut tables = vec![0u64; 4 * E];
+    let mut s2 = vec![0f32; 2 * E];
+    for (i, &e) in ids.iter().enumerate() {
+        for j in 0..2 {
+            tables[2 * j * E + e] = dev[i][j].0.addr();
+            tables[(2 * j + 1) * E + e] = dev[i][j].1.addr();
+            s2[j * E + e] = experts[i][j].2;
+        }
+    }
+    let dt = upload(&s, &tables);
+    let ds2 = upload(&s, &s2);
+    // Token 0 -> experts 7 and 300, token 1 -> expert 300: rows grouped by expert.
+    let x: Vec<f32> = rng.vec(t * k).iter().map(|&v| bf16::round(v)).collect();
+    let dx = upload(&s, &to_bf16(&x));
+    let mut offsets = vec![3i32; E + 1];
+    for (e, o) in offsets.iter_mut().enumerate() {
+        *o = if e <= 7 { 0 } else if e <= 300 { 1 } else { 3 };
+    }
+    let row_token = [0i32, 0, (t - 1) as i32];
+    let active = [7i32, 300];
+    let (d_off, d_rt, d_act, d_na) = (upload(&s, &offsets), upload(&s, &row_token), upload(&s, &active), upload(&s, &[2i32]));
+    let out = DeviceBuffer::new(3 * n * 2).unwrap();
+    let a = |j: usize| (dt.addr() + (2 * j * E * 8) as u64, dt.addr() + ((2 * j + 1) * E * 8) as u64, ds2.addr() + (j * E * 4) as u64);
+    kernels::moe_gate_up_small(&s, dx.addr(), d_rt.addr(), a(0), a(1), d_off.addr(), d_act.addr(), d_na.addr(), 2, t, out.addr()).unwrap();
+    let got: Vec<u16> = s.download(out.addr(), 3 * n).unwrap();
+    let row_expert = [0usize, 1, 1];
+    for r in 0..3 {
+        let xi = &x[row_token[r] as usize * k..][..k];
+        let ex = &experts[row_expert[r]];
+        for f in [0usize, 1, 2, 3, 100, 333, 639] {
+            let dot = |w: &(Vec<u8>, Vec<u8>, f32)| -> f64 {
+                (0..k).map(|c| {
+                    let byte = w.0[f * k / 2 + c / 2];
+                    let code = if c % 2 == 0 { byte & 15 } else { byte >> 4 };
+                    let sc = fp8_e4m3(w.1[f * k / 16 + c / 16]);
+                    (nvfp4_value(code) * sc) as f64 * xi[c] as f64
+                }).sum::<f64>() * w.2 as f64
+            };
+            let (g, u) = (dot(&ex[0]), dot(&ex[1]));
+            let want = g / (1.0 + (-g).exp()) * u;
+            let have = bf16::to_f32(got[r * n + f]) as f64;
+            assert!((have - want).abs() <= 1e-2 * want.abs().max(1e-3) + 1e-4, "t {t} row {r} feature {f}: {have} vs {want}");
+        }
+    }
+    }
+}

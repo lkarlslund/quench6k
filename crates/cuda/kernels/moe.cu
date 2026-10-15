@@ -560,6 +560,84 @@ __global__ void __launch_bounds__(EW * 32) gate_up_kernel(const __nv_bfloat16* _
         }
 }
 
+// Multi-row variant of gate_up_kernel: half-warp h of warp w owns feature 2w + h and streams both its
+// gate and up rows, so each activation chunk it loads serves two weight rows. Same per-row arithmetic
+// and reduction order as gate_up_kernel (chunk k = (hl + 16 c) * 32; lanes 0..15 sum, gate then up).
+template <int MAXR>
+__global__ void __launch_bounds__(EW * 32) gate_up_pair_kernel(const __nv_bfloat16* __restrict__ m,
+                                                               const int* __restrict__ row_token,
+                                                               const uint64_t* __restrict__ gw,
+                                                               const uint64_t* __restrict__ gs, const float* __restrict__ g2,
+                                                               const uint64_t* __restrict__ uw,
+                                                               const uint64_t* __restrict__ us, const float* __restrict__ u2,
+                                                               const int* __restrict__ offsets,
+                                                               const int* __restrict__ active,
+                                                               const int* __restrict__ num_active, __nv_bfloat16* act) {
+    constexpr int N = 640, K = D, CHUNKS = K / 32 / 16;
+    pdl_wait();
+    if ((int)blockIdx.y >= *num_active) return;
+    const int e = active[blockIdx.y];
+    const int r0 = offsets[e], rows = min(offsets[e + 1] - r0, MAXR);
+    const int lane = threadIdx.x & 31, half = lane >> 4, hl = lane & 15;
+    const int n = (blockIdx.x * EW + (threadIdx.x >> 5)) * 2 + half;
+    const uint8_t* G = reinterpret_cast<const uint8_t*>(gw[e]) + (size_t)n * (K / 2);
+    const uint8_t* GS = reinterpret_cast<const uint8_t*>(gs[e]) + (size_t)n * (K / 16);
+    const uint8_t* U = reinterpret_cast<const uint8_t*>(uw[e]) + (size_t)n * (K / 2);
+    const uint8_t* US = reinterpret_cast<const uint8_t*>(us[e]) + (size_t)n * (K / 16);
+    uint4 gc[CHUNKS], uc[CHUNKS];
+    uint16_t gsc[CHUNKS], usc[CHUNKS];
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int k = (hl + 16 * c) * 32;
+        gc[c] = __ldg(reinterpret_cast<const uint4*>(G + k / 2));
+        uc[c] = __ldg(reinterpret_cast<const uint4*>(U + k / 2));
+        gsc[c] = __ldg(reinterpret_cast<const uint16_t*>(GS + k / 16));
+        usc[c] = __ldg(reinterpret_cast<const uint16_t*>(US + k / 16));
+    }
+    const __nv_bfloat16* xrow[MAXR];
+#pragma unroll
+    for (int mm = 0; mm < MAXR; ++mm) xrow[mm] = m + (size_t)row_token[r0 + min(mm, rows - 1)] * K;
+    float ag[MAXR] = {}, au[MAXR] = {};
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int k = (hl + 16 * c) * 32;
+        float wg[32], wu[32];
+        decode32(gc[c], gsc[c], wg);
+        decode32(uc[c], usc[c], wu);
+#pragma unroll
+        for (int mm = 0; mm < MAXR; ++mm) {
+            if (mm >= rows) break;
+            const uint4* xp = reinterpret_cast<const uint4*>(xrow[mm] + k);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const uint4 xv = __ldg(xp + q);
+                const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(&xv);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float2 xf = __bfloat1622float2(x2[i]);
+                    ag[mm] = fmaf(wg[q * 8 + 2 * i], xf.x, ag[mm]);
+                    ag[mm] = fmaf(wg[q * 8 + 2 * i + 1], xf.y, ag[mm]);
+                    au[mm] = fmaf(wu[q * 8 + 2 * i], xf.x, au[mm]);
+                    au[mm] = fmaf(wu[q * 8 + 2 * i + 1], xf.y, au[mm]);
+                }
+            }
+        }
+    }
+    pdl_launch_dependents();
+    const float sg = g2[e], su = u2[e];
+#pragma unroll
+    for (int mm = 0; mm < MAXR; ++mm) {
+        if (mm >= rows) break;
+        float g = ag[mm], u = au[mm];
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) {
+            g += __shfl_xor_sync(0xffffffff, g, o);
+            u += __shfl_xor_sync(0xffffffff, u, o);
+        }
+        if (hl == 0) act[(size_t)(r0 + mm) * N + n] = f2bf(silu(g * sg) * (u * su));
+    }
+}
+
 // yd[row, n] = down_e[n] . act[row] for every row of active expert e. grid (2560 / 64, active slots):
 // each warp owns 8 features with 4 lanes per feature, five 32-weight chunks per lane loaded up front.
 template <int MAXR>
@@ -938,12 +1016,11 @@ extern "C" cudaError_t squash_moe_gate_up_small(const void* m, const int* row_to
                                                 const int* active, const int* num_active, int max_active, int T,
                                                 void* act, cudaStream_t st) {
     if (max_active == 0) return cudaSuccess;
-    // One feature per warp beyond a single row per expert: fewer registers, more blocks in flight.
-    const int feat = T <= 1 ? 2 : 1;
-    const dim3 grid(640 / (EW * feat), max_active);
+    // Two features per warp, each half-warp streaming one feature's gate and up rows.
+    const dim3 grid(640 / (EW * 2), max_active);
     const auto* x = static_cast<const __nv_bfloat16*>(m);
     auto* a = static_cast<__nv_bfloat16*>(act);
-#define SQ_GU(R) SQ_CHECK_LAUNCH(sq_launch(gate_up_kernel<R, (R == 1 ? 2 : 1)>, grid, EW * 32, 0, st, x, row_token, gw, gs, g2, uw, us, u2, offsets, active, num_active, a))
+#define SQ_GU(R) SQ_CHECK_LAUNCH(sq_launch(gate_up_pair_kernel<R>, grid, EW * 32, 0, st, x, row_token, gw, gs, g2, uw, us, u2, offsets, active, num_active, a))
     if (T <= 1) SQ_GU(1);
     else if (T <= 2) SQ_GU(2);
     else if (T <= 4) SQ_GU(4);
