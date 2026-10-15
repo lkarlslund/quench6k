@@ -544,6 +544,7 @@ __global__ void __launch_bounds__(EW * 32) gate_up_kernel(const __nv_bfloat16* _
         }
     }
     const float sg = g2[e], su = u2[e];
+    // Nothing of the successor can start before this kernel's results: signal at the end.
     pdl_launch_dependents();
 #pragma unroll
     for (int f = 0; f < FEAT; ++f)
@@ -594,6 +595,7 @@ __global__ void __launch_bounds__(EW * 32) down_kernel(const __nv_bfloat16* __re
         for (int mm = 0; mm < MAXR; ++mm)
             if (mm < rows) chunk_dot(w, act + (size_t)(r0 + mm) * K + k, acc[mm]);
     }
+    // Nothing of the successor can start before this kernel's results: signal at the end.
     pdl_launch_dependents();
     const float s = d2[e];
 #pragma unroll
@@ -620,6 +622,7 @@ __global__ void __launch_bounds__(256) shared_combine_kernel(const float* __rest
                                                               const float* __restrict__ yd,
                                                               const int* __restrict__ pair_row,
                                                               const float* __restrict__ top_w, float* y) {
+    pdl_launch_dependents();
     constexpr int K = 640, GATE = 512, UP = 1152, SG = 1792;
     const int lane = threadIdx.x & 31, n = blockIdx.x * 8 + (threadIdx.x >> 5);
     const uint8_t* row = W + (size_t)n * K * elem_bytes<F>();
@@ -661,9 +664,150 @@ __global__ void __launch_bounds__(256) shared_combine_kernel(const float* __rest
         routed = warp_sum(routed);
         if (lane == 0) y[(size_t)t * D + n] = routed + sigmoidf(proj[(size_t)t * ld + SG]) * v;
     }
-    // The successor is the cooperative HyperConnection kernel, which needs every SM's resources at
-    // once: let it launch only as this kernel's blocks finish.
+}
+
+
+// ---- single-token decode: routing fused into the expert gate/up kernel ------------------------
+
+// Softmax over the 512 router logits and top-10 (ties: lower expert), renormalized; computed by one
+// warp, results in shared memory. Identical in every block that calls it.
+SQ_DEVICE void route_one(const float* logits, int lane, int* s_top, float* s_w) {
+    float v[E / 32];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < E / 32; ++j) {
+        v[j] = logits[j * 32 + lane];
+        mx = fmaxf(mx, v[j]);
+    }
+    mx = warp_max(mx);
+    float sum = 0;
+#pragma unroll
+    for (int j = 0; j < E / 32; ++j) {
+        v[j] = __expf(v[j] - mx);
+        sum += v[j];
+    }
+    sum = warp_sum(sum);
+    float chosen_sum = 0;
+    for (int r = 0; r < TOPK; ++r) {
+        float best = -1;
+        int best_i = 0x7fffffff;
+#pragma unroll
+        for (int j = 0; j < E / 32; ++j)
+            if (v[j] > best) {
+                best = v[j];
+                best_i = j * 32 + lane;
+            }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ob = __shfl_xor_sync(0xffffffff, best, o);
+            const int oi = __shfl_xor_sync(0xffffffff, best_i, o);
+            if (ob > best || (ob == best && oi < best_i)) {
+                best = ob;
+                best_i = oi;
+            }
+        }
+        if (lane == 0) {
+            s_top[r] = best_i;
+            s_w[r] = best / sum;
+        }
+        chosen_sum += best / sum;
+        if ((best_i & 31) == lane) v[best_i / 32] = -2;
+    }
+    if (lane == 0)
+        for (int r = 0; r < TOPK; ++r) s_w[r] /= chosen_sum;
+}
+
+// grid (640 / 16, 10 routing slots). Each block routes the token itself, then computes
+// act[slot, n] = silu(gate_e . m) * (up_e . m) for expert e = top[slot]; block (0, 0) publishes
+// top_i/top_w and pair_row[k] = k for the down and combine kernels.
+__global__ void __launch_bounds__(EW * 32) gate_up_t1_kernel(const __nv_bfloat16* __restrict__ m,
+                                                             const float* __restrict__ logits,
+                                                             const uint64_t* __restrict__ gw, const uint64_t* __restrict__ gs,
+                                                             const float* __restrict__ g2, const uint64_t* __restrict__ uw,
+                                                             const uint64_t* __restrict__ us, const float* __restrict__ u2,
+                                                             int* top_i, float* top_w, int* pair_row,
+                                                             __nv_bfloat16* act) {
+    constexpr int N = 640, K = D, CHUNKS = K / 32 / 16, FEAT = 2;
+    __shared__ int s_top[TOPK];
+    __shared__ float s_w[TOPK];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, half = lane >> 4, hl = lane & 15;
+    pdl_wait();
+    if (warp == 0) route_one(logits, lane, s_top, s_w);
+    __syncthreads();
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x < TOPK) {
+        top_i[threadIdx.x] = s_top[threadIdx.x];
+        top_w[threadIdx.x] = s_w[threadIdx.x];
+        pair_row[threadIdx.x] = threadIdx.x;
+    }
+    const int slot = blockIdx.y, e = s_top[slot];
+    const int n0 = (blockIdx.x * EW + warp) * FEAT;
+    const uint8_t* W = reinterpret_cast<const uint8_t*>(half ? uw[e] : gw[e]) + (size_t)n0 * (K / 2);
+    const uint8_t* Sc = reinterpret_cast<const uint8_t*>(half ? us[e] : gs[e]) + (size_t)n0 * (K / 16);
+    uint4 codes[FEAT][CHUNKS];
+    uint16_t scales[FEAT][CHUNKS];
+#pragma unroll
+    for (int f = 0; f < FEAT; ++f)
+#pragma unroll
+        for (int c = 0; c < CHUNKS; ++c) {
+            const int k = (hl + 16 * c) * 32;
+            codes[f][c] = __ldg(reinterpret_cast<const uint4*>(W + (size_t)f * (K / 2) + k / 2));
+            scales[f][c] = __ldg(reinterpret_cast<const uint16_t*>(Sc + (size_t)f * (K / 16) + k / 16));
+        }
+    float acc[FEAT] = {};
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int k = (hl + 16 * c) * 32;
+#pragma unroll
+        for (int f = 0; f < FEAT; ++f) {
+            float w[32];
+            decode32(codes[f][c], scales[f][c], w);
+            chunk_dot(w, m + k, acc[f]);
+        }
+    }
     pdl_launch_dependents();
+    const float sg = g2[e], su = u2[e];
+#pragma unroll
+    for (int f = 0; f < FEAT; ++f) {
+        float v = acc[f];
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+        const float other = __shfl_xor_sync(0xffffffff, v, 16);
+        if (lane == 0) act[(size_t)slot * N + n0 + f] = f2bf(silu(v * sg) * (other * su));
+    }
+}
+
+// grid (2560 / 64, 10 slots): yd[slot, n] = down_e[n] . act[slot] with e = top_i[slot].
+__global__ void __launch_bounds__(EW * 32) down_t1_kernel(const __nv_bfloat16* __restrict__ act,
+                                                          const uint64_t* __restrict__ dw, const uint64_t* __restrict__ ds,
+                                                          const float* __restrict__ d2, const int* __restrict__ top_i,
+                                                          float* yd) {
+    constexpr int K = 640, CHUNKS = K / 32 / 4;
+    pdl_wait();
+    const int slot = blockIdx.y, e = top_i[slot];
+    const int lane = threadIdx.x & 31, q = lane & 3;
+    const int n = (blockIdx.x * EW + (threadIdx.x >> 5)) * 8 + (lane >> 2);
+    const uint8_t* W = reinterpret_cast<const uint8_t*>(dw[e]) + (size_t)n * (K / 2);
+    const uint8_t* Sc = reinterpret_cast<const uint8_t*>(ds[e]) + (size_t)n * (K / 16);
+    uint4 codes[CHUNKS];
+    uint16_t scales[CHUNKS];
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int k = (q + 4 * c) * 32;
+        codes[c] = __ldg(reinterpret_cast<const uint4*>(W + k / 2));
+        scales[c] = __ldg(reinterpret_cast<const uint16_t*>(Sc + k / 16));
+    }
+    float acc = 0;
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int k = (q + 4 * c) * 32;
+        float w[32];
+        decode32(codes[c], scales[c], w);
+        chunk_dot(w, act + (size_t)slot * K + k, acc);
+    }
+    pdl_launch_dependents();
+    acc += __shfl_xor_sync(0xffffffff, acc, 2);
+    acc += __shfl_xor_sync(0xffffffff, acc, 1);
+    if (q == 0) yd[(size_t)slot * D + n] = acc * d2[e];
 }
 
 }  // namespace
@@ -806,5 +950,20 @@ extern "C" cudaError_t squash_moe_shared_combine(int fmt, const float* proj, int
     }
 #undef SQ_SC_T
 #undef SQ_SC
+    SQ_RETURN_LAUNCH();
+}
+
+// Single-token MoE experts: routing (from the router logits row) fused into gate/up, then down.
+// Writes top_i, top_w, pair_row (= slot) and yd [10, 2560] for squash_moe_shared_combine.
+extern "C" cudaError_t squash_moe_experts_t1(const void* m, const float* logits, const uint64_t* gw, const uint64_t* gs,
+                                            const float* g2, const uint64_t* uw, const uint64_t* us, const float* u2,
+                                            const uint64_t* dw, const uint64_t* ds, const float* d2, int* top_i,
+                                            float* top_w, int* pair_row, void* act, float* yd, cudaStream_t st) {
+    const auto* mb = static_cast<const __nv_bfloat16*>(m);
+    auto* ab = static_cast<__nv_bfloat16*>(act);
+    SQ_CHECK_LAUNCH(sq_launch(gate_up_t1_kernel, dim3(640 / (EW * 2), TOPK), EW * 32, 0, st, mb, logits, gw, gs, g2, uw, us,
+                              u2, top_i, top_w, pair_row, ab));
+    SQ_CHECK_LAUNCH(sq_launch(down_t1_kernel, dim3(D / (EW * 8), TOPK), EW * 32, 0, st, static_cast<const __nv_bfloat16*>(ab),
+                              dw, ds, d2, static_cast<const int*>(top_i), yd));
     SQ_RETURN_LAUNCH();
 }

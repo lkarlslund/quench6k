@@ -322,3 +322,14 @@ pub fn hc_small(s: &Stream, h: u64, t: usize, y: u64, inj_prev: u64, down: Weigh
 pub fn moe_shared_combine(s: &Stream, proj: u64, ld: usize, t: usize, down: Weight, yd: u64, pair_row: u64, top_w: u64, y: u64) -> Result<()> {
     launch!("moe_shared_combine", ffi::squash_moe_shared_combine(down.0 as i32, f(proj), n32(ld), n32(t), p(down.1), opt_f(down.2), f(yd), i(pair_row), f(top_w), fm(y), s.raw()))
 }
+
+/// Single-token MoE experts with routing fused into the gate/up kernel (see the kernel). Tables are
+/// (codes, scales, weight_scale_2) device arrays over the 512 experts.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_t1(s: &Stream, m: u64, logits: u64, gate: (u64, u64, u64), up: (u64, u64, u64), down: (u64, u64, u64), top_i: u64, top_w: u64, pair_row: u64, act: u64, yd: u64) -> Result<()> {
+    let t = |a: u64| a as *const u64;
+    launch!(
+        "moe_experts_t1",
+        ffi::squash_moe_experts_t1(p(m), f(logits), t(gate.0), t(gate.1), f(gate.2), t(up.0), t(up.1), f(up.2), t(down.0), t(down.1), f(down.2), im(top_i), fm(top_w), im(pair_row), pm(act), fm(yd), s.raw())
+    )
+}

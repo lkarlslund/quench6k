@@ -95,6 +95,7 @@ pub mod ffi {
         pub fn squash_moe_gate_up_small(m: *const c_void, row_token: *const i32, gw: *const u64, gs: *const u64, g2: *const f32, uw: *const u64, us: *const u64, u2: *const f32, offsets: *const i32, active: *const i32, num_active: *const i32, max_active: c_int, t: c_int, act: *mut c_void, stream: Stream) -> Error;
         pub fn squash_moe_down_small(act: *const c_void, dw: *const u64, ds: *const u64, d2: *const f32, offsets: *const i32, active: *const i32, num_active: *const i32, max_active: c_int, t: c_int, yd: *mut f32, stream: Stream) -> Error;
         pub fn squash_moe_shared_combine(fmt: c_int, proj: *const f32, ld: c_int, t: c_int, w: *const c_void, scale: *const f32, yd: *const f32, pair_row: *const i32, top_w: *const f32, y: *mut f32, stream: Stream) -> Error;
+        pub fn squash_moe_experts_t1(m: *const c_void, logits: *const f32, gw: *const u64, gs: *const u64, g2: *const f32, uw: *const u64, us: *const u64, u2: *const f32, dw: *const u64, ds: *const u64, d2: *const f32, top_i: *mut i32, top_w: *mut f32, pair_row: *mut i32, act: *mut c_void, yd: *mut f32, stream: Stream) -> Error;
         pub fn squash_qsa_split_floats(t: c_int) -> usize;
         pub fn squash_qsa_attention_split(q: *const f32, qg: *const f32, ld: c_int, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: *const i32, t: c_int, part: *mut f32, out: *mut c_void, stream: Stream) -> Error;
         pub fn squash_moe_route(logits: *const f32, ld: c_int, t: c_int, top_i: *mut i32, top_w: *mut f32, stream: Stream) -> Error;

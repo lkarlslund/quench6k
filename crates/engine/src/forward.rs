@@ -451,9 +451,11 @@ pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &
         let (ld, x) = (moe.proj.n, ws.proj);
         let col = |j: usize| x + (moe.proj.col(j) * 4) as u64;
         op!(prof, "moe proj", s, project(s, ws, ws.m, &moe.proj, x, t));
-        if t <= k::moe_small_tokens() {
+        let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
+        if t == 1 {
+            op!(prof, "experts t1", s, k::moe_experts_t1(s, ws.m, col(0), tables(&moe.gate), tables(&moe.up), tables(&moe.down), ws.top_i, ws.top_w, ws.pair_row, ws.act, ws.yd));
+        } else if t <= k::moe_small_tokens() {
             let max_active = (t * TOP_K).min(EXPERTS);
-            let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
             op!(prof, "moe_route_small", s, k::moe_route_small(s, col(0), ld, t, ws.top_i, ws.top_w, ws.offsets, ws.pair_row, ws.row_token, ws.active, ws.num_active));
             op!(prof, "experts gate_up", s, k::moe_gate_up_small(s, ws.m, ws.row_token, tables(&moe.gate), tables(&moe.up), ws.offsets, ws.active, ws.num_active, max_active, t, ws.act));
             op!(prof, "experts down", s, k::moe_down_small(s, ws.act, tables(&moe.down), ws.offsets, ws.active, ws.num_active, max_active, t, ws.yd));
