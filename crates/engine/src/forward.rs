@@ -195,7 +195,7 @@ pub struct Workspace {
     ones: u64,
     /// MTP step block (start, tokens, positions; StepLayout without PLE rows) and its pinned staging,
     /// and the MTP input rows (FP32 [T, 10240]).
-    mtp_step: u64,
+    pub(crate) mtp_step: u64,
     mtp_step_host: PinnedBuffer,
     pub mtp_hin: u64,
     inj2: u64,
@@ -632,7 +632,8 @@ fn layer_forward(layer: &crate::model::Layer, gdn: Option<&GdnState>, gdn_rec: O
         op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, t * TOP_K));
         op!(prof, "experts down", s, grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH));
     }
-    if t <= k::moe_small_tokens() {
+    // The fused shared-expert tail recomputes the SwiGLU input per warp: only worth it for one token.
+    if t == 1 {
         let down = (moe.shared_down.fmt, moe.shared_down.addr, moe.shared_down.scale);
         op!(prof, "moe_shared_combine", s, k::moe_shared_combine(s, x, ld, t, down, ws.yd, ws.pair_row, ws.top_w, ws.y));
     } else {
@@ -668,11 +669,23 @@ pub fn prepare_mtp(ws: &mut Workspace, start: usize, tokens: &[i32]) -> Result<(
 /// preceding hidden rows `hprev` (FP32 [t, 10240], each the pre-mixer residual of the position before
 /// its token). Afterwards `ws.out` holds the MTP mixer output (BF16 [t, 2560]) and `ws.h` the MTP
 /// pre-mixer residual, the `hprev` of the next draft step.
-pub fn forward_mtp(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, hprev: u64, mut prof: Option<&mut Profiler>) -> Result<()> {
+pub fn forward_mtp(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, hprev: u64, prof: Option<&mut Profiler>) -> Result<()> {
+    let layout = StepLayout::new(ws.max_tokens);
+    unsafe { s.copy_h2d(ws.mtp_step, ws.mtp_step_host.as_ptr(), layout.ple)? };
+    forward_mtp_staged(model, state, ws, s, t, hprev, prof)
+}
+
+/// Offsets of the token IDs and positions inside a step block.
+pub fn step_offsets(ws: &Workspace) -> (usize, usize) {
+    let l = StepLayout::new(ws.max_tokens);
+    (l.tokens, l.pos)
+}
+
+/// As [`forward_mtp`], with the MTP step block already on the device at `ws.mtp_step`.
+pub fn forward_mtp_staged(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, hprev: u64, mut prof: Option<&mut Profiler>) -> Result<()> {
     let mtp = model.mtp.as_ref().expect("model loaded without MTP");
     let cache = state.mtp_qsa.as_ref().expect("sequence without MTP cache");
     let layout = StepLayout::new(ws.max_tokens);
-    unsafe { s.copy_h2d(ws.mtp_step, ws.mtp_step_host.as_ptr(), layout.ple)? };
     let start = ws.mtp_step;
     op!(prof, "store_positions", s, k::store_positions(s, ws.mtp_step + layout.pos as u64, state.pos3.addr(), start, t));
     op!(prof, "mtp embed", s, k::embed(s, ws.mtp_step + layout.tokens as u64, t, model.embed, ws.h));
@@ -694,6 +707,11 @@ pub fn forward_profiled(model: &Model, state: &mut SequenceState, ws: &mut Works
     forward_device(model, state, ws, s, new_tokens.len(), bytes, Some(prof))?;
     s.synchronize()?;
     prof.collect()
+}
+
+/// Bytes of step block a step of `t` tokens transfers.
+pub fn step_bytes(ws: &Workspace, t: usize) -> usize {
+    StepLayout::new(ws.max_tokens).used(t)
 }
 
 /// Eager step: [`prepare`] then [`forward_device`].
@@ -746,6 +764,20 @@ impl DecodeGraph {
         times[1] += t1.elapsed().as_secs_f64();
         Ok(i32::from_le_bytes(hw.token_host.as_slice()[..4].try_into().unwrap()))
     }
+}
+
+/// Greedy tokens of `rows` final hidden states (BF16 [rows, 2560]) written to the device i32s at `out`.
+pub fn head_argmax_into(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64, rows: usize, out: u64) -> Result<()> {
+    ensure!(rows <= hw.rows, "head workspace holds {} rows", hw.rows);
+    linear_ld(s, hw.partial.addr(), hidden, D, &model.lm_head, hw.logits.addr(), VOCAB, rows)?;
+    k::argmax(s, hw.logits.addr(), rows, VOCAB, VOCAB, hw.argmax.addr(), out)
+}
+
+/// Greedy draft token for one hidden state through the drafter's NVFP4 LM head, written to `out`.
+pub fn draft_head_argmax_into(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64, out: u64) -> Result<()> {
+    let (codes, scales, scale2) = model.mtp.as_ref().expect("model loaded without MTP").draft_head;
+    k::nvfp4_dense_gemv(s, hidden, codes, scales, scale2, hw.logits.addr(), VOCAB)?;
+    k::argmax(s, hw.logits.addr(), 1, VOCAB, VOCAB, hw.argmax.addr(), out)
 }
 
 /// Greedy next token for one hidden state: LM head, argmax, and a copy of the token to `hw.token_host`.

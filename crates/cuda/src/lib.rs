@@ -100,6 +100,10 @@ pub mod ffi {
         pub fn squash_moe_shared_combine(fmt: c_int, proj: *const f32, ld: c_int, t: c_int, w: *const c_void, scale: *const f32, yd: *const f32, pair_row: *const i32, top_w: *const f32, y: *mut f32, stream: Stream) -> Error;
         pub fn squash_moe_experts_t1(m: *const c_void, logits: *const f32, gw: *const u64, gs: *const u64, g2: *const f32, uw: *const u64, us: *const u64, u2: *const f32, dw: *const u64, ds: *const u64, d2: *const f32, top_i: *mut i32, top_w: *mut f32, pair_row: *mut i32, act: *mut c_void, yd: *mut f32, stream: Stream) -> Error;
         pub fn squash_quantize_nvfp4(w: *const c_void, count: c_int, n: c_int, k: c_int, codes: *mut c_void, scales: *mut c_void, scale2: *mut f32, amax: *mut u32, stream: Stream) -> Error;
+        pub fn squash_spec_layout(field: c_int) -> c_int;
+        pub fn squash_spec_mtp_header(rc: *const i32, hdr: *mut i32, tokens_off: c_int, pos_off: c_int, j: c_int, c: c_int, stream: Stream) -> Error;
+        pub fn squash_spec_accept(rc: *mut i32, ctl: *mut i32, n: c_int, stream: Stream) -> Error;
+        pub fn squash_nvfp4_dense_gemv(x: *const c_void, codes: *const c_void, scales: *const c_void, scale2: *const f32, y: *mut f32, n: c_int, stream: Stream) -> Error;
         pub fn squash_qsa_split_floats(t: c_int) -> usize;
         pub fn squash_qsa_attention_split(q: *const f32, qg: *const f32, ld: c_int, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: *const i32, t: c_int, part: *mut f32, out: *mut c_void, stream: Stream) -> Error;
         pub fn squash_moe_route(logits: *const f32, ld: c_int, t: c_int, top_i: *mut i32, top_w: *mut f32, stream: Stream) -> Error;

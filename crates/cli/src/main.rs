@@ -148,6 +148,12 @@ enum Command {
         drafts: usize,
         #[arg(long, default_value_t = 1024)]
         chunk: usize,
+        /// Run the speculative rounds as CUDA graphs.
+        #[arg(long)]
+        graphs: bool,
+        /// With --graphs, run this many more rounds inside a cudaProfilerStart/Stop region.
+        #[arg(long, default_value_t = 0)]
+        profile_rounds: usize,
     },
     /// Apply the correctness gate (GOAL.md §1) to teacher-forced candidate distributions.
     Gate {
@@ -207,7 +213,7 @@ fn main() -> Result<()> {
         Command::Score { model, precision, fixture, out, suffix, chunk, decode } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode)?,
         Command::Generate { model, precision, fixture, tie } => generate(&model, precision.into(), &fixture, tie)?,
         Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
-        Command::SpecCheck { model, precision, fixture, n, drafts, chunk } => mtp::check(&model, precision.into(), &fixture, n, drafts, chunk)?,
+        Command::SpecCheck { model, precision, fixture, n, drafts, chunk, graphs, profile_rounds } => mtp::check(&model, precision.into(), &fixture, n, drafts, chunk, graphs, profile_rounds)?,
         Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps)?,
         Command::Gate { fixtures, candidates, suffix } => {
             let mut all = true;

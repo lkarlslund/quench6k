@@ -87,7 +87,7 @@ pub fn probe(model_dir: &Path, precision: Precision, fixture: &Path, steps: usiz
 
 /// Generates `n` tokens after a fixture prompt with plain greedy decoding and with MTP speculative
 /// decoding, and checks that both produce exactly the same tokens.
-pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, drafts: usize, chunk: usize) -> Result<()> {
+pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, drafts: usize, chunk: usize, graphs: bool, profile_rounds: usize) -> Result<()> {
     use squash_engine::spec::SpecDecoder;
     #[derive(serde::Deserialize)]
     struct Sequence {
@@ -97,7 +97,7 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
     let seq: Sequence = serde_json::from_slice(&std::fs::read(fixture.join("sequence.json"))?)?;
     let (model, s) = crate::load(model_dir, precision, true)?;
     let prompt = &seq.tokens[..seq.prompt_len];
-    let cap = prompt.len() + n + drafts + 8;
+    let cap = prompt.len() + n + (profile_rounds + 1) * (drafts + 1) + 8;
     let mut ws = Workspace::new(chunk, cap)?;
     let hw = HeadWorkspace::new(1, 1)?;
 
@@ -121,21 +121,36 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
     // Speculative decoding.
     let mut state = SequenceState::with_mtp(cap, true)?;
     let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &s, prompt, drafts, chunk)?;
+    let g = if graphs { Some(squash_engine::spec::SpecGraphs::capture(&model, &state, &mut ws, &dec, &s)?) } else { None };
     let t0 = std::time::Instant::now();
     let mut spec = Vec::with_capacity(n + drafts);
     while spec.len() < n {
-        spec.extend(dec.round(&model, &mut state, &mut ws, &s)?);
+        match &g {
+            Some(g) => spec.extend(g.round(&model, &mut state, &mut ws, &mut dec, &s)?),
+            None => spec.extend(dec.round(&model, &mut state, &mut ws, &s)?),
+        }
     }
     let spec_secs = t0.elapsed().as_secs_f64();
+    if let Some(g) = &g {
+        if profile_rounds > 0 {
+            squash_cuda::profiler_start()?;
+            for _ in 0..profile_rounds {
+                g.round(&model, &mut state, &mut ws, &mut dec, &s)?;
+            }
+            squash_cuda::profiler_stop()?;
+        }
+    }
     spec.truncate(n);
     let first_diff = plain.iter().zip(&spec).position(|(a, b)| a != b);
     println!(
-        "plain {:.1} tok/s eager, speculative {:.1} tok/s eager ({} rounds, {:.2} tokens per round)",
+        "plain {:.1} tok/s eager, speculative {:.1} tok/s {} ({} rounds, {:.2} tokens per round)",
         n as f64 / plain_secs,
         n as f64 / spec_secs,
+        if graphs { "with graphs" } else { "eager" },
         dec.rounds,
         (dec.accepted + dec.rounds) as f64 / dec.rounds as f64
     );
+    println!("per round: draft {:.3} ms, verify {:.3} ms", 1e3 * dec.draft_secs / dec.rounds as f64, 1e3 * dec.verify_secs / dec.rounds as f64);
     match first_diff {
         None => println!("spec-check: {n}/{n} tokens identical to plain greedy decoding"),
         Some(i) => anyhow::bail!("spec-check FAILED: token {i}: plain {} vs speculative {}", plain[i], spec[i]),

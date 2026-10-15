@@ -372,3 +372,24 @@ pub fn quantize_nvfp4(s: &Stream, w: u64, count: usize, n: usize, k: usize, code
 pub fn rmsnorm_rows(s: &Stream, x: u64, ldx: usize, w: u64, out: u64, rows: usize) -> Result<()> {
     launch!("rmsnorm_rows", ffi::squash_rmsnorm_rows(f(x), n32(ldx), p(w), pm(out), n32(rows), s.raw()))
 }
+
+/// Layout of the speculative round control buffer: (max drafts, draft offset, greedy offset, ints).
+pub fn spec_layout() -> (usize, usize, usize, usize) {
+    unsafe { (ffi::squash_spec_layout(0) as usize, ffi::squash_spec_layout(1) as usize, ffi::squash_spec_layout(2) as usize, ffi::squash_spec_layout(3) as usize) }
+}
+
+/// Builds MTP step `j`'s step block from the round control buffer (`c` catch-up tokens at step 0).
+#[allow(clippy::too_many_arguments)]
+pub fn spec_mtp_header(s: &Stream, rc: u64, hdr: u64, tokens_off: usize, pos_off: usize, j: usize, c: usize) -> Result<()> {
+    launch!("spec_mtp_header", ffi::squash_spec_mtp_header(i(rc), im(hdr), n32(tokens_off), n32(pos_off), n32(j), n32(c), s.raw()))
+}
+
+/// Accepts a verification of `n` drafts (see the kernel) and updates the round and control words.
+pub fn spec_accept(s: &Stream, rc: u64, ctl: u64, n: usize) -> Result<()> {
+    launch!("spec_accept", ffi::squash_spec_accept(im(rc), im(ctl), n32(n), s.raw()))
+}
+
+/// y[n] = scale2 · W[n] · x for one BF16 token x of 2560, W NVFP4 [n, 2560] (codes, block scales, scale2).
+pub fn nvfp4_dense_gemv(s: &Stream, x: u64, codes: u64, scales: u64, scale2: u64, y: u64, n: usize) -> Result<()> {
+    launch!("nvfp4_dense_gemv", ffi::squash_nvfp4_dense_gemv(p(x), p(codes), p(scales), f(scale2), fm(y), n32(n), s.raw()))
+}

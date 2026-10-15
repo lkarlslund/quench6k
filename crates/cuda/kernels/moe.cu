@@ -810,6 +810,43 @@ __global__ void __launch_bounds__(EW * 32) down_t1_kernel(const __nv_bfloat16* _
     if (q == 0) yd[(size_t)slot * D + n] = acc * d2[e];
 }
 
+
+// Dense NVFP4 GEMV for one token over K = 2560: y[n] = scale2 * W[n] . x, W in the checkpoint NVFP4
+// layout (codes [N, 1280], block scales [N, 160]). Used for the drafter's quantized LM head. A warp
+// owns two rows; lanes 0-15 and 16-31 each stream one row, five 32-weight chunks per lane.
+__global__ void __launch_bounds__(EW * 32) nvfp4_dense_kernel(const __nv_bfloat16* __restrict__ x,
+                                                              const uint8_t* __restrict__ codes,
+                                                              const uint8_t* __restrict__ scales, const float* scale2,
+                                                              float* y, int N) {
+    constexpr int K = D, CHUNKS = K / 32 / 16;
+    pdl_launch_dependents();
+    const int lane = threadIdx.x & 31, half = lane >> 4, hl = lane & 15;
+    const int n = (blockIdx.x * EW + (threadIdx.x >> 5)) * 2 + half;
+    const int row = min(n, N - 1);
+    const uint8_t* W = codes + (size_t)row * (K / 2);
+    const uint8_t* Sc = scales + (size_t)row * (K / 16);
+    uint4 c[CHUNKS];
+    uint16_t sc[CHUNKS];
+#pragma unroll
+    for (int i = 0; i < CHUNKS; ++i) {
+        const int k = (hl + 16 * i) * 32;
+        c[i] = __ldg(reinterpret_cast<const uint4*>(W + k / 2));
+        sc[i] = __ldg(reinterpret_cast<const uint16_t*>(Sc + k / 16));
+    }
+    pdl_wait();
+    float acc = 0;
+#pragma unroll
+    for (int i = 0; i < CHUNKS; ++i) {
+        const int k = (hl + 16 * i) * 32;
+        float w[32];
+        decode32(c[i], sc[i], w);
+        chunk_dot(w, x + k, acc);
+    }
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, o);
+    if (hl == 0 && n < N) y[n] = acc * *scale2;
+}
+
 }  // namespace
 
 extern "C" int squash_moe_tile_rows() { return BM; }
@@ -965,5 +1002,13 @@ extern "C" cudaError_t squash_moe_experts_t1(const void* m, const float* logits,
                               u2, top_i, top_w, pair_row, ab));
     SQ_CHECK_LAUNCH(sq_launch(down_t1_kernel, dim3(D / (EW * 8), TOPK), EW * 32, 0, st, static_cast<const __nv_bfloat16*>(ab),
                               dw, ds, d2, static_cast<const int*>(top_i), yd));
+    SQ_RETURN_LAUNCH();
+}
+
+extern "C" cudaError_t squash_nvfp4_dense_gemv(const void* x, const void* codes, const void* scales, const float* scale2,
+                                               float* y, int N, cudaStream_t st) {
+    SQ_CHECK_LAUNCH(sq_launch(nvfp4_dense_kernel, (N + 2 * EW - 1) / (2 * EW), EW * 32, 0, st,
+                              static_cast<const __nv_bfloat16*>(x), static_cast<const uint8_t*>(codes),
+                              static_cast<const uint8_t*>(scales), scale2, y, N));
     SQ_RETURN_LAUNCH();
 }
