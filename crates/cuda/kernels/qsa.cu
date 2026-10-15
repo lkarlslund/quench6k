@@ -249,7 +249,7 @@ __global__ void __launch_bounds__(ATT_THREADS) attention_kernel(const float* __r
 
 // ---- split-key attention for small batches -------------------------------------------------
 // A query attends to at most 512 * 4 + 3 = 2051 keys, so SPLITS chunks of CHUNK keys always cover it.
-constexpr int CHUNK = 32, SPLITS = (TOPG * GROUP + GROUP - 1 + CHUNK - 1) / CHUNK;
+constexpr int CHUNK = 64, SPLITS = (TOPG * GROUP + GROUP - 1 + CHUNK - 1) / CHUNK;
 
 SQ_DEVICE int key_at(int i, bool dense, const int* sel_row, int tail_begin) {
     return dense ? i : (i < TOPG * GROUP ? sel_row[i / GROUP] * GROUP + i % GROUP : tail_begin + i - TOPG * GROUP);

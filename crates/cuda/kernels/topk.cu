@@ -157,12 +157,6 @@ extern "C" cudaError_t squash_row_lse(const float* x, int rows, int n, size_t ld
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_qsa_select(const float* scores, int T, size_t ld, const int* start, int* sel,
-                                         cudaStream_t st) {
-    if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(topk_kernel, T, THREADS, 0, st, scores, 0, ld, MAXK, 1, sel, nullptr, start, 4));
-    SQ_RETURN_LAUNCH();
-}
 
 namespace {
 
@@ -256,5 +250,122 @@ extern "C" cudaError_t squash_argmax(const float* x, int rows, int n, size_t ld,
     int* pi = reinterpret_cast<int*>(pv + (size_t)rows * slices);
     SQ_CHECK_LAUNCH(sq_launch(argmax_partial_kernel, dim3(slices, rows), 1024, 0, st, x, n, ld, pv, pi));
     SQ_CHECK_LAUNCH(sq_launch(argmax_final_kernel, rows, 32, 0, st, pv, pi, slices, out));
+    SQ_RETURN_LAUNCH();
+}
+
+namespace {
+
+// QSA group selection: per query row, the 512 highest-scoring complete groups, written in ascending
+// group order. Exact radix selection in three passes (11, 11, 10 bits) over order-preserving keys;
+// ties at the threshold go to the lowest group indices. Each thread owns a contiguous range of the
+// row, so the compaction is a prefix sum over thread counts: deterministic and already sorted.
+constexpr int SEL_THREADS = 1024, SEL_K = 512, SEL_BINS = 2048;
+
+// Inclusive prefix sum over the block's per-thread values (1024 threads). `scratch` holds 32 ints.
+SQ_DEVICE int block_inclusive_scan(int v, int* scratch) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int n = __shfl_up_sync(0xffffffff, v, o);
+        if (lane >= o) v += n;
+    }
+    __syncthreads();
+    if (lane == 31) scratch[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        int w = scratch[lane];
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int n = __shfl_up_sync(0xffffffff, w, o);
+            if (lane >= o) w += n;
+        }
+        scratch[lane] = w;
+    }
+    __syncthreads();
+    return v + (warp > 0 ? scratch[warp - 1] : 0);
+}
+
+__global__ void __launch_bounds__(SEL_THREADS) qsa_select_kernel(const float* __restrict__ scores, size_t ld,
+                                                                 const int* __restrict__ start_ptr, int group,
+                                                                 int* out) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ int hist[SEL_BINS];
+    __shared__ int scratch[32];
+    __shared__ unsigned s_prefix, s_mask;
+    __shared__ int s_remaining;
+    const int n = (*start_ptr + (int)blockIdx.x + 1) / group;
+    if (n <= SEL_K) return;  // dense row
+    const float* row = scores + blockIdx.x * ld;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    if (tid == 0) {
+        s_prefix = 0;
+        s_mask = 0;
+        s_remaining = SEL_K;
+    }
+    const int shifts[3] = {21, 10, 0}, widths[3] = {11, 11, 10};
+    for (int pass = 0; pass < 3; ++pass) {
+        const int shift = shifts[pass], bins = 1 << widths[pass];
+        for (int b = tid; b < SEL_BINS; b += SEL_THREADS) hist[b] = 0;
+        __syncthreads();
+        const unsigned prefix = s_prefix, mask = s_mask;
+        for (int i = tid; i < n; i += SEL_THREADS) {
+            const unsigned u = order_key(row[i]);
+            if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & (bins - 1)], 1);
+        }
+        __syncthreads();
+        // Find the bin holding the remaining-th largest key: warp w sums bins [64 w, 64 w + 64).
+        const int per_warp = SEL_BINS / 32;
+        int wsum = 0;
+        for (int b = lane; b < per_warp; b += 32) wsum += hist[warp * per_warp + b];
+        wsum = __reduce_add_sync(0xffffffff, wsum);
+        if (lane == 0) scratch[warp] = wsum;
+        __syncthreads();
+        if (tid == 0) {
+            int above = 0, w = 31;
+            for (; w > 0; --w) {
+                if (above + scratch[w] >= s_remaining) break;
+                above += scratch[w];
+            }
+            int b = w * per_warp + per_warp - 1;
+            for (; b > w * per_warp; --b) {
+                if (above + hist[b] >= s_remaining) break;
+                above += hist[b];
+            }
+            s_remaining -= above;
+            s_prefix |= (unsigned)b << shift;
+            s_mask |= (unsigned)(bins - 1) << shift;
+        }
+        __syncthreads();
+    }
+    const unsigned threshold = s_prefix;
+    const int take_equal = s_remaining;
+    // Compaction over contiguous per-thread ranges.
+    const int per = (n + SEL_THREADS - 1) / SEL_THREADS, b0 = min(n, tid * per), b1 = min(n, b0 + per);
+    int gt = 0, eq = 0;
+    for (int i = b0; i < b1; ++i) {
+        const unsigned u = order_key(row[i]);
+        gt += u > threshold;
+        eq += u == threshold;
+    }
+    const int eq_before = block_inclusive_scan(eq, scratch) - eq;
+    const int eq_take = max(0, min(eq, take_equal - eq_before));
+    const int mine = gt + eq_take;
+    int pos = block_inclusive_scan(mine, scratch) - mine;
+    int eq_seen = 0;
+    int* dst = out + (size_t)blockIdx.x * SEL_K;
+    for (int i = b0; i < b1; ++i) {
+        const unsigned u = order_key(row[i]);
+        if (u > threshold || (u == threshold && eq_seen++ < eq_take)) dst[pos++] = i;
+    }
+    (void)lane;
+}
+
+}  // namespace
+
+extern "C" cudaError_t squash_qsa_select(const float* scores, int T, size_t ld, const int* start, int* sel,
+                                            cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(qsa_select_kernel, T, SEL_THREADS, 0, st, scores, ld, start, 4, sel));
     SQ_RETURN_LAUNCH();
 }
