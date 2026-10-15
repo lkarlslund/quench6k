@@ -47,6 +47,8 @@ pub mod ffi {
         pub fn cudaStreamBeginCapture(stream: Stream, mode: c_int) -> Error;
         pub fn cudaStreamEndCapture(stream: Stream, graph: *mut *mut c_void) -> Error;
         pub fn cudaGraphInstantiateWithFlags(exec: *mut *mut c_void, graph: *mut c_void, flags: u64) -> Error;
+        pub fn cudaProfilerStart() -> Error;
+        pub fn cudaProfilerStop() -> Error;
         pub fn cudaGraphLaunch(exec: *mut c_void, stream: Stream) -> Error;
         pub fn cudaGraphExecDestroy(exec: *mut c_void) -> Error;
         pub fn cudaGraphDestroy(graph: *mut c_void) -> Error;
@@ -125,6 +127,15 @@ pub fn set_device(device: i32) -> Result<()> {
 
 pub fn synchronize() -> Result<()> {
     check(unsafe { ffi::cudaDeviceSynchronize() }, "cudaDeviceSynchronize")
+}
+
+/// Brackets the region an external profiler (`ncu --profile-from-start off`) collects.
+pub fn profiler_start() -> Result<()> {
+    check(unsafe { ffi::cudaProfilerStart() }, "cudaProfilerStart")
+}
+
+pub fn profiler_stop() -> Result<()> {
+    check(unsafe { ffi::cudaProfilerStop() }, "cudaProfilerStop")
 }
 
 /// Free and total device memory in bytes.

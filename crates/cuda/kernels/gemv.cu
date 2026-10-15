@@ -84,7 +84,33 @@ SQ_DEVICE void load_x8(const float* x, float* out) {
     out[0] = a.x, out[1] = a.y, out[2] = a.z, out[3] = a.w, out[4] = b.x, out[5] = b.y, out[6] = b.z, out[7] = b.w;
 }
 
-// grid (ceil(N / 16), splits). Each split covers k_per_split columns (a multiple of 256).
+// Loads 16 consecutive weights starting at element k as floats (scale not applied).
+template <WFmt F>
+SQ_DEVICE void load16(const uint8_t* row, int k, float* w) {
+    if constexpr (F == WFmt::BF16) {
+        load8<F>(row, k, w);
+        load8<F>(row, k + 8, w + 8);
+    } else {
+        const uint4 v = __ldg(reinterpret_cast<const uint4*>(row + k));
+        if constexpr (F == WFmt::FP8) {
+            const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&v);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(p[i], __NV_E4M3);
+                const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+                w[2 * i] = f.x;
+                w[2 * i + 1] = f.y;
+            }
+        } else {
+            const int8_t* p = reinterpret_cast<const int8_t*>(&v);
+#pragma unroll
+            for (int i = 0; i < 16; ++i) w[i] = (float)p[i];
+        }
+    }
+}
+
+// grid (ceil(N / 16), splits). Each split covers k_per_split columns (a multiple of 512). Lanes walk
+// 16-weight chunks with a 512-column stride, two chunks per step so two loads per lane are in flight.
 template <WFmt F, int M, typename XT>
 __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X, int ldx,
                                                        const uint8_t* __restrict__ W, const float* __restrict__ row_scale,
@@ -98,21 +124,34 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X,
         const int n = blockIdx.x * ROWS_PER_CTA + warp * ROWS_PER_WARP + r;
         if (n >= N) break;
         const uint8_t* row = W + n * row_bytes;
+        const float* gscale = F == WFmt::INT8G ? row_scale + (size_t)n * (K / GROUP) : nullptr;
         float acc[M] = {};
-        for (int k = k_begin + lane * 8; k < k_end; k += 256) {
-            float w[8];
-            load8<F>(row, k, w);
-            if constexpr (F == WFmt::INT8G) {
-                const float gs = __ldg(row_scale + (size_t)n * (K / GROUP) + k / GROUP);
+        for (int k0 = k_begin + lane * 16; k0 < k_end; k0 += 2 * 512) {
+            float w[2][16];
+            bool live[2];
 #pragma unroll
-                for (int i = 0; i < 8; ++i) w[i] *= gs;
+            for (int u = 0; u < 2; ++u) {
+                const int k = k0 + u * 512;
+                live[u] = k < k_end;
+                if (live[u]) load16<F>(row, k, w[u]);
             }
 #pragma unroll
-            for (int m = 0; m < M; ++m) {
-                float xf[8];
-                load_x8(X + (size_t)m * ldx + k, xf);
+            for (int u = 0; u < 2; ++u) {
+                if (!live[u]) continue;
+                const int k = k0 + u * 512;
+                if constexpr (F == WFmt::INT8G) {
+                    const float gs = __ldg(gscale + k / GROUP);
 #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[m] = fmaf(w[i], xf[i], acc[m]);
+                    for (int i = 0; i < 16; ++i) w[u][i] *= gs;
+                }
+#pragma unroll
+                for (int m = 0; m < M; ++m) {
+                    float xf[16];
+                    load_x8(X + (size_t)m * ldx + k, xf);
+                    load_x8(X + (size_t)m * ldx + k + 8, xf + 8);
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) acc[m] = fmaf(w[u][i], xf[i], acc[m]);
+                }
             }
         }
 #pragma unroll
@@ -149,7 +188,7 @@ template <WFmt F, int M>
 cudaError_t launch_m(const void* X, int x_f32, int ldx, const void* W, const float* scale, float* Y, int ldy,
                      float* partial, int ldp, int N, int K, int splits, float alpha, int accumulate, int reduce,
                      cudaStream_t st) {
-    const int k_per_split = ((K + splits - 1) / splits + 255) / 256 * 256;
+    const int k_per_split = ((K + splits - 1) / splits + 511) / 512 * 512;
     splits = (K + k_per_split - 1) / k_per_split;
     dim3 grid((N + ROWS_PER_CTA - 1) / ROWS_PER_CTA, splits);
     if (x_f32)

@@ -68,10 +68,10 @@ pub fn gemv(s: &Stream, m: usize, x: u64, ldx: usize, fmt: WeightFormat, w: u64,
 }
 
 /// Split-K partial sums only, over FP32 activations: partial[(split · M + m) · ldp + n] for exactly
-/// `splits` splits (K / splits must be a multiple of 256).
+/// `splits` splits (K / splits must be a multiple of 512).
 #[allow(clippy::too_many_arguments)]
 pub fn gemv_partials_f32(s: &Stream, m: usize, x: u64, ldx: usize, fmt: WeightFormat, w: u64, scale: u64, partial: u64, ldp: usize, n: usize, k: usize, splits: usize) -> Result<()> {
-    anyhow::ensure!(k % splits == 0 && (k / splits) % 256 == 0, "gemv_partials_f32: K {k} does not split into {splits} multiples of 256");
+    anyhow::ensure!(k % splits == 0 && (k / splits) % 512 == 0, "gemv_partials_f32: K {k} does not split into {splits} multiples of 512");
     let err = unsafe { ffi::squash_gemv(fmt as i32, m as i32, p(x), 1, ldx as i32, p(w), opt_f(scale), std::ptr::null_mut(), 0, partial as *mut f32, ldp as i32, n as i32, k as i32, splits as i32, 1.0, 0, 0, s.raw()) };
     check(err, "gemv_partials_f32")
 }

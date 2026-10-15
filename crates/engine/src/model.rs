@@ -153,6 +153,14 @@ impl PleTable {
         Ok(Self { maps, rows_per_shard })
     }
 
+    /// Asks the kernel to start reading row `r` from disk if it is not resident, so that a batch of cold
+    /// rows is fetched in parallel instead of one page fault at a time.
+    pub fn prefetch(&self, r: usize) {
+        let (map, base) = &self.maps[r / self.rows_per_shard];
+        let start = base + (r % self.rows_per_shard) * Self::WIDTH * 2;
+        let _ = map.advise_range(memmap2::Advice::WillNeed, start, Self::WIDTH * 2);
+    }
+
     /// Appends row `r` (160 BF16 values) to `out`.
     pub fn gather(&self, r: usize, out: &mut Vec<u16>) {
         let (map, base) = &self.maps[r / self.rows_per_shard];

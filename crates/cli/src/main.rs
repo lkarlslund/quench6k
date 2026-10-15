@@ -119,6 +119,10 @@ enum Command {
         /// Also print per-op GPU time for a few eager decode steps.
         #[arg(long)]
         profile: bool,
+        /// After the timed run, decode this many graph steps inside a cudaProfilerStart/Stop region
+        /// (for `ncu --profile-from-start off`).
+        #[arg(long, default_value_t = 0)]
+        ncu_steps: usize,
     },
     /// Apply the correctness gate (GOAL.md §1) to teacher-forced candidate distributions.
     Gate {
@@ -177,7 +181,7 @@ fn main() -> Result<()> {
         }
         Command::Score { model, precision, fixture, out, suffix, chunk, decode } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode)?,
         Command::Generate { model, precision, fixture, tie } => generate(&model, precision.into(), &fixture, tie)?,
-        Command::Bench { model, precision, ctx, generate, chunk, profile } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile)?,
+        Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps)?,
         Command::Gate { fixtures, candidates, suffix } => {
             let mut all = true;
             let mut any = false;

@@ -347,10 +347,16 @@ pub fn prepare(model: &Model, state: &mut SequenceState, ws: &mut Workspace, new
         }
     }
     let ple = model.layers[1].ple.as_ref().expect("layer 1 has PLE");
+    let row_ids: Vec<[usize; 16]> = (0..t).map(|j| ple_rows(&state.tokens, start + j, &ple.multipliers, &ple.sizes, &ple.offsets)).collect();
+    for ids in &row_ids {
+        for &r in ids {
+            model.ple_table.prefetch(r);
+        }
+    }
     let mut rows = Vec::with_capacity(D);
-    for j in 0..t {
+    for (j, ids) in row_ids.iter().enumerate() {
         rows.clear();
-        for r in ple_rows(&state.tokens, start + j, &ple.multipliers, &ple.sizes, &ple.offsets) {
+        for &r in ids {
             model.ple_table.gather(r, &mut rows);
         }
         let o = layout.ple + 2 * D * j;

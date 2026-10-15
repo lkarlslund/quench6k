@@ -18,16 +18,16 @@ fn prompt(len: usize) -> Result<Vec<i32>> {
     Ok(seq.tokens.iter().cycle().take(len).copied().collect())
 }
 
-pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, profile: bool) -> Result<()> {
+pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, profile: bool, ncu_steps: usize) -> Result<()> {
     let (model, stream) = crate::load(model_dir, precision)?;
-    let capacity = contexts.iter().max().copied().unwrap_or(0) + generate + 16;
+    let capacity = contexts.iter().max().copied().unwrap_or(0) + generate + 16 + ncu_steps;
     let mut ws = Workspace::new(chunk, capacity)?;
     let hw = HeadWorkspace::new(1, 1)?;
 
     println!("{:>8} {:>14} {:>14}", "context", "prefill tok/s", "decode tok/s");
     for &ctx in contexts {
         let tokens = prompt(ctx)?;
-        let mut state = SequenceState::new(ctx + generate + 16)?;
+        let mut state = SequenceState::new(ctx + generate + 16 + ncu_steps)?;
         let t0 = Instant::now();
         for c in tokens.chunks(chunk) {
             forward::forward(&model, &mut state, &mut ws, &stream, c)?;
@@ -42,6 +42,13 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
             next = graph.step_timed(&model, &mut state, &mut ws, &hw, &stream, next, &mut times)?;
         }
         let decode = generate as f64 / t1.elapsed().as_secs_f64();
+        if ncu_steps > 0 {
+            squash_cuda::profiler_start()?;
+            for _ in 0..ncu_steps {
+                next = graph.step(&model, &mut state, &mut ws, &hw, &stream, next)?;
+            }
+            squash_cuda::profiler_stop()?;
+        }
         println!(
             "{ctx:>8} {prefill:>14.1} {decode:>14.1}   per token: host prepare {:.3} ms, graph {:.3} ms",
             1e3 * times[0] / generate as f64,
