@@ -332,6 +332,12 @@ impl StepLayout {
 /// Fills the pinned step block for `new_tokens` (appending them to `state`): start position, token
 /// IDs, positions, and the PLE rows gathered from the host table. Returns the bytes to transfer.
 pub fn prepare(model: &Model, state: &mut SequenceState, ws: &mut Workspace, new_tokens: &[i32]) -> Result<usize> {
+    prepare_tokens(state, ws, new_tokens)?;
+    prepare_ple(model, state, ws, new_tokens.len())
+}
+
+/// First half of [`prepare`]: start position, token IDs and positions (appends to `state`).
+pub fn prepare_tokens(state: &mut SequenceState, ws: &mut Workspace, new_tokens: &[i32]) -> Result<()> {
     let t = new_tokens.len();
     let start = state.len();
     ensure!(t > 0 && t <= ws.max_tokens, "step of {t} tokens exceeds the workspace ({})", ws.max_tokens);
@@ -347,6 +353,15 @@ pub fn prepare(model: &Model, state: &mut SequenceState, ws: &mut Workspace, new
             block[o..o + 4].copy_from_slice(&((start + j) as i32).to_le_bytes());
         }
     }
+    Ok(())
+}
+
+/// Second half of [`prepare`]: gathers the PLE rows of the last `t` tokens of `state`. Returns the bytes
+/// of step block to transfer.
+pub fn prepare_ple(model: &Model, state: &SequenceState, ws: &mut Workspace, t: usize) -> Result<usize> {
+    let start = state.len() - t;
+    let layout = StepLayout::new(ws.max_tokens);
+    let block = ws.step_host.as_mut_slice();
     let ple = model.layers[1].ple.as_ref().expect("layer 1 has PLE");
     let row_ids: Vec<[usize; 16]> = (0..t).map(|j| ple_rows(&state.tokens, start + j, &ple.multipliers, &ple.sizes, &ple.offsets)).collect();
     for ids in &row_ids {
@@ -371,21 +386,47 @@ pub fn prepare(model: &Model, state: &mut SequenceState, ws: &mut Workspace, new
 /// Runs the step prepared by [`prepare`] (`t` tokens, `bytes` of step block) entirely on the device:
 /// no host synchronization, so it can be captured into a CUDA graph. Afterwards `ws.out` holds the final
 /// mixer output, BF16 [T, D].
-pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, bytes: usize, mut prof: Option<&mut Profiler>) -> Result<()> {
+pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, bytes: usize, prof: Option<&mut Profiler>) -> Result<()> {
+    forward_part(model, state, ws, s, t, bytes, Part::Whole, prof)
+}
+
+/// A slice of a step: the whole step, or the part before PLE (the step header, embedding and layer 0,
+/// which need only token IDs) and the rest (PLE rows, layers 1..48, final mixer).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    Whole,
+    BeforePle,
+    FromPle,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, bytes: usize, part: Part, mut prof: Option<&mut Profiler>) -> Result<()> {
     let layout = StepLayout::new(ws.max_tokens);
-    unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? };
+    match part {
+        Part::Whole => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? },
+        Part::BeforePle => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), layout.ple)? },
+        Part::FromPle => unsafe { s.copy_h2d(ws.step + layout.ple as u64, ws.step_host.as_ptr().add(layout.ple), bytes - layout.ple)? },
+    }
     let start = ws.step;
     let tokens = ws.step + layout.tokens as u64;
     let pos3 = state.pos3.addr();
-    op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, pos3, start, t));
-
-    op!(prof, "embed", s, k::embed(s, tokens, t, model.embed, ws.h));
+    if part != Part::FromPle {
+        op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, pos3, start, t));
+        op!(prof, "embed", s, k::embed(s, tokens, t, model.embed, ws.h));
+    }
     // Small batches defer each block's residual update to the next HyperConnection kernel; `inj` and
-    // `inj_next` alternate so that kernel reads the previous weights while writing its own.
+    // `inj_next` alternate so that kernel reads the previous weights while writing its own. After
+    // layer 0 the deferred update is the MoE output in ws.y with weights in ws.inj (two swaps).
     let small = t <= k::gemv_max_m();
-    let mut pending: Option<u64> = None;
+    let mut pending: Option<u64> = if part == Part::FromPle && small { Some(ws.y) } else { None };
     let (mut inj, mut inj_next) = (ws.inj, ws.inj2);
-    for (i, layer) in model.layers.iter().enumerate() {
+    let layers = match part {
+        Part::Whole => 0..model.layers.len(),
+        Part::BeforePle => 0..1,
+        Part::FromPle => 1..model.layers.len(),
+    };
+    for i in layers {
+        let layer = &model.layers[i];
         if let Some(ple) = &layer.ple {
             if let Some(y) = pending.take() {
                 op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, inj, t));
@@ -486,6 +527,9 @@ pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &
             op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, ws.y, ws.inj, t));
         }
     }
+    if part == Part::BeforePle {
+        return Ok(());
+    }
     if small {
         op!(prof, "hc_small", s, hyper_connection_small(s, ws, &model.final_hc, t, pending.map(|y| (y, inj)), inj_next, ws.out));
     } else {
@@ -512,19 +556,24 @@ pub fn forward(model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: 
 
 /// A one-token decode step captured as a CUDA graph for a given sequence: forward pass, LM head and
 /// greedy argmax, with the chosen token copied to pinned host memory.
+///
+/// The step is split into two graphs around PLE: the first (embedding, layer 0) is launched as soon as
+/// the token is known, and the host gathers the token's PLE rows while it runs.
 pub struct DecodeGraph {
-    graph: squash_cuda::Graph,
+    before_ple: squash_cuda::Graph,
+    from_ple: squash_cuda::Graph,
     bytes: usize,
 }
 
 impl DecodeGraph {
     pub fn capture(model: &Model, state: &SequenceState, ws: &Workspace, hw: &HeadWorkspace, s: &Stream) -> Result<Self> {
         let bytes = StepLayout::new(ws.max_tokens).used(1);
-        let graph = squash_cuda::Graph::capture(s, |s| {
-            forward_device(model, state, ws, s, 1, bytes, None)?;
+        let before_ple = squash_cuda::Graph::capture(s, |s| forward_part(model, state, ws, s, 1, bytes, Part::BeforePle, None))?;
+        let from_ple = squash_cuda::Graph::capture(s, |s| {
+            forward_part(model, state, ws, s, 1, bytes, Part::FromPle, None)?;
             head_argmax(model, hw, s, ws.out)
         })?;
-        Ok(Self { graph, bytes })
+        Ok(Self { before_ple, from_ple, bytes })
     }
 
     /// Decodes `token` (appended to `state`) and returns the greedy next token.
@@ -536,10 +585,12 @@ impl DecodeGraph {
     #[allow(clippy::too_many_arguments)]
     pub fn step_timed(&self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, hw: &HeadWorkspace, s: &Stream, token: i32, times: &mut [f64; 2]) -> Result<i32> {
         let t0 = std::time::Instant::now();
-        let bytes = prepare(model, state, ws, &[token])?;
+        prepare_tokens(state, ws, &[token])?;
+        self.before_ple.launch(s)?;
+        let bytes = prepare_ple(model, state, ws, 1)?;
         debug_assert_eq!(bytes, self.bytes);
         let t1 = std::time::Instant::now();
-        self.graph.launch(s)?;
+        self.from_ple.launch(s)?;
         s.synchronize()?;
         times[0] += (t1 - t0).as_secs_f64();
         times[1] += t1.elapsed().as_secs_f64();

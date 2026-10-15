@@ -249,7 +249,7 @@ __global__ void __launch_bounds__(ATT_THREADS) attention_kernel(const float* __r
 
 // ---- split-key attention for small batches -------------------------------------------------
 // A query attends to at most 512 * 4 + 3 = 2051 keys, so SPLITS chunks of CHUNK keys always cover it.
-constexpr int CHUNK = 64, SPLITS = (TOPG * GROUP + GROUP - 1 + CHUNK - 1) / CHUNK;
+constexpr int CHUNK = 32, SPLITS = (TOPG * GROUP + GROUP - 1 + CHUNK - 1) / CHUNK;
 
 SQ_DEVICE int key_at(int i, bool dense, const int* sel_row, int tail_begin) {
     return dense ? i : (i < TOPG * GROUP ? sel_row[i / GROUP] * GROUP + i % GROUP : tail_begin + i - TOPG * GROUP);
@@ -353,27 +353,41 @@ __global__ void __launch_bounds__(ATT_THREADS) attention_split_kernel(const floa
     for (int h = 0; h < QPG; ++h) out[2 * QPG + h * HD + tid] = acc[h];
 }
 
-// Merges the splits of (t, head) in split order and applies the output gate. grid (T, 24), 256 threads.
+// Merges the splits of (t, head) in split order and applies the output gate. grid (T, 24), 256 threads:
+// warp 0 turns the used splits' (max, sum) pairs into weights in shared memory, then every thread sums
+// its output dimension over the splits.
 __global__ void attention_merge_kernel(const float* __restrict__ part, const float* __restrict__ qg, int ld,
                                        const int* __restrict__ start_ptr, __nv_bfloat16* out) {
     pdl_launch_dependents();
     pdl_wait();
+    __shared__ float weight[SPLITS];
+    __shared__ float inv_l;
     const int t = blockIdx.x, head = blockIdx.y, kvh = head / QPG, h = head % QPG, d = threadIdx.x;
     const int p = *start_ptr + t, complete = (p + 1) / GROUP;
     const int nkeys = complete <= TOPG ? p + 1 : TOPG * GROUP + (p + 1 - complete * GROUP);
     const int used = (nkeys + CHUNK - 1) / CHUNK;
-    const float* base = part + ((size_t)t * KVH + kvh) * SPLITS * (2 * QPG + QPG * HD);
-    float m = -INFINITY;
-    for (int s = 0; s < used; ++s) m = fmaxf(m, base[s * (2 * QPG + QPG * HD) + h]);
-    float l = 0, o = 0;
-    for (int s = 0; s < used; ++s) {
-        const float* b = base + s * (2 * QPG + QPG * HD);
-        const float w = b[QPG + h] > 0 ? __expf(b[h] - m) : 0.0f;
-        l += w * b[QPG + h];
-        o += w * b[2 * QPG + h * HD + d];
+    constexpr int STRIDE = 2 * QPG + QPG * HD;
+    const float* base = part + ((size_t)t * KVH + kvh) * SPLITS * STRIDE;
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
+        float m = -INFINITY;
+        for (int s = lane; s < used; s += 32) m = fmaxf(m, base[s * STRIDE + h]);
+        m = warp_max(m);
+        float l = 0;
+        for (int s = lane; s < used; s += 32) {
+            const float w = __expf(base[s * STRIDE + h] - m);
+            weight[s] = w;
+            l += w * base[s * STRIDE + QPG + h];
+        }
+        l = warp_sum(l);
+        if (lane == 0) inv_l = 1.0f / l;
     }
+    __syncthreads();
+    float o = 0;
+#pragma unroll 8
+    for (int s = 0; s < used; ++s) o += weight[s] * base[s * STRIDE + 2 * QPG + h * HD + d];
     const float gate = qg[(size_t)t * ld + head * 2 * HD + HD + d];
-    out[(size_t)t * QH * HD + head * HD + d] = f2bf(o / l * sigmoidf(gate));
+    out[(size_t)t * QH * HD + head * HD + d] = f2bf(o * inv_l * sigmoidf(gate));
 }
 
 }  // namespace
