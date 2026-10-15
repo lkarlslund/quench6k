@@ -500,7 +500,7 @@ SQ_DEVICE void chunk_dot(const float* w, const __nv_bfloat16* xrow, float& acc) 
 // x = m[row_token[row]]. grid (640 / 16, active slots). Warp w owns features 2w, 2w + 1 of the block:
 // lanes 0-15 stream the gate rows and lanes 16-31 the up rows, five 32-weight chunks per row per lane,
 // all loads issued before any arithmetic.
-template <int MAXR>
+template <int MAXR, int FEAT>
 __global__ void __launch_bounds__(EW * 32) gate_up_kernel(const __nv_bfloat16* __restrict__ m,
                                                           const int* __restrict__ row_token,
                                                           const uint64_t* __restrict__ gw, const uint64_t* __restrict__ gs,
@@ -509,7 +509,7 @@ __global__ void __launch_bounds__(EW * 32) gate_up_kernel(const __nv_bfloat16* _
                                                           const int* __restrict__ offsets, const int* __restrict__ active,
                                                           const int* __restrict__ num_active, __nv_bfloat16* act) {
     pdl_wait();
-    constexpr int N = 640, K = D, CHUNKS = K / 32 / 16, FEAT = 2;
+    constexpr int N = 640, K = D, CHUNKS = K / 32 / 16;
     if ((int)blockIdx.y >= *num_active) return;
     const int e = active[blockIdx.y];
     const int r0 = offsets[e], rows = min(offsets[e + 1] - r0, MAXR);
@@ -935,10 +935,12 @@ extern "C" cudaError_t squash_moe_gate_up_small(const void* m, const int* row_to
                                                 const int* active, const int* num_active, int max_active, int T,
                                                 void* act, cudaStream_t st) {
     if (max_active == 0) return cudaSuccess;
-    const dim3 grid(640 / (EW * 2), max_active);
+    // One feature per warp beyond a single row per expert: fewer registers, more blocks in flight.
+    const int feat = T <= 1 ? 2 : 1;
+    const dim3 grid(640 / (EW * feat), max_active);
     const auto* x = static_cast<const __nv_bfloat16*>(m);
     auto* a = static_cast<__nv_bfloat16*>(act);
-#define SQ_GU(R) SQ_CHECK_LAUNCH(sq_launch(gate_up_kernel<R>, grid, EW * 32, 0, st, x, row_token, gw, gs, g2, uw, us, u2, offsets, active, num_active, a))
+#define SQ_GU(R) SQ_CHECK_LAUNCH(sq_launch(gate_up_kernel<R, (R == 1 ? 2 : 1)>, grid, EW * 32, 0, st, x, row_token, gw, gs, g2, uw, us, u2, offsets, active, num_active, a))
     if (T <= 1) SQ_GU(1);
     else if (T <= 2) SQ_GU(2);
     else if (T <= 4) SQ_GU(4);

@@ -120,6 +120,9 @@ enum Command {
         /// (for `ncu --profile-from-start off`).
         #[arg(long, default_value_t = 0)]
         ncu_steps: usize,
+        /// MTP speculative decoding with this many drafts per round (0: plain decoding).
+        #[arg(long, default_value_t = 0)]
+        mtp: usize,
     },
     /// Measure MTP draft acceptance on a fixture (drafts are compared with the target's greedy tokens).
     MtpProbe {
@@ -214,7 +217,7 @@ fn main() -> Result<()> {
         Command::Generate { model, precision, fixture, tie } => generate(&model, precision.into(), &fixture, tie)?,
         Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
         Command::SpecCheck { model, precision, fixture, n, drafts, chunk, graphs, profile_rounds } => mtp::check(&model, precision.into(), &fixture, n, drafts, chunk, graphs, profile_rounds)?,
-        Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps)?,
+        Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps, mtp } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps, mtp)?,
         Command::Gate { fixtures, candidates, suffix } => {
             let mut all = true;
             let mut any = false;
