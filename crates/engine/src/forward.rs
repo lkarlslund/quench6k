@@ -52,6 +52,21 @@ pub struct SequenceState {
     pub ple_conv: DeviceBuffer,
     /// The MTP drafter's own attention cache, when drafting.
     pub mtp_qsa: Option<QsaCache>,
+    /// Speculative decoding: recurrent state is committed one step behind (see `Spec`).
+    pub spec: Option<Spec>,
+}
+
+/// Recurrent-state bookkeeping for speculative decoding. A verification step processes drafts that may
+/// be rejected, so GDN and PLE-conv kernels record each token's raw inputs instead of committing; the
+/// next step first replays the accepted prefix (`ctl` = {tokens to replay, record parity}) onto the
+/// committed state. Records are double-buffered by parity.
+pub struct Spec {
+    pub ctl: DeviceBuffer,
+    pub gdn_rec: Vec<Option<DeviceBuffer>>,
+    pub ple_rec: DeviceBuffer,
+    /// Host copy of the control word.
+    pub replay: i32,
+    pub parity: i32,
 }
 
 impl SequenceState {
@@ -96,6 +111,17 @@ impl SequenceState {
             gdn,
             ple_conv: DeviceBuffer::zeroed(PLE_HIST * H * 4)?,
             mtp_qsa: if mtp { Some(qsa_cache()?) } else { None },
+            spec: if mtp {
+                Some(Spec {
+                    ctl: DeviceBuffer::zeroed(8)?,
+                    gdn_rec: (0..LAYERS).map(|l| if is_attention(l) { Ok(None) } else { DeviceBuffer::new(k::gdn_record_floats() * 4).map(Some) }).collect::<Result<_>>()?,
+                    ple_rec: DeviceBuffer::new(k::ple_record_floats() * 4)?,
+                    replay: 0,
+                    parity: 0,
+                })
+            } else {
+                None
+            },
         })
     }
 
@@ -421,7 +447,7 @@ pub fn prepare_ple(model: &Model, state: &SequenceState, ws: &mut Workspace, t: 
 /// no host synchronization, so it can be captured into a CUDA graph. Afterwards `ws.out` holds the final
 /// mixer output, BF16 [T, D].
 pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, bytes: usize, prof: Option<&mut Profiler>) -> Result<()> {
-    forward_part(model, state, ws, s, t, bytes, Part::Whole, prof)
+    forward_part(model, state, ws, s, t, bytes, Part::Whole, false, prof)
 }
 
 /// A slice of a step: the whole step, or the part before PLE (the step header, embedding and layer 0,
@@ -434,14 +460,17 @@ pub enum Part {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, bytes: usize, part: Part, mut prof: Option<&mut Profiler>) -> Result<()> {
+/// With `defer` (speculative verification, needs `state.spec`), the recurrent layers record this step's
+/// tokens instead of committing them; see [`Spec`].
+pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, bytes: usize, part: Part, defer: bool, mut prof: Option<&mut Profiler>) -> Result<()> {
     let layout = StepLayout::new(ws.max_tokens);
     match part {
         Part::Whole => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? },
         Part::BeforePle => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), layout.ple)? },
         Part::FromPle => unsafe { s.copy_h2d(ws.step + layout.ple as u64, ws.step_host.as_ptr().add(layout.ple), bytes - layout.ple)? },
     }
-    let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr() };
+    let spec = state.spec.as_ref().map(|sp| (sp.ctl.addr(), sp.ple_rec.addr(), defer));
+    let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr(), spec };
     if part != Part::FromPle {
         op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, ctx.pos3, ctx.start, t));
         op!(prof, "embed", s, k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h));
@@ -454,7 +483,8 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
         Part::FromPle => 1..model.layers.len(),
     };
     for i in layers {
-        layer_forward(&model.layers[i], state.gdn[i].as_ref(), state.qsa[i].as_ref(), &ctx, &mut carry, prof.as_deref_mut())?;
+        let rec = state.spec.as_ref().and_then(|sp| sp.gdn_rec[i].as_ref().map(|b| b.addr()));
+        layer_forward(&model.layers[i], state.gdn[i].as_ref(), rec, state.qsa[i].as_ref(), &ctx, &mut carry, prof.as_deref_mut())?;
     }
     if part == Part::BeforePle {
         return Ok(());
@@ -474,6 +504,8 @@ struct LayerCtx<'a> {
     /// Gathered PLE rows (BF16 [t, 2560]) and the PLE conv state, for the layer that has PLE.
     ple_rows: u64,
     ple_state: u64,
+    /// Speculative bookkeeping: control word, PLE records, and whether this step defers its commit.
+    spec: Option<(u64, u64, bool)>,
 }
 
 /// Residual bookkeeping carried from layer to layer. Small batches defer each block's residual update to
@@ -502,7 +534,8 @@ fn final_mixer(hc: &Hc, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut
 }
 
 /// One decoder layer (SPEC §3) over the step's tokens, with the layer's own GDN or QSA state.
-fn layer_forward(layer: &crate::model::Layer, gdn: Option<&GdnState>, qsa: Option<&QsaCache>, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn layer_forward(layer: &crate::model::Layer, gdn: Option<&GdnState>, gdn_rec: Option<u64>, qsa: Option<&QsaCache>, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>) -> Result<()> {
     let (ws, s, t, start, pos3) = (ctx.ws, ctx.s, ctx.t, ctx.start, ctx.pos3);
     let small = t <= k::gemv_max_m();
     if let Some(ple) = &layer.ple {
@@ -512,7 +545,8 @@ fn layer_forward(layer: &crate::model::Layer, gdn: Option<&GdnState>, qsa: Optio
         op!(prof, "ple.key", s, linear(s, ws, ctx.ple_rows, &ple.key, ws.kp, t));
         op!(prof, "ple.value", s, linear(s, ws, ctx.ple_rows, &ple.value, ws.pv, t));
         op!(prof, "ple_gate", s, k::ple_gate(s, ws.kp, ws.h, ws.pv, ple.norm_key, ple.norm_query, ple.norm_conv, ws.gv, ws.xn, t));
-        op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv, ws.xn, ple.conv, ctx.ple_state, ws.h, t));
+        let spec = ctx.spec.map(|(ctl, rec, defer)| k::Deferral { rec, ctl, defer });
+        op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv, ws.xn, ple.conv, ctx.ple_state, ws.h, t, spec));
     }
 
     if small {
@@ -527,9 +561,17 @@ fn layer_forward(layer: &crate::model::Layer, gdn: Option<&GdnState>, qsa: Optio
             let (ld, x) = (g.proj.n, ws.proj);
             let col = |j: usize| x + (g.proj.col(j) * 4) as u64;
             op!(prof, "gdn proj", s, project(s, ws, ws.m, &g.proj, x, t));
+            let spec = match (ctx.spec, gdn_rec) {
+                (Some((ctl, _, defer)), Some(rec)) => Some(k::Deferral { rec, ctl, defer }),
+                _ => None,
+            };
             if t <= k::gemv_max_m() {
-                op!(prof, "gdn_fused_small", s, k::gdn_fused_small(s, x, ld, t, g.conv, st.conv.addr(), st.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf));
+                op!(prof, "gdn_fused_small", s, k::gdn_fused_small(s, x, ld, t, g.conv, st.conv.addr(), st.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, spec));
             } else {
+                // The chunked prefill kernels work on committed state: replay any pending records first.
+                if let Some(sp) = spec {
+                    op!(prof, "gdn_flush", s, k::gdn_fused_small(s, x, ld, 0, g.conv, st.conv.addr(), st.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, Some(k::Deferral { defer: false, ..sp })));
+                }
                 op!(prof, "gdn_conv", s, k::gdn_conv(s, col(0), ld, ws.conv, st.conv.addr(), g.conv, t));
                 op!(prof, "gdn_prep", s, k::gdn_prep(s, ws.conv, col(2), col(3), ld, g.a_log, g.dt_bias, ws.beta, ws.g, t));
                 op!(prof, "gdn_recurrent", s, k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st.recurrent.addr(), ws.o, t));
@@ -640,9 +682,9 @@ pub fn forward_mtp(model: &Model, state: &SequenceState, ws: &Workspace, s: &Str
     // fc_hidden maps each of the 4 streams: rows of the [t, 4, 2560] input are the 4t stream slices.
     op!(prof, "mtp fc_h", s, linear_ld(s, ws.partial, ws.n, D, &mtp.fc_hidden, ws.h, D, S * t));
     op!(prof, "mtp combine", s, k::hc_combine(s, ws.h, ws.y, ws.ones, t));
-    let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0 };
+    let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0, spec: None };
     let mut carry = Carry::new(ws, false);
-    layer_forward(&mtp.layer, None, Some(cache), &ctx, &mut carry, prof.as_deref_mut())?;
+    layer_forward(&mtp.layer, None, None, Some(cache), &ctx, &mut carry, prof.as_deref_mut())?;
     final_mixer(&mtp.final_hc, &ctx, &mut carry, prof)
 }
 
@@ -676,9 +718,9 @@ pub struct DecodeGraph {
 impl DecodeGraph {
     pub fn capture(model: &Model, state: &SequenceState, ws: &Workspace, hw: &HeadWorkspace, s: &Stream) -> Result<Self> {
         let bytes = StepLayout::new(ws.max_tokens).used(1);
-        let before_ple = squash_cuda::Graph::capture(s, |s| forward_part(model, state, ws, s, 1, bytes, Part::BeforePle, None))?;
+        let before_ple = squash_cuda::Graph::capture(s, |s| forward_part(model, state, ws, s, 1, bytes, Part::BeforePle, false, None))?;
         let from_ple = squash_cuda::Graph::capture(s, |s| {
-            forward_part(model, state, ws, s, 1, bytes, Part::FromPle, None)?;
+            forward_part(model, state, ws, s, 1, bytes, Part::FromPle, false, None)?;
             head_argmax(model, hw, s, ws.out)
         })?;
         Ok(Self { before_ple, from_ple, bytes })

@@ -148,13 +148,17 @@ constexpr int FT = 512;  // threads of the fused kernel: 4 per value column
 // delta-rule update and the gated RMSNorm, writing y[t, vh, :] (BF16). Thread (col, part) keeps
 // rows part*32 .. part*32+31 of state column col in registers. Conv history for q/k channels is
 // advanced only by the first of the three value heads sharing them.
+// Speculative records: per token, the raw (pre-conv) q/k/v channels and the a, b gate inputs.
+constexpr int REC = C + 2 * VH, REC_TOKENS = 16;
+
 __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict__ proj, int ld, int T,
                                                          const __nv_bfloat16* __restrict__ conv_w,
                                                          float* conv_state, float* state,
                                                          const __nv_bfloat16* __restrict__ a_log,
                                                          const __nv_bfloat16* __restrict__ dt_bias,
                                                          const __nv_bfloat16* __restrict__ norm_w, int z_col, int a_col,
-                                                         int b_col, __nv_bfloat16* y) {
+                                                         int b_col, __nv_bfloat16* y, float* rec, const int* ctl,
+                                                         int defer) {
     pdl_launch_dependents();
     __shared__ float sq[DK], sk[DK], sv[DV], so[DV];
     __shared__ float scratch[32];
@@ -180,8 +184,9 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
     // State, conv history and weights come from earlier steps or are static: loaded before the wait.
     pdl_wait();
 
-    for (int t = 0; t < T; ++t) {
-        const float* row = proj + (size_t)t * ld;
+    // Advances conv history and state by one token whose raw inputs are in `row` (a, b at a_off, b_off);
+    // with `out`, also writes the gated-norm output for row `t`.
+    auto advance = [&](const float* row, int a_off, int b_off, bool out, int t) {
         if (owns_channel) {
             const float x = row[ch];
             const float c = silu(cw[0] * hist[0] + cw[1] * hist[1] + cw[2] * hist[2] + cw[3] * x);
@@ -193,9 +198,9 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
             else sv[tid - 2 * DK] = c;
         }
         if (tid == 0) {
-            const float xa = row[a_col + vh] + bias;
+            const float xa = row[a_off + vh] + bias;
             s_decay = __expf(A * (xa > 20.0f ? xa : log1pf(__expf(xa))));
-            s_beta = sigmoidf(row[b_col + vh]);
+            s_beta = sigmoidf(row[b_off + vh]);
         }
         __syncthreads();
         // l2-normalize q (also / sqrt(128)) and k
@@ -222,37 +227,72 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
 #pragma unroll
         for (int j = 0; j < 32; ++j) {
             s[j] += sk[part * 32 + j] * delta;
-            o += s[j] * sq[part * 32 + j];
+            if (out) o += s[j] * sq[part * 32 + j];
         }
-        o += __shfl_xor_sync(0xffffffff, o, 1);
-        o += __shfl_xor_sync(0xffffffff, o, 2);
-        if (part == 0) so[col] = o;
+        if (out) {
+            o += __shfl_xor_sync(0xffffffff, o, 1);
+            o += __shfl_xor_sync(0xffffffff, o, 2);
+            if (part == 0) so[col] = o;
+            __syncthreads();
+            // gated RMSNorm over the head's 128 outputs
+            const float ov = tid < DV ? so[tid] : 0.0f;
+            const float r = rsqrtf(block_sum(ov * ov, scratch) / DV + EPS);
+            if (tid < DV)
+                y[(size_t)t * VH * DV + vh * DV + tid] = f2bf(ov * r * bf2f(norm_w[tid]) * sigmoidf(row[z_col + vh * DV + tid]));
+        }
         __syncthreads();
-        // gated RMSNorm over the head's 128 outputs
-        const float ov = tid < DV ? so[tid] : 0.0f;
-        const float r = rsqrtf(block_sum(ov * ov, scratch) / DV + EPS);
-        if (tid < DV)
-            y[(size_t)t * VH * DV + vh * DV + tid] = f2bf(ov * r * bf2f(norm_w[tid]) * sigmoidf(row[z_col + vh * DV + tid]));
-        __syncthreads();
+    };
+    auto commit = [&]() {
+        if (writes_conv)
+#pragma unroll
+            for (int j = 0; j < 3; ++j) conv_state[j * C + ch] = hist[j];
+#pragma unroll
+        for (int j = 0; j < 32; ++j) st[(part * 32 + j) * DV + col] = s[j];
+    };
+
+    // Speculative mode: first replay the accepted tokens of the previous step from its records
+    // (parity ctl[1]) onto the committed state, and commit that.
+    if (rec) {
+        const int n_commit = ctl[0], parity = ctl[1];
+        const float* prev = rec + (size_t)parity * REC_TOKENS * REC;
+        for (int t = 0; t < n_commit; ++t) advance(prev + (size_t)t * REC, C, C + VH, false, 0);
+        if (n_commit > 0 && defer) commit();
     }
-    if (writes_conv)
-#pragma unroll
-        for (int j = 0; j < 3; ++j) conv_state[j * C + ch] = hist[j];
-#pragma unroll
-    for (int j = 0; j < 32; ++j) st[(part * 32 + j) * DV + col] = s[j];
+    float* next = rec ? rec + (size_t)(rec ? (ctl[1] ^ 1) : 0) * REC_TOKENS * REC : nullptr;
+    for (int t = 0; t < T; ++t) {
+        const float* row = proj + (size_t)t * ld;
+        if (defer && next) {
+            if (writes_conv) next[(size_t)t * REC + ch] = row[ch];
+            if (tid == 0) {
+                next[(size_t)t * REC + C + vh] = row[a_col + vh];
+                next[(size_t)t * REC + C + VH + vh] = row[b_col + vh];
+            }
+        }
+        advance(row, a_col, b_col, true, t);
+    }
+    // Plain steps commit everything; deferred steps leave this step's tokens to the next replay.
+    if (!defer) commit();
 }
 
 }  // namespace
 
 // proj: the fused GDN projection rows [T, ld] (qkv at column 0, z/a/b at the given columns).
+extern "C" size_t squash_gdn_record_floats() { return (size_t)2 * REC_TOKENS * REC; }
+
+// rec/ctl (optional, speculative decoding): double-buffered per-token records
+// (squash_gdn_record_floats() floats) and the control word {tokens to replay, record parity}.
+// defer = 1: replay and commit the previous step's accepted tokens, process this step without
+// committing it, and record its tokens; defer = 0: replay, then commit everything.
 extern "C" cudaError_t squash_gdn_fused_small(const float* proj, int ld, int T, const void* conv_w, float* conv_state,
                                              float* state, const void* a_log, const void* dt_bias, const void* norm_w,
-                                             int z_col, int a_col, int b_col, void* y, cudaStream_t st) {
-    if (T == 0) return cudaSuccess;
+                                             int z_col, int a_col, int b_col, void* y, float* rec, const int* ctl,
+                                             int defer, cudaStream_t st) {
+    if (T > REC_TOKENS && rec && defer) return cudaErrorInvalidValue;
+    if (T == 0 && !rec) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(fused_small_kernel, VH, FT, 0, st, proj, ld, T, static_cast<const __nv_bfloat16*>(conv_w), conv_state, state,
                                           static_cast<const __nv_bfloat16*>(a_log),
                                           static_cast<const __nv_bfloat16*>(dt_bias),
                                           static_cast<const __nv_bfloat16*>(norm_w), z_col, a_col, b_col,
-                                          static_cast<__nv_bfloat16*>(y)));
+                                          static_cast<__nv_bfloat16*>(y), rec, ctl, defer));
     SQ_RETURN_LAUNCH();
 }

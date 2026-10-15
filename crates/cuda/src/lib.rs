@@ -81,7 +81,9 @@ pub mod ffi {
         pub fn squash_gdn_conv(x: *const f32, ldx: c_int, out: *mut f32, state: *mut f32, w: *const c_void, t: c_int, stream: Stream) -> Error;
         pub fn squash_gdn_prep(qkv: *mut f32, a: *const f32, b: *const f32, ldab: c_int, a_log: *const c_void, dt_bias: *const c_void, beta: *mut f32, g: *mut f32, t: c_int, stream: Stream) -> Error;
         pub fn squash_gdn_recurrent(qkv: *const f32, beta: *const f32, g: *const f32, state: *mut f32, out: *mut f32, t: c_int, stream: Stream) -> Error;
-        pub fn squash_gdn_fused_small(proj: *const f32, ld: c_int, t: c_int, conv_w: *const c_void, conv_state: *mut f32, state: *mut f32, a_log: *const c_void, dt_bias: *const c_void, norm_w: *const c_void, z_col: c_int, a_col: c_int, b_col: c_int, y: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_gdn_fused_small(proj: *const f32, ld: c_int, t: c_int, conv_w: *const c_void, conv_state: *mut f32, state: *mut f32, a_log: *const c_void, dt_bias: *const c_void, norm_w: *const c_void, z_col: c_int, a_col: c_int, b_col: c_int, y: *mut c_void, rec: *mut f32, ctl: *const i32, defer: c_int, stream: Stream) -> Error;
+        pub fn squash_gdn_record_floats() -> usize;
+        pub fn squash_ple_record_floats() -> usize;
         pub fn squash_gdn_gated_norm(o: *const f32, z: *const f32, ldz: c_int, w: *const c_void, y: *mut c_void, t: c_int, stream: Stream) -> Error;
         pub fn squash_qsa_qkv_prep(qg: *const f32, kv: *const f32, ld: c_int, q_norm: *const c_void, k_norm: *const c_void, q: *mut f32, kcache: *mut c_void, vcache: *mut c_void, pos3: *const i32, start: *const i32, t: c_int, stream: Stream) -> Error;
         pub fn squash_qsa_index_prep(idx: *const f32, ld: c_int, q_ln: *const c_void, iq: *mut f32, raw: *mut c_void, pos3: *const i32, start: *const i32, t: c_int, stream: Stream) -> Error;
@@ -107,7 +109,7 @@ pub mod ffi {
         pub fn squash_swiglu(gate: *const f32, up: *const f32, ld: c_int, width: c_int, act: *mut c_void, count: usize, stream: Stream) -> Error;
         pub fn squash_moe_combine(yd: *const f32, pair_row: *const i32, top_w: *const f32, sg: *const f32, ld_sg: c_int, sh: *const f32, y: *mut f32, t: c_int, stream: Stream) -> Error;
         pub fn squash_ple_gate(kp: *const f32, h: *const f32, v: *const f32, wk: *const c_void, wq: *const c_void, wc: *const c_void, gv: *mut f32, xn: *mut f32, t: c_int, stream: Stream) -> Error;
-        pub fn squash_ple_conv(gv: *const f32, xn: *const f32, w: *const c_void, state: *mut f32, h: *mut f32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_ple_conv(gv: *const f32, xn: *const f32, w: *const c_void, state: *mut f32, h: *mut f32, t: c_int, rec: *mut f32, ctl: *const i32, defer: c_int, stream: Stream) -> Error;
     }
 }
 

@@ -230,8 +230,34 @@ pub fn ple_gate(s: &Stream, kp: u64, h: u64, v: u64, wk: u64, wq: u64, wc: u64, 
     launch!("ple_gate", ffi::squash_ple_gate(f(kp), f(h), f(v), p(wk), p(wq), p(wc), fm(gv), fm(xn), n32(t), s.raw()))
 }
 
-pub fn ple_conv(s: &Stream, gv: u64, xn: u64, w: u64, state: u64, h: u64, t: usize) -> Result<()> {
-    launch!("ple_conv", ffi::squash_ple_conv(f(gv), f(xn), p(w), fm(state), fm(h), n32(t), s.raw()))
+/// Speculative-decoding records for a recurrent kernel: (records, control word {replay count, parity}),
+/// and whether this step defers its own commit.
+#[derive(Clone, Copy)]
+pub struct Deferral {
+    pub rec: u64,
+    pub ctl: u64,
+    pub defer: bool,
+}
+
+fn deferral(d: Option<Deferral>) -> (*mut f32, *const i32, i32) {
+    match d {
+        Some(d) => (d.rec as *mut f32, d.ctl as *const i32, d.defer as i32),
+        None => (std::ptr::null_mut(), std::ptr::null(), 0),
+    }
+}
+
+pub fn gdn_record_floats() -> usize {
+    unsafe { ffi::squash_gdn_record_floats() }
+}
+
+pub fn ple_record_floats() -> usize {
+    unsafe { ffi::squash_ple_record_floats() }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ple_conv(s: &Stream, gv: u64, xn: u64, w: u64, state: u64, h: u64, t: usize, spec: Option<Deferral>) -> Result<()> {
+    let (rec, ctl, defer) = deferral(spec);
+    launch!("ple_conv", ffi::squash_ple_conv(f(gv), f(xn), p(w), fm(state), fm(h), n32(t), rec, ctl, defer, s.raw()))
 }
 
 pub fn moe_active(s: &Stream, counts: u64, active: u64, num_active: u64) -> Result<()> {
@@ -279,10 +305,11 @@ pub fn qsa_attention_split(s: &Stream, q: u64, qg: u64, ld: usize, kcache: u64, 
 
 /// Fused small-batch GDN: conv, gating, delta rule and gated norm in one kernel (one block per value head).
 #[allow(clippy::too_many_arguments)]
-pub fn gdn_fused_small(s: &Stream, proj: u64, ld: usize, t: usize, conv_w: u64, conv_state: u64, state: u64, a_log: u64, dt_bias: u64, norm_w: u64, z_col: usize, a_col: usize, b_col: usize, y: u64) -> Result<()> {
+pub fn gdn_fused_small(s: &Stream, proj: u64, ld: usize, t: usize, conv_w: u64, conv_state: u64, state: u64, a_log: u64, dt_bias: u64, norm_w: u64, z_col: usize, a_col: usize, b_col: usize, y: u64, spec: Option<Deferral>) -> Result<()> {
+    let (rec, ctl, defer) = deferral(spec);
     launch!(
         "gdn_fused_small",
-        ffi::squash_gdn_fused_small(f(proj), n32(ld), n32(t), p(conv_w), fm(conv_state), fm(state), p(a_log), p(dt_bias), p(norm_w), n32(z_col), n32(a_col), n32(b_col), pm(y), s.raw())
+        ffi::squash_gdn_fused_small(f(proj), n32(ld), n32(t), p(conv_w), fm(conv_state), fm(state), p(a_log), p(dt_bias), p(norm_w), n32(z_col), n32(a_col), n32(b_col), pm(y), rec, ctl, defer, s.raw())
     )
 }
 

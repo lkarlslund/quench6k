@@ -134,6 +134,21 @@ enum Command {
         #[arg(long, default_value_t = 1024)]
         chunk: usize,
     },
+    /// Check that MTP speculative decoding produces exactly the plain greedy tokens.
+    SpecCheck {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, value_enum, default_value_t = PrecisionArg::Int8g)]
+        precision: PrecisionArg,
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        #[arg(long, default_value_t = 3)]
+        drafts: usize,
+        #[arg(long, default_value_t = 1024)]
+        chunk: usize,
+    },
     /// Apply the correctness gate (GOAL.md §1) to teacher-forced candidate distributions.
     Gate {
         /// Fixture root containing one directory per fixture.
@@ -192,6 +207,7 @@ fn main() -> Result<()> {
         Command::Score { model, precision, fixture, out, suffix, chunk, decode } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode)?,
         Command::Generate { model, precision, fixture, tie } => generate(&model, precision.into(), &fixture, tie)?,
         Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
+        Command::SpecCheck { model, precision, fixture, n, drafts, chunk } => mtp::check(&model, precision.into(), &fixture, n, drafts, chunk)?,
         Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps)?,
         Command::Gate { fixtures, candidates, suffix } => {
             let mut all = true;

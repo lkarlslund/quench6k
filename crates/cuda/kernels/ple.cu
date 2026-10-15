@@ -46,9 +46,14 @@ __global__ void gate_kernel(const float* __restrict__ kp, const float* __restric
     }
 }
 
-// h[t, c] += gv[t, c] + silu(sum_j w[c, j] * xn[t - 9 + 3j, c]), with history from `state` (then advanced).
+constexpr int REC_TOKENS = 16;
+
+// h[t, c] += gv[t, c] + silu(sum_j w[c, j] * xn[t - 9 + 3j, c]), with history from `state`. Speculative
+// decoding (rec/ctl set) keeps the history committed one step behind like the GDN kernel: the previous
+// step's accepted xn values (ctl[0] tokens, records of parity ctl[1]) are replayed first; with `defer`
+// this step's values go to the other record buffer instead of the committed history.
 __global__ void conv_kernel(const float* __restrict__ gv, const float* __restrict__ xn, const __nv_bfloat16* __restrict__ w,
-                            float* state, float* h, int T) {
+                            float* state, float* h, int T, float* rec, const int* ctl, int defer) {
     pdl_launch_dependents();
     pdl_wait();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -56,17 +61,32 @@ __global__ void conv_kernel(const float* __restrict__ gv, const float* __restric
     float hist[HIST];
 #pragma unroll
     for (int j = 0; j < HIST; ++j) hist[j] = state[j * H + c];
+    auto shift = [&](float cur) {
+#pragma unroll
+        for (int j = 0; j < HIST - 1; ++j) hist[j] = hist[j + 1];
+        hist[HIST - 1] = cur;
+    };
+    float* next = nullptr;
+    if (rec) {
+        const int n_commit = ctl[0], parity = ctl[1];
+        const float* prev = rec + (size_t)parity * REC_TOKENS * H;
+        for (int t = 0; t < n_commit; ++t) shift(prev[(size_t)t * H + c]);
+        if (n_commit > 0 && defer)
+#pragma unroll
+            for (int j = 0; j < HIST; ++j) state[j * H + c] = hist[j];
+        next = rec + (size_t)(parity ^ 1) * REC_TOKENS * H;
+    }
     const float w0 = bf2f(w[c * 4]), w1 = bf2f(w[c * 4 + 1]), w2 = bf2f(w[c * 4 + 2]), w3 = bf2f(w[c * 4 + 3]);
     for (int t = 0; t < T; ++t) {
         const size_t i = (size_t)t * H + c;
         const float cur = xn[i];
         h[i] += gv[i] + silu(w0 * hist[0] + w1 * hist[3] + w2 * hist[6] + w3 * cur);
-#pragma unroll
-        for (int j = 0; j < HIST - 1; ++j) hist[j] = hist[j + 1];
-        hist[HIST - 1] = cur;
+        if (defer && next) next[(size_t)t * H + c] = cur;
+        shift(cur);
     }
+    if (!defer)
 #pragma unroll
-    for (int j = 0; j < HIST; ++j) state[j * H + c] = hist[j];
+        for (int j = 0; j < HIST; ++j) state[j * H + c] = hist[j];
 }
 
 }  // namespace
@@ -80,8 +100,13 @@ extern "C" cudaError_t squash_ple_gate(const float* kp, const float* h, const fl
     SQ_RETURN_LAUNCH();
 }
 
+extern "C" size_t squash_ple_record_floats() { return (size_t)2 * REC_TOKENS * H; }
+
+// rec/ctl/defer as for squash_gdn_fused_small (records: squash_ple_record_floats() floats).
 extern "C" cudaError_t squash_ple_conv(const float* gv, const float* xn, const void* w, float* state, float* h, int T,
-                                       cudaStream_t st) {
-    SQ_CHECK_LAUNCH(sq_launch(conv_kernel, H / 256, 256, 0, st, gv, xn, static_cast<const __nv_bfloat16*>(w), state, h, T));
+                                       float* rec, const int* ctl, int defer, cudaStream_t st) {
+    if (T > REC_TOKENS && rec && defer) return cudaErrorInvalidValue;
+    SQ_CHECK_LAUNCH(sq_launch(conv_kernel, H / 256, 256, 0, st, gv, xn, static_cast<const __nv_bfloat16*>(w), state, h, T,
+                              rec, ctl, defer));
     SQ_RETURN_LAUNCH();
 }
