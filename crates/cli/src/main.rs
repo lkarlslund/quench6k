@@ -4,6 +4,7 @@ use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
 use squash_engine::checkpoint::Checkpoint;
 use squash_engine::loader::{self, LoadOptions};
+use squash_engine::oracle;
 use squash_engine::selection;
 
 #[derive(Parser)]
@@ -33,6 +34,18 @@ enum Command {
         /// Verify this many tensors (spread across the checkpoint) against the file bytes.
         #[arg(long, default_value_t = 0)]
         verify: usize,
+    },
+    /// Apply the correctness gate (GOAL.md §1) to teacher-forced candidate distributions.
+    Gate {
+        /// Fixture root containing one directory per fixture.
+        #[arg(long, default_value = "oracle/fixtures")]
+        fixtures: PathBuf,
+        /// Directory holding `<fixture>.json`/`<fixture>.bin` candidate files, or `<dir>/<fixture>-<suffix>`.
+        #[arg(long)]
+        candidates: PathBuf,
+        /// Candidate file suffix: files are named `<fixture><suffix>.{json,bin}`.
+        #[arg(long, default_value = "")]
+        suffix: String,
     },
 }
 
@@ -73,6 +86,43 @@ fn main() -> Result<()> {
                     checked += 1;
                 }
                 println!("verified {checked} tensors byte-exact");
+            }
+        }
+        Command::Gate { fixtures, candidates, suffix } => {
+            let mut all = true;
+            let mut any = false;
+            for dir in oracle::fixtures(&fixtures)? {
+                let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+                let stem = candidates.join(format!("{name}{suffix}"));
+                if !stem.with_extension("json").exists() {
+                    println!("{name:14} (no candidate)");
+                    continue;
+                }
+                any = true;
+                let verdict = oracle::gate(&dir, &oracle::Distributions::load(&stem)?)?;
+                for r in &verdict.regions {
+                    println!(
+                        "{name:14} {:10} n={:4} {}  |dlogp| mean {:.4} p99 {:.4} (bound {:.4} / {:.4}; floor {:.4} / {:.4}; vs B {:.4} / {:.4})  top1 agree {:.3}",
+                        r.region,
+                        r.positions,
+                        if r.pass { "PASS" } else { "FAIL" },
+                        r.vs_a.mean,
+                        r.vs_a.p99,
+                        r.bound_mean,
+                        r.bound_p99,
+                        r.floor.mean,
+                        r.floor.p99,
+                        r.vs_b.mean,
+                        r.vs_b.p99,
+                        r.top1_agree_a
+                    );
+                }
+                all &= verdict.pass;
+            }
+            ensure!(any, "no candidate files found in {}", candidates.display());
+            println!("gate: {}", if all { "PASS" } else { "FAIL" });
+            if !all {
+                std::process::exit(1);
             }
         }
     }
