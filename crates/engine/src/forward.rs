@@ -152,6 +152,8 @@ pub struct Workspace {
     att_part: u64,
     hc_r: u64,
     hc_xsq: u64,
+    inj2: u64,
+    hc_scratch: u64,
     /// Device copy of the step block, and its pinned host staging.
     step: u64,
     step_host: PinnedBuffer,
@@ -218,6 +220,8 @@ impl Workspace {
             row_token: alloc(k::moe_small_tokens() * TOP_K * 4)?,
             hc_r: alloc(t * S * 4)?,
             hc_xsq: alloc(HC_SPLITS * t.min(k::gemv_max_m()) * 4)?,
+            inj2: alloc(t * S * 4)?,
+            hc_scratch: alloc(k::hc_small_scratch_floats(t.min(k::gemv_max_m())) * 4)?,
             att_part: alloc(k::qsa_split_floats(k::gemv_max_m()) * 4)?,
             step: alloc(StepLayout::new(t).bytes)?,
             step_host: PinnedBuffer::new(StepLayout::new(t).bytes)?,
@@ -296,6 +300,17 @@ fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, out: u64, mut
         op!(prof, "hc mix", s, k::hc_mix(s, ws.up, ws.n, hc.norm, out, t));
     }
     Ok(())
+}
+
+/// Small-batch HyperConnection: one cooperative kernel. `pending` is the previous block's output and
+/// injection weights, applied to the residual first; the new injection weights go to `inj_out`.
+#[allow(clippy::too_many_arguments)]
+fn hyper_connection_small(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, pending: Option<(u64, u64)>, inj_out: u64, out: u64) -> Result<()> {
+    let weight = |l: &Linear| (l.fmt, l.addr, l.scale);
+    let down = weight(&hc.down.parts[0].0);
+    let inject = hc.injects.then(|| weight(&hc.down.parts[1].0));
+    let (y, inj_prev) = pending.unwrap_or((0, ws.inj));
+    k::hc_small(s, ws.h, t, y, inj_prev, down, inject, weight(&hc.up), hc.norm, ws.hc_scratch, ws.low_bf, ws.hc_r, inj_out, out)
 }
 
 /// PLE row indices of the token at position `p` given the full token history (SPEC §8.1).
@@ -384,8 +399,16 @@ pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &
     op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, pos3, start, t));
 
     op!(prof, "embed", s, k::embed(s, tokens, t, model.embed, ws.h));
+    // Small batches defer each block's residual update to the next HyperConnection kernel; `inj` and
+    // `inj_next` alternate so that kernel reads the previous weights while writing its own.
+    let small = t <= k::gemv_max_m();
+    let mut pending: Option<u64> = None;
+    let (mut inj, mut inj_next) = (ws.inj, ws.inj2);
     for (i, layer) in model.layers.iter().enumerate() {
         if let Some(ple) = &layer.ple {
+            if let Some(y) = pending.take() {
+                op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, inj, t));
+            }
             let e = ws.step + layout.ple as u64;
             op!(prof, "ple.key", s, linear(s, ws, e, &ple.key, ws.kp, t));
             op!(prof, "ple.value", s, linear(s, ws, e, &ple.value, ws.pv, t));
@@ -393,7 +416,12 @@ pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &
             op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv, ws.xn, ple.conv, state.ple_conv.addr(), ws.h, t));
         }
 
-        hyper_connection(s, ws, &layer.attn_hc, t, ws.m, prof.as_deref_mut())?;
+        if small {
+            op!(prof, "hc_small", s, hyper_connection_small(s, ws, &layer.attn_hc, t, pending.map(|y| (y, inj)), inj_next, ws.m));
+            std::mem::swap(&mut inj, &mut inj_next);
+        } else {
+            hyper_connection(s, ws, &layer.attn_hc, t, ws.m, prof.as_deref_mut())?;
+        }
         match &layer.block {
             Block::Gdn(g) => {
                 let st = state.gdn[i].as_ref().unwrap();
@@ -431,9 +459,13 @@ pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &
                 op!(prof, "qsa o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
             }
         }
-        op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, ws.y, ws.inj, t));
-
-        hyper_connection(s, ws, &layer.mlp_hc, t, ws.m, prof.as_deref_mut())?;
+        if small {
+            op!(prof, "hc_small", s, hyper_connection_small(s, ws, &layer.mlp_hc, t, Some((ws.y, inj)), inj_next, ws.m));
+            std::mem::swap(&mut inj, &mut inj_next);
+        } else {
+            op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, ws.y, ws.inj, t));
+            hyper_connection(s, ws, &layer.mlp_hc, t, ws.m, prof.as_deref_mut())?;
+        }
         let moe = &layer.moe;
         let (ld, x) = (moe.proj.n, ws.proj);
         let col = |j: usize| x + (moe.proj.col(j) * 4) as u64;
@@ -460,9 +492,17 @@ pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &
         op!(prof, "shared swiglu", s, k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
         op!(prof, "shared down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
         op!(prof, "moe_combine", s, k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
-        op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, ws.y, ws.inj, t));
+        if small {
+            pending = Some(ws.y);
+        } else {
+            op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, ws.y, ws.inj, t));
+        }
     }
-    hyper_connection(s, ws, &model.final_hc, t, ws.out, prof.as_deref_mut())?;
+    if small {
+        op!(prof, "hc_small", s, hyper_connection_small(s, ws, &model.final_hc, t, pending.map(|y| (y, inj)), inj_next, ws.out));
+    } else {
+        hyper_connection(s, ws, &model.final_hc, t, ws.out, prof.as_deref_mut())?;
+    }
     Ok(())
 }
 

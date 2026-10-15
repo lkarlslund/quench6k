@@ -329,3 +329,24 @@ pub fn argmax_scratch(rows: usize, n: usize) -> usize {
 pub fn argmax(s: &Stream, x: u64, rows: usize, n: usize, ld: usize, scratch: u64, out: u64) -> Result<()> {
     launch!("argmax", ffi::squash_argmax(f(x), n32(rows), n32(n), ld, pm(scratch), im(out), s.raw()))
 }
+
+pub fn hc_small_scratch_floats(t: usize) -> usize {
+    unsafe { ffi::squash_hc_small_scratch_floats(t as i32) }
+}
+
+/// Weight of one projection for kernels that take raw pointers: (format, codes, scales).
+pub type Weight = (WeightFormat, u64, u64);
+
+/// One cooperative kernel for a whole HyperConnection on <= 16 tokens: applies the pending residual
+/// update `h += y · inj_prev` (when `y` is non-zero), projects through the norm-folded down/injection
+/// weights, and writes the block input `m` and, when `inject` is given, the new injection weights.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_small(s: &Stream, h: u64, t: usize, y: u64, inj_prev: u64, down: Weight, inject: Option<Weight>, up: Weight, g: u64, scratch: u64, z: u64, r: u64, inj: u64, m: u64) -> Result<()> {
+    anyhow::ensure!(down.0 == up.0 && inject.is_none_or(|w| w.0 == down.0), "hc_small needs one weight format");
+    let (wi, si, inj) = match inject {
+        Some(w) => (p(w.1), f(w.2), fm(inj)),
+        None => (std::ptr::null(), std::ptr::null(), std::ptr::null_mut()),
+    };
+    let y = if y == 0 { std::ptr::null() } else { f(y) };
+    launch!("hc_small", ffi::squash_hc_small(down.0 as i32, fm(h), n32(t), y, f(inj_prev), p(down.1), f(down.2), wi, si, p(up.1), f(up.2), p(g), fm(scratch), pm(z), fm(r), inj, pm(m), s.raw()))
+}
