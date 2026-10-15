@@ -20,17 +20,35 @@ SQ_DEVICE float row_scale(const float* scales, int row) {
     return F == WFmt::FP8 || F == WFmt::INT8 ? __ldg(scales + row) : 1.0f;
 }
 
-// grid (ceil(N / 16), SPLITS); warp w owns rows 16 blockIdx.x + 2w, +1 (down rows, then injection rows).
+// Four consecutive weights of a row at column k as floats (BF16 or INT8 storage, no scale).
+template <WFmt F>
+SQ_DEVICE void load4(const uint8_t* row, int k, float* w) {
+    if constexpr (F == WFmt::BF16) {
+        const uint2 v = __ldg(reinterpret_cast<const uint2*>(row + (size_t)k * 2));
+        const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&v);
+        const float2 a = __bfloat1622float2(p[0]), b = __bfloat1622float2(p[1]);
+        w[0] = a.x, w[1] = a.y, w[2] = b.x, w[3] = b.y;
+    } else {
+        const int v = __ldg(reinterpret_cast<const int*>(row + k));
+        const int8_t* p = reinterpret_cast<const int8_t*>(&v);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) w[i] = (float)p[i];
+    }
+}
+
+// grid (ceil(N / 16), SPLITS); warp w owns rows 16 blockIdx.x + 2w, +1 (down rows, then injection rows)
+// over the block's 512-column split; lane l covers columns 4 l + 128 j (j < 4). The block first stages
+// x = h (+ y * inj_prev) of all its tokens' split in shared memory with one cooperative load.
 template <WFmt F, int MAXT>
 __global__ void __launch_bounds__(WARPS * 32) hc_down_kernel(const float* h, int T, const float* y, const float* inj_prev,
                                                              const uint8_t* __restrict__ wd, const float* __restrict__ sd,
                                                              const uint8_t* __restrict__ wi, const float* __restrict__ si,
                                                              int N, float* partial, float* xsq) {
     pdl_launch_dependents();
+    __shared__ __align__(16) float xs[MAXT][SPLIT];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, sp = blockIdx.y, s = sp / (SPLITS / S);
-    const int k = sp * SPLIT + lane * 16, d = k - s * D;
-    Raw16<F> raw[2];
-    float gs[2] = {1.0f, 1.0f}, rs[2] = {0.0f, 0.0f};
+    const int k0 = sp * SPLIT, d0 = k0 - s * D;
+    float w[2][16], rs[2];
     int rows[2];
 #pragma unroll
     for (int rr = 0; rr < 2; ++rr) {
@@ -38,18 +56,52 @@ __global__ void __launch_bounds__(WARPS * 32) hc_down_kernel(const float* h, int
         const int row = min(rows[rr], N - 1);
         const bool down = row < RANK;
         const int wr = down ? row : row - RANK;
-        raw[rr] = load_raw16<F>((down ? wd : wi) + (size_t)wr * H * elem_bytes<F>(), k);
-        if constexpr (F == WFmt::INT8G) gs[rr] = __ldg((down ? sd : si) + (size_t)wr * (H / GROUP) + k / GROUP);
+        const uint8_t* wrow = (down ? wd : wi) + (size_t)wr * H * elem_bytes<F>();
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int k = k0 + 4 * lane + 128 * j;
+            load4<F>(wrow, k, w[rr] + 4 * j);
+            if constexpr (F == WFmt::INT8G) {
+                const float gs = __ldg((down ? sd : si) + (size_t)wr * (H / GROUP) + k / GROUP);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) w[rr][4 * j + i] *= gs;
+            }
+        }
         rs[rr] = row_scale<F>(down ? sd : si, wr);
     }
-    float w[2][16];
-#pragma unroll
-    for (int rr = 0; rr < 2; ++rr) {
-        decode_raw16<F>(raw[rr], w[rr]);
-#pragma unroll
-        for (int i = 0; i < 16; ++i) w[rr][i] *= gs[rr];
-    }
     pdl_wait();
+
+    // Stage x for every token: float4 q of token t covers columns 4 q .. 4 q + 3 of the split.
+    constexpr int ITEMS = MAXT * SPLIT / 4, ITERS = (ITEMS + WARPS * 32 - 1) / (WARPS * 32);
+    float4 hv[ITERS], yv[ITERS];
+    float iv[ITERS];
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+        const int q = threadIdx.x + it * WARPS * 32, t = q / (SPLIT / 4), c = (q % (SPLIT / 4)) * 4;
+        if (t < T) {
+            hv[it] = __ldg(reinterpret_cast<const float4*>(h + (size_t)t * H + k0 + c));
+            if (y) {
+                yv[it] = __ldg(reinterpret_cast<const float4*>(y + (size_t)t * D + d0 + c));
+                iv[it] = inj_prev[t * S + s];
+            }
+        }
+    }
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+        const int q = threadIdx.x + it * WARPS * 32, t = q / (SPLIT / 4), c = (q % (SPLIT / 4)) * 4;
+        if (t < T) {
+            float4 x = hv[it];
+            if (y) {
+                x.x = fmaf(yv[it].x, iv[it], x.x);
+                x.y = fmaf(yv[it].y, iv[it], x.y);
+                x.z = fmaf(yv[it].z, iv[it], x.z);
+                x.w = fmaf(yv[it].w, iv[it], x.w);
+            }
+            *reinterpret_cast<float4*>(&xs[t][c]) = x;
+        }
+    }
+    __syncthreads();
+
     // Tokens in groups of up to four; the group's 2 x TG dot products are reduced together (slot
     // 2 t + rr), each bitwise as a warp_sum of its own.
     constexpr int TG = MAXT < 4 ? MAXT : 4, NS = 2 * TG;
@@ -58,19 +110,14 @@ __global__ void __launch_bounds__(WARPS * 32) hc_down_kernel(const float* h, int
         if (t0 >= T) break;
         float acc[NS] = {};
 #pragma unroll
-        for (int j = 0; j < TG; ++j) {
-            const int t = t0 + j;
+        for (int jt = 0; jt < TG; ++jt) {
+            const int t = t0 + jt;
             if (t >= T) break;
             float x[16];
-            load_x8(h + (size_t)t * H + k, x);
-            load_x8(h + (size_t)t * H + k + 8, x + 8);
-            if (y) {
-                float yv[16];
-                load_x8(y + (size_t)t * D + d, yv);
-                load_x8(y + (size_t)t * D + d + 8, yv + 8);
-                const float iv = inj_prev[t * S + s];
 #pragma unroll
-                for (int i = 0; i < 16; ++i) x[i] = fmaf(yv[i], iv, x[i]);
+            for (int j = 0; j < 4; ++j) {
+                const float4 v = *reinterpret_cast<const float4*>(&xs[t][4 * lane + 128 * j]);
+                x[4 * j] = v.x, x[4 * j + 1] = v.y, x[4 * j + 2] = v.z, x[4 * j + 3] = v.w;
             }
             if (blockIdx.x == 0 && warp == 0) {
                 float ss = 0;
@@ -82,7 +129,7 @@ __global__ void __launch_bounds__(WARPS * 32) hc_down_kernel(const float* h, int
 #pragma unroll
             for (int rr = 0; rr < 2; ++rr)
 #pragma unroll
-                for (int i = 0; i < 16; ++i) acc[2 * j + rr] = fmaf(w[rr][i], x[i], acc[2 * j + rr]);
+                for (int i = 0; i < 16; ++i) acc[2 * jt + rr] = fmaf(w[rr][i], x[i], acc[2 * jt + rr]);
         }
         const float v = warp_sum_slots(acc);
         const int slot = lane / (32 / NS), t = t0 + slot / 2, rr = slot % 2;
