@@ -15,14 +15,14 @@ namespace {
 constexpr int E = 512, TOPK = 10, D = 2560;
 
 // One warp per token: softmax over 512 router logits, top 10 (ties: lower expert), renormalized.
-__global__ void route_kernel(const float* __restrict__ logits, int T, int* top_i, float* top_w) {
+__global__ void route_kernel(const float* __restrict__ logits, int ld, int T, int* top_i, float* top_w) {
     const int t = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
     if (t >= T) return;
     float v[E / 32];
     float mx = -INFINITY;
 #pragma unroll
     for (int j = 0; j < E / 32; ++j) {
-        v[j] = logits[(size_t)t * E + j * 32 + lane];
+        v[j] = logits[(size_t)t * ld + j * 32 + lane];
         mx = fmaxf(mx, v[j]);
     }
     mx = warp_max(mx);
@@ -219,20 +219,22 @@ __global__ void __launch_bounds__(THREADS) nvfp4_gemm_kernel(const __nv_bfloat16
             }
 }
 
-// act[r, i] = bf16(silu(gate[r, i]) * up[r, i])
-__global__ void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up, __nv_bfloat16* act,
-                              size_t count) {
+// act[r, i] = bf16(silu(gate[r * ld + i]) * up[r * ld + i]) for i < width
+__global__ void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up, int ld, int width,
+                              __nv_bfloat16* act, size_t count) {
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i < count) act[i] = f2bf(silu(gate[i]) * up[i]);
+    if (i >= count) return;
+    const size_t r = i / width, c = i % width;
+    act[i] = f2bf(silu(gate[r * ld + c]) * up[r * ld + c]);
 }
 
 // y[t, d] = sum_k w[t, k] * Yd[pair_row[t*10+k], d] + sigmoid(sg[t]) * sh[t, d]
 __global__ void combine_kernel(const float* __restrict__ yd, const int* __restrict__ pair_row,
-                               const float* __restrict__ top_w, const float* __restrict__ sg,
+                               const float* __restrict__ top_w, const float* __restrict__ sg, int ld_sg,
                                const float* __restrict__ sh, float* y) {
     const int t = blockIdx.x;
-    const float g = sigmoidf(sg[t]);
-    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    const float g = sigmoidf(sg[(size_t)t * ld_sg]);
+    for (int d = blockIdx.y * blockDim.x + threadIdx.x; d < D; d += gridDim.y * blockDim.x) {
         float acc = 0;
 #pragma unroll
         for (int k = 0; k < TOPK; ++k) acc += top_w[t * TOPK + k] * yd[(size_t)pair_row[t * TOPK + k] * D + d];
@@ -330,7 +332,7 @@ constexpr int SMALL_T = 16, SMALL_PAIRS = SMALL_T * TOPK;
 // One block of 512 threads for T <= 16 tokens: routing (softmax, top 10, renormalize) and grouping of
 // the pairs by expert. Outputs top_i/top_w [T, 10], offsets [513], pair_row [10 T], row_token [10 T],
 // active [<= 10 T] and num_active.
-__global__ void __launch_bounds__(512) route_small_kernel(const float* __restrict__ logits, int T, int* top_i,
+__global__ void __launch_bounds__(512) route_small_kernel(const float* __restrict__ logits, int ld, int T, int* top_i,
                                                           float* top_w, int* offsets, int* pair_row, int* row_token,
                                                           int* active, int* num_active) {
     __shared__ int s_top[SMALL_PAIRS];
@@ -345,7 +347,7 @@ __global__ void __launch_bounds__(512) route_small_kernel(const float* __restric
         float mx = -INFINITY;
 #pragma unroll
         for (int j = 0; j < E / 32; ++j) {
-            v[j] = logits[(size_t)t * E + j * 32 + lane];
+            v[j] = logits[(size_t)t * ld + j * 32 + lane];
             mx = fmaxf(mx, v[j]);
         }
         mx = warp_max(mx);
@@ -453,32 +455,29 @@ SQ_DEVICE void decode32(const uint4 codes, uint16_t sc, float* w) {
     }
 }
 
-// acc[m] += w[0..32) . x_m[k .. k+32) for the rows m < rows, x_m = X[row_index(m)].
-template <typename RowOf>
-SQ_DEVICE void dot32(const float* w, const __nv_bfloat16* X, int ldx, int k, int rows, RowOf row_of, float* acc) {
+constexpr int EW = 8;  // warps per expert-GEMV CTA
+
+// x[m] . w for one 32-weight chunk of each routed row m, accumulated into acc[m].
+SQ_DEVICE void chunk_dot(const float* w, const __nv_bfloat16* xrow, float& acc) {
+    const uint4* xp = reinterpret_cast<const uint4*>(xrow);
 #pragma unroll
-    for (int m = 0; m < SMALL_T; ++m) {
-        if (m < rows) {
-            const uint4* xp = reinterpret_cast<const uint4*>(X + (size_t)row_of(m) * ldx + k);
+    for (int c = 0; c < 4; ++c) {
+        const uint4 xv = __ldg(xp + c);
+        const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(&xv);
 #pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                const uint4 xv = __ldg(xp + c);
-                const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(&xv);
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    const float2 xf = __bfloat1622float2(x2[i]);
-                    acc[m] = fmaf(w[c * 8 + 2 * i], xf.x, acc[m]);
-                    acc[m] = fmaf(w[c * 8 + 2 * i + 1], xf.y, acc[m]);
-                }
-            }
+        for (int i = 0; i < 4; ++i) {
+            const float2 xf = __bfloat1622float2(x2[i]);
+            acc = fmaf(w[c * 8 + 2 * i], xf.x, acc);
+            acc = fmaf(w[c * 8 + 2 * i + 1], xf.y, acc);
         }
     }
 }
 
-constexpr int EW = 8;  // warps per expert-GEMV CTA
-
 // act[row, n] = bf16(silu(gate_e[n] . x) * (up_e[n] . x)) for every row of active expert e,
-// x = m[row_token[row]]. grid (640 / 8, active slots): warp w handles output feature n.
+// x = m[row_token[row]]. grid (640 / 16, active slots). Warp w owns features 2w, 2w + 1 of the block:
+// lanes 0-15 stream the gate rows and lanes 16-31 the up rows, five 32-weight chunks per row per lane,
+// all loads issued before any arithmetic.
+template <int MAXR>
 __global__ void __launch_bounds__(EW * 32) gate_up_kernel(const __nv_bfloat16* __restrict__ m,
                                                           const int* __restrict__ row_token,
                                                           const uint64_t* __restrict__ gw, const uint64_t* __restrict__ gs,
@@ -486,61 +485,97 @@ __global__ void __launch_bounds__(EW * 32) gate_up_kernel(const __nv_bfloat16* _
                                                           const uint64_t* __restrict__ us, const float* __restrict__ u2,
                                                           const int* __restrict__ offsets, const int* __restrict__ active,
                                                           const int* __restrict__ num_active, __nv_bfloat16* act) {
-    constexpr int N = 640, K = D;
+    constexpr int N = 640, K = D, CHUNKS = K / 32 / 16, FEAT = 2;
     if ((int)blockIdx.y >= *num_active) return;
     const int e = active[blockIdx.y];
-    const int r0 = offsets[e], rows = min(offsets[e + 1] - r0, SMALL_T);
-    const int lane = threadIdx.x & 31, n = blockIdx.x * EW + (threadIdx.x >> 5);
-    const uint8_t* GW = reinterpret_cast<const uint8_t*>(gw[e]) + (size_t)n * (K / 2);
-    const uint8_t* GS = reinterpret_cast<const uint8_t*>(gs[e]) + (size_t)n * (K / 16);
-    const uint8_t* UW = reinterpret_cast<const uint8_t*>(uw[e]) + (size_t)n * (K / 2);
-    const uint8_t* US = reinterpret_cast<const uint8_t*>(us[e]) + (size_t)n * (K / 16);
-    auto row_of = [&](int mm) { return row_token[r0 + mm]; };
-    float ag[SMALL_T] = {}, au[SMALL_T] = {};
-    for (int k = lane * 32; k < K; k += 32 * 32) {
-        float w[32];
-        decode32(__ldg(reinterpret_cast<const uint4*>(GW + k / 2)), __ldg(reinterpret_cast<const uint16_t*>(GS + k / 16)), w);
-        dot32(w, m, K, k, rows, row_of, ag);
-        decode32(__ldg(reinterpret_cast<const uint4*>(UW + k / 2)), __ldg(reinterpret_cast<const uint16_t*>(US + k / 16)), w);
-        dot32(w, m, K, k, rows, row_of, au);
+    const int r0 = offsets[e], rows = min(offsets[e + 1] - r0, MAXR);
+    const int lane = threadIdx.x & 31, half = lane >> 4, hl = lane & 15;
+    const int n0 = (blockIdx.x * EW + (threadIdx.x >> 5)) * FEAT;
+    const uint8_t* W = reinterpret_cast<const uint8_t*>(half ? uw[e] : gw[e]) + (size_t)n0 * (K / 2);
+    const uint8_t* Sc = reinterpret_cast<const uint8_t*>(half ? us[e] : gs[e]) + (size_t)n0 * (K / 16);
+    uint4 codes[FEAT][CHUNKS];
+    uint16_t scales[FEAT][CHUNKS];
+#pragma unroll
+    for (int f = 0; f < FEAT; ++f)
+#pragma unroll
+        for (int c = 0; c < CHUNKS; ++c) {
+            const int k = (hl + 16 * c) * 32;
+            codes[f][c] = __ldg(reinterpret_cast<const uint4*>(W + (size_t)f * (K / 2) + k / 2));
+            scales[f][c] = __ldg(reinterpret_cast<const uint16_t*>(Sc + (size_t)f * (K / 16) + k / 16));
+        }
+    const __nv_bfloat16* xrow[MAXR];
+#pragma unroll
+    for (int mm = 0; mm < MAXR; ++mm) xrow[mm] = m + (size_t)row_token[r0 + min(mm, rows - 1)] * K;
+    float acc[FEAT][MAXR] = {};
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int k = (hl + 16 * c) * 32;
+#pragma unroll
+        for (int f = 0; f < FEAT; ++f) {
+            float w[32];
+            decode32(codes[f][c], scales[f][c], w);
+#pragma unroll
+            for (int mm = 0; mm < MAXR; ++mm)
+                if (mm < rows) chunk_dot(w, xrow[mm] + k, acc[f][mm]);
+        }
     }
     const float sg = g2[e], su = u2[e];
 #pragma unroll
-    for (int mm = 0; mm < SMALL_T; ++mm) {
-        if (mm < rows) {
-            const float g = warp_sum(ag[mm]) * sg, u = warp_sum(au[mm]) * su;
-            if (lane == 0) act[(size_t)(r0 + mm) * N + n] = f2bf(silu(g) * u);
+    for (int f = 0; f < FEAT; ++f)
+#pragma unroll
+        for (int mm = 0; mm < MAXR; ++mm) {
+            if (mm < rows) {
+                float v = acc[f][mm];
+#pragma unroll
+                for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+                const float other = __shfl_xor_sync(0xffffffff, v, 16);
+                if (lane == 0) act[(size_t)(r0 + mm) * N + n0 + f] = f2bf(silu(v * sg) * (other * su));
+            }
         }
-    }
-    (void)N;
 }
 
-// yd[row, n] = down_e[n] . act[row] for every row of active expert e. grid (2560 / 8, active slots).
+// yd[row, n] = down_e[n] . act[row] for every row of active expert e. grid (2560 / 64, active slots):
+// each warp owns 8 features with 4 lanes per feature, five 32-weight chunks per lane loaded up front.
+template <int MAXR>
 __global__ void __launch_bounds__(EW * 32) down_kernel(const __nv_bfloat16* __restrict__ act,
                                                        const uint64_t* __restrict__ dw, const uint64_t* __restrict__ ds,
                                                        const float* __restrict__ d2, const int* __restrict__ offsets,
                                                        const int* __restrict__ active, const int* __restrict__ num_active,
                                                        float* yd) {
-    constexpr int K = 640;
+    constexpr int K = 640, CHUNKS = K / 32 / 4;  // 5 chunks per lane
     if ((int)blockIdx.y >= *num_active) return;
     const int e = active[blockIdx.y];
-    const int r0 = offsets[e], rows = min(offsets[e + 1] - r0, SMALL_T);
-    const int lane = threadIdx.x & 31, n = blockIdx.x * EW + (threadIdx.x >> 5);
+    const int r0 = offsets[e], rows = min(offsets[e + 1] - r0, MAXR);
+    const int lane = threadIdx.x & 31, q = lane & 3;
+    const int n = (blockIdx.x * EW + (threadIdx.x >> 5)) * 8 + (lane >> 2);
     const uint8_t* W = reinterpret_cast<const uint8_t*>(dw[e]) + (size_t)n * (K / 2);
     const uint8_t* Sc = reinterpret_cast<const uint8_t*>(ds[e]) + (size_t)n * (K / 16);
-    auto row_of = [&](int mm) { return r0 + mm; };
-    float acc[SMALL_T] = {};
-    for (int k = lane * 32; k < K; k += 32 * 32) {
+    uint4 codes[CHUNKS];
+    uint16_t scales[CHUNKS];
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int k = (q + 4 * c) * 32;
+        codes[c] = __ldg(reinterpret_cast<const uint4*>(W + k / 2));
+        scales[c] = __ldg(reinterpret_cast<const uint16_t*>(Sc + k / 16));
+    }
+    float acc[MAXR] = {};
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int k = (q + 4 * c) * 32;
         float w[32];
-        decode32(__ldg(reinterpret_cast<const uint4*>(W + k / 2)), __ldg(reinterpret_cast<const uint16_t*>(Sc + k / 16)), w);
-        dot32(w, act, K, k, rows, row_of, acc);
+        decode32(codes[c], scales[c], w);
+#pragma unroll
+        for (int mm = 0; mm < MAXR; ++mm)
+            if (mm < rows) chunk_dot(w, act + (size_t)(r0 + mm) * K + k, acc[mm]);
     }
     const float s = d2[e];
 #pragma unroll
-    for (int mm = 0; mm < SMALL_T; ++mm) {
+    for (int mm = 0; mm < MAXR; ++mm) {
         if (mm < rows) {
-            const float v = warp_sum(acc[mm]) * s;
-            if (lane == 0) yd[(size_t)(r0 + mm) * D + n] = v;
+            float v = acc[mm];
+            v += __shfl_xor_sync(0xffffffff, v, 2);
+            v += __shfl_xor_sync(0xffffffff, v, 1);
+            if (q == 0) yd[(size_t)(r0 + mm) * D + n] = v * s;
         }
     }
 }
@@ -549,9 +584,9 @@ __global__ void __launch_bounds__(EW * 32) down_kernel(const __nv_bfloat16* __re
 
 extern "C" int squash_moe_tile_rows() { return BM; }
 
-extern "C" cudaError_t squash_moe_route(const float* logits, int T, int* top_i, float* top_w, cudaStream_t st) {
+extern "C" cudaError_t squash_moe_route(const float* logits, int ld, int T, int* top_i, float* top_w, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    route_kernel<<<(T + 7) / 8, 256, 0, st>>>(logits, T, top_i, top_w);
+    route_kernel<<<(T + 7) / 8, 256, 0, st>>>(logits, ld, T, top_i, top_w);
     SQ_RETURN_LAUNCH();
 }
 
@@ -585,16 +620,18 @@ extern "C" cudaError_t squash_moe_nvfp4_gemm(const void* xs, const uint64_t* w_p
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_swiglu(const float* gate, const float* up, void* act, size_t count, cudaStream_t st) {
+extern "C" cudaError_t squash_swiglu(const float* gate, const float* up, int ld, int width, void* act, size_t count,
+                                     cudaStream_t st) {
     if (count == 0) return cudaSuccess;
-    swiglu_kernel<<<(unsigned)((count + 255) / 256), 256, 0, st>>>(gate, up, static_cast<__nv_bfloat16*>(act), count);
+    swiglu_kernel<<<(unsigned)((count + 255) / 256), 256, 0, st>>>(gate, up, ld, width, static_cast<__nv_bfloat16*>(act),
+                                                                    count);
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t squash_moe_combine(const float* yd, const int* pair_row, const float* top_w, const float* sg,
-                                          const float* sh, float* y, int T, cudaStream_t st) {
+                                          int ld_sg, const float* sh, float* y, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    combine_kernel<<<T, 256, 0, st>>>(yd, pair_row, top_w, sg, sh, y);
+    combine_kernel<<<dim3(T, D / 256), 256, 0, st>>>(yd, pair_row, top_w, sg, ld_sg, sh, y);
     SQ_RETURN_LAUNCH();
 }
 
@@ -616,32 +653,46 @@ extern "C" cudaError_t squash_moe_nvfp4_gemv(const void* xs, const uint64_t* w_p
 
 extern "C" int squash_moe_small_tokens() { return SMALL_T; }
 
-extern "C" cudaError_t squash_moe_route_small(const float* logits, int T, int* top_i, float* top_w, int* offsets,
+extern "C" cudaError_t squash_moe_route_small(const float* logits, int ld, int T, int* top_i, float* top_w, int* offsets,
                                               int* pair_row, int* row_token, int* active, int* num_active,
                                               cudaStream_t st) {
     if (T == 0 || T > SMALL_T) return T == 0 ? cudaSuccess : cudaErrorInvalidValue;
-    route_small_kernel<<<1, 512, 0, st>>>(logits, T, top_i, top_w, offsets, pair_row, row_token, active, num_active);
+    route_small_kernel<<<1, 512, 0, st>>>(logits, ld, T, top_i, top_w, offsets, pair_row, row_token, active, num_active);
     SQ_RETURN_LAUNCH();
 }
 
-// gate/up tables: [codes, scales] u64 x 512 each and weight_scale_2 f32 x 512.
+// gate/up tables: [codes, scales] u64 x 512 each and weight_scale_2 f32 x 512. T bounds the rows per expert.
 extern "C" cudaError_t squash_moe_gate_up_small(const void* m, const int* row_token, const uint64_t* gw,
                                                 const uint64_t* gs, const float* g2, const uint64_t* uw,
                                                 const uint64_t* us, const float* u2, const int* offsets,
-                                                const int* active, const int* num_active, int max_active, void* act,
-                                                cudaStream_t st) {
+                                                const int* active, const int* num_active, int max_active, int T,
+                                                void* act, cudaStream_t st) {
     if (max_active == 0) return cudaSuccess;
-    gate_up_kernel<<<dim3(640 / EW, max_active), EW * 32, 0, st>>>(static_cast<const __nv_bfloat16*>(m), row_token, gw,
-                                                                    gs, g2, uw, us, u2, offsets, active, num_active,
-                                                                    static_cast<__nv_bfloat16*>(act));
+    const dim3 grid(640 / (EW * 2), max_active);
+    const auto* x = static_cast<const __nv_bfloat16*>(m);
+    auto* a = static_cast<__nv_bfloat16*>(act);
+#define SQ_GU(R) gate_up_kernel<R><<<grid, EW * 32, 0, st>>>(x, row_token, gw, gs, g2, uw, us, u2, offsets, active, num_active, a)
+    if (T <= 1) SQ_GU(1);
+    else if (T <= 2) SQ_GU(2);
+    else if (T <= 4) SQ_GU(4);
+    else if (T <= 8) SQ_GU(8);
+    else SQ_GU(16);
+#undef SQ_GU
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t squash_moe_down_small(const void* act, const uint64_t* dw, const uint64_t* ds, const float* d2,
                                              const int* offsets, const int* active, const int* num_active,
-                                             int max_active, float* yd, cudaStream_t st) {
+                                             int max_active, int T, float* yd, cudaStream_t st) {
     if (max_active == 0) return cudaSuccess;
-    down_kernel<<<dim3(D / EW, max_active), EW * 32, 0, st>>>(static_cast<const __nv_bfloat16*>(act), dw, ds, d2, offsets,
-                                                              active, num_active, yd);
+    const dim3 grid(D / (EW * 8), max_active);
+    const auto* x = static_cast<const __nv_bfloat16*>(act);
+#define SQ_DN(R) down_kernel<R><<<grid, EW * 32, 0, st>>>(x, dw, ds, d2, offsets, active, num_active, yd)
+    if (T <= 1) SQ_DN(1);
+    else if (T <= 2) SQ_DN(2);
+    else if (T <= 4) SQ_DN(4);
+    else if (T <= 8) SQ_DN(8);
+    else SQ_DN(16);
+#undef SQ_DN
     SQ_RETURN_LAUNCH();
 }

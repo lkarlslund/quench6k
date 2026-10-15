@@ -50,55 +50,101 @@ impl DeviceWeights {
     }
 }
 
-/// Uploads the selected 2-D BF16 tensors and converts each to an 8-bit format (FP8 E4M3 or INT8) with
-/// per-row scales on the GPU, one file at a time, so only one file's BF16 copy is ever resident.
-pub fn upload_quantized(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, format: squash_cuda::kernels::WeightFormat, opts: LoadOptions, stream: &squash_cuda::Stream) -> Result<(DeviceWeights, LoadStats)> {
-    use squash_cuda::kernels::WeightFormat;
+/// Uploads the selected 2-D BF16 tensors and converts each to an 8-bit format (FP8 E4M3, INT8 or
+/// group-scaled INT8) with per-row or per-group scales on the GPU, one file at a time, so only one file's
+/// BF16 copy is ever resident.
+///
+/// `prep(name, addr, n, k)` may transform each staged BF16 tensor in place before it is quantized.
+///
+/// Each `groups` entry `(name, members)` quantizes its members (same K, same file) into consecutive rows
+/// of one weight, registered under `name` with shape `[sum of rows, K]`, so a single GEMV computes all
+/// of them; the members stay addressable under their own names.
+pub fn upload_quantized(
+    ckpt: &Checkpoint,
+    select: impl Fn(&str) -> bool,
+    format: squash_cuda::kernels::WeightFormat,
+    groups: &[(String, Vec<String>)],
+    prep: &dyn Fn(&str, u64, usize, usize) -> Result<()>,
+    opts: LoadOptions,
+    stream: &squash_cuda::Stream,
+) -> Result<(DeviceWeights, LoadStats)> {
+    use squash_cuda::kernels::{self as k, WeightFormat};
     anyhow::ensure!(format != WeightFormat::Bf16, "upload_quantized needs an 8-bit format");
     let start = Instant::now();
-    let mut per_file: Vec<Vec<&str>> = vec![Vec::new(); ckpt.files.len()];
-    for (name, info) in &ckpt.tensors {
-        if select(name) {
-            anyhow::ensure!(info.dtype == DType::BF16 && info.shape.len() == 2, "{name}: only 2-D BF16 tensors convert to FP8");
-            per_file[info.file].push(name.as_str());
+    let scales_per_row = |kk: usize| if format == WeightFormat::Int8Group { kk / k::int8_group() } else { 1 };
+
+    // Units of contiguous placement: a group's members, or a single tensor.
+    let mut grouped = std::collections::HashSet::new();
+    let mut units: Vec<Vec<usize>> = vec![Vec::new(); ckpt.files.len()];
+    let mut unit_list: Vec<(Option<&str>, Vec<&str>)> = Vec::new();
+    for (name, members) in groups {
+        anyhow::ensure!(!members.is_empty(), "empty fusion group {name}");
+        let file = ckpt.get(&members[0])?.file;
+        let kk = ckpt.get(&members[0])?.shape[1];
+        for m in members {
+            anyhow::ensure!(select(m), "fusion group {name}: member {m} is not selected for quantization");
+            let info = ckpt.get(m)?;
+            anyhow::ensure!(info.file == file && info.shape[1] == kk, "fusion group {name}: members differ in file or K");
+            grouped.insert(m.as_str());
         }
+        units[file].push(unit_list.len());
+        unit_list.push((Some(name.as_str()), members.iter().map(|m| m.as_str()).collect()));
     }
+    let mut singles: Vec<&str> = ckpt.tensors.keys().map(|n| n.as_str()).filter(|n| select(n) && !grouped.contains(n)).collect();
+    singles.sort();
+    for name in singles {
+        let info = &ckpt.tensors[name];
+        anyhow::ensure!(info.dtype == DType::BF16 && info.shape.len() == 2, "{name}: only 2-D BF16 tensors quantize");
+        units[info.file].push(unit_list.len());
+        unit_list.push((None, vec![name]));
+    }
+
     let mut out = DeviceWeights { segments: Vec::new(), tensors: HashMap::new() };
     let mut stats = LoadStats::default();
-    for names in per_file.iter_mut().filter(|n| !n.is_empty()) {
+    for file_units in units.iter().filter(|u| !u.is_empty()) {
+        let mut names: Vec<&str> = file_units.iter().flat_map(|&u| unit_list[u].1.iter().copied()).collect();
         names.sort();
         let (staged, s) = upload(ckpt, |n| names.binary_search(&n).is_ok(), opts)?;
         stats.bytes += s.bytes;
-        let mut layout = Vec::with_capacity(names.len());
+        // Layout: per unit, the members' codes back to back, then their scales back to back.
+        let mut placements = Vec::new();
         let mut total = 0usize;
-        for name in names.iter() {
-            let shape = &ckpt.tensors[*name].shape;
-            let scales = if format == WeightFormat::Int8Group { shape[0] * shape[1] / squash_cuda::kernels::int8_group() } else { shape[0] };
-            let (q, sc) = (total, total + (shape[0] * shape[1]).div_ceil(256) * 256);
-            total = sc + (scales * 4).div_ceil(256) * 256;
-            layout.push((q, sc));
+        for &u in file_units {
+            let members = &unit_list[u].1;
+            let kk = ckpt.tensors[members[0]].shape[1];
+            let rows: usize = members.iter().map(|m| ckpt.tensors[*m].shape[0]).sum();
+            let (q, sc) = (total, total + (rows * kk).div_ceil(256) * 256);
+            total = sc + (rows * scales_per_row(kk) * 4).div_ceil(256) * 256;
+            placements.push((u, q, sc, rows, kk));
         }
         let arena = DeviceBuffer::new(total)?;
-        for (name, (q, sc)) in names.iter().zip(layout) {
-            let src = staged.get(name)?;
-            let (n, k) = (src.shape[0], src.shape[1]);
-            let (qa, sa) = (arena.addr() + q as u64, arena.addr() + sc as u64);
+        for (u, q, sc, rows, kk) in placements {
+            let (group, members) = &unit_list[u];
+            let (mut qa, mut sa) = (arena.addr() + q as u64, arena.addr() + sc as u64);
             let dtype = match format {
-                WeightFormat::Fp8 => {
-                    squash_cuda::kernels::quantize_fp8_rows(stream, src.addr, n, k, qa, sa)?;
-                    DType::F8E4M3
-                }
-                WeightFormat::Int8 => {
-                    squash_cuda::kernels::quantize_int8_rows(stream, src.addr, n, k, qa, sa)?;
-                    DType::I8
-                }
-                _ => {
-                    anyhow::ensure!(k % squash_cuda::kernels::int8_group() == 0, "{name}: K {k} is not a multiple of the INT8 group");
-                    squash_cuda::kernels::quantize_int8_groups(stream, src.addr, n, k, qa, sa)?;
-                    DType::I8G
-                }
+                WeightFormat::Fp8 => DType::F8E4M3,
+                WeightFormat::Int8 => DType::I8,
+                _ => DType::I8G,
             };
-            out.tensors.insert(name.to_string(), DeviceTensor { addr: qa, bytes: (n * k) as u64, dtype, shape: src.shape.clone(), scale: sa });
+            if let Some(g) = group {
+                out.tensors.insert(g.to_string(), DeviceTensor { addr: qa, bytes: (rows * kk) as u64, dtype, shape: vec![rows, kk], scale: sa });
+            }
+            for name in members {
+                let src = staged.get(name)?;
+                let n = src.shape[0];
+                prep(name, src.addr, n, kk)?;
+                match format {
+                    WeightFormat::Fp8 => k::quantize_fp8_rows(stream, src.addr, n, kk, qa, sa)?,
+                    WeightFormat::Int8 => k::quantize_int8_rows(stream, src.addr, n, kk, qa, sa)?,
+                    _ => {
+                        anyhow::ensure!(kk % k::int8_group() == 0, "{name}: K {kk} is not a multiple of the INT8 group");
+                        k::quantize_int8_groups(stream, src.addr, n, kk, qa, sa)?
+                    }
+                }
+                out.tensors.insert(name.to_string(), DeviceTensor { addr: qa, bytes: (n * kk) as u64, dtype, shape: src.shape.clone(), scale: sa });
+                qa += (n * kk) as u64;
+                sa += (n * scales_per_row(kk) * 4) as u64;
+            }
         }
         stream.synchronize()?;
         out.segments.push(arena);

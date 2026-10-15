@@ -68,12 +68,28 @@ constexpr int elem_bytes() {
     return F == WFmt::BF16 ? 2 : 1;
 }
 
+// Loads 8 consecutive activations as floats from BF16 or FP32 storage.
+SQ_DEVICE void load_x8(const __nv_bfloat16* x, float* out) {
+    const uint4 xv = __ldg(reinterpret_cast<const uint4*>(x));
+    const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&xv);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 f = __bfloat1622float2(xp[i]);
+        out[2 * i] = f.x;
+        out[2 * i + 1] = f.y;
+    }
+}
+SQ_DEVICE void load_x8(const float* x, float* out) {
+    const float4 a = __ldg(reinterpret_cast<const float4*>(x)), b = __ldg(reinterpret_cast<const float4*>(x + 4));
+    out[0] = a.x, out[1] = a.y, out[2] = a.z, out[3] = a.w, out[4] = b.x, out[5] = b.y, out[6] = b.z, out[7] = b.w;
+}
+
 // grid (ceil(N / 16), splits). Each split covers k_per_split columns (a multiple of 256).
-template <WFmt F, int M>
-__global__ void __launch_bounds__(THREADS) gemv_kernel(const __nv_bfloat16* __restrict__ X, int ldx,
+template <WFmt F, int M, typename XT>
+__global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X, int ldx,
                                                        const uint8_t* __restrict__ W, const float* __restrict__ row_scale,
-                                                       float* Y, int ldy, float* partial, int N, int K, int k_per_split,
-                                                       float alpha, int accumulate) {
+                                                       float* Y, int ldy, float* partial, int ldp, int N, int K,
+                                                       int k_per_split, float alpha, int accumulate) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int k_begin = blockIdx.y * k_per_split, k_end = min(K, k_begin + k_per_split);
     const size_t row_bytes = (size_t)K * elem_bytes<F>();
@@ -93,14 +109,10 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const __nv_bfloat16* __re
             }
 #pragma unroll
             for (int m = 0; m < M; ++m) {
-                const uint4 xv = __ldg(reinterpret_cast<const uint4*>(X + (size_t)m * ldx + k));
-                const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&xv);
+                float xf[8];
+                load_x8(X + (size_t)m * ldx + k, xf);
 #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    const float2 xf = __bfloat1622float2(xp[i]);
-                    acc[m] = fmaf(w[2 * i], xf.x, acc[m]);
-                    acc[m] = fmaf(w[2 * i + 1], xf.y, acc[m]);
-                }
+                for (int i = 0; i < 8; ++i) acc[m] = fmaf(w[i], xf[i], acc[m]);
             }
         }
 #pragma unroll
@@ -113,7 +125,7 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const __nv_bfloat16* __re
                     float* y = &Y[(size_t)m * ldy + n];
                     *y = accumulate ? *y + acc[m] * scale : acc[m] * scale;
                 } else {
-                    partial[((size_t)blockIdx.y * M + m) * N + n] = acc[m] * scale;
+                    partial[((size_t)blockIdx.y * M + m) * ldp + n] = acc[m] * scale;
                 }
             }
         }
@@ -121,38 +133,46 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const __nv_bfloat16* __re
 }
 
 // Y[m, n] (+)= sum over splits of partial[split, m, n], in split order.
-__global__ void reduce_kernel(const float* __restrict__ partial, int splits, int M, int N, float* Y, int ldy,
+__global__ void reduce_kernel(const float* __restrict__ partial, int ldp, int splits, int M, int N, float* Y, int ldy,
                               int accumulate) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= M * N) return;
     const int m = i / N, n = i % N;
     float acc = 0;
-    for (int s = 0; s < splits; ++s) acc += partial[((size_t)s * M + m) * N + n];
+    for (int s = 0; s < splits; ++s) acc += partial[((size_t)s * M + m) * ldp + n];
     float* y = &Y[(size_t)m * ldy + n];
     *y = accumulate ? *y + acc : acc;
 }
 
+// x_f32: X holds FP32 activations. reduce = 0 leaves split partials in `partial` for the caller.
 template <WFmt F, int M>
-cudaError_t launch_m(const void* X, int ldx, const void* W, const float* scale, float* Y, int ldy, float* partial,
-                     int N, int K, int splits, float alpha, int accumulate, cudaStream_t st) {
+cudaError_t launch_m(const void* X, int x_f32, int ldx, const void* W, const float* scale, float* Y, int ldy,
+                     float* partial, int ldp, int N, int K, int splits, float alpha, int accumulate, int reduce,
+                     cudaStream_t st) {
     const int k_per_split = ((K + splits - 1) / splits + 255) / 256 * 256;
     splits = (K + k_per_split - 1) / k_per_split;
     dim3 grid((N + ROWS_PER_CTA - 1) / ROWS_PER_CTA, splits);
-    gemv_kernel<F, M><<<grid, THREADS, 0, st>>>(static_cast<const __nv_bfloat16*>(X), ldx,
-                                                static_cast<const uint8_t*>(W), scale, Y, ldy, partial, N, K,
-                                                k_per_split, alpha, accumulate);
-    if (splits > 1) reduce_kernel<<<(M * N + 255) / 256, 256, 0, st>>>(partial, splits, M, N, Y, ldy, accumulate);
+    if (x_f32)
+        gemv_kernel<F, M, float><<<grid, THREADS, 0, st>>>(static_cast<const float*>(X), ldx, static_cast<const uint8_t*>(W),
+                                                           scale, Y, ldy, partial, ldp, N, K, k_per_split, alpha, accumulate);
+    else
+        gemv_kernel<F, M, __nv_bfloat16><<<grid, THREADS, 0, st>>>(static_cast<const __nv_bfloat16*>(X), ldx,
+                                                                   static_cast<const uint8_t*>(W), scale, Y, ldy,
+                                                                   partial, ldp, N, K, k_per_split, alpha, accumulate);
+    if (splits > 1 && reduce)
+        reduce_kernel<<<(M * N + 255) / 256, 256, 0, st>>>(partial, ldp, splits, M, N, Y, ldy, accumulate);
     return cudaGetLastError();
 }
 
 template <WFmt F>
-cudaError_t launch(int M, const void* X, int ldx, const void* W, const float* scale, float* Y, int ldy, float* partial,
-                   int N, int K, int splits, float alpha, int accumulate, cudaStream_t st) {
+cudaError_t launch(int M, const void* X, int x_f32, int ldx, const void* W, const float* scale, float* Y, int ldy,
+                   float* partial, int ldp, int N, int K, int splits, float alpha, int accumulate, int reduce,
+                   cudaStream_t st) {
     if (K % 8 != 0 || ldx % 8 != 0) return cudaErrorInvalidValue;
     switch (M) {
 #define SQ_CASE(m) \
     case m:        \
-        return launch_m<F, m>(X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
+        return launch_m<F, m>(X, x_f32, ldx, W, scale, Y, ldy, partial, ldp, N, K, splits, alpha, accumulate, reduce, st);
         SQ_CASE(1) SQ_CASE(2) SQ_CASE(3) SQ_CASE(4) SQ_CASE(5) SQ_CASE(6) SQ_CASE(7) SQ_CASE(8)
         SQ_CASE(9) SQ_CASE(10) SQ_CASE(11) SQ_CASE(12) SQ_CASE(13) SQ_CASE(14) SQ_CASE(15) SQ_CASE(16)
 #undef SQ_CASE
@@ -165,16 +185,19 @@ cudaError_t launch(int M, const void* X, int ldx, const void* W, const float* sc
 
 extern "C" int squash_gemv_max_m() { return 16; }
 
-// Splits must leave partial[splits * M * N] room in `partial` when > 1.
-extern "C" cudaError_t squash_gemv(int fmt, int M, const void* X, int ldx, const void* W, const float* scale, float* Y,
-                                   int ldy, float* partial, int N, int K, int splits, float alpha, int accumulate,
-                                   cudaStream_t st) {
+// With splits > 1, partial sums go to partial[(split * M + m) * ldp + n] (ldp >= N). With reduce = 0 they
+// are left for the caller (Y untouched); the effective split count then must be exactly `splits`.
+extern "C" cudaError_t squash_gemv(int fmt, int M, const void* X, int x_f32, int ldx, const void* W, const float* scale,
+                                   float* Y, int ldy, float* partial, int ldp, int N, int K, int splits, float alpha,
+                                   int accumulate, int reduce, cudaStream_t st) {
     if (M == 0) return cudaSuccess;
-    if (fmt == 0) return launch<WFmt::BF16>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
-    if (fmt == 1) return launch<WFmt::FP8>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
-    if (fmt == 2) return launch<WFmt::INT8>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
+#define SQ_ARGS M, X, x_f32, ldx, W, scale, Y, ldy, partial, ldp, N, K, splits, alpha, accumulate, reduce, st
+    if (fmt == 0) return launch<WFmt::BF16>(SQ_ARGS);
+    if (fmt == 1) return launch<WFmt::FP8>(SQ_ARGS);
+    if (fmt == 2) return launch<WFmt::INT8>(SQ_ARGS);
     if (K % GROUP != 0) return cudaErrorInvalidValue;
-    return launch<WFmt::INT8G>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
+    return launch<WFmt::INT8G>(SQ_ARGS);
+#undef SQ_ARGS
 }
 
 namespace {
@@ -255,5 +278,23 @@ extern "C" cudaError_t squash_quantize_int8_groups(const void* w, int N, int K, 
     const int items = N * (K / GROUP);
     quantize_int8_groups_kernel<<<(items + 7) / 8, 256, 0, st>>>(static_cast<const __nv_bfloat16*>(w), K,
                                                                   static_cast<int8_t*>(q), scale);
+    SQ_RETURN_LAUNCH();
+}
+
+namespace {
+
+// W[n, k] = bf16(W[n, k] * (1 + g[k])): folds a (1 + w)-style norm weight into a projection's columns.
+__global__ void fold_norm_kernel(__nv_bfloat16* w, const __nv_bfloat16* __restrict__ g, int K, size_t count) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < count) w[i] = f2bf(bf2f(w[i]) * (1.0f + bf2f(g[i % K])));
+}
+
+}  // namespace
+
+extern "C" cudaError_t squash_fold_norm(void* w, const void* g, int N, int K, cudaStream_t st) {
+    const size_t count = (size_t)N * K;
+    if (count == 0) return cudaSuccess;
+    fold_norm_kernel<<<(unsigned)((count + 255) / 256), 256, 0, st>>>(static_cast<__nv_bfloat16*>(w),
+                                                                      static_cast<const __nv_bfloat16*>(g), K, count);
     SQ_RETURN_LAUNCH();
 }

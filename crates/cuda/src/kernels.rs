@@ -59,12 +59,26 @@ pub fn gemv_max_m() -> usize {
     unsafe { ffi::squash_gemv_max_m() as usize }
 }
 
-/// Skinny GEMM for M <= 16 rows, FP32 output; formats as in [`gemm_f32`]. With `splits` > 1 the K
-/// range is split across CTAs and `partial` must hold `splits * M * N` floats.
+/// Skinny GEMM for M <= 16 rows of BF16 activations, FP32 output; formats as in [`gemm_f32`]. With
+/// `splits` > 1 the K range is split across CTAs and `partial` must hold `splits * M * N` floats.
 #[allow(clippy::too_many_arguments)]
 pub fn gemv(s: &Stream, m: usize, x: u64, ldx: usize, fmt: WeightFormat, w: u64, scale: u64, y: u64, ldy: usize, partial: u64, n: usize, k: usize, splits: usize, alpha: f32, accumulate: bool) -> Result<()> {
-    let err = unsafe { ffi::squash_gemv(fmt as i32, m as i32, p(x), ldx as i32, p(w), opt_f(scale), y as *mut f32, ldy as i32, partial as *mut f32, n as i32, k as i32, splits as i32, alpha, accumulate as i32, s.raw()) };
+    let err = unsafe { ffi::squash_gemv(fmt as i32, m as i32, p(x), 0, ldx as i32, p(w), opt_f(scale), y as *mut f32, ldy as i32, partial as *mut f32, n as i32, n as i32, k as i32, splits as i32, alpha, accumulate as i32, 1, s.raw()) };
     check(err, "gemv")
+}
+
+/// Split-K partial sums only, over FP32 activations: partial[(split · M + m) · ldp + n] for exactly
+/// `splits` splits (K / splits must be a multiple of 256).
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_partials_f32(s: &Stream, m: usize, x: u64, ldx: usize, fmt: WeightFormat, w: u64, scale: u64, partial: u64, ldp: usize, n: usize, k: usize, splits: usize) -> Result<()> {
+    anyhow::ensure!(k % splits == 0 && (k / splits) % 256 == 0, "gemv_partials_f32: K {k} does not split into {splits} multiples of 256");
+    let err = unsafe { ffi::squash_gemv(fmt as i32, m as i32, p(x), 1, ldx as i32, p(w), opt_f(scale), std::ptr::null_mut(), 0, partial as *mut f32, ldp as i32, n as i32, k as i32, splits as i32, 1.0, 0, 0, s.raw()) };
+    check(err, "gemv_partials_f32")
+}
+
+/// W[n, k] *= 1 + g[k] in place (BF16).
+pub fn fold_norm(s: &Stream, w: u64, g: u64, n: usize, k: usize) -> Result<()> {
+    check(unsafe { ffi::squash_fold_norm(pm(w), p(g), n as i32, k as i32, s.raw()) }, "fold_norm")
 }
 
 /// BF16 [N, K] -> INT8 [N, K] with per-row scales absmax / 127.
@@ -117,6 +131,7 @@ pub fn embed(s: &Stream, tokens: u64, t: usize, table: u64, h: u64) -> Result<()
     launch!("embed", ffi::squash_embed(i(tokens), n32(t), p(table), fm(h), s.raw()))
 }
 
+/// n = rms(h per stream) · (1 + w), or without the weight when `w` is 0.
 pub fn grouped_rmsnorm(s: &Stream, h: u64, w: u64, n: u64, t: usize) -> Result<()> {
     launch!("grouped_rmsnorm", ffi::squash_grouped_rmsnorm(f(h), p(w), pm(n), n32(t), s.raw()))
 }
@@ -125,12 +140,27 @@ pub fn hc_inject(s: &Stream, n: u64, w: u64, inj: u64, t: usize) -> Result<()> {
     launch!("hc_inject", ffi::squash_hc_inject(p(n), p(w), fm(inj), n32(t), s.raw()))
 }
 
-pub fn hc_low_rank_act(s: &Stream, x: u64, z: u64, count: usize) -> Result<()> {
-    launch!("hc_low_rank_act", ffi::squash_hc_low_rank_act(f(x), pm(z), n32(count), s.raw()))
+/// From the fused HyperConnection projection x [T, 324] (row stride `ld`): the BF16 low-rank activation
+/// z [T, 320], and the injection weights [T, 4] when `inj` is non-zero.
+pub fn hc_act(s: &Stream, x: u64, ld: usize, z: u64, inj: u64, t: usize) -> Result<()> {
+    let inj = if inj == 0 { std::ptr::null_mut() } else { fm(inj) };
+    launch!("hc_act", ffi::squash_hc_act(f(x), n32(ld), pm(z), inj, n32(t), s.raw()))
 }
 
-pub fn hc_mix(s: &Stream, u: u64, n: u64, m: u64, t: usize) -> Result<()> {
-    launch!("hc_mix", ffi::squash_hc_mix(f(u), p(n), pm(m), n32(t), s.raw()))
+/// m = mean over streams of sigmoid(u) · n · (1 + g); `g` 0 omits the norm weight.
+pub fn hc_mix(s: &Stream, u: u64, n: u64, g: u64, m: u64, t: usize) -> Result<()> {
+    launch!("hc_mix", ffi::squash_hc_mix(f(u), p(n), p(g), pm(m), n32(t), s.raw()))
+}
+
+/// Reduces the HC down-projection split partials with per-stream RMS factors (see the kernel).
+#[allow(clippy::too_many_arguments)]
+pub fn hc_finish(s: &Stream, partial: u64, splits: usize, t: usize, n: usize, h: u64, z: u64, inj: u64, r: u64) -> Result<()> {
+    let inj = if inj == 0 { std::ptr::null_mut() } else { fm(inj) };
+    launch!("hc_finish", ffi::squash_hc_finish(f(partial), n32(splits), n32(t), n32(n), f(h), pm(z), inj, fm(r), s.raw()))
+}
+
+pub fn hc_mix_small(s: &Stream, u: u64, h: u64, r: u64, g: u64, m: u64, t: usize) -> Result<()> {
+    launch!("hc_mix_small", ffi::squash_hc_mix_small(f(u), f(h), f(r), p(g), pm(m), n32(t), s.raw()))
 }
 
 pub fn hc_combine(s: &Stream, h: u64, y: u64, inj: u64, t: usize) -> Result<()> {
@@ -145,31 +175,31 @@ pub fn add_f32(s: &Stream, y: u64, x: u64, count: usize) -> Result<()> {
     launch!("add_f32", ffi::squash_add_f32(fm(y), f(x), count, s.raw()))
 }
 
-pub fn gdn_conv(s: &Stream, x: u64, out: u64, state: u64, w: u64, t: usize) -> Result<()> {
-    launch!("gdn_conv", ffi::squash_gdn_conv(f(x), fm(out), fm(state), p(w), n32(t), s.raw()))
+pub fn gdn_conv(s: &Stream, x: u64, ldx: usize, out: u64, state: u64, w: u64, t: usize) -> Result<()> {
+    launch!("gdn_conv", ffi::squash_gdn_conv(f(x), n32(ldx), fm(out), fm(state), p(w), n32(t), s.raw()))
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn gdn_prep(s: &Stream, qkv: u64, a: u64, b: u64, a_log: u64, dt_bias: u64, beta: u64, g: u64, t: usize) -> Result<()> {
-    launch!("gdn_prep", ffi::squash_gdn_prep(fm(qkv), f(a), f(b), p(a_log), p(dt_bias), fm(beta), fm(g), n32(t), s.raw()))
+pub fn gdn_prep(s: &Stream, qkv: u64, a: u64, b: u64, ldab: usize, a_log: u64, dt_bias: u64, beta: u64, g: u64, t: usize) -> Result<()> {
+    launch!("gdn_prep", ffi::squash_gdn_prep(fm(qkv), f(a), f(b), n32(ldab), p(a_log), p(dt_bias), fm(beta), fm(g), n32(t), s.raw()))
 }
 
 pub fn gdn_recurrent(s: &Stream, qkv: u64, beta: u64, g: u64, state: u64, out: u64, t: usize) -> Result<()> {
     launch!("gdn_recurrent", ffi::squash_gdn_recurrent(f(qkv), f(beta), f(g), fm(state), fm(out), n32(t), s.raw()))
 }
 
-pub fn gdn_gated_norm(s: &Stream, o: u64, z: u64, w: u64, y: u64, t: usize) -> Result<()> {
-    launch!("gdn_gated_norm", ffi::squash_gdn_gated_norm(f(o), f(z), p(w), pm(y), n32(t), s.raw()))
+pub fn gdn_gated_norm(s: &Stream, o: u64, z: u64, ldz: usize, w: u64, y: u64, t: usize) -> Result<()> {
+    launch!("gdn_gated_norm", ffi::squash_gdn_gated_norm(f(o), f(z), n32(ldz), p(w), pm(y), n32(t), s.raw()))
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_qkv_prep(s: &Stream, qg: u64, kv: u64, q_norm: u64, k_norm: u64, q: u64, kcache: u64, vcache: u64, pos3: u64, start: u64, t: usize) -> Result<()> {
-    launch!("qsa_qkv_prep", ffi::squash_qsa_qkv_prep(f(qg), f(kv), p(q_norm), p(k_norm), fm(q), pm(kcache), pm(vcache), i(pos3), i(start), n32(t), s.raw()))
+pub fn qsa_qkv_prep(s: &Stream, qg: u64, kv: u64, ld: usize, q_norm: u64, k_norm: u64, q: u64, kcache: u64, vcache: u64, pos3: u64, start: u64, t: usize) -> Result<()> {
+    launch!("qsa_qkv_prep", ffi::squash_qsa_qkv_prep(f(qg), f(kv), n32(ld), p(q_norm), p(k_norm), fm(q), pm(kcache), pm(vcache), i(pos3), i(start), n32(t), s.raw()))
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_index_prep(s: &Stream, idx: u64, q_ln: u64, iq: u64, raw: u64, pos3: u64, start: u64, t: usize) -> Result<()> {
-    launch!("qsa_index_prep", ffi::squash_qsa_index_prep(f(idx), p(q_ln), fm(iq), pm(raw), i(pos3), i(start), n32(t), s.raw()))
+pub fn qsa_index_prep(s: &Stream, idx: u64, ld: usize, q_ln: u64, iq: u64, raw: u64, pos3: u64, start: u64, t: usize) -> Result<()> {
+    launch!("qsa_index_prep", ffi::squash_qsa_index_prep(f(idx), n32(ld), p(q_ln), fm(iq), pm(raw), i(pos3), i(start), n32(t), s.raw()))
 }
 
 pub fn qsa_pool(s: &Stream, raw: u64, k_ln: u64, pooled: u64, pos3: u64, start: u64, t: usize) -> Result<()> {
@@ -190,16 +220,16 @@ pub fn store_positions(s: &Stream, src: u64, pos3: u64, start: u64, t: usize) ->
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_attention(s: &Stream, q: u64, qg: u64, kcache: u64, vcache: u64, sel: u64, start: u64, t: usize, out: u64) -> Result<()> {
-    launch!("qsa_attention", ffi::squash_qsa_attention(f(q), f(qg), p(kcache), p(vcache), i(sel), i(start), n32(t), pm(out), s.raw()))
+pub fn qsa_attention(s: &Stream, q: u64, qg: u64, ld: usize, kcache: u64, vcache: u64, sel: u64, start: u64, t: usize, out: u64) -> Result<()> {
+    launch!("qsa_attention", ffi::squash_qsa_attention(f(q), f(qg), n32(ld), p(kcache), p(vcache), i(sel), i(start), n32(t), pm(out), s.raw()))
 }
 
 pub fn moe_tile_rows() -> usize {
     unsafe { ffi::squash_moe_tile_rows() as usize }
 }
 
-pub fn moe_route(s: &Stream, logits: u64, t: usize, top_i: u64, top_w: u64) -> Result<()> {
-    launch!("moe_route", ffi::squash_moe_route(f(logits), n32(t), im(top_i), fm(top_w), s.raw()))
+pub fn moe_route(s: &Stream, logits: u64, ld: usize, t: usize, top_i: u64, top_w: u64) -> Result<()> {
+    launch!("moe_route", ffi::squash_moe_route(f(logits), n32(ld), n32(t), im(top_i), fm(top_w), s.raw()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -219,13 +249,14 @@ pub fn moe_nvfp4_gemm(s: &Stream, xs: u64, w_ptr: u64, s_ptr: u64, ws2: u64, off
     )
 }
 
-pub fn swiglu(s: &Stream, gate: u64, up: u64, act: u64, count: usize) -> Result<()> {
-    launch!("swiglu", ffi::squash_swiglu(f(gate), f(up), pm(act), count, s.raw()))
+/// act[r, i] = bf16(silu(gate[r·ld + i]) · up[r·ld + i]) for `rows` rows of `width`.
+pub fn swiglu(s: &Stream, gate: u64, up: u64, ld: usize, width: usize, act: u64, rows: usize) -> Result<()> {
+    launch!("swiglu", ffi::squash_swiglu(f(gate), f(up), n32(ld), n32(width), pm(act), rows * width, s.raw()))
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn moe_combine(s: &Stream, yd: u64, pair_row: u64, top_w: u64, sg: u64, sh: u64, y: u64, t: usize) -> Result<()> {
-    launch!("moe_combine", ffi::squash_moe_combine(f(yd), i(pair_row), f(top_w), f(sg), f(sh), fm(y), n32(t), s.raw()))
+pub fn moe_combine(s: &Stream, yd: u64, pair_row: u64, top_w: u64, sg: u64, ld_sg: usize, sh: u64, y: u64, t: usize) -> Result<()> {
+    launch!("moe_combine", ffi::squash_moe_combine(f(yd), i(pair_row), f(top_w), f(sg), n32(ld_sg), f(sh), fm(y), n32(t), s.raw()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -252,22 +283,22 @@ pub fn moe_small_tokens() -> usize {
 
 /// Routing and expert grouping for at most [`moe_small_tokens`] tokens, in one kernel.
 #[allow(clippy::too_many_arguments)]
-pub fn moe_route_small(s: &Stream, logits: u64, t: usize, top_i: u64, top_w: u64, offsets: u64, pair_row: u64, row_token: u64, active: u64, num_active: u64) -> Result<()> {
-    launch!("moe_route_small", ffi::squash_moe_route_small(f(logits), n32(t), im(top_i), fm(top_w), im(offsets), im(pair_row), im(row_token), im(active), im(num_active), s.raw()))
+pub fn moe_route_small(s: &Stream, logits: u64, ld: usize, t: usize, top_i: u64, top_w: u64, offsets: u64, pair_row: u64, row_token: u64, active: u64, num_active: u64) -> Result<()> {
+    launch!("moe_route_small", ffi::squash_moe_route_small(f(logits), n32(ld), n32(t), im(top_i), fm(top_w), im(offsets), im(pair_row), im(row_token), im(active), im(num_active), s.raw()))
 }
 
 /// Expert gate and up GEMVs with the SwiGLU epilogue (W4A16, small batches).
 #[allow(clippy::too_many_arguments)]
-pub fn moe_gate_up_small(s: &Stream, m: u64, row_token: u64, gate: (u64, u64, u64), up: (u64, u64, u64), offsets: u64, active: u64, num_active: u64, max_active: usize, act: u64) -> Result<()> {
+pub fn moe_gate_up_small(s: &Stream, m: u64, row_token: u64, gate: (u64, u64, u64), up: (u64, u64, u64), offsets: u64, active: u64, num_active: u64, max_active: usize, t: usize, act: u64) -> Result<()> {
     launch!(
         "moe_gate_up_small",
-        ffi::squash_moe_gate_up_small(p(m), i(row_token), gate.0 as *const u64, gate.1 as *const u64, f(gate.2), up.0 as *const u64, up.1 as *const u64, f(up.2), i(offsets), i(active), i(num_active), n32(max_active), pm(act), s.raw())
+        ffi::squash_moe_gate_up_small(p(m), i(row_token), gate.0 as *const u64, gate.1 as *const u64, f(gate.2), up.0 as *const u64, up.1 as *const u64, f(up.2), i(offsets), i(active), i(num_active), n32(max_active), n32(t), pm(act), s.raw())
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn moe_down_small(s: &Stream, act: u64, down: (u64, u64, u64), offsets: u64, active: u64, num_active: u64, max_active: usize, yd: u64) -> Result<()> {
-    launch!("moe_down_small", ffi::squash_moe_down_small(p(act), down.0 as *const u64, down.1 as *const u64, f(down.2), i(offsets), i(active), i(num_active), n32(max_active), fm(yd), s.raw()))
+pub fn moe_down_small(s: &Stream, act: u64, down: (u64, u64, u64), offsets: u64, active: u64, num_active: u64, max_active: usize, t: usize, yd: u64) -> Result<()> {
+    launch!("moe_down_small", ffi::squash_moe_down_small(p(act), down.0 as *const u64, down.1 as *const u64, f(down.2), i(offsets), i(active), i(num_active), n32(max_active), n32(t), fm(yd), s.raw()))
 }
 
 pub fn qsa_split_floats(t: usize) -> usize {
@@ -276,6 +307,24 @@ pub fn qsa_split_floats(t: usize) -> usize {
 
 /// Key-split attention for small batches; `part` holds [`qsa_split_floats`]`(t)` floats.
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_attention_split(s: &Stream, q: u64, qg: u64, kcache: u64, vcache: u64, sel: u64, start: u64, t: usize, part: u64, out: u64) -> Result<()> {
-    launch!("qsa_attention_split", ffi::squash_qsa_attention_split(f(q), f(qg), p(kcache), p(vcache), i(sel), i(start), n32(t), fm(part), pm(out), s.raw()))
+pub fn qsa_attention_split(s: &Stream, q: u64, qg: u64, ld: usize, kcache: u64, vcache: u64, sel: u64, start: u64, t: usize, part: u64, out: u64) -> Result<()> {
+    launch!("qsa_attention_split", ffi::squash_qsa_attention_split(f(q), f(qg), n32(ld), p(kcache), p(vcache), i(sel), i(start), n32(t), fm(part), pm(out), s.raw()))
+}
+
+/// Fused small-batch GDN: conv, gating, delta rule and gated norm in one kernel (one block per value head).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_fused_small(s: &Stream, proj: u64, ld: usize, t: usize, conv_w: u64, conv_state: u64, state: u64, a_log: u64, dt_bias: u64, norm_w: u64, z_col: usize, a_col: usize, b_col: usize, y: u64) -> Result<()> {
+    launch!(
+        "gdn_fused_small",
+        ffi::squash_gdn_fused_small(f(proj), n32(ld), n32(t), p(conv_w), fm(conv_state), fm(state), p(a_log), p(dt_bias), p(norm_w), n32(z_col), n32(a_col), n32(b_col), pm(y), s.raw())
+    )
+}
+
+pub fn argmax_scratch(rows: usize, n: usize) -> usize {
+    unsafe { ffi::squash_argmax_scratch(rows as i32, n as i32) }
+}
+
+/// Row-wise argmax (ties: lower index); `scratch` holds [`argmax_scratch`] bytes.
+pub fn argmax(s: &Stream, x: u64, rows: usize, n: usize, ld: usize, scratch: u64, out: u64) -> Result<()> {
+    launch!("argmax", ffi::squash_argmax(f(x), n32(rows), n32(n), ld, pm(scratch), im(out), s.raw()))
 }

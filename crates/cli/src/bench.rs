@@ -37,11 +37,16 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         let prefill = ctx as f64 / t0.elapsed().as_secs_f64();
         let graph = forward::DecodeGraph::capture(&model, &state, &ws, &hw, &stream)?;
         let t1 = Instant::now();
+        let mut times = [0.0; 2];
         for _ in 0..generate {
-            next = graph.step(&model, &mut state, &mut ws, &hw, &stream, next)?;
+            next = graph.step_timed(&model, &mut state, &mut ws, &hw, &stream, next, &mut times)?;
         }
         let decode = generate as f64 / t1.elapsed().as_secs_f64();
-        println!("{ctx:>8} {prefill:>14.1} {decode:>14.1}");
+        println!(
+            "{ctx:>8} {prefill:>14.1} {decode:>14.1}   per token: host prepare {:.3} ms, graph {:.3} ms",
+            1e3 * times[0] / generate as f64,
+            1e3 * times[1] / generate as f64
+        );
         if profile {
             const STEPS: usize = 16;
             let mut prof = squash_engine::profile::Profiler::default();

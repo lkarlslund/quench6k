@@ -20,14 +20,18 @@ pub mod selection {
         name.starts_with("model.visual.")
     }
 
-    /// Projections that the 8-bit profiles store with per-row scales. Everything else
-    /// (embedding, norms, convolutions, gating vectors, the 48-row GDN a/b projections, the
-    /// HyperConnection injection, the indexer projection and the NVFP4 experts) keeps its format.
+    /// Projections that the 8-bit profiles quantize. Everything else (embedding, norms, convolutions,
+    /// gating vectors and the NVFP4 experts) keeps its checkpoint format.
     pub fn eight_bit(name: &str) -> bool {
         if name.contains(".experts.") || name.contains(".ngram_embedding.") {
             return false;
         }
-        const SUFFIXES: [&str; 15] = [
+        const SUFFIXES: [&str; 20] = [
+            "linear_attn.in_proj_a.weight",
+            "linear_attn.in_proj_b.weight",
+            "block_inject_weight.weight",
+            "indexer.index_qk_proj.weight",
+            "mlp.shared_expert_gate.weight",
             "self_attn.q_proj.weight",
             "self_attn.k_proj.weight",
             "self_attn.v_proj.weight",

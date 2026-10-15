@@ -5,7 +5,17 @@ use squash_cuda::{DeviceBuffer, PinnedBuffer, Stream, kernels as k};
 
 use crate::profile::Profiler;
 
-use crate::model::{Block, D, EOS, EXPERT_WIDTH, EXPERTS, H, HC_RANK, Hc, LAYERS, Linear, Model, S, TOP_K, VOCAB, is_attention};
+/// Runs `$call` (a `Result<()>` expression) on stream `$s`, timed under `$name` when profiling.
+macro_rules! op {
+    ($prof:ident, $name:expr, $s:expr, $call:expr) => {
+        match $prof.as_deref_mut() {
+            Some(p) => p.time($name, $s, || $call)?,
+            None => $call?,
+        }
+    };
+}
+
+use crate::model::{Block, D, EOS, EXPERT_WIDTH, EXPERTS, H, HC_RANK, Hc, LAYERS, Linear, Model, Proj, S, TOP_K, VOCAB, is_attention};
 
 const QSA_HEADS: usize = 24;
 const QSA_KV: usize = 2;
@@ -17,6 +27,10 @@ const GDN_HEADS: usize = 48;
 const GDN_DIM: usize = 128;
 const GDN_Z: usize = GDN_HEADS * GDN_DIM;
 const PLE_HIST: usize = 9;
+/// K splits of the small-batch HC down projection: 5 per 2560-wide stream (512 columns each).
+const HC_SPLITS: usize = 20;
+/// Widest projection group: GDN in_proj (10240 + 6144 + 48 + 48).
+const PROJ_WIDTH: usize = GDN_CONV + GDN_Z + 2 * GDN_HEADS;
 
 pub struct QsaCache {
     pub k: DeviceBuffer,
@@ -87,34 +101,27 @@ pub struct Workspace {
     score_cols: usize,
     bufs: Vec<DeviceBuffer>,
     pub h: u64,
+    /// Output of a projection group, FP32 [T, <= PROJ_WIDTH].
+    proj: u64,
     n: u64,
-    low: u64,
     low_bf: u64,
     up: u64,
     inj: u64,
     pub m: u64,
     y: u64,
     // GDN
-    qkv: u64,
     conv: u64,
-    z: u64,
-    ga: u64,
-    gb: u64,
     beta: u64,
     g: u64,
     o: u64,
     o_bf: u64,
     // QSA
-    qg: u64,
-    kv: u64,
     q: u64,
-    idx: u64,
     iq: u64,
     scores: u64,
     sel: u64,
     att: u64,
     // MoE
-    logits: u64,
     top_i: u64,
     top_w: u64,
     counts: u64,
@@ -129,9 +136,6 @@ pub struct Workspace {
     eu: u64,
     act: u64,
     yd: u64,
-    sg: u64,
-    sgate: u64,
-    sup: u64,
     sact: u64,
     sh: u64,
     // PLE
@@ -146,6 +150,7 @@ pub struct Workspace {
     num_active: u64,
     row_token: u64,
     att_part: u64,
+    hc_r: u64,
     /// Device copy of the step block, and its pinned host staging.
     step: u64,
     step_host: PinnedBuffer,
@@ -168,31 +173,23 @@ impl Workspace {
             max_tokens,
             score_cols,
             h: alloc(t * H * 4)?,
+            proj: alloc(t * PROJ_WIDTH * 4)?,
             n: alloc(t * H * 2)?,
-            low: alloc(t * HC_RANK * 4)?,
             low_bf: alloc(t * HC_RANK * 2)?,
             up: alloc(t * H * 4)?,
             inj: alloc(t * S * 4)?,
             m: alloc(t * D * 2)?,
             y: alloc(t * D * 4)?,
-            qkv: alloc(t * GDN_CONV * 4)?,
             conv: alloc(t * GDN_CONV * 4)?,
-            z: alloc(t * GDN_Z * 4)?,
-            ga: alloc(t * GDN_HEADS * 4)?,
-            gb: alloc(t * GDN_HEADS * 4)?,
             beta: alloc(t * GDN_HEADS * 4)?,
             g: alloc(t * GDN_HEADS * 4)?,
             o: alloc(t * GDN_Z * 4)?,
             o_bf: alloc(t * GDN_Z * 2)?,
-            qg: alloc(t * QSA_HEADS * 2 * QSA_DIM * 4)?,
-            kv: alloc(t * 2 * QSA_KV * QSA_DIM * 4)?,
             q: alloc(t * QSA_HEADS * QSA_DIM * 4)?,
-            idx: alloc(t * 5 * INDEX_DIM * 4)?,
             iq: alloc(t * 4 * INDEX_DIM * 4)?,
             scores: alloc(t * score_cols * 4)?,
             sel: alloc(t * TOP_GROUPS * 4)?,
             att: alloc(t * QSA_HEADS * QSA_DIM * 2)?,
-            logits: alloc(t * EXPERTS * 4)?,
             top_i: alloc(pairs * 4)?,
             top_w: alloc(pairs * 4)?,
             counts: alloc(EXPERTS * 4)?,
@@ -207,9 +204,6 @@ impl Workspace {
             eu: alloc(pairs * EXPERT_WIDTH * 4)?,
             act: alloc(pairs * EXPERT_WIDTH * 2)?,
             yd: alloc(pairs * D * 4)?,
-            sg: alloc(t * 4)?,
-            sgate: alloc(t * EXPERT_WIDTH * 4)?,
-            sup: alloc(t * EXPERT_WIDTH * 4)?,
             sact: alloc(t * EXPERT_WIDTH * 2)?,
             sh: alloc(t * D * 4)?,
             kp: alloc(t * H * 4)?,
@@ -221,6 +215,7 @@ impl Workspace {
             active: alloc(EXPERTS * 4)?,
             num_active: alloc(4)?,
             row_token: alloc(k::moe_small_tokens() * TOP_K * 4)?,
+            hc_r: alloc(t * S * 4)?,
             att_part: alloc(k::qsa_split_floats(k::gemv_max_m()) * 4)?,
             step: alloc(StepLayout::new(t).bytes)?,
             step_host: PinnedBuffer::new(StepLayout::new(t).bytes)?,
@@ -258,16 +253,42 @@ fn linear(s: &Stream, ws: &Workspace, x: u64, w: &Linear, y: u64, t: usize) -> R
     linear_ld(s, ws.partial, x, w.k, w, y, w.n, t)
 }
 
-/// Mixes the residual through a HyperConnection: writes the BF16 block input to `ws.m` (or `out`)
-/// and, when the HC injects, the injection weights to `ws.inj`.
-fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, out: u64) -> Result<()> {
-    k::grouped_rmsnorm(s, ws.h, hc.norm, ws.n, t)?;
-    linear(s, ws, ws.n, &hc.down, ws.low, t)?;
-    k::hc_low_rank_act(s, ws.low, ws.low_bf, t * HC_RANK)?;
-    linear(s, ws, ws.low_bf, &hc.up, ws.up, t)?;
-    k::hc_mix(s, ws.up, ws.n, out, t)?;
-    if let Some(inject) = hc.inject {
-        k::hc_inject(s, ws.n, inject, ws.inj, t)?;
+/// Computes every member of `proj` for `t` rows of `x` into `out` ([t, proj.n], FP32).
+fn project(s: &Stream, ws: &Workspace, x: u64, proj: &Proj, out: u64, t: usize) -> Result<()> {
+    match &proj.fused {
+        Some(w) => linear_ld(s, ws.partial, x, w.k, w, out, proj.n, t),
+        None => {
+            for (w, col) in &proj.parts {
+                linear_ld(s, ws.partial, x, w.k, w, out + (*col * 4) as u64, proj.n, t)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Mixes the residual through a HyperConnection: writes the BF16 block input to `out` and, when the HC
+/// injects, the injection weights to `ws.inj`.
+fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, out: u64, mut prof: Option<&mut Profiler>) -> Result<()> {
+    let inj = if hc.injects { ws.inj } else { 0 };
+    if t <= k::gemv_max_m() {
+        // Project the raw FP32 residual with stream-aligned K splits; the finish kernel applies each
+        // stream's RMS factor while reducing them.
+        op!(prof, "hc down", s, {
+            let parts: Vec<(Linear, usize)> = match &hc.down.fused {
+                Some(w) => vec![(*w, 0)],
+                None => hc.down.parts.clone(),
+            };
+            parts.iter().try_for_each(|(w, col)| k::gemv_partials_f32(s, t, ws.h, H, w.fmt, w.addr, w.scale, ws.partial + (*col * 4) as u64, hc.down.n, w.n, H, HC_SPLITS))
+        });
+        op!(prof, "hc finish", s, k::hc_finish(s, ws.partial, HC_SPLITS, t, hc.down.n, ws.h, ws.low_bf, inj, ws.hc_r));
+        op!(prof, "hc up", s, linear(s, ws, ws.low_bf, &hc.up, ws.up, t));
+        op!(prof, "hc mix", s, k::hc_mix_small(s, ws.up, ws.h, ws.hc_r, hc.norm, out, t));
+    } else {
+        op!(prof, "hc norm", s, k::grouped_rmsnorm(s, ws.h, 0, ws.n, t));
+        op!(prof, "hc down", s, project(s, ws, ws.n, &hc.down, ws.proj, t));
+        op!(prof, "hc act", s, k::hc_act(s, ws.proj, hc.down.n, ws.low_bf, inj, t));
+        op!(prof, "hc up", s, linear(s, ws, ws.low_bf, &hc.up, ws.up, t));
+        op!(prof, "hc mix", s, k::hc_mix(s, ws.up, ws.n, hc.norm, out, t));
     }
     Ok(())
 }
@@ -283,16 +304,6 @@ pub fn ple_rows(tokens: &[i32], p: usize, mult: &[i64; 3], sizes: &[i64; 16], of
         let x = if j < 8 { bigram } else { trigram };
         (x.rem_euclid(sizes[j]) + offsets[j]) as usize
     })
-}
-
-/// Runs `$call` (a `Result<()>` expression) on stream `$s`, timed under `$name` when profiling.
-macro_rules! op {
-    ($prof:ident, $name:expr, $s:expr, $call:expr) => {
-        match $prof.as_deref_mut() {
-            Some(p) => p.time($name, $s, || $call)?,
-            None => $call?,
-        }
-    };
 }
 
 /// Byte offsets inside the step block: [start: i32 | pad][tokens: i32 x max][pos3: i32 x 3 x max][PLE rows: BF16 x D x max].
@@ -371,28 +382,30 @@ pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &
             op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv, ws.xn, ple.conv, state.ple_conv.addr(), ws.h, t));
         }
 
-        op!(prof, "hc attn_hc", s, hyper_connection(s, ws, &layer.attn_hc, t, ws.m));
+        hyper_connection(s, ws, &layer.attn_hc, t, ws.m, prof.as_deref_mut())?;
         match &layer.block {
             Block::Gdn(g) => {
                 let st = state.gdn[i].as_ref().unwrap();
-                op!(prof, "g.qkv", s, linear(s, ws, ws.m, &g.qkv, ws.qkv, t));
-                op!(prof, "g.z", s, linear(s, ws, ws.m, &g.z, ws.z, t));
-                op!(prof, "g.a", s, linear(s, ws, ws.m, &g.a, ws.ga, t));
-                op!(prof, "g.b", s, linear(s, ws, ws.m, &g.b, ws.gb, t));
-                op!(prof, "gdn_conv", s, k::gdn_conv(s, ws.qkv, ws.conv, st.conv.addr(), g.conv, t));
-                op!(prof, "gdn_prep", s, k::gdn_prep(s, ws.conv, ws.ga, ws.gb, g.a_log, g.dt_bias, ws.beta, ws.g, t));
-                op!(prof, "gdn_recurrent", s, k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st.recurrent.addr(), ws.o, t));
-                op!(prof, "gdn_gated_norm", s, k::gdn_gated_norm(s, ws.o, ws.z, g.norm, ws.o_bf, t));
-                op!(prof, "g.out", s, linear(s, ws, ws.o_bf, &g.out, ws.y, t));
+                let (ld, x) = (g.proj.n, ws.proj);
+                let col = |j: usize| x + (g.proj.col(j) * 4) as u64;
+                op!(prof, "gdn proj", s, project(s, ws, ws.m, &g.proj, x, t));
+                if t <= k::gemv_max_m() {
+                    op!(prof, "gdn_fused_small", s, k::gdn_fused_small(s, x, ld, t, g.conv, st.conv.addr(), st.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf));
+                } else {
+                    op!(prof, "gdn_conv", s, k::gdn_conv(s, col(0), ld, ws.conv, st.conv.addr(), g.conv, t));
+                    op!(prof, "gdn_prep", s, k::gdn_prep(s, ws.conv, col(2), col(3), ld, g.a_log, g.dt_bias, ws.beta, ws.g, t));
+                    op!(prof, "gdn_recurrent", s, k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st.recurrent.addr(), ws.o, t));
+                    op!(prof, "gdn_gated_norm", s, k::gdn_gated_norm(s, ws.o, col(1), ld, g.norm, ws.o_bf, t));
+                }
+                op!(prof, "gdn out", s, linear(s, ws, ws.o_bf, &g.out, ws.y, t));
             }
             Block::Qsa(q) => {
                 let c = state.qsa[i].as_ref().unwrap();
-                op!(prof, "q.q", s, linear(s, ws, ws.m, &q.q, ws.qg, t));
-                op!(prof, "q.k", s, linear_ld(s, ws.partial, ws.m, D, &q.k, ws.kv, 2 * QSA_KV * QSA_DIM, t));
-                op!(prof, "q.v", s, linear_ld(s, ws.partial, ws.m, D, &q.v, ws.kv + (QSA_KV * QSA_DIM * 4) as u64, 2 * QSA_KV * QSA_DIM, t));
-                op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, ws.qg, ws.kv, q.q_norm, q.k_norm, ws.q, c.k.addr(), c.v.addr(), pos3, start, t));
-                op!(prof, "q.index_qk", s, linear(s, ws, ws.m, &q.index_qk, ws.idx, t));
-                op!(prof, "qsa_index_prep", s, k::qsa_index_prep(s, ws.idx, q.index_q_norm, ws.iq, c.raw.addr(), pos3, start, t));
+                let (ld, x) = (q.proj.n, ws.proj);
+                let col = |j: usize| x + (q.proj.col(j) * 4) as u64;
+                op!(prof, "qsa proj", s, project(s, ws, ws.m, &q.proj, x, t));
+                op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, col(0), col(1), ld, q.q_norm, q.k_norm, ws.q, c.k.addr(), c.v.addr(), pos3, start, t));
+                op!(prof, "qsa_index_prep", s, k::qsa_index_prep(s, col(3), ld, q.index_q_norm, ws.iq, c.raw.addr(), pos3, start, t));
                 op!(prof, "qsa_pool", s, k::qsa_pool(s, c.raw.addr(), q.index_k_norm, c.pooled.addr(), pos3, start, t));
                 // Rows whose query sees at most 512 complete groups attend densely and skip selection.
                 if state.capacity / 4 > TOP_GROUPS {
@@ -400,26 +413,28 @@ pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &
                     op!(prof, "qsa_select", s, k::qsa_select(s, ws.scores, t, ws.score_cols, start, ws.sel));
                 }
                 if t <= k::gemv_max_m() {
-                    op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, ws.q, ws.qg, c.k.addr(), c.v.addr(), ws.sel, start, t, ws.att_part, ws.att));
+                    op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, ws.q, col(0), ld, c.k.addr(), c.v.addr(), ws.sel, start, t, ws.att_part, ws.att));
                 } else {
-                    op!(prof, "qsa_attention", s, k::qsa_attention(s, ws.q, ws.qg, c.k.addr(), c.v.addr(), ws.sel, start, t, ws.att));
+                    op!(prof, "qsa_attention", s, k::qsa_attention(s, ws.q, col(0), ld, c.k.addr(), c.v.addr(), ws.sel, start, t, ws.att));
                 }
-                op!(prof, "q.o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
+                op!(prof, "qsa o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
             }
         }
         op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, ws.y, ws.inj, t));
 
-        op!(prof, "hc mlp_hc", s, hyper_connection(s, ws, &layer.mlp_hc, t, ws.m));
+        hyper_connection(s, ws, &layer.mlp_hc, t, ws.m, prof.as_deref_mut())?;
         let moe = &layer.moe;
-        op!(prof, "moe.router", s, linear(s, ws, ws.m, &moe.router, ws.logits, t));
+        let (ld, x) = (moe.proj.n, ws.proj);
+        let col = |j: usize| x + (moe.proj.col(j) * 4) as u64;
+        op!(prof, "moe proj", s, project(s, ws, ws.m, &moe.proj, x, t));
         if t <= k::moe_small_tokens() {
             let max_active = (t * TOP_K).min(EXPERTS);
             let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
-            op!(prof, "moe_route_small", s, k::moe_route_small(s, ws.logits, t, ws.top_i, ws.top_w, ws.offsets, ws.pair_row, ws.row_token, ws.active, ws.num_active));
-            op!(prof, "experts gate_up", s, k::moe_gate_up_small(s, ws.m, ws.row_token, tables(&moe.gate), tables(&moe.up), ws.offsets, ws.active, ws.num_active, max_active, ws.act));
-            op!(prof, "experts down", s, k::moe_down_small(s, ws.act, tables(&moe.down), ws.offsets, ws.active, ws.num_active, max_active, ws.yd));
+            op!(prof, "moe_route_small", s, k::moe_route_small(s, col(0), ld, t, ws.top_i, ws.top_w, ws.offsets, ws.pair_row, ws.row_token, ws.active, ws.num_active));
+            op!(prof, "experts gate_up", s, k::moe_gate_up_small(s, ws.m, ws.row_token, tables(&moe.gate), tables(&moe.up), ws.offsets, ws.active, ws.num_active, max_active, t, ws.act));
+            op!(prof, "experts down", s, k::moe_down_small(s, ws.act, tables(&moe.down), ws.offsets, ws.active, ws.num_active, max_active, t, ws.yd));
         } else {
-            op!(prof, "moe_route", s, k::moe_route(s, ws.logits, t, ws.top_i, ws.top_w));
+            op!(prof, "moe_route", s, k::moe_route(s, col(0), ld, t, ws.top_i, ws.top_w));
             op!(prof, "moe_plan", s, k::moe_plan(s, ws.top_i, t, ws.counts, ws.cursor, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row));
             op!(prof, "moe_gather", s, k::moe_gather(s, ws.m, ws.pair_row, t, ws.xs));
             let tiles = ws.max_tiles().min((t * TOP_K).div_ceil(k::moe_tile_rows()) + EXPERTS);
@@ -428,18 +443,15 @@ pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &
             };
             op!(prof, "experts gate", s, grouped(&moe.gate, ws.xs, ws.eg, EXPERT_WIDTH, D));
             op!(prof, "experts up", s, grouped(&moe.up, ws.xs, ws.eu, EXPERT_WIDTH, D));
-            op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, ws.act, t * TOP_K * EXPERT_WIDTH));
+            op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, t * TOP_K));
             op!(prof, "experts down", s, grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH));
         }
-        op!(prof, "moe.shared_gate", s, linear(s, ws, ws.m, &moe.shared_gate, ws.sgate, t));
-        op!(prof, "moe.shared_up", s, linear(s, ws, ws.m, &moe.shared_up, ws.sup, t));
-        op!(prof, "swiglu", s, k::swiglu(s, ws.sgate, ws.sup, ws.sact, t * EXPERT_WIDTH));
-        op!(prof, "moe.shared_down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
-        op!(prof, "moe.shared_expert_gate", s, linear(s, ws, ws.m, &moe.shared_expert_gate, ws.sg, t));
-        op!(prof, "moe_combine", s, k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, ws.sg, ws.sh, ws.y, t));
+        op!(prof, "shared swiglu", s, k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
+        op!(prof, "shared down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
+        op!(prof, "moe_combine", s, k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
         op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, ws.y, ws.inj, t));
     }
-    op!(prof, "hc final_hc", s, hyper_connection(s, ws, &model.final_hc, t, ws.out));
+    hyper_connection(s, ws, &model.final_hc, t, ws.out, prof.as_deref_mut())?;
     Ok(())
 }
 
@@ -478,10 +490,20 @@ impl DecodeGraph {
 
     /// Decodes `token` (appended to `state`) and returns the greedy next token.
     pub fn step(&self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, hw: &HeadWorkspace, s: &Stream, token: i32) -> Result<i32> {
+        self.step_timed(model, state, ws, hw, s, token, &mut [0.0; 2])
+    }
+
+    /// As [`step`](Self::step), adding host preparation and graph execution seconds to `times`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_timed(&self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, hw: &HeadWorkspace, s: &Stream, token: i32, times: &mut [f64; 2]) -> Result<i32> {
+        let t0 = std::time::Instant::now();
         let bytes = prepare(model, state, ws, &[token])?;
         debug_assert_eq!(bytes, self.bytes);
+        let t1 = std::time::Instant::now();
         self.graph.launch(s)?;
         s.synchronize()?;
+        times[0] += (t1 - t0).as_secs_f64();
+        times[1] += t1.elapsed().as_secs_f64();
         Ok(i32::from_le_bytes(hw.token_host.as_slice()[..4].try_into().unwrap()))
     }
 }
@@ -489,7 +511,7 @@ impl DecodeGraph {
 /// Greedy next token for one hidden state: LM head, argmax, and a copy of the token to `hw.token_host`.
 pub fn head_argmax(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64) -> Result<()> {
     linear_ld(s, hw.partial.addr(), hidden, D, &model.lm_head, hw.logits.addr(), VOCAB, 1)?;
-    k::topk(s, hw.logits.addr(), 1, VOCAB, VOCAB, 1, false, hw.top_ids.addr(), 0)?;
+    k::argmax(s, hw.logits.addr(), 1, VOCAB, VOCAB, hw.argmax.addr(), hw.top_ids.addr())?;
     unsafe { s.copy_d2h(hw.token_host.as_ptr(), hw.top_ids.addr(), 4) }
 }
 
@@ -505,6 +527,7 @@ pub struct HeadStats {
 pub struct HeadWorkspace {
     rows: usize,
     partial: DeviceBuffer,
+    argmax: DeviceBuffer,
     token_host: PinnedBuffer,
     logits: DeviceBuffer,
     targets: DeviceBuffer,
@@ -519,6 +542,7 @@ impl HeadWorkspace {
         Ok(Self {
             rows,
             partial: DeviceBuffer::new(PARTIAL_FLOATS * 4)?,
+            argmax: DeviceBuffer::new(k::argmax_scratch(rows, VOCAB))?,
             token_host: PinnedBuffer::new(4)?,
             logits: DeviceBuffer::new(rows * VOCAB * 4)?,
             targets: DeviceBuffer::new(rows * 4)?,

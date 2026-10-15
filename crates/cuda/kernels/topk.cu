@@ -159,3 +159,94 @@ extern "C" cudaError_t squash_qsa_select(const float* scores, int T, size_t ld, 
     topk_kernel<<<T, THREADS, 0, st>>>(scores, 0, ld, MAXK, 1, sel, nullptr, start, 4);
     SQ_RETURN_LAUNCH();
 }
+
+namespace {
+
+// Per-row argmax in two passes: blocks of 1024 threads reduce 8192-wide slices to (value, index)
+// candidates, then one warp per row picks the best (ties: lower index).
+constexpr int AM_SLICE = 8192;
+
+__global__ void argmax_partial_kernel(const float* __restrict__ x, int n, size_t ld, float* pv, int* pi) {
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const float* row = x + blockIdx.y * ld;
+    const int begin = blockIdx.x * AM_SLICE, end = min(n, begin + AM_SLICE);
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int i = begin + threadIdx.x; i < end; i += blockDim.x)
+        if (row[i] > best) {
+            best = row[i];
+            bi = i;
+        }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffff, best, o);
+        const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+        if (ov > best || (ov == best && oi < bi)) {
+            best = ov;
+            bi = oi;
+        }
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        sv[warp] = best;
+        si[warp] = bi;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        best = lane < (int)(blockDim.x / 32) ? sv[lane] : -INFINITY;
+        bi = lane < (int)(blockDim.x / 32) ? si[lane] : 0x7fffffff;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffff, best, o);
+            const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (ov > best || (ov == best && oi < bi)) {
+                best = ov;
+                bi = oi;
+            }
+        }
+        if (lane == 0) {
+            pv[blockIdx.y * gridDim.x + blockIdx.x] = best;
+            pi[blockIdx.y * gridDim.x + blockIdx.x] = bi;
+        }
+    }
+}
+
+__global__ void argmax_final_kernel(const float* __restrict__ pv, const int* __restrict__ pi, int slices, int* out) {
+    const int r = blockIdx.x, lane = threadIdx.x;
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int i = lane; i < slices; i += 32) {
+        const float v = pv[r * slices + i];
+        const int idx = pi[r * slices + i];
+        if (v > best || (v == best && idx < bi)) {
+            best = v;
+            bi = idx;
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffff, best, o);
+        const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+        if (ov > best || (ov == best && oi < bi)) {
+            best = ov;
+            bi = oi;
+        }
+    }
+    if (lane == 0) out[r] = bi;
+}
+
+}  // namespace
+
+extern "C" size_t squash_argmax_scratch(int rows, int n) { return (size_t)rows * ((n + AM_SLICE - 1) / AM_SLICE) * 8; }
+
+// scratch: squash_argmax_scratch(rows, n) bytes.
+extern "C" cudaError_t squash_argmax(const float* x, int rows, int n, size_t ld, void* scratch, int* out, cudaStream_t st) {
+    if (rows == 0) return cudaSuccess;
+    const int slices = (n + AM_SLICE - 1) / AM_SLICE;
+    float* pv = static_cast<float*>(scratch);
+    int* pi = reinterpret_cast<int*>(pv + (size_t)rows * slices);
+    argmax_partial_kernel<<<dim3(slices, rows), 1024, 0, st>>>(x, n, ld, pv, pi);
+    argmax_final_kernel<<<rows, 32, 0, st>>>(pv, pi, slices, out);
+    SQ_RETURN_LAUNCH();
+}

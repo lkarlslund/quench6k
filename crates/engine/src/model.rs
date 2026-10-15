@@ -33,19 +33,35 @@ pub struct Linear {
     pub k: usize,
 }
 
-/// A HyperConnection's weights (SPEC §4); `inject` is absent in the final mixers.
-pub struct Hc {
-    pub norm: u64,
-    pub down: Linear,
-    pub up: Linear,
-    pub inject: Option<u64>,
+/// Projections that share an input, computed into one output row per token: member `i` fills columns
+/// `parts[i].1 ..` of a row of width `n`. With `fused`, the members are contiguous rows of one weight
+/// and a single GEMV/GEMM computes all of them.
+pub struct Proj {
+    pub parts: Vec<(Linear, usize)>,
+    pub fused: Option<Linear>,
+    pub n: usize,
 }
 
+impl Proj {
+    /// Output column where member `i` starts.
+    pub fn col(&self, i: usize) -> usize {
+        self.parts[i].1
+    }
+}
+
+/// A HyperConnection's weights (SPEC §4). `down` holds the low-rank down projection and, except in the
+/// final mixers, the 4-row injection projection after it; both have the `(1 + norm)` weight folded into
+/// their columns at load.
+pub struct Hc {
+    pub norm: u64,
+    pub down: Proj,
+    pub up: Linear,
+    pub injects: bool,
+}
+
+/// `proj`: in_proj_qkv | in_proj_z | in_proj_a | in_proj_b.
 pub struct Gdn {
-    pub qkv: Linear,
-    pub z: Linear,
-    pub a: Linear,
-    pub b: Linear,
+    pub proj: Proj,
     pub conv: u64,
     pub a_log: u64,
     pub dt_bias: u64,
@@ -53,14 +69,12 @@ pub struct Gdn {
     pub out: Linear,
 }
 
+/// `proj`: q_proj (query and gate per head) | k_proj | v_proj | indexer index_qk_proj.
 pub struct Qsa {
-    pub q: Linear,
-    pub k: Linear,
-    pub v: Linear,
+    pub proj: Proj,
     pub o: Linear,
     pub q_norm: u64,
     pub k_norm: u64,
-    pub index_qk: Linear,
     pub index_q_norm: u64,
     pub index_k_norm: u64,
 }
@@ -77,12 +91,10 @@ pub struct ExpertProj {
     pub scale2: u64,
 }
 
+/// `proj`: router | shared gate_proj | shared up_proj | shared_expert_gate.
 pub struct Moe {
-    pub router: Linear,
-    pub shared_gate: Linear,
-    pub shared_up: Linear,
+    pub proj: Proj,
     pub shared_down: Linear,
-    pub shared_expert_gate: Linear,
     pub gate: ExpertProj,
     pub up: ExpertProj,
     pub down: ExpertProj,
@@ -180,12 +192,29 @@ impl Model {
             };
             Ok(Linear { fmt, addr: t.addr, scale: t.scale, n: t.shape[0], k: t.shape[1] })
         };
-        let hc = |prefix: &str, inject: bool| -> Result<Hc> {
+        let proj = |(group, members): (String, Vec<String>)| -> Result<Proj> {
+            let mut parts = Vec::with_capacity(members.len());
+            let mut n = 0;
+            for m in &members {
+                let l = lin(m)?;
+                parts.push((l, n));
+                n += l.n;
+            }
+            let fused = if weights.tensors.contains_key(&group) {
+                Some(lin(&group)?)
+            } else if parts.len() == 1 {
+                Some(parts[0].0)
+            } else {
+                None
+            };
+            Ok(Proj { parts, fused, n })
+        };
+        let hc = |prefix: &str, injects: bool| -> Result<Hc> {
             Ok(Hc {
                 norm: w(&format!("{prefix}.hc_norm.weight"))?,
-                down: lin(&format!("{prefix}.input_mix_weight_down.weight"))?,
+                down: proj(hc_group(prefix, injects))?,
                 up: lin(&format!("{prefix}.input_mix_weight_up.weight"))?,
-                inject: if inject { Some(w(&format!("{prefix}.block_inject_weight.weight"))?) } else { None },
+                injects,
             })
         };
 
@@ -195,23 +224,17 @@ impl Model {
             let block = if is_attention(i) {
                 let a = format!("{p}.self_attn");
                 Block::Qsa(Qsa {
-                    q: lin(&format!("{a}.q_proj.weight"))?,
-                    k: lin(&format!("{a}.k_proj.weight"))?,
-                    v: lin(&format!("{a}.v_proj.weight"))?,
+                    proj: proj(qsa_group(&p))?,
                     o: lin(&format!("{a}.o_proj.weight"))?,
                     q_norm: w(&format!("{a}.q_norm.weight"))?,
                     k_norm: w(&format!("{a}.k_norm.weight"))?,
-                    index_qk: lin(&format!("{a}.indexer.index_qk_proj.weight"))?,
                     index_q_norm: w(&format!("{a}.indexer.q_layernorm.weight"))?,
                     index_k_norm: w(&format!("{a}.indexer.k_layernorm.weight"))?,
                 })
             } else {
                 let g = format!("{p}.linear_attn");
                 Block::Gdn(Gdn {
-                    qkv: lin(&format!("{g}.in_proj_qkv.weight"))?,
-                    z: lin(&format!("{g}.in_proj_z.weight"))?,
-                    a: lin(&format!("{g}.in_proj_a.weight"))?,
-                    b: lin(&format!("{g}.in_proj_b.weight"))?,
+                    proj: proj(gdn_group(&p))?,
                     conv: w(&format!("{g}.conv1d.weight"))?,
                     a_log: w(&format!("{g}.A_log"))?,
                     dt_bias: w(&format!("{g}.dt_bias"))?,
@@ -240,11 +263,8 @@ impl Model {
             let s2 = |j: usize| tables.addr() + (addrs.len() * 8 + j * EXPERTS * 4) as u64;
             let m = format!("{p}.mlp");
             let moe = Moe {
-                router: lin(&format!("{m}.gate.weight"))?,
-                shared_gate: lin(&format!("{m}.shared_expert.gate_proj.weight"))?,
-                shared_up: lin(&format!("{m}.shared_expert.up_proj.weight"))?,
+                proj: proj(moe_group(&p))?,
                 shared_down: lin(&format!("{m}.shared_expert.down_proj.weight"))?,
-                shared_expert_gate: lin(&format!("{m}.shared_expert_gate.weight"))?,
                 gate: ExpertProj { weights: t(0), scales: t(1), scale2: s2(0) },
                 up: ExpertProj { weights: t(2), scales: t(3), scale2: s2(1) },
                 down: ExpertProj { weights: t(4), scales: t(5), scale2: s2(2) },
@@ -288,6 +308,42 @@ impl Model {
     }
 }
 
+fn hc_group(prefix: &str, injects: bool) -> (String, Vec<String>) {
+    let mut members = vec![format!("{prefix}.input_mix_weight_down.weight")];
+    if injects {
+        members.push(format!("{prefix}.block_inject_weight.weight"));
+    }
+    (format!("{prefix}.squash.down_inject"), members)
+}
+
+fn gdn_group(layer: &str) -> (String, Vec<String>) {
+    let g = format!("{layer}.linear_attn");
+    (format!("{g}.squash.in_proj"), ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"].iter().map(|m| format!("{g}.{m}.weight")).collect())
+}
+
+fn qsa_group(layer: &str) -> (String, Vec<String>) {
+    let a = format!("{layer}.self_attn");
+    (format!("{a}.squash.in_proj"), ["q_proj", "k_proj", "v_proj", "indexer.index_qk_proj"].iter().map(|m| format!("{a}.{m}.weight")).collect())
+}
+
+fn moe_group(layer: &str) -> (String, Vec<String>) {
+    let m = format!("{layer}.mlp");
+    (format!("{m}.squash.in_proj"), ["gate", "shared_expert.gate_proj", "shared_expert.up_proj", "shared_expert_gate"].iter().map(|x| format!("{m}.{x}.weight")).collect())
+}
+
+/// Every multi-member projection group of the text model; quantized profiles store each contiguously.
+pub fn projection_groups() -> Vec<(String, Vec<String>)> {
+    let mut groups = Vec::new();
+    for i in 0..LAYERS {
+        let p = format!("model.language_model.layers.{i}");
+        groups.push(hc_group(&format!("{p}.attn_hyper_connection"), true));
+        groups.push(hc_group(&format!("{p}.mlp_hyper_connection"), true));
+        groups.push(if is_attention(i) { qsa_group(&p) } else { gdn_group(&p) });
+        groups.push(moe_group(&p));
+    }
+    groups
+}
+
 /// Weight precision profile for the non-expert projections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
@@ -312,8 +368,24 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, opts: crate::loader::L
     };
     let quantized = |n: &str| format != WeightFormat::Bf16 && selection::eight_bit(n);
     let (mut weights, mut stats) = loader::upload(ckpt, |n| selection::text(n) && !quantized(n), opts)?;
-    if format != WeightFormat::Bf16 {
-        let (converted, s) = loader::upload_quantized(ckpt, |n| selection::text(n) && quantized(n), format, opts, stream)?;
+    // Fold each HyperConnection's (1 + w) norm weight into its down and injection projections (SPEC §4),
+    // so small batches can project the raw residual and apply the per-stream RMS factor afterwards.
+    let fold = |name: &str, addr: u64, n: usize, k: usize| -> Result<()> {
+        let prefix = name.strip_suffix(".input_mix_weight_down.weight").or_else(|| name.strip_suffix(".block_inject_weight.weight"));
+        match prefix {
+            Some(prefix) => squash_cuda::kernels::fold_norm(stream, addr, weights.get(&format!("{prefix}.hc_norm.weight"))?.addr, n, k),
+            None => Ok(()),
+        }
+    };
+    if format == WeightFormat::Bf16 {
+        let names: Vec<String> = weights.tensors.keys().filter(|n| n.ends_with(".input_mix_weight_down.weight") || n.ends_with(".block_inject_weight.weight")).cloned().collect();
+        for name in names {
+            let t = weights.get(&name)?;
+            fold(&name, t.addr, t.shape[0], t.shape[1])?;
+        }
+        stream.synchronize()?;
+    } else {
+        let (converted, s) = loader::upload_quantized(ckpt, |n| selection::text(n) && quantized(n), format, &projection_groups(), &fold, opts, stream)?;
         stats.bytes += s.bytes;
         stats.seconds += s.seconds;
         stats.segments += s.segments;
