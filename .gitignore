@@ -1,0 +1,8 @@
+/target/
+*.cubin
+*.fatbin
+*.ptx
+*.nsys-rep
+*.ncu-rep
+/out/
+__pycache__/
