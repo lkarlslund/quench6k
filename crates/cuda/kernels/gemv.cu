@@ -14,23 +14,23 @@
 
 namespace {
 
-constexpr int WARPS = 8, THREADS = WARPS * 32, ROWS_PER_WARP = 2, ROWS_PER_CTA = WARPS * ROWS_PER_WARP;
+constexpr int WARPS = 8, THREADS = WARPS * 32;
 
 // grid (ceil(N / 16), splits). Each split covers k_per_split columns (a multiple of 512). A warp owns
 // ROWS_PER_WARP rows and walks them together: per step every lane loads two 16-weight chunks of each
 // row (all in flight at once) and one activation chunk per token, reused across the rows. When `xsq`
 // is set, blocks with blockIdx.x == 0 also write each token's sum of squared activations over their
 // K range to xsq[split * M + m].
-template <WFmt F, int M, typename XT>
+template <WFmt F, int M, typename XT, int R>
 __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X, int ldx,
                                                        const uint8_t* __restrict__ W, const float* __restrict__ row_scale,
                                                        float* Y, int ldy, float* partial, int ldp, float* xsq, int N,
                                                        int K, int k_per_split, float alpha, int accumulate) {
-    constexpr int R = ROWS_PER_WARP, U = 2;
+    constexpr int U = 2;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int k_begin = blockIdx.y * k_per_split, k_end = min(K, k_begin + k_per_split);
     const size_t row_bytes = (size_t)K * elem_bytes<F>();
-    const int n0 = blockIdx.x * ROWS_PER_CTA + warp * R;
+    const int n0 = (blockIdx.x * WARPS + warp) * R;
     const uint8_t* rows[R];
     bool row_live[R];
 #pragma unroll
@@ -123,14 +123,22 @@ cudaError_t launch_m(const void* X, int x_f32, int ldx, const void* W, const flo
                      int reduce, cudaStream_t st) {
     const int k_per_split = ((K + splits - 1) / splits + 511) / 512 * 512;
     splits = (K + k_per_split - 1) / k_per_split;
-    dim3 grid((N + ROWS_PER_CTA - 1) / ROWS_PER_CTA, splits);
-    if (x_f32)
-        gemv_kernel<F, M, float><<<grid, THREADS, 0, st>>>(static_cast<const float*>(X), ldx, static_cast<const uint8_t*>(W),
-                                                           scale, Y, ldy, partial, ldp, xsq, N, K, k_per_split, alpha, accumulate);
-    else
-        gemv_kernel<F, M, __nv_bfloat16><<<grid, THREADS, 0, st>>>(static_cast<const __nv_bfloat16*>(X), ldx,
-                                                                   static_cast<const uint8_t*>(W), scale, Y, ldy,
-                                                                   partial, ldp, xsq, N, K, k_per_split, alpha, accumulate);
+    // Two rows per warp when that still gives at least one CTA per SM; otherwise one.
+    const bool two = (N + 2 * WARPS - 1) / (2 * WARPS) * splits >= 188;
+    const int rows_per_cta = WARPS * (two ? 2 : 1);
+    dim3 grid((N + rows_per_cta - 1) / rows_per_cta, splits);
+    const auto* w8 = static_cast<const uint8_t*>(W);
+#define SQ_GEMV(XT, R) \
+    gemv_kernel<F, M, XT, R><<<grid, THREADS, 0, st>>>(static_cast<const XT*>(X), ldx, w8, scale, Y, ldy, partial, ldp, \
+                                                        xsq, N, K, k_per_split, alpha, accumulate)
+    if (x_f32) {
+        if (two) SQ_GEMV(float, 2);
+        else SQ_GEMV(float, 1);
+    } else {
+        if (two) SQ_GEMV(__nv_bfloat16, 2);
+        else SQ_GEMV(__nv_bfloat16, 1);
+    }
+#undef SQ_GEMV
     if (splits > 1 && reduce)
         reduce_kernel<<<(M * N + 255) / 256, 256, 0, st>>>(partial, ldp, splits, M, N, Y, ldy, accumulate);
     return cudaGetLastError();

@@ -343,13 +343,16 @@ __global__ void __launch_bounds__(ATT_THREADS) attention_split_kernel(const floa
 
 // Merges the splits of (t, head) in split order and applies the output gate. grid (T, 24), 256 threads.
 __global__ void attention_merge_kernel(const float* __restrict__ part, const float* __restrict__ qg, int ld,
-                                       __nv_bfloat16* out) {
+                                       const int* __restrict__ start_ptr, __nv_bfloat16* out) {
     const int t = blockIdx.x, head = blockIdx.y, kvh = head / QPG, h = head % QPG, d = threadIdx.x;
+    const int p = *start_ptr + t, complete = (p + 1) / GROUP;
+    const int nkeys = complete <= TOPG ? p + 1 : TOPG * GROUP + (p + 1 - complete * GROUP);
+    const int used = (nkeys + CHUNK - 1) / CHUNK;
     const float* base = part + ((size_t)t * KVH + kvh) * SPLITS * (2 * QPG + QPG * HD);
     float m = -INFINITY;
-    for (int s = 0; s < SPLITS; ++s) m = fmaxf(m, base[s * (2 * QPG + QPG * HD) + h]);
+    for (int s = 0; s < used; ++s) m = fmaxf(m, base[s * (2 * QPG + QPG * HD) + h]);
     float l = 0, o = 0;
-    for (int s = 0; s < SPLITS; ++s) {
+    for (int s = 0; s < used; ++s) {
         const float* b = base + s * (2 * QPG + QPG * HD);
         const float w = b[QPG + h] > 0 ? __expf(b[h] - m) : 0.0f;
         l += w * b[QPG + h];
@@ -433,6 +436,6 @@ extern "C" cudaError_t squash_qsa_attention_split(const float* q, const float* q
     attention_split_kernel<<<dim3(T, KVH, SPLITS), ATT_THREADS, 0, st>>>(q, static_cast<const __nv_bfloat16*>(kcache),
                                                                         static_cast<const __nv_bfloat16*>(vcache), sel,
                                                                         start, part);
-    attention_merge_kernel<<<dim3(T, QH), HD, 0, st>>>(part, qg, ld, static_cast<__nv_bfloat16*>(out));
+    attention_merge_kernel<<<dim3(T, QH), HD, 0, st>>>(part, qg, ld, start, static_cast<__nv_bfloat16*>(out));
     SQ_RETURN_LAUNCH();
 }

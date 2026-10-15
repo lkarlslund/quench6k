@@ -247,8 +247,9 @@ const PARTIAL_FLOATS: usize = 1 << 22;
 #[allow(clippy::too_many_arguments)]
 fn linear_ld(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, ldy: usize, t: usize) -> Result<()> {
     if t <= k::gemv_max_m() {
-        let ctas = w.n.div_ceil(16);
-        let splits = TARGET_CTAS.div_ceil(ctas).clamp(1, w.k.div_ceil(256)).min(PARTIAL_FLOATS / (t * w.n)).max(1);
+        // Split K only when even one row per warp leaves fewer CTAs than SMs.
+        let ctas = w.n.div_ceil(8);
+        let splits = if ctas >= TARGET_CTAS / 2 { 1 } else { (TARGET_CTAS / 2).div_ceil(ctas).clamp(1, w.k.div_ceil(512)).min(PARTIAL_FLOATS / (t * w.n)).max(1) };
         k::gemv(s, t, x, ldx, w.fmt, w.addr, w.scale, y, ldy, partial, w.n, w.k, splits, 1.0, false)
     } else {
         k::gemm_f32(s, x, ldx, w.fmt, w.addr, w.k, w.scale, y, ldy, t, w.n, w.k, 1.0, false)
