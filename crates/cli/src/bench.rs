@@ -37,12 +37,20 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         let mut next = forward::head_stats(&model, &hw, &stream, last, &[0], 1)?.top_ids[0];
         let prefill = ctx as f64 / t0.elapsed().as_secs_f64();
         let graph = forward::DecodeGraph::capture(&model, &state, &ws, &hw, &stream)?;
-        let t1 = Instant::now();
+        // Three decode runs of `generate / 3` tokens each; the median run is reported.
+        let per_run = (generate / 3).max(1);
+        let mut runs = Vec::new();
         let mut times = [0.0; 2];
-        for _ in 0..generate {
-            next = graph.step_timed(&model, &mut state, &mut ws, &hw, &stream, next, &mut times)?;
+        for _ in 0..3 {
+            let t1 = Instant::now();
+            for _ in 0..per_run {
+                next = graph.step_timed(&model, &mut state, &mut ws, &hw, &stream, next, &mut times)?;
+            }
+            runs.push(per_run as f64 / t1.elapsed().as_secs_f64());
         }
-        let decode = generate as f64 / t1.elapsed().as_secs_f64();
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let decode = runs[1];
+        let generate = 3 * per_run;
         if ncu_steps > 0 {
             squash_cuda::profiler_start()?;
             for _ in 0..ncu_steps {

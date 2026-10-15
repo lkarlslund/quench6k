@@ -12,6 +12,8 @@ constexpr float EPS = 1e-6f;
 // out[t, c] = silu(sum_j w[c, j] * x[t + j - 3, c]); history from `state`, which is then advanced.
 __global__ void conv_kernel(const float* __restrict__ x, int ldx, float* out, float* state,
                             const __nv_bfloat16* __restrict__ w, int T) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float w0 = bf2f(w[c * TAPS]), w1 = bf2f(w[c * TAPS + 1]), w2 = bf2f(w[c * TAPS + 2]), w3 = bf2f(w[c * TAPS + 3]);
@@ -33,6 +35,8 @@ __global__ void conv_kernel(const float* __restrict__ x, int ldx, float* out, fl
 __global__ void prep_kernel(float* qkv, const float* __restrict__ a, const float* __restrict__ b, int ldab,
                             const __nv_bfloat16* __restrict__ a_log, const __nv_bfloat16* __restrict__ dt_bias,
                             float* beta, float* g) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ float scratch[32];
     const int t = blockIdx.x / KH, h = blockIdx.x % KH, i = threadIdx.x;
     float* q = qkv + (size_t)t * C + h * DK;
@@ -55,6 +59,8 @@ __global__ void prep_kernel(float* qkv, const float* __restrict__ a, const float
 // grid (48 heads, 4 column groups) x 32 threads.
 __global__ void __launch_bounds__(32) recurrent_kernel(const float* __restrict__ qkv, const float* __restrict__ beta,
                                                        const float* __restrict__ g, float* state, float* out, int T) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ float sq[DK], sk[DK];
     const int vh = blockIdx.x, col = blockIdx.y * 32 + threadIdx.x, kh = vh / 3;
     float s[DK];
@@ -94,6 +100,8 @@ __global__ void __launch_bounds__(32) recurrent_kernel(const float* __restrict__
 // y[t, h, :] = bf16(rms(o[t, h, :]) * w * sigmoid(z[t, h, :])); one block of 128 per (t, head).
 __global__ void gated_norm_kernel(const float* __restrict__ o, const float* __restrict__ z, int ldz,
                                   const __nv_bfloat16* __restrict__ w, __nv_bfloat16* y) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ float scratch[32];
     const size_t base = (size_t)blockIdx.x * DV;
     const int t = blockIdx.x / VH, h = blockIdx.x % VH, i = threadIdx.x;
@@ -106,28 +114,28 @@ __global__ void gated_norm_kernel(const float* __restrict__ o, const float* __re
 
 extern "C" cudaError_t squash_gdn_conv(const float* x, int ldx, float* out, float* state, const void* w, int T,
                                        cudaStream_t st) {
-    conv_kernel<<<C / 256, 256, 0, st>>>(x, ldx, out, state, static_cast<const __nv_bfloat16*>(w), T);
+    SQ_CHECK_LAUNCH(sq_launch(conv_kernel, C / 256, 256, 0, st, x, ldx, out, state, static_cast<const __nv_bfloat16*>(w), T));
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t squash_gdn_prep(float* qkv, const float* a, const float* b, int ldab, const void* a_log,
                                        const void* dt_bias, float* beta, float* g, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    prep_kernel<<<T * KH, DK, 0, st>>>(qkv, a, b, ldab, static_cast<const __nv_bfloat16*>(a_log),
-                                       static_cast<const __nv_bfloat16*>(dt_bias), beta, g);
+    SQ_CHECK_LAUNCH(sq_launch(prep_kernel, T * KH, DK, 0, st, qkv, a, b, ldab, static_cast<const __nv_bfloat16*>(a_log),
+                                       static_cast<const __nv_bfloat16*>(dt_bias), beta, g));
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t squash_gdn_recurrent(const float* qkv, const float* beta, const float* g, float* state, float* out,
                                             int T, cudaStream_t st) {
-    recurrent_kernel<<<dim3(VH, DV / 32), 32, 0, st>>>(qkv, beta, g, state, out, T);
+    SQ_CHECK_LAUNCH(sq_launch(recurrent_kernel, dim3(VH, DV / 32), 32, 0, st, qkv, beta, g, state, out, T));
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t squash_gdn_gated_norm(const float* o, const float* z, int ldz, const void* w, void* y, int T,
                                              cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    gated_norm_kernel<<<T * VH, DV, 0, st>>>(o, z, ldz, static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(y));
+    SQ_CHECK_LAUNCH(sq_launch(gated_norm_kernel, T * VH, DV, 0, st, o, z, ldz, static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(y)));
     SQ_RETURN_LAUNCH();
 }
 
@@ -147,6 +155,8 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
                                                          const __nv_bfloat16* __restrict__ dt_bias,
                                                          const __nv_bfloat16* __restrict__ norm_w, int z_col, int a_col,
                                                          int b_col, __nv_bfloat16* y) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ float sq[DK], sk[DK], sv[DV], so[DV];
     __shared__ float scratch[32];
     __shared__ float s_beta, s_decay;
@@ -238,10 +248,10 @@ extern "C" cudaError_t squash_gdn_fused_small(const float* proj, int ld, int T, 
                                              float* state, const void* a_log, const void* dt_bias, const void* norm_w,
                                              int z_col, int a_col, int b_col, void* y, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    fused_small_kernel<<<VH, FT, 0, st>>>(proj, ld, T, static_cast<const __nv_bfloat16*>(conv_w), conv_state, state,
+    SQ_CHECK_LAUNCH(sq_launch(fused_small_kernel, VH, FT, 0, st, proj, ld, T, static_cast<const __nv_bfloat16*>(conv_w), conv_state, state,
                                           static_cast<const __nv_bfloat16*>(a_log),
                                           static_cast<const __nv_bfloat16*>(dt_bias),
                                           static_cast<const __nv_bfloat16*>(norm_w), z_col, a_col, b_col,
-                                          static_cast<__nv_bfloat16*>(y));
+                                          static_cast<__nv_bfloat16*>(y)));
     SQ_RETURN_LAUNCH();
 }

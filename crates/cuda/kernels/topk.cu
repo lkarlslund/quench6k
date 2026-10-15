@@ -20,6 +20,8 @@ SQ_DEVICE unsigned order_key(float f) {
 __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__ x, int n, size_t ld, int k,
                                                        int sort_by_index, int* out_idx, float* out_val,
                                                        const int* __restrict__ start_ptr, int group) {
+    pdl_launch_dependents();
+    pdl_wait();
     if (start_ptr) {
         n = (*start_ptr + (int)blockIdx.x + 1) / group;
         if (n <= k) return;
@@ -121,7 +123,7 @@ extern "C" cudaError_t squash_topk(const float* x, int rows, int n, size_t ld, i
                                    float* out_val, cudaStream_t st) {
     if (k > MAXK || k > n || k <= 0) return cudaErrorInvalidValue;
     if (rows == 0) return cudaSuccess;
-    topk_kernel<<<rows, THREADS, 0, st>>>(x, n, ld, k, sort_by_index, out_idx, out_val, nullptr, 0);
+    SQ_CHECK_LAUNCH(sq_launch(topk_kernel, rows, THREADS, 0, st, x, n, ld, k, sort_by_index, out_idx, out_val, nullptr, 0));
     SQ_RETURN_LAUNCH();
 }
 
@@ -130,6 +132,8 @@ namespace {
 // lse[r] = logsumexp(x[r, :n]); target_logit[r] = x[r, targets[r]] (if targets). One block per row.
 __global__ void lse_kernel(const float* __restrict__ x, int n, size_t ld, const int* __restrict__ targets, float* lse,
                            float* target_logit) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ float scratch[32];
     const float* row = x + blockIdx.x * ld;
     float mx = -INFINITY;
@@ -149,14 +153,14 @@ __global__ void lse_kernel(const float* __restrict__ x, int n, size_t ld, const 
 extern "C" cudaError_t squash_row_lse(const float* x, int rows, int n, size_t ld, const int* targets, float* lse,
                                       float* target_logit, cudaStream_t st) {
     if (rows == 0) return cudaSuccess;
-    lse_kernel<<<rows, 1024, 0, st>>>(x, n, ld, targets, lse, target_logit);
+    SQ_CHECK_LAUNCH(sq_launch(lse_kernel, rows, 1024, 0, st, x, n, ld, targets, lse, target_logit));
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t squash_qsa_select(const float* scores, int T, size_t ld, const int* start, int* sel,
                                          cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    topk_kernel<<<T, THREADS, 0, st>>>(scores, 0, ld, MAXK, 1, sel, nullptr, start, 4);
+    SQ_CHECK_LAUNCH(sq_launch(topk_kernel, T, THREADS, 0, st, scores, 0, ld, MAXK, 1, sel, nullptr, start, 4));
     SQ_RETURN_LAUNCH();
 }
 
@@ -167,6 +171,8 @@ namespace {
 constexpr int AM_SLICE = 8192;
 
 __global__ void argmax_partial_kernel(const float* __restrict__ x, int n, size_t ld, float* pv, int* pi) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ float sv[32];
     __shared__ int si[32];
     const float* row = x + blockIdx.y * ld;
@@ -213,6 +219,8 @@ __global__ void argmax_partial_kernel(const float* __restrict__ x, int n, size_t
 }
 
 __global__ void argmax_final_kernel(const float* __restrict__ pv, const int* __restrict__ pi, int slices, int* out) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int r = blockIdx.x, lane = threadIdx.x;
     float best = -INFINITY;
     int bi = 0x7fffffff;
@@ -246,7 +254,7 @@ extern "C" cudaError_t squash_argmax(const float* x, int rows, int n, size_t ld,
     const int slices = (n + AM_SLICE - 1) / AM_SLICE;
     float* pv = static_cast<float*>(scratch);
     int* pi = reinterpret_cast<int*>(pv + (size_t)rows * slices);
-    argmax_partial_kernel<<<dim3(slices, rows), 1024, 0, st>>>(x, n, ld, pv, pi);
-    argmax_final_kernel<<<rows, 32, 0, st>>>(pv, pi, slices, out);
+    SQ_CHECK_LAUNCH(sq_launch(argmax_partial_kernel, dim3(slices, rows), 1024, 0, st, x, n, ld, pv, pi));
+    SQ_CHECK_LAUNCH(sq_launch(argmax_final_kernel, rows, 32, 0, st, pv, pi, slices, out));
     SQ_RETURN_LAUNCH();
 }

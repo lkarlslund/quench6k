@@ -30,6 +30,8 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
                                                        const void* __restrict__ Wv, int ldw,
                                                        const float* __restrict__ row_scale, OutT* Y, int ldy,
                                                        int M, int N, int K, float alpha, bool accumulate) {
+    pdl_launch_dependents();
+    pdl_wait();
     const __nv_bfloat16* W = static_cast<const __nv_bfloat16*>(Wv);
     const uint8_t* W8 = static_cast<const uint8_t*>(Wv);
     __shared__ __align__(16) __nv_bfloat16 sA[STAGES][BM * LDS];
@@ -151,13 +153,13 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
     const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
     OutT* y = static_cast<OutT*>(Y);
     if (fmt == 1)
-        gemm_kernel<OutT, 1><<<grid, THREADS, 0, stream>>>(x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0);
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 1>, grid, THREADS, 0, stream, x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0));
     else if (fmt == 2)
-        gemm_kernel<OutT, 2><<<grid, THREADS, 0, stream>>>(x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0);
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 2>, grid, THREADS, 0, stream, x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0));
     else if (fmt == 3)
-        gemm_kernel<OutT, 3><<<grid, THREADS, 0, stream>>>(x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0);
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 3>, grid, THREADS, 0, stream, x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0));
     else
-        gemm_kernel<OutT, 0><<<grid, THREADS, 0, stream>>>(x, ldx, W, ldw, nullptr, y, ldy, M, N, K, alpha, accumulate != 0);
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 0>, grid, THREADS, 0, stream, x, ldx, W, ldw, nullptr, y, ldy, M, N, K, alpha, accumulate != 0));
     SQ_RETURN_LAUNCH();
 }
 

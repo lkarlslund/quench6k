@@ -13,6 +13,8 @@ constexpr float EPS = 1e-6f;
 __global__ void gate_kernel(const float* __restrict__ kp, const float* __restrict__ h, const float* __restrict__ v,
                             const __nv_bfloat16* __restrict__ wk, const __nv_bfloat16* __restrict__ wq,
                             const __nv_bfloat16* __restrict__ wc, float* gv, float* xn) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ float scratch[32];
     const int t = blockIdx.x / S, s = blockIdx.x % S;
     const float* k = kp + (size_t)t * H + s * D;
@@ -47,6 +49,8 @@ __global__ void gate_kernel(const float* __restrict__ kp, const float* __restric
 // h[t, c] += gv[t, c] + silu(sum_j w[c, j] * xn[t - 9 + 3j, c]), with history from `state` (then advanced).
 __global__ void conv_kernel(const float* __restrict__ gv, const float* __restrict__ xn, const __nv_bfloat16* __restrict__ w,
                             float* state, float* h, int T) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= H) return;
     float hist[HIST];
@@ -70,14 +74,14 @@ __global__ void conv_kernel(const float* __restrict__ gv, const float* __restric
 extern "C" cudaError_t squash_ple_gate(const float* kp, const float* h, const float* v, const void* wk, const void* wq,
                                        const void* wc, float* gv, float* xn, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    gate_kernel<<<T * S, 256, 0, st>>>(kp, h, v, static_cast<const __nv_bfloat16*>(wk),
+    SQ_CHECK_LAUNCH(sq_launch(gate_kernel, T * S, 256, 0, st, kp, h, v, static_cast<const __nv_bfloat16*>(wk),
                                        static_cast<const __nv_bfloat16*>(wq), static_cast<const __nv_bfloat16*>(wc), gv,
-                                       xn);
+                                       xn));
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t squash_ple_conv(const float* gv, const float* xn, const void* w, float* state, float* h, int T,
                                        cudaStream_t st) {
-    conv_kernel<<<H / 256, 256, 0, st>>>(gv, xn, static_cast<const __nv_bfloat16*>(w), state, h, T);
+    SQ_CHECK_LAUNCH(sq_launch(conv_kernel, H / 256, 256, 0, st, gv, xn, static_cast<const __nv_bfloat16*>(w), state, h, T));
     SQ_RETURN_LAUNCH();
 }

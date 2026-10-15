@@ -47,3 +47,30 @@ SQ_DEVICE float block_max(float v, float* scratch) {
 }
 
 #define SQ_RETURN_LAUNCH() return cudaGetLastError()
+#define SQ_CHECK_LAUNCH(call)              \
+    do {                                   \
+        const cudaError_t sq_err_ = (call); \
+        if (sq_err_ != cudaSuccess) return sq_err_; \
+    } while (0)
+
+// Programmatic dependent launch (PDL). Every kernel lets its successor start launching immediately and
+// waits for its predecessor's completion (and memory) before reading anything an earlier kernel wrote.
+// Every kernel waits at some point, so completion stays ordered transitively along the stream.
+SQ_DEVICE void pdl_launch_dependents() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+SQ_DEVICE void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+
+// Launches with the PDL attribute so the successor's blocks may start while this kernel finishes.
+template <typename... Exp, typename... Act>
+cudaError_t sq_launch(void (*kernel)(Exp...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, Act&&... args) {
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = st;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    return cudaLaunchKernelEx(&cfg, kernel, static_cast<Exp>(args)...);
+}

@@ -57,6 +57,8 @@ SQ_DEVICE float row_scale(const float* scales, int row) {
 
 template <WFmt F, int MAXT>
 __global__ void __launch_bounds__(WARPS * 32) hc_small_kernel(Args a) {
+    pdl_launch_dependents();
+    pdl_wait();
     cg::grid_group grid = cg::this_grid();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, T = a.T;
     const int N = a.wi ? RANK + S : RANK;
@@ -207,9 +209,18 @@ cudaError_t launch(const Args& args, cudaStream_t st) {
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, hc_small_kernel<F, MAXT>, WARPS * 32, 0);
         max_blocks = std::min(per_sm, 3) * sms;
     }
-    Args a = args;
-    void* params[] = {&a};
-    return cudaLaunchCooperativeKernel((void*)hc_small_kernel<F, MAXT>, dim3(max_blocks), dim3(WARPS * 32), params, 0, st);
+    cudaLaunchAttribute attr[2];
+    attr[0].id = cudaLaunchAttributeCooperative;
+    attr[0].val.cooperative = 1;
+    attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[1].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(max_blocks);
+    cfg.blockDim = dim3(WARPS * 32);
+    cfg.stream = st;
+    cfg.attrs = attr;
+    cfg.numAttrs = 2;
+    return cudaLaunchKernelEx(&cfg, hc_small_kernel<F, MAXT>, args);
 }
 
 template <WFmt F>

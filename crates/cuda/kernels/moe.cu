@@ -16,6 +16,8 @@ constexpr int E = 512, TOPK = 10, D = 2560;
 
 // One warp per token: softmax over 512 router logits, top 10 (ties: lower expert), renormalized.
 __global__ void route_kernel(const float* __restrict__ logits, int ld, int T, int* top_i, float* top_w) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int t = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
     if (t >= T) return;
     float v[E / 32];
@@ -66,6 +68,8 @@ __global__ void route_kernel(const float* __restrict__ logits, int ld, int T, in
 }
 
 __global__ void count_kernel(const int* __restrict__ top_i, int pairs, int* counts) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < pairs) atomicAdd(&counts[top_i[i]], 1);
 }
@@ -73,6 +77,8 @@ __global__ void count_kernel(const int* __restrict__ top_i, int pairs, int* coun
 // One block of 512 threads: expert row offsets, and the list of BM-row tiles (expert, first row).
 __global__ void plan_kernel(const int* __restrict__ counts, int* offsets, int* cursor, int* tile_expert, int* tile_row,
                             int* num_tiles, int bm) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ int s_rows[E], s_tiles[E];
     const int e = threadIdx.x;
     const int c = counts[e];
@@ -101,6 +107,8 @@ __global__ void plan_kernel(const int* __restrict__ counts, int* offsets, int* c
 }
 
 __global__ void scatter_kernel(const int* __restrict__ top_i, int pairs, int* cursor, int* pair_row) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < pairs) pair_row[i] = atomicAdd(&cursor[top_i[i]], 1);
 }
@@ -108,6 +116,8 @@ __global__ void scatter_kernel(const int* __restrict__ top_i, int pairs, int* cu
 // xs[pair_row[pair]] = m[pair / 10]
 __global__ void gather_kernel(const __nv_bfloat16* __restrict__ m, const int* __restrict__ pair_row, int pairs,
                               __nv_bfloat16* xs) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int pair = blockIdx.x;
     const uint4* src = reinterpret_cast<const uint4*>(m + (size_t)(pair / TOPK) * D);
     uint4* dst = reinterpret_cast<uint4*>(xs + (size_t)pair_row[pair] * D);
@@ -136,6 +146,8 @@ __global__ void __launch_bounds__(THREADS) nvfp4_gemm_kernel(const __nv_bfloat16
                                                              const int* __restrict__ tile_expert,
                                                              const int* __restrict__ tile_row,
                                                              const int* __restrict__ num_tiles, float* Y, int N, int K) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ __align__(16) __nv_bfloat16 sA[STAGES][BM * LDS];
     __shared__ __align__(16) __nv_bfloat16 sB[STAGES][BN * LDS];
     if ((int)blockIdx.y >= *num_tiles) return;
@@ -222,6 +234,8 @@ __global__ void __launch_bounds__(THREADS) nvfp4_gemm_kernel(const __nv_bfloat16
 // act[r, i] = bf16(silu(gate[r * ld + i]) * up[r * ld + i]) for i < width
 __global__ void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up, int ld, int width,
                               __nv_bfloat16* act, size_t count) {
+    pdl_launch_dependents();
+    pdl_wait();
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= count) return;
     const size_t r = i / width, c = i % width;
@@ -232,6 +246,8 @@ __global__ void swiglu_kernel(const float* __restrict__ gate, const float* __res
 __global__ void combine_kernel(const float* __restrict__ yd, const int* __restrict__ pair_row,
                                const float* __restrict__ top_w, const float* __restrict__ sg, int ld_sg,
                                const float* __restrict__ sh, float* y) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int t = blockIdx.x;
     const float g = sigmoidf(sg[(size_t)t * ld_sg]);
     for (int d = blockIdx.y * blockDim.x + threadIdx.x; d < D; d += gridDim.y * blockDim.x) {
@@ -245,6 +261,8 @@ __global__ void combine_kernel(const float* __restrict__ yd, const int* __restri
 
 // Compacts the experts with at least one routed row into active[0 .. *num_active). One block of 512.
 __global__ void active_kernel(const int* __restrict__ counts, int* active, int* num_active) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ int s[E];
     const int e = threadIdx.x;
     const int flag = counts[e] > 0;
@@ -272,6 +290,8 @@ __global__ void __launch_bounds__(GV_WARPS * 32) nvfp4_gemv_kernel(const __nv_bf
                                                                    const int* __restrict__ active,
                                                                    const int* __restrict__ num_active, float* Y, int N,
                                                                    int K) {
+    pdl_launch_dependents();
+    pdl_wait();
     if ((int)blockIdx.y >= *num_active) return;
     const int e = active[blockIdx.y];
     const int r0 = offsets[e], rows = min(offsets[e + 1] - r0, GV_MAX_M);
@@ -335,6 +355,8 @@ constexpr int SMALL_T = 16, SMALL_PAIRS = SMALL_T * TOPK;
 __global__ void __launch_bounds__(512) route_small_kernel(const float* __restrict__ logits, int ld, int T, int* top_i,
                                                           float* top_w, int* offsets, int* pair_row, int* row_token,
                                                           int* active, int* num_active) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ int s_top[SMALL_PAIRS];
     __shared__ int s_count[E], s_scan[E];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -485,6 +507,8 @@ __global__ void __launch_bounds__(EW * 32) gate_up_kernel(const __nv_bfloat16* _
                                                           const uint64_t* __restrict__ us, const float* __restrict__ u2,
                                                           const int* __restrict__ offsets, const int* __restrict__ active,
                                                           const int* __restrict__ num_active, __nv_bfloat16* act) {
+    pdl_launch_dependents();
+    pdl_wait();
     constexpr int N = 640, K = D, CHUNKS = K / 32 / 16, FEAT = 2;
     if ((int)blockIdx.y >= *num_active) return;
     const int e = active[blockIdx.y];
@@ -542,6 +566,8 @@ __global__ void __launch_bounds__(EW * 32) down_kernel(const __nv_bfloat16* __re
                                                        const float* __restrict__ d2, const int* __restrict__ offsets,
                                                        const int* __restrict__ active, const int* __restrict__ num_active,
                                                        float* yd) {
+    pdl_launch_dependents();
+    pdl_wait();
     constexpr int K = 640, CHUNKS = K / 32 / 4;  // 5 chunks per lane
     if ((int)blockIdx.y >= *num_active) return;
     const int e = active[blockIdx.y];
@@ -586,7 +612,7 @@ extern "C" int squash_moe_tile_rows() { return BM; }
 
 extern "C" cudaError_t squash_moe_route(const float* logits, int ld, int T, int* top_i, float* top_w, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    route_kernel<<<(T + 7) / 8, 256, 0, st>>>(logits, ld, T, top_i, top_w);
+    SQ_CHECK_LAUNCH(sq_launch(route_kernel, (T + 7) / 8, 256, 0, st, logits, ld, T, top_i, top_w));
     SQ_RETURN_LAUNCH();
 }
 
@@ -597,16 +623,16 @@ extern "C" cudaError_t squash_moe_plan(const int* top_i, int T, int* counts, int
     const int pairs = T * TOPK;
     cudaError_t err = cudaMemsetAsync(counts, 0, E * sizeof(int), st);
     if (err != cudaSuccess) return err;
-    if (pairs > 0) count_kernel<<<(pairs + 255) / 256, 256, 0, st>>>(top_i, pairs, counts);
-    plan_kernel<<<1, E, 0, st>>>(counts, offsets, cursor, tile_expert, tile_row, num_tiles, BM);
-    if (pairs > 0) scatter_kernel<<<(pairs + 255) / 256, 256, 0, st>>>(top_i, pairs, cursor, pair_row);
+    if (pairs > 0) SQ_CHECK_LAUNCH(sq_launch(count_kernel, (pairs + 255) / 256, 256, 0, st, top_i, pairs, counts));
+    SQ_CHECK_LAUNCH(sq_launch(plan_kernel, 1, E, 0, st, counts, offsets, cursor, tile_expert, tile_row, num_tiles, BM));
+    if (pairs > 0) SQ_CHECK_LAUNCH(sq_launch(scatter_kernel, (pairs + 255) / 256, 256, 0, st, top_i, pairs, cursor, pair_row));
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t squash_moe_gather(const void* m, const int* pair_row, int T, void* xs, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    gather_kernel<<<T * TOPK, 128, 0, st>>>(static_cast<const __nv_bfloat16*>(m), pair_row, T * TOPK,
-                                            static_cast<__nv_bfloat16*>(xs));
+    SQ_CHECK_LAUNCH(sq_launch(gather_kernel, T * TOPK, 128, 0, st, static_cast<const __nv_bfloat16*>(m), pair_row, T * TOPK,
+                                            static_cast<__nv_bfloat16*>(xs)));
     SQ_RETURN_LAUNCH();
 }
 
@@ -615,28 +641,28 @@ extern "C" cudaError_t squash_moe_nvfp4_gemm(const void* xs, const uint64_t* w_p
                                              const int* tile_row, const int* num_tiles, int max_tiles, float* y, int N,
                                              int K, cudaStream_t st) {
     if (K % BK != 0 || max_tiles == 0) return max_tiles == 0 ? cudaSuccess : cudaErrorInvalidValue;
-    nvfp4_gemm_kernel<<<dim3((N + BN - 1) / BN, max_tiles), THREADS, 0, st>>>(
-        static_cast<const __nv_bfloat16*>(xs), w_ptr, s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, y, N, K);
+    SQ_CHECK_LAUNCH(sq_launch(nvfp4_gemm_kernel, dim3((N + BN - 1) / BN, max_tiles), THREADS, 0, st, 
+        static_cast<const __nv_bfloat16*>(xs), w_ptr, s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, y, N, K));
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t squash_swiglu(const float* gate, const float* up, int ld, int width, void* act, size_t count,
                                      cudaStream_t st) {
     if (count == 0) return cudaSuccess;
-    swiglu_kernel<<<(unsigned)((count + 255) / 256), 256, 0, st>>>(gate, up, ld, width, static_cast<__nv_bfloat16*>(act),
-                                                                    count);
+    SQ_CHECK_LAUNCH(sq_launch(swiglu_kernel, (unsigned)((count + 255) / 256), 256, 0, st, gate, up, ld, width, static_cast<__nv_bfloat16*>(act),
+                                                                    count));
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t squash_moe_combine(const float* yd, const int* pair_row, const float* top_w, const float* sg,
                                           int ld_sg, const float* sh, float* y, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    combine_kernel<<<dim3(T, D / 256), 256, 0, st>>>(yd, pair_row, top_w, sg, ld_sg, sh, y);
+    SQ_CHECK_LAUNCH(sq_launch(combine_kernel, dim3(T, D / 256), 256, 0, st, yd, pair_row, top_w, sg, ld_sg, sh, y));
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t squash_moe_active(const int* counts, int* active, int* num_active, cudaStream_t st) {
-    active_kernel<<<1, E, 0, st>>>(counts, active, num_active);
+    SQ_CHECK_LAUNCH(sq_launch(active_kernel, 1, E, 0, st, counts, active, num_active));
     SQ_RETURN_LAUNCH();
 }
 
@@ -646,8 +672,8 @@ extern "C" cudaError_t squash_moe_nvfp4_gemv(const void* xs, const uint64_t* w_p
                                              const int* num_active, int max_active, float* y, int N, int K,
                                              cudaStream_t st) {
     if (K % 32 != 0 || max_active == 0) return max_active == 0 ? cudaSuccess : cudaErrorInvalidValue;
-    nvfp4_gemv_kernel<<<dim3((N + GV_ROWS - 1) / GV_ROWS, max_active), GV_WARPS * 32, 0, st>>>(
-        static_cast<const __nv_bfloat16*>(xs), w_ptr, s_ptr, ws2, offsets, active, num_active, y, N, K);
+    SQ_CHECK_LAUNCH(sq_launch(nvfp4_gemv_kernel, dim3((N + GV_ROWS - 1) / GV_ROWS, max_active), GV_WARPS * 32, 0, st, 
+        static_cast<const __nv_bfloat16*>(xs), w_ptr, s_ptr, ws2, offsets, active, num_active, y, N, K));
     SQ_RETURN_LAUNCH();
 }
 
@@ -657,7 +683,7 @@ extern "C" cudaError_t squash_moe_route_small(const float* logits, int ld, int T
                                               int* pair_row, int* row_token, int* active, int* num_active,
                                               cudaStream_t st) {
     if (T == 0 || T > SMALL_T) return T == 0 ? cudaSuccess : cudaErrorInvalidValue;
-    route_small_kernel<<<1, 512, 0, st>>>(logits, ld, T, top_i, top_w, offsets, pair_row, row_token, active, num_active);
+    SQ_CHECK_LAUNCH(sq_launch(route_small_kernel, 1, 512, 0, st, logits, ld, T, top_i, top_w, offsets, pair_row, row_token, active, num_active));
     SQ_RETURN_LAUNCH();
 }
 
@@ -671,7 +697,7 @@ extern "C" cudaError_t squash_moe_gate_up_small(const void* m, const int* row_to
     const dim3 grid(640 / (EW * 2), max_active);
     const auto* x = static_cast<const __nv_bfloat16*>(m);
     auto* a = static_cast<__nv_bfloat16*>(act);
-#define SQ_GU(R) gate_up_kernel<R><<<grid, EW * 32, 0, st>>>(x, row_token, gw, gs, g2, uw, us, u2, offsets, active, num_active, a)
+#define SQ_GU(R) SQ_CHECK_LAUNCH(sq_launch(gate_up_kernel<R>, grid, EW * 32, 0, st, x, row_token, gw, gs, g2, uw, us, u2, offsets, active, num_active, a))
     if (T <= 1) SQ_GU(1);
     else if (T <= 2) SQ_GU(2);
     else if (T <= 4) SQ_GU(4);
@@ -687,7 +713,7 @@ extern "C" cudaError_t squash_moe_down_small(const void* act, const uint64_t* dw
     if (max_active == 0) return cudaSuccess;
     const dim3 grid(D / (EW * 8), max_active);
     const auto* x = static_cast<const __nv_bfloat16*>(act);
-#define SQ_DN(R) down_kernel<R><<<grid, EW * 32, 0, st>>>(x, dw, ds, d2, offsets, active, num_active, yd)
+#define SQ_DN(R) SQ_CHECK_LAUNCH(sq_launch(down_kernel<R>, grid, EW * 32, 0, st, x, dw, ds, d2, offsets, active, num_active, yd))
     if (T <= 1) SQ_DN(1);
     else if (T <= 2) SQ_DN(2);
     else if (T <= 4) SQ_DN(4);

@@ -1,12 +1,13 @@
 // Utility kernels: byte checksums for verifying uploads.
 
-#include <cuda_runtime.h>
-#include <stdint.h>
+#include "common.cuh"
 
 namespace {
 
 // Wrapping sum of little-endian u32 words; a trailing partial word is zero-padded.
 __global__ void checksum_kernel(const uint8_t* data, size_t bytes, unsigned long long* out) {
+    pdl_launch_dependents();
+    pdl_wait();
     const size_t words = bytes / 4;
     const uint32_t* w = reinterpret_cast<const uint32_t*>(data);
     unsigned long long sum = 0;
@@ -27,6 +28,6 @@ __global__ void checksum_kernel(const uint8_t* data, size_t bytes, unsigned long
 extern "C" cudaError_t squash_checksum(const void* data, size_t bytes, unsigned long long* out, cudaStream_t stream) {
     cudaError_t err = cudaMemsetAsync(out, 0, sizeof(*out), stream);
     if (err != cudaSuccess) return err;
-    checksum_kernel<<<264, 256, 0, stream>>>(static_cast<const uint8_t*>(data), bytes, out);
+    SQ_CHECK_LAUNCH(sq_launch(checksum_kernel, 264, 256, 0, stream, static_cast<const uint8_t*>(data), bytes, out));
     return cudaGetLastError();
 }

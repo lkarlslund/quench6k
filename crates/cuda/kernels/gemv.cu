@@ -26,6 +26,7 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X,
                                                        const uint8_t* __restrict__ W, const float* __restrict__ row_scale,
                                                        float* Y, int ldy, float* partial, int ldp, float* xsq, int N,
                                                        int K, int k_per_split, float alpha, int accumulate) {
+    pdl_launch_dependents();
     constexpr int U = 2;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int k_begin = blockIdx.y * k_per_split, k_end = min(K, k_begin + k_per_split);
@@ -38,6 +39,7 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X,
         row_live[r] = n0 + r < N;
         rows[r] = W + (size_t)min(n0 + r, N - 1) * row_bytes;
     }
+    pdl_wait();
     float acc[R][M] = {};
     float sq[M] = {};
     for (int k0 = k_begin + lane * 16; k0 < k_end; k0 += U * 512) {
@@ -107,6 +109,8 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X,
 // Y[m, n] (+)= sum over splits of partial[split, m, n], in split order.
 __global__ void reduce_kernel(const float* __restrict__ partial, int ldp, int splits, int M, int N, float* Y, int ldy,
                               int accumulate) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= M * N) return;
     const int m = i / N, n = i % N;
@@ -129,8 +133,8 @@ cudaError_t launch_m(const void* X, int x_f32, int ldx, const void* W, const flo
     dim3 grid((N + rows_per_cta - 1) / rows_per_cta, splits);
     const auto* w8 = static_cast<const uint8_t*>(W);
 #define SQ_GEMV(XT, R) \
-    gemv_kernel<F, M, XT, R><<<grid, THREADS, 0, st>>>(static_cast<const XT*>(X), ldx, w8, scale, Y, ldy, partial, ldp, \
-                                                        xsq, N, K, k_per_split, alpha, accumulate)
+    SQ_CHECK_LAUNCH(sq_launch(gemv_kernel<F, M, XT, R>, grid, THREADS, 0, st, static_cast<const XT*>(X), ldx, w8, scale, Y, ldy, partial, ldp, \
+                                                        xsq, N, K, k_per_split, alpha, accumulate))
     if (x_f32) {
         if (two) SQ_GEMV(float, 2);
         else SQ_GEMV(float, 1);
@@ -140,7 +144,7 @@ cudaError_t launch_m(const void* X, int x_f32, int ldx, const void* W, const flo
     }
 #undef SQ_GEMV
     if (splits > 1 && reduce)
-        reduce_kernel<<<(M * N + 255) / 256, 256, 0, st>>>(partial, ldp, splits, M, N, Y, ldy, accumulate);
+        SQ_CHECK_LAUNCH(sq_launch(reduce_kernel, (M * N + 255) / 256, 256, 0, st, partial, ldp, splits, M, N, Y, ldy, accumulate));
     return cudaGetLastError();
 }
 
@@ -185,6 +189,8 @@ namespace {
 
 // BF16 [N, K] -> FP8 E4M3 [N, K] with scale[n] = absmax(row) / 448. One block per row.
 __global__ void quantize_fp8_rows_kernel(const __nv_bfloat16* __restrict__ w, int K, uint8_t* q, float* scale) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ float scratch[32];
     const __nv_bfloat16* row = w + (size_t)blockIdx.x * K;
     float mx = 0;
@@ -200,7 +206,7 @@ __global__ void quantize_fp8_rows_kernel(const __nv_bfloat16* __restrict__ w, in
 
 extern "C" cudaError_t squash_quantize_fp8_rows(const void* w, int N, int K, void* q, float* scale, cudaStream_t st) {
     if (N == 0) return cudaSuccess;
-    quantize_fp8_rows_kernel<<<N, 256, 0, st>>>(static_cast<const __nv_bfloat16*>(w), K, static_cast<uint8_t*>(q), scale);
+    SQ_CHECK_LAUNCH(sq_launch(quantize_fp8_rows_kernel, N, 256, 0, st, static_cast<const __nv_bfloat16*>(w), K, static_cast<uint8_t*>(q), scale));
     SQ_RETURN_LAUNCH();
 }
 
@@ -208,6 +214,8 @@ namespace {
 
 // BF16 [N, K] -> INT8 [N, K] with scale[n] = absmax(row) / 127, round to nearest. One block per row.
 __global__ void quantize_int8_rows_kernel(const __nv_bfloat16* __restrict__ w, int K, int8_t* q, float* scale) {
+    pdl_launch_dependents();
+    pdl_wait();
     __shared__ float scratch[32];
     const __nv_bfloat16* row = w + (size_t)blockIdx.x * K;
     float mx = 0;
@@ -223,7 +231,7 @@ __global__ void quantize_int8_rows_kernel(const __nv_bfloat16* __restrict__ w, i
 
 extern "C" cudaError_t squash_quantize_int8_rows(const void* w, int N, int K, void* q, float* scale, cudaStream_t st) {
     if (N == 0) return cudaSuccess;
-    quantize_int8_rows_kernel<<<N, 256, 0, st>>>(static_cast<const __nv_bfloat16*>(w), K, static_cast<int8_t*>(q), scale);
+    SQ_CHECK_LAUNCH(sq_launch(quantize_int8_rows_kernel, N, 256, 0, st, static_cast<const __nv_bfloat16*>(w), K, static_cast<int8_t*>(q), scale));
     SQ_RETURN_LAUNCH();
 }
 
@@ -231,6 +239,8 @@ namespace {
 
 // BF16 [N, K] -> INT8 [N, K] with scale[n, g] = absmax(row n, group g) / 127. One warp per (row, group of 128).
 __global__ void quantize_int8_groups_kernel(const __nv_bfloat16* __restrict__ w, int K, int8_t* q, float* scale) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int groups = K / GROUP;
     const int item = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
     const int n = item / groups, g = item % groups;
@@ -257,8 +267,8 @@ extern "C" cudaError_t squash_quantize_int8_groups(const void* w, int N, int K, 
     if (N == 0) return cudaSuccess;
     if (K % GROUP != 0) return cudaErrorInvalidValue;
     const int items = N * (K / GROUP);
-    quantize_int8_groups_kernel<<<(items + 7) / 8, 256, 0, st>>>(static_cast<const __nv_bfloat16*>(w), K,
-                                                                  static_cast<int8_t*>(q), scale);
+    SQ_CHECK_LAUNCH(sq_launch(quantize_int8_groups_kernel, (items + 7) / 8, 256, 0, st, static_cast<const __nv_bfloat16*>(w), K,
+                                                                  static_cast<int8_t*>(q), scale));
     SQ_RETURN_LAUNCH();
 }
 
@@ -266,6 +276,8 @@ namespace {
 
 // W[n, k] = bf16(W[n, k] * (1 + g[k])): folds a (1 + w)-style norm weight into a projection's columns.
 __global__ void fold_norm_kernel(__nv_bfloat16* w, const __nv_bfloat16* __restrict__ g, int K, size_t count) {
+    pdl_launch_dependents();
+    pdl_wait();
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i < count) w[i] = f2bf(bf2f(w[i]) * (1.0f + bf2f(g[i % K])));
 }
@@ -275,7 +287,7 @@ __global__ void fold_norm_kernel(__nv_bfloat16* w, const __nv_bfloat16* __restri
 extern "C" cudaError_t squash_fold_norm(void* w, const void* g, int N, int K, cudaStream_t st) {
     const size_t count = (size_t)N * K;
     if (count == 0) return cudaSuccess;
-    fold_norm_kernel<<<(unsigned)((count + 255) / 256), 256, 0, st>>>(static_cast<__nv_bfloat16*>(w),
-                                                                      static_cast<const __nv_bfloat16*>(g), K, count);
+    SQ_CHECK_LAUNCH(sq_launch(fold_norm_kernel, (unsigned)((count + 255) / 256), 256, 0, st, static_cast<__nv_bfloat16*>(w),
+                                                                      static_cast<const __nv_bfloat16*>(g), K, count));
     SQ_RETURN_LAUNCH();
 }
