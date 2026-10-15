@@ -219,3 +219,53 @@ fn expert_gate_up_small_matches_cpu() {
     }
     }
 }
+
+/// The small-batch HyperConnection gives every token the same bits whatever the batch size.
+#[test]
+fn hc_small_is_batch_invariant() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x5eed_0f_4c);
+    const D: usize = 2560;
+    const H: usize = 4 * D;
+    const RANK: usize = 320;
+    let gr = kernels::int8_group();
+    let bytes = |n: usize, rng: &mut Rng| -> Vec<i8> { (0..n).map(|_| (rng.next() * 100.0) as i8).collect() };
+    let pos = |n: usize, rng: &mut Rng| -> Vec<f32> { (0..n).map(|_| 0.002 + 0.002 * rng.next().abs()).collect() };
+    let (wd, sd) = (upload(&s, &bytes(RANK * H, &mut rng)), upload(&s, &pos(RANK * H / gr, &mut rng)));
+    let (wi, si) = (upload(&s, &bytes(4 * H, &mut rng)), upload(&s, &pos(4 * H / gr, &mut rng)));
+    let (wu, su) = (upload(&s, &bytes(H * RANK, &mut rng)), upload(&s, &pos(H * RANK / gr, &mut rng)));
+    let g = upload(&s, &to_bf16(&rng.vec(4 * D).iter().map(|v| v * 0.1).collect::<Vec<_>>()));
+    let fmt = WeightFormat::Int8Group;
+    for (with_y, with_inj) in [(true, true), (false, true), (true, false), (false, false)] {
+    let run = |t: usize, h0: &[f32], y0: &[f32], ip: &[f32]| -> (Vec<f32>, Vec<u16>, Vec<f32>) {
+        let h = upload(&s, h0);
+        let y = upload(&s, y0);
+        let inj_prev = upload(&s, ip);
+        let scratch = DeviceBuffer::zeroed(kernels::hc_small_scratch_floats(t) * 4).unwrap();
+        let z = DeviceBuffer::new(t * RANK * 2).unwrap();
+        let r = DeviceBuffer::new(t * 16).unwrap();
+        let inj = DeviceBuffer::new(t * 16).unwrap();
+        let m = DeviceBuffer::new(t * D * 2).unwrap();
+        s.memset(inj.addr(), 0, t * 16).unwrap();
+        let y = if with_y { y.addr() } else { 0 };
+        let inject = with_inj.then(|| (fmt, wi.addr(), si.addr()));
+        kernels::hc_small(&s, h.addr(), t, y, inj_prev.addr(), (fmt, wd.addr(), sd.addr()), inject,
+            (fmt, wu.addr(), su.addr()), g.addr(), scratch.addr(), z.addr(), r.addr(), inj.addr(), m.addr()).unwrap();
+        (s.download(h.addr(), t * H).unwrap(), s.download(m.addr(), t * D).unwrap(), s.download(inj.addr(), t * 4).unwrap())
+    };
+    for &t in &[2usize, 4, 5, 8, 16] {
+        let h0 = rng.vec(t * H);
+        let y0 = rng.vec(t * D);
+        let ip: Vec<f32> = (0..t * 4).map(|_| 1.0 + rng.next() * 0.5).collect();
+        let (hb, mb, ib) = run(t, &h0, &y0, &ip);
+        for i in 0..t {
+            let (h1, m1, i1) = run(1, &h0[i * H..(i + 1) * H], &y0[i * D..(i + 1) * D], &ip[i * 4..(i + 1) * 4]);
+            assert!(h1.iter().zip(&hb[i * H..]).all(|(a, b)| a.to_bits() == b.to_bits()), "T={t} token {i}: residual differs");
+            assert!(i1.iter().zip(&ib[i * 4..]).all(|(a, b)| a.to_bits() == b.to_bits()), "T={t} token {i}: injection differs");
+            let bad = m1.iter().zip(&mb[i * D..]).filter(|(a, b)| a != b).count();
+            assert!(bad == 0, "T={t} token {i} (y {with_y}, inj {with_inj}): {bad} block-input values differ");
+        }
+    }
+    }
+}

@@ -19,6 +19,29 @@ SQ_DEVICE float warp_sum(float v) {
     return v;
 }
 
+// Sums N slots (N a power of two <= 32) over the warp at once: returns, in every lane, the warp sum of
+// v[lane >> (5 - log2 N)]. Each slot is added over the same xor 16, 8, 4, 2, 1 pairing as warp_sum
+// (and addition is commutative), so every result is bitwise equal to warp_sum of that slot; it takes
+// N - 1 + (5 - log2 N) shuffles instead of 5 N. v is clobbered.
+template <int N>
+SQ_DEVICE float warp_sum_slots(float (&v)[N]) {
+    const int lane = threadIdx.x & 31;
+    int off = 16;
+#pragma unroll
+    for (int n = N; n > 1; n >>= 1, off >>= 1) {
+        const bool hi = lane & off;
+#pragma unroll
+        for (int i = 0; i < n / 2; ++i) {
+            const float send = hi ? v[i] : v[i + n / 2];
+            const float keep = hi ? v[i + n / 2] : v[i];
+            v[i] = keep + __shfl_xor_sync(0xffffffff, send, off);
+        }
+    }
+#pragma unroll
+    for (; off > 0; off >>= 1) v[0] += __shfl_xor_sync(0xffffffff, v[0], off);
+    return v[0];
+}
+
 SQ_DEVICE float warp_max(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));

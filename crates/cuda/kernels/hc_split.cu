@@ -42,7 +42,6 @@ __global__ void __launch_bounds__(WARPS * 32) hc_down_kernel(const float* h, int
         if constexpr (F == WFmt::INT8G) gs[rr] = __ldg((down ? sd : si) + (size_t)wr * (H / GROUP) + k / GROUP);
         rs[rr] = row_scale<F>(down ? sd : si, wr);
     }
-    pdl_wait();
     float w[2][16];
 #pragma unroll
     for (int rr = 0; rr < 2; ++rr) {
@@ -50,35 +49,45 @@ __global__ void __launch_bounds__(WARPS * 32) hc_down_kernel(const float* h, int
 #pragma unroll
         for (int i = 0; i < 16; ++i) w[rr][i] *= gs[rr];
     }
+    pdl_wait();
+    // Tokens in groups of up to four; the group's 2 x TG dot products are reduced together (slot
+    // 2 t + rr), each bitwise as a warp_sum of its own.
+    constexpr int TG = MAXT < 4 ? MAXT : 4, NS = 2 * TG;
 #pragma unroll
-    for (int t = 0; t < MAXT; ++t) {
-        if (t >= T) break;
-        float x[16];
-        load_x8(h + (size_t)t * H + k, x);
-        load_x8(h + (size_t)t * H + k + 8, x + 8);
-        if (y) {
-            float yv[16];
-            load_x8(y + (size_t)t * D + d, yv);
-            load_x8(y + (size_t)t * D + d + 8, yv + 8);
-            const float iv = inj_prev[t * S + s];
+    for (int t0 = 0; t0 < MAXT; t0 += TG) {
+        if (t0 >= T) break;
+        float acc[NS] = {};
 #pragma unroll
-            for (int i = 0; i < 16; ++i) x[i] = fmaf(yv[i], iv, x[i]);
+        for (int j = 0; j < TG; ++j) {
+            const int t = t0 + j;
+            if (t >= T) break;
+            float x[16];
+            load_x8(h + (size_t)t * H + k, x);
+            load_x8(h + (size_t)t * H + k + 8, x + 8);
+            if (y) {
+                float yv[16];
+                load_x8(y + (size_t)t * D + d, yv);
+                load_x8(y + (size_t)t * D + d + 8, yv + 8);
+                const float iv = inj_prev[t * S + s];
+#pragma unroll
+                for (int i = 0; i < 16; ++i) x[i] = fmaf(yv[i], iv, x[i]);
+            }
+            if (blockIdx.x == 0 && warp == 0) {
+                float ss = 0;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) ss = fmaf(x[i], x[i], ss);
+                ss = warp_sum(ss);
+                if (lane == 0) xsq[sp * T + t] = ss;
+            }
+#pragma unroll
+            for (int rr = 0; rr < 2; ++rr)
+#pragma unroll
+                for (int i = 0; i < 16; ++i) acc[2 * j + rr] = fmaf(w[rr][i], x[i], acc[2 * j + rr]);
         }
-        if (blockIdx.x == 0 && warp == 0) {
-            float ss = 0;
-#pragma unroll
-            for (int i = 0; i < 16; ++i) ss = fmaf(x[i], x[i], ss);
-            ss = warp_sum(ss);
-            if (lane == 0) xsq[sp * T + t] = ss;
-        }
-#pragma unroll
-        for (int rr = 0; rr < 2; ++rr) {
-            float acc = 0;
-#pragma unroll
-            for (int i = 0; i < 16; ++i) acc = fmaf(w[rr][i], x[i], acc);
-            acc = warp_sum(acc);
-            if (lane == 0 && rows[rr] < N) partial[((size_t)sp * T + t) * N + rows[rr]] = acc * rs[rr];
-        }
+        const float v = warp_sum_slots(acc);
+        const int slot = lane / (32 / NS), t = t0 + slot / 2, rr = slot % 2;
+        const int row = rr ? rows[1] : rows[0];
+        if (lane % (32 / NS) == 0 && t < T && row < N) partial[((size_t)sp * T + t) * N + row] = v * (rr ? rs[1] : rs[0]);
     }
 }
 
@@ -132,52 +141,58 @@ __global__ void __launch_bounds__(WARPS * 32) hc_up_mix_kernel(float* h, int T, 
         }
         rs[s] = row_scale<F>(su, row);
     }
-    const int ls = lane & 3;
+    // Tokens in groups of up to four: slot 4 t + s of the group (u for stream s of token t) is reduced
+    // over the warp together with the others, landing in lanes lane / (32 / NS) == slot.
+    constexpr int TG = MAXT < 4 ? MAXT : 4, NS = S * TG, LPS = 32 / NS;
+    const int slot = lane / LPS, ls = slot % S, lt = slot / S;
     const float gw = 1.0f + bf2f(g[ls * D + d]);
+    // Weights decoded (group scale applied) once, before the wait.
+    float w[S][16];
+#pragma unroll
+    for (int s = 0; s < S; ++s) {
+        decode_raw16<F>(raw[s], w[s]);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) w[s][i] *= gs[s];
+    }
     pdl_wait();
 
-    float u[S][MAXT];
 #pragma unroll
-    for (int t = 0; t < MAXT; ++t) {
-        if (t >= T) break;
-        float acc[S] = {};
-        if (active) {
-            float zf[16];
-            load_x8(z + t * RANK + k, zf);
-            load_x8(z + t * RANK + k + 8, zf + 8);
+    for (int t0 = 0; t0 < MAXT; t0 += TG) {
+        if (t0 >= T) break;
+        float acc[NS] = {};
 #pragma unroll
-            for (int s = 0; s < S; ++s) {
-                float w[16];
-                decode_raw16<F>(raw[s], w);
+        for (int j = 0; j < TG; ++j) {
+            if (t0 + j >= T) break;
+            if (active) {
+                float zf[16];
+                load_x8(z + (t0 + j) * RANK + k, zf);
+                load_x8(z + (t0 + j) * RANK + k + 8, zf + 8);
 #pragma unroll
-                for (int i = 0; i < 16; ++i) acc[s] = fmaf(w[i] * gs[s], zf[i], acc[s]);
+                for (int s = 0; s < S; ++s)
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) acc[S * j + s] = fmaf(w[s][i], zf[i], acc[S * j + s]);
             }
         }
+        float rsl = rs[0];
 #pragma unroll
-        for (int s = 0; s < S; ++s) u[s][t] = warp_sum(acc[s]) * rs[s];
-    }
-    // Lane (stream ls, token lane / 4 + 8 j) finishes one stream of one token; 4-lane sums give m.
-    for (int tq = 0; tq < T; tq += 8) {
-        const int t = tq + (lane >> 2);
-        float us = 0;
-#pragma unroll
-        for (int ss = 0; ss < S; ++ss)
-#pragma unroll
-            for (int tt = 0; tt < MAXT; ++tt)
-                if (ss == ls && tt == t) us = u[ss][tt];
+        for (int s = 1; s < S; ++s)
+            if (ls == s) rsl = rs[s];
+        const float us = warp_sum_slots(acc) * rsl;
+        // Lane group (stream ls, token t) finishes one stream; sums over the 4 streams give m.
+        const int t = t0 + lt;
         float term = 0;
         if (t < T) {
             const size_t idx = (size_t)t * H + ls * D + d;
             float x = h[idx];
             if (y) {
                 x = fmaf(y[(size_t)t * D + d], inj_prev[t * S + ls], x);
-                h[idx] = x;
+                if (lane % LPS == 0) h[idx] = x;
             }
             term = sigmoidf(us) * x * r[t * S + ls] * gw;
         }
-        term += __shfl_xor_sync(0xffffffff, term, 1);
-        term += __shfl_xor_sync(0xffffffff, term, 2);
-        if (ls == 0 && t < T) m[(size_t)t * D + d] = f2bf(term / S);
+        term += __shfl_xor_sync(0xffffffff, term, LPS);
+        term += __shfl_xor_sync(0xffffffff, term, 2 * LPS);
+        if (ls == 0 && lane % LPS == 0 && t < T) m[(size_t)t * D + d] = f2bf(term / S);
     }
 }
 
