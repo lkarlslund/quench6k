@@ -22,4 +22,5 @@ previous one stopped.
 
 ## Progress log
 
-- 2026-10-15: repo created; GOAL.md agreed; oracle fixtures imported. Next: M0.
+- 2026-10-15: repo created; GOAL.md agreed; oracle fixtures imported.
+- 2026-10-15: M0 done: SPEC.md written from HF qwen4_exp and llama.cpp qwen4exp. Open details, deferred to their milestones: MTP K/V positions (M5), vision preprocessing and multimodal positions (M10). Next: M1.
