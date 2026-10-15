@@ -715,6 +715,16 @@ __global__ void __launch_bounds__(256) shared_combine_kernel(const float* __rest
         }
     }
     pdl_wait();
+    // The SwiGLU input bf16(silu(gate) * up) of every token, computed once per block; column k is
+    // stored at k + k / 16 so the lanes' 16-column chunks fall in different banks.
+    constexpr int KP = K + K / 16;
+    __shared__ float xs[MAXT][KP];
+    for (int i = threadIdx.x; i < T * K; i += blockDim.x) {
+        const float* pr = proj + (size_t)(i / K) * ld;
+        const int kk = i % K;
+        xs[i / K][kk + kk / 16] = bf2f(f2bf(silu(pr[GATE + kk]) * pr[UP + kk]));
+    }
+    __syncthreads();
     float acc[MAXT] = {};
 #pragma unroll
     for (int c = 0; c < 2; ++c) {
@@ -725,24 +735,35 @@ __global__ void __launch_bounds__(256) shared_combine_kernel(const float* __rest
 #pragma unroll
         for (int t = 0; t < MAXT; ++t) {
             if (t >= T) break;
-            const float* pr = proj + (size_t)t * ld;
 #pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                const float x = bf2f(f2bf(silu(pr[GATE + k + i]) * pr[UP + k + i]));
-                acc[t] = fmaf(w[i] * gs[c], x, acc[t]);
-            }
+            for (int i = 0; i < 16; ++i) acc[t] = fmaf(w[i] * gs[c], xs[t][k + k / 16 + i], acc[t]);
         }
     }
+    // Routed sum: lanes 10 j + k load slot k of token t0 + j (three tokens per pass); the operands are
+    // shuffled to every lane and added in slot order, the same arithmetic and order as combine_kernel,
+    // so every batch size gives identical results.
+    constexpr int TPP = 32 / TOPK;
 #pragma unroll
-    for (int t = 0; t < MAXT; ++t) {
-        if (t >= T) break;
-        const float v = warp_sum(acc[t]);
-        // Same arithmetic and order as combine_kernel, so every batch size gives identical results.
-        if (lane == 0) {
+    for (int t0 = 0; t0 < MAXT; t0 += TPP) {
+        if (t0 >= T) break;
+        const int tl = t0 + lane / TOPK, pidx = tl * TOPK + lane % TOPK;
+        float tw = 0, yv = 0;
+        if (lane < TPP * TOPK && tl < T) {
+            tw = top_w[pidx];
+            yv = yd[(size_t)pair_row[pidx] * D + n];
+        }
+#pragma unroll
+        for (int j = 0; j < TPP; ++j) {
+            const int t = t0 + j;
+            if (t >= MAXT) break;
             float routed = 0;
 #pragma unroll
-            for (int k = 0; k < TOPK; ++k) routed += top_w[t * TOPK + k] * yd[(size_t)pair_row[t * TOPK + k] * D + n];
-            y[(size_t)t * D + n] = routed + sigmoidf(proj[(size_t)t * ld + SG]) * v;
+            for (int k = 0; k < TOPK; ++k) {
+                const float a = __shfl_sync(0xffffffff, tw, j * TOPK + k), b = __shfl_sync(0xffffffff, yv, j * TOPK + k);
+                routed += a * b;
+            }
+            const float v = warp_sum(acc[t]);
+            if (lane == 0 && t < T) y[(size_t)t * D + n] = routed + sigmoidf(proj[(size_t)t * ld + SG]) * v;
         }
     }
 }

@@ -641,7 +641,8 @@ fn layer_forward(layer: &crate::model::Layer, gdn: Option<&GdnState>, gdn_rec: O
         op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, t * TOP_K));
         op!(prof, "experts down", s, grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH));
     }
-    // The fused shared-expert tail recomputes the SwiGLU input per warp: only worth it for one token.
+    // One token: the shared-expert tail (SwiGLU, down projection, combine) in one kernel. Larger
+    // batches are faster as three kernels; the arithmetic is the same either way.
     if t == 1 {
         let down = (moe.shared_down.fmt, moe.shared_down.addr, moe.shared_down.scale);
         op!(prof, "moe_shared_combine", s, k::moe_shared_combine(s, x, ld, t, down, ws.yd, ws.pair_row, ws.top_w, ws.y));
