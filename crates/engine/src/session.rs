@@ -515,7 +515,9 @@ impl Session {
         let rec: usize = Self::pieces(&self.state, self.dec.pending_addr()).iter().map(|p| p.1).sum();
         let kv = self.kv_pieces(snap.pos);
         let total = rec + kv.iter().map(|p| p.1).sum::<usize>();
+        let t0 = std::time::Instant::now();
         let buf = squash_cuda::PinnedBuffer::new(total)?;
+        let t1 = std::time::Instant::now();
         let s = Stream::new()?;
         unsafe {
             s.copy_d2h(buf.as_ptr(), snap.buf.addr(), rec)?;
@@ -526,12 +528,18 @@ impl Session {
             }
         }
         s.synchronize()?;
-        self.store.insert(tokens, buf)
+        let t2 = std::time::Instant::now();
+        self.store.insert(tokens, buf)?;
+        if std::env::var_os("SQUASH_TIMING").is_some() {
+            eprintln!("stash {} tokens, {} MiB: alloc {:.3}s copy {:.3}s insert {:.3}s", snap.pos, total >> 20, (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64());
+        }
+        Ok(())
     }
 
     /// Loads stored entry `i` into the live caches and makes it the GPU context (one snapshot at its
     /// end).
     fn load_entry(&mut self, s: &Stream, i: usize) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let rec: usize = Self::pieces(&self.state, self.dec.pending_addr()).iter().map(|p| p.1).sum();
         let (tokens, _) = self.store.get(i)?;
         let kv = self.kv_pieces(tokens.len());
@@ -550,6 +558,9 @@ impl Session {
             }
         }
         s.synchronize()?;
+        if std::env::var_os("SQUASH_TIMING").is_some() {
+            eprintln!("load {} tokens from the store: {:.3}s", tokens.len(), t0.elapsed().as_secs_f64());
+        }
         self.snapshots.push(Snapshot { pos: tokens.len(), buf: snap_buf, periodic: false });
         self.kv_tokens = tokens;
         Ok(())
