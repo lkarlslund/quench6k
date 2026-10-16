@@ -956,7 +956,7 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
 }
 
 /// Prefill experts on the FP4 tensor cores (W4A4, activations quantized per row with least-error block
-/// scales); set by SQUASH_PREFILL_FP4=1 while it is evaluated.
+/// scales): the default (gate PASS); SQUASH_PREFILL_FP4=0 keeps BF16 activations.
 /// Prefill GDN on the tensor cores (3xTF32; the default, SQUASH_GDN_TC=0 selects the CUDA-core kernels).
 fn gdn_tc() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -971,7 +971,7 @@ pub fn fp4_prefill() -> bool {
 /// only, 4: gate/up only (down BF16).
 fn fp4_mode() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SQUASH_PREFILL_FP4").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    *ON.get_or_init(|| std::env::var("SQUASH_PREFILL_FP4").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
 }
 
 /// The second half of a layer: the MLP HyperConnection, the MoE block and its output.
