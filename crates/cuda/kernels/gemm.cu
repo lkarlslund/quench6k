@@ -502,8 +502,8 @@ extern "C" cudaError_t squash_gemm_hc_up_mix(int fmt, const void* X, int ldx, co
     if (M == 0) return cudaSuccess;
     static bool configured = false;
     if (!configured) {
-        for (auto kern : {gemm_kernel<float, 0, true>, gemm_kernel<float, 3, true>}) {
-            const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GEMM_SMEM);
+        for (auto kern : {gemm_kernel<float, 0, true, 2>, gemm_kernel<float, 3, true, 2>}) {
+            const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gemm_smem_bytes(2));
             if (e != cudaSuccess) return e;
         }
         configured = true;
@@ -512,10 +512,10 @@ extern "C" cudaError_t squash_gemm_hc_up_mix(int fmt, const void* X, int ldx, co
     const dim3 grid(HC_D / 32, (M + BM - 1) / BM);
     const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
     if (fmt == 3)
-        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 3, true>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, scale, (float*)nullptr, 0, M,
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 3, true, 2>, grid, THREADS, gemm_smem_bytes(2), stream, x, ldx, W, ldw, scale, (float*)nullptr, 0, M,
                                   HC_S * HC_D, K, 1.0f, false, mix, (float*)nullptr));
     else if (fmt == 0)
-        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 0, true>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, (const float*)nullptr,
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 0, true, 2>, grid, THREADS, gemm_smem_bytes(2), stream, x, ldx, W, ldw, (const float*)nullptr,
                                   (float*)nullptr, 0, M, HC_S * HC_D, K, 1.0f, false, mix, (float*)nullptr));
     else
         return cudaErrorInvalidValue;
