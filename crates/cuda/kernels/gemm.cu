@@ -1,7 +1,8 @@
 // BF16 tensor-core GEMM: Y[M, N] (= or +=) alpha * X[M, K] . W[N, K]^T, FP32 accumulation.
 //
 // Both operands are K-contiguous (activations row-major, weights in PyTorch Linear layout), which
-// is exactly mma.sync's row.col form. 64x128x32 CTA tiles, 8 warps of 32x32, three cp.async stages.
+// is exactly mma.sync's row.col form. 128x128x32 CTA tiles, 8 warps of 64x32, three cp.async stages
+// (dynamic shared memory).
 // K must be a multiple of 32 and rows 16-byte aligned; M and N are arbitrary.
 
 #include <cuda_fp8.h>
@@ -10,8 +11,9 @@
 
 namespace {
 
-constexpr int BM = 64, BN = 128, BK = 32, STAGES = 3, THREADS = 256;
+constexpr int BM = 128, BN = 128, BK = 32, STAGES = 3, THREADS = 256;
 constexpr int LDS = BK + 8;  // padded smem row (elements): conflict-free ldmatrix
+constexpr size_t GEMM_SMEM = (size_t)STAGES * (BM + BN) * LDS * 2;
 
 template <typename OutT>
 SQ_DEVICE void store_out(OutT* p, float v, bool accumulate);
@@ -34,20 +36,25 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
     pdl_wait();
     const __nv_bfloat16* W = static_cast<const __nv_bfloat16*>(Wv);
     const uint8_t* W8 = static_cast<const uint8_t*>(Wv);
-    __shared__ __align__(16) __nv_bfloat16 sA[STAGES][BM * LDS];
-    __shared__ __align__(16) __nv_bfloat16 sB[STAGES][BN * LDS];
+    extern __shared__ __align__(16) unsigned char gemm_smem[];
+    auto sA = reinterpret_cast<__nv_bfloat16 (*)[BM * LDS]>(gemm_smem);
+    auto sB = reinterpret_cast<__nv_bfloat16 (*)[BN * LDS]>(gemm_smem + (size_t)STAGES * BM * LDS * 2);
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int warp_m = warp >> 2, warp_n = warp & 3;  // 2 x 4 warps
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
     const int k_tiles = K / BK;
 
-    auto load_a = [&](int stage, int kt) {  // A: 64 rows x 4 chunks of 8 elements
+    auto load_a = [&](int stage, int kt) {  // A: 128 rows x 4 chunks of 8 elements
         const int k = kt * BK;
-        const int r = tid >> 2, c = (tid & 3) * 8;
-        const int gm = m0 + r;
-        const bool ok = gm < M;
-        cp_async16(&sA[stage][r * LDS + c], X + (size_t)(ok ? gm : 0) * ldx + k + c, ok);
+#pragma unroll
+        for (int i = 0; i < BM * 4 / THREADS; ++i) {
+            const int idx = tid + i * THREADS;
+            const int r = idx >> 2, c = (idx & 3) * 8;
+            const int gm = m0 + r;
+            const bool ok = gm < M;
+            cp_async16(&sA[stage][r * LDS + c], X + (size_t)(ok ? gm : 0) * ldx + k + c, ok);
+        }
     };
     auto load = [&](int stage, int kt) {
         const int k = kt * BK;
@@ -89,7 +96,8 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
         }
     };
 
-    float acc[2][4][4] = {};
+    constexpr int MI = BM / 32;  // 16-row MMA tiles per warp (2 x 4 warps)
+    float acc[MI][4][4] = {};
 
     // 8-bit weights: the raw 16 bytes (and group scale) of the tile STAGES - 1 ahead are fetched into
     // registers before this tile's MMAs and converted into shared memory after them.
@@ -154,10 +162,10 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
         const __nv_bfloat16* b_tile = sB[kt % STAGES];
 #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
-            uint32_t a[2][4], b[2][4];
+            uint32_t a[MI][4], b[2][4];
 #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                const int r = warp_m * 32 + i * 16 + (lane & 15);
+            for (int i = 0; i < MI; ++i) {
+                const int r = warp_m * (BM / 2) + i * 16 + (lane & 15);
                 const int c = kk + (lane >> 4) * 8;
                 ldmatrix_x4(a[i], &a_tile[r * LDS + c]);
             }
@@ -168,7 +176,7 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
                 ldmatrix_x4(b[j], &b_tile[r * LDS + c]);
             }
 #pragma unroll
-            for (int i = 0; i < 2; ++i)
+            for (int i = 0; i < MI; ++i)
 #pragma unroll
                 for (int j = 0; j < 4; ++j) mma_bf16(acc[i][j], a[i], &b[j >> 1][(j & 1) * 2]);
         }
@@ -180,12 +188,12 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
 
     const int g = lane >> 2, t4 = lane & 3;
 #pragma unroll
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < MI; ++i)
 #pragma unroll
         for (int j = 0; j < 4; ++j)
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                const int m = m0 + warp_m * 32 + i * 16 + g + h * 8;
+                const int m = m0 + warp_m * (BM / 2) + i * 16 + g + h * 8;
                 const int n = n0 + warp_n * 32 + j * 8 + t4 * 2;
                 if (m >= M) continue;
                 const float s0 = (WF == 1 || WF == 2) && n < N ? row_scale[n] : 1.0f;
@@ -203,10 +211,18 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
     const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
     OutT* y = static_cast<OutT*>(Y);
+    static bool configured = false;
+    if (!configured) {
+        for (auto kern : {gemm_kernel<OutT, 0>, gemm_kernel<OutT, 3>}) {
+            const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GEMM_SMEM);
+            if (e != cudaSuccess) return e;
+        }
+        configured = true;
+    }
     if (fmt == 3)
-        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 3>, grid, THREADS, 0, stream, x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0));
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 3>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0));
     else if (fmt == 0)
-        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 0>, grid, THREADS, 0, stream, x, ldx, W, ldw, nullptr, y, ldy, M, N, K, alpha, accumulate != 0));
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 0>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, nullptr, y, ldy, M, N, K, alpha, accumulate != 0));
     else
         return cudaErrorInvalidValue;
     SQ_RETURN_LAUNCH();
