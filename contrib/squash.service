@@ -7,7 +7,7 @@ Conflicts=ninfer-qwen38-flash-next.service
 [Service]
 Type=simple
 WorkingDirectory=/home/lak/github-repos/squash
-ExecStart=/home/lak/github-repos/squash/target/release/squash serve --model /storage/ai/huggingface/main/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4 --listen 0.0.0.0:8003 --name Qwen/Qwen3.8-Flash-Next --context 262144 --slots 2 --kv fp8 --cache-dir /home/lak/.cache/squash --capture-dir /home/lak/.local/state/squash/captures
+ExecStart=/home/lak/github-repos/squash/target/release/squash serve --model /storage/ai/huggingface/main/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4 --listen 0.0.0.0:8003 --name Qwen/Qwen3.8-Flash-Next --context 262144 --slots 2 --kv fp8 --cache-dir /home/lak/.cache/squash --capture-dir /home/lak/.local/state/squash/captures --steering /home/lak/research/q38fn-abliteration/analysis/pack520.nsp
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=60

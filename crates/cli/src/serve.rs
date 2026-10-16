@@ -29,6 +29,8 @@ pub struct ServeOptions {
     pub drafts: usize,
     pub name: String,
     pub steer: crate::SteerArgs,
+    /// With a steering pack: the name of the steered model (the base name is served unsteered).
+    pub steered_name: Option<String>,
     pub cache_host_gib: f64,
     pub cache_dir: Option<PathBuf>,
     pub chat_template: Option<PathBuf>,
@@ -87,6 +89,8 @@ struct App {
     /// Steering strength used when a request carries none (the loaded pack's, or 0).
     default_strength: f32,
     steering: bool,
+    /// The steered model's name and strength (with a pack loaded).
+    steered: Option<(String, f32)>,
     tool_retries: usize,
     default_max_tokens: usize,
     tool_call_token: Option<i32>,
@@ -139,8 +143,14 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         }
         schedule(&model, &stream, &mut session, &jobs_rx);
     });
-    let default_strength = ready_rx.recv().context("worker thread")??;
-    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, tool_retries: opts.tool_retries, default_max_tokens: opts.default_max_tokens, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model), vision, image_max_pixels: opts.image_max_pixels, video_max_frames: opts.video_max_frames });
+    let _ = ready_rx.recv().context("worker thread")??;
+    // With a pack, the base name runs unsteered and the steered name applies --strength (default 1).
+    let steered = steering.then(|| (opts.steered_name.clone().unwrap_or_else(|| format!("{}-steered", opts.name)), opts.steer.strength.unwrap_or(1.0)));
+    let default_strength = 0.0;
+    if let Some((name, strength)) = &steered {
+        println!("models: {} (unsteered), {name} (steering strength {strength})", opts.name);
+    }
+    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, steered, tool_retries: opts.tool_retries, default_max_tokens: opts.default_max_tokens, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model), vision, image_max_pixels: opts.image_max_pixels, video_max_frames: opts.video_max_frames });
     let router = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -312,7 +322,11 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
 }
 
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
-    Json(json!({"object": "list", "data": [{"id": app.name, "object": "model", "owned_by": "squash"}]}))
+    let mut data = vec![json!({"id": app.name, "object": "model", "owned_by": "squash"})];
+    if let Some((name, _)) = &app.steered {
+        data.push(json!({"id": name, "object": "model", "owned_by": "squash"}));
+    }
+    Json(json!({"object": "list", "data": data}))
 }
 
 fn error(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -335,6 +349,8 @@ struct Prepared {
     /// Stream prefill progress chunks ("return_progress", as llama.cpp's server).
     progress: bool,
     mtp: bool,
+    /// The model name reported back (base or steered).
+    model: String,
 }
 
 fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
@@ -365,10 +381,13 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
         Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect(),
         _ => Vec::new(),
     };
+    // The requested model: the steered one, or else the base model (any other name).
+    let steered = app.steered.as_ref().filter(|(name, _)| req.get("model").and_then(Value::as_str) == Some(name.as_str()));
+    let model = steered.map_or_else(|| app.name.clone(), |(name, _)| name.clone());
     let steering_strength = match req.get("steering").and_then(|s| s.get("steering_strength")).and_then(Value::as_f64) {
         Some(_) if !app.steering => return Err(error(StatusCode::BAD_REQUEST, "steering requested but no pack is loaded")),
         Some(a) => a as f32,
-        None => app.default_strength,
+        None => steered.map_or(app.default_strength, |(_, strength)| *strength),
     };
     let capture = match req.get("capture") {
         None | Some(Value::Null) => None,
@@ -387,7 +406,7 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let progress = stream && req.get("return_progress").and_then(Value::as_bool).unwrap_or(false);
     let mtp = req.get("mtp").and_then(Value::as_bool).unwrap_or(true);
-    Ok(Prepared { capture, ids, params, stops, thinking, tools, stream, progress, mtp })
+    Ok(Prepared { capture, ids, params, stops, thinking, tools, stream, progress, mtp, model })
 }
 
 /// Splits generated text into (reasoning, content, tool calls).
@@ -541,7 +560,7 @@ async fn full_response(app: Arc<App>, p: Prepared, id: String) -> Response {
     }
     let reason = if seg.stopped { "stop" } else { finish_reason(finish, !calls.is_empty()) };
     Json(json!({
-        "id": id, "object": "chat.completion", "created": now(), "model": app.name,
+        "id": id, "object": "chat.completion", "created": now(), "model": p.model,
         "choices": [{"index": 0, "message": message, "finish_reason": reason}],
         "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n,
                   "prompt_tokens_details": {"cached_tokens": cached}},
@@ -791,7 +810,7 @@ async fn stream_response(app: Arc<App>, p: Prepared, id: String) -> Response {
     tokio::spawn(async move {
         let created = now();
         let chunk = |delta: Value, finish: Option<&str>| {
-            let data = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": app.name,
+            let data = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": p.model,
                               "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
             Ok(Event::default().data(data.to_string()))
         };
@@ -802,13 +821,13 @@ async fn stream_response(app: Arc<App>, p: Prepared, id: String) -> Response {
                 Seg::Content(t) => json!({"content": t}),
                 // llama.cpp-style extensions (requested with "return_progress"; harmless otherwise).
                 Seg::Prompt(processed, total, cache, ms) => {
-                    let c = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": app.name, "choices": [],
+                    let c = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": p.model, "choices": [],
                                    "prompt_progress": {"total": total, "cache": cache, "processed": processed, "time_ms": ms}});
                     let _ = out_tx.send(Ok(Event::default().data(c.to_string())));
                     return;
                 }
                 Seg::ToolBytes(b) => {
-                    let c = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": app.name,
+                    let c = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": p.model,
                                    "choices": [{"index": 0, "delta": {}, "finish_reason": Value::Null}], "tool_call_progress": {"bytes": b}});
                     let _ = out_tx.send(Ok(Event::default().data(c.to_string())));
                     return;
@@ -834,7 +853,7 @@ async fn stream_response(app: Arc<App>, p: Prepared, id: String) -> Response {
             let _ = out_tx.send(chunk(json!({"tool_calls": deltas}), None));
         }
         let reason = if seg.stopped { "stop" } else { finish_reason(finish, !calls.is_empty()) };
-        let mut last = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": app.name,
+        let mut last = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": p.model,
                               "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]});
         last["usage"] = json!({"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n,
                                "prompt_tokens_details": {"cached_tokens": cached}});
@@ -922,7 +941,7 @@ fn from_anthropic(req: &Value) -> Value {
                                                          "parameters": t.get("input_schema").cloned().unwrap_or(json!({"type": "object"}))}}))
         .collect();
     let thinking = req.get("thinking").and_then(|t| t.get("type")).and_then(Value::as_str) == Some("enabled");
-    let mut out = json!({"messages": messages,
+    let mut out = json!({"messages": messages, "model": req.get("model").cloned().unwrap_or(Value::Null),
                          "chat_template_kwargs": {"enable_thinking": thinking}, "stream": req.get("stream").cloned().unwrap_or(json!(false))});
     if !tools.is_empty() {
         out["tools"] = Value::Array(tools);
@@ -974,7 +993,7 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
             blocks.push(json!({"type": "text", "text": content}));
         }
         blocks.extend(tool_use_blocks(&calls));
-        return Json(json!({"id": id, "type": "message", "role": "assistant", "model": app.name, "content": blocks,
+        return Json(json!({"id": id, "type": "message", "role": "assistant", "model": p.model, "content": blocks,
                            "stop_reason": stop_reason(finish, seg.stopped, !calls.is_empty()), "stop_sequence": Value::Null,
                            "usage": {"input_tokens": prompt_tokens - cached, "cache_read_input_tokens": cached, "output_tokens": n}}))
         .into_response();
@@ -983,7 +1002,7 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
     tokio::spawn(async move {
         let ev = |name: &str, data: Value| Ok(Event::default().event(name).data(data.to_string()));
         let _ = out_tx.send(ev("message_start", json!({"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant",
-            "model": app.name, "content": [], "stop_reason": Value::Null, "stop_sequence": Value::Null,
+            "model": p.model, "content": [], "stop_reason": Value::Null, "stop_sequence": Value::Null,
             "usage": {"input_tokens": prompt_tokens, "output_tokens": 0}}})));
         // Blocks open as their kind changes: (index, kind) of the open block.
         let mut open: Option<(usize, bool)> = None;

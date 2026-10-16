@@ -193,6 +193,10 @@ enum Command {
         name: String,
         #[command(flatten)]
         steer: SteerArgs,
+        /// With --steering: name of the model that applies the pack (default "<name>-steered"); the base
+        /// name is served unsteered. Its strength is --strength (default 1).
+        #[arg(long)]
+        steered_name: Option<String>,
         /// Pinned host memory for stored conversation contexts, in GiB (0: none).
         #[arg(long, default_value_t = 16.0)]
         cache_host_gib: f64,
@@ -374,8 +378,8 @@ fn main() -> Result<()> {
         }
         Command::VisionCheck { model, reference, max_pixels } => vision_check(&model, &reference, max_pixels)?,
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, batch2, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, batch2, &steer)?,
-        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, default_max_tokens, slots, capture_dir, no_vision, image_max_pixels, video_max_frames } => {
-            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, default_max_tokens, slots, capture_dir, vision: !no_vision, image_max_pixels, video_max_frames })?
+        Command::Serve { model, listen, context, drafts, name, steer, steered_name, cache_host_gib, cache_dir, chat_template, tool_retries, default_max_tokens, slots, capture_dir, no_vision, image_max_pixels, video_max_frames } => {
+            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, steered_name, cache_host_gib, cache_dir, chat_template, tool_retries, default_max_tokens, slots, capture_dir, vision: !no_vision, image_max_pixels, video_max_frames })?
         }
         Command::BatchCheck { model, fixture, n } => batch_check(&model, &fixture, n)?,
         Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, image, video, steer } => {
