@@ -93,22 +93,35 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X,
         }
         consume(k, w);
     }
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
+    auto store = [&](int r, int m, float v) {
         const int n = n0 + r;
+        const float scale = alpha * (F == WFmt::FP8 || F == WFmt::INT8 ? row_scale[n] : 1.0f);
+        if (gridDim.y == 1) {
+            float* y = &Y[(size_t)m * ldy + n];
+            *y = accumulate ? *y + v * scale : v * scale;
+        } else {
+            partial[((size_t)blockIdx.y * M + m) * ldp + n] = v * scale;
+        }
+    };
+    constexpr int NS = R * M;
+    if constexpr ((NS & (NS - 1)) == 0 && NS <= 32) {
+        // All R x M sums at once (slot r * M + m), each bitwise as its own warp_sum.
+        float v[NS];
 #pragma unroll
-        for (int m = 0; m < M; ++m) acc[r][m] = warp_sum(acc[r][m]);
-        if (lane == 0 && row_live[r]) {
-            const float scale = alpha * (F == WFmt::FP8 || F == WFmt::INT8 ? row_scale[n] : 1.0f);
+        for (int r = 0; r < R; ++r)
 #pragma unroll
-            for (int m = 0; m < M; ++m) {
-                if (gridDim.y == 1) {
-                    float* y = &Y[(size_t)m * ldy + n];
-                    *y = accumulate ? *y + acc[r][m] * scale : acc[r][m] * scale;
-                } else {
-                    partial[((size_t)blockIdx.y * M + m) * ldp + n] = acc[r][m] * scale;
-                }
-            }
+            for (int m = 0; m < M; ++m) v[r * M + m] = acc[r][m];
+        const float sum = warp_sum_slots(v);
+        const int slot = lane / (32 / NS), r = slot / M, m = slot % M;
+        if (lane % (32 / NS) == 0 && (r == 0 ? row_live[0] : row_live[R - 1])) store(r, m, sum);
+    } else {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+#pragma unroll
+            for (int m = 0; m < M; ++m) acc[r][m] = warp_sum(acc[r][m]);
+            if (lane == 0 && row_live[r])
+#pragma unroll
+                for (int m = 0; m < M; ++m) store(r, m, acc[r][m]);
         }
     }
 }
