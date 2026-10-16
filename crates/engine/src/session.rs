@@ -221,7 +221,7 @@ impl Session {
     /// longest speculative draft (adaptive 1..=max_drafts).
     pub fn new(model: &Model, s: &Stream, capacity: usize, chunk: usize, max_drafts: usize, store: StoreOptions) -> Result<Self> {
         let slack = 2 * (max_drafts + 2) + 16;
-        let mut ws = Workspace::new(chunk, capacity + slack)?;
+        let mut ws = Workspace::for_model(&model, chunk, capacity + slack)?;
         let mut state = SequenceState::with_mtp(capacity + slack, true)?;
         let hw = HeadWorkspace::new(1, MAX_TOP_K)?;
         // A one-token prompt to bring the sequence into a valid state for capture.

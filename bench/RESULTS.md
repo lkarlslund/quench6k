@@ -10,21 +10,28 @@ build (FP4 prefill experts, MXFP8 GDN input projections, tensor-core GDN, multi-
 | Context | Decode | NInfer | MTP3 (LM-head draft) | NInfer MTP3 + LM-head draft | Adaptive MTP (≤6) | Prefill | NInfer prefill |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 512 | **193.3** | 172.0 | **308.7** | 274.8 | 307.1 | **6,599** | 5,905 |
-| 8K | **188.6** | 170.6 | **406.9** | 401.3 | 515.3 | **13,936** | 13,908 |
-| 64K | **183.7** | 153.9 | **395.4** | 380.3 | 493.7 | **13,334** | 12,171 |
-| 128K | **180.0** | 149.8 | **390.6** | 368.0 | 484.9 | **12,915** | 11,032 |
-| 256K | **176.7** | 149.0 | **382.7** | 360.6 | 478.6 | **12,133** | 9,154 |
+| 8K | **188.6** | 170.6 | **406.9** | 401.3 | 515.3 | **14,792** | 13,908 |
+| 64K | **183.7** | 153.9 | **395.4** | 380.3 | 493.7 | **14,300** | 12,171 |
+| 128K | **180.0** | 149.8 | **390.6** | 368.0 | 484.9 | **13,860** | 11,032 |
+| 256K | **176.7** | 149.0 | **382.7** | 360.6 | 478.6 | **13,000** | 9,154 |
 
-- Decode, MTP and prefill beat every NInfer cell (8K prefill by a hair: run-to-run variation on this
-  machine is about 3%; the first, cold 8K run after other work measured 11,036 because the PLE pages
+- Prefill at 8K and above: re-measured after the BF16-expanded INT8 GEMMs (below), +6-7%.
+- Decode, MTP and prefill beat every NInfer cell (run-to-run variation on this machine is about 3%; the first, cold 8K run after other work measured 11,036 because the PLE pages
   were evicted, which the serving path warms in the background). The 8K and 512 rows are warm runs.
 - With MTP enabled (the serving path) prefill also feeds the drafter's cache:
-  13,245 / 12,691 / 12,230 / 11,446 at 8K / 64K / 128K / 256K.
+  14,125 / 13,188 at 8K / 128K (before the GEMM change: 13,245 / 12,230).
 - The corpus repeats few distinct tokens, so its draft acceptance is near 100% (4.0 tokens per MTP3
   round); on real prompts acceptance is lower.
 - Sampled requests (temperature > 0) use MTP too (exact rejection sampling against the deterministic
   drafts): 262-273 tok/s against 166-179 plain on three prompts at temperature 0.6 and 1.0, with the
   token distribution equal to plain sampling (two-sample test, 600 samples per position).
+
+## Prefill, later the same day
+
+- INT8-group dense weights are expanded to BF16 once per GEMM for batches of 2048+ rows (68 MiB
+  workspace buffer) and multiplied with the BF16 kernel, which stages tiles with cp.async instead of
+  converting them in registers: 8192x2560x6144 0.86 -> 0.64 ms. Bit-identical (gate outputs equal to
+  the previous run byte for byte; kernel test). `SQUASH_DEQUANT_GEMM=0` disables.
 
 ## Prefill, what changed today (8K chunk: 1,108 ms -> about 585 ms on the GPU)
 

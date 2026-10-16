@@ -452,7 +452,7 @@ fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf]
         .collect::<Result<_>>()?;
     let longest = seqs.iter().map(|(_, s)| s.tokens.len()).max().unwrap_or(0);
     let capacity = if batch2 { 2 * longest } else { longest };
-    let mut ws = Workspace::new(chunk, capacity)?;
+    let mut ws = Workspace::for_model(&model, chunk, capacity)?;
     let hw = HeadWorkspace::new(256, TOP_K)?;
     println!("workspace {:.2} GiB", ws.bytes() as f64 / 1073741824.0);
 
@@ -536,7 +536,7 @@ fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathB
         .map(|f| Ok((f.clone(), serde_json::from_slice(&std::fs::read(f.join("sequence.json"))?)?)))
         .collect::<Result<_>>()?;
     let capacity = seqs.iter().map(|(_, s)| s.tokens.len()).max().unwrap_or(0);
-    let mut ws = Workspace::new(1024, capacity)?;
+    let mut ws = Workspace::for_model(&model, 1024, capacity)?;
     let hw = HeadWorkspace::new(1, 1)?;
     let mut all_ok = true;
     for (dir, seq) in &seqs {
@@ -661,7 +661,7 @@ fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> R
         })
         .collect::<Result<_>>()?;
     let cap = prompts.iter().map(|p| p.len()).max().unwrap() + 2 * n + 16;
-    let mut ws = Workspace::new(2048, cap)?;
+    let mut ws = Workspace::for_model(&model, 2048, cap)?;
     let hw = HeadWorkspace::new(2, 1)?;
     let out = squash_cuda::DeviceBuffer::new(8)?;
     // Prefill each sequence; returns (state, first token).

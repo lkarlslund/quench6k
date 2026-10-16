@@ -25,7 +25,7 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
     }
     let (model, stream) = crate::load(model_dir, precision, false)?;
     let capacity = contexts.iter().max().copied().unwrap_or(0) + generate + 16 + ncu_steps;
-    let mut ws = Workspace::new(chunk, capacity)?;
+    let mut ws = Workspace::for_model(&model, chunk, capacity)?;
     let hw = HeadWorkspace::new(1, 1)?;
 
     sanity(&model, &stream, chunk)?;
@@ -95,7 +95,7 @@ fn sanity(model: &squash_engine::model::Model, stream: &squash_cuda::Stream, chu
     let seq: Sequence = serde_json::from_slice(&std::fs::read("oracle/fixtures/code/sequence.json")?)?;
     let prompt = &seq.tokens[..seq.prompt_len];
     let want = &seq.tokens[seq.prompt_len..seq.prompt_len + CHECK];
-    let mut ws = Workspace::new(chunk, seq.tokens.len())?;
+    let mut ws = Workspace::for_model(&model, chunk, seq.tokens.len())?;
     let hw = HeadWorkspace::new(1, 1)?;
     let mut state = SequenceState::new(seq.tokens.len())?;
     for c in prompt.chunks(chunk) {
@@ -124,7 +124,7 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
     let (model, stream) = crate::load(model_dir, precision, true)?;
     let max_ctx = contexts.iter().max().copied().unwrap_or(0).max(512);
     let slack = (ncu_rounds + 4) * (drafts + 1) + 16;
-    let mut ws = Workspace::new(chunk, max_ctx + generate + slack)?;
+    let mut ws = Workspace::for_model(&model, chunk, max_ctx + generate + slack)?;
 
     // Sanity: speculative greedy tokens of the code fixture equal its reference.
     {

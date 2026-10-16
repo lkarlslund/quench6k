@@ -70,6 +70,7 @@ pub mod ffi {
         pub fn squash_hc_small_scratch_floats(t: c_int) -> usize;
         pub fn squash_hc_small(fmt: c_int, h: *mut f32, t: c_int, y: *const f32, inj_prev: *const f32, wd: *const c_void, sd: *const f32, wi: *const c_void, si: *const f32, wu: *const c_void, su: *const f32, g: *const c_void, scratch: *mut f32, z: *mut c_void, r: *mut f32, inj: *mut f32, m: *mut c_void, stream: Stream) -> Error;
         pub fn squash_int8_group() -> c_int;
+        pub fn squash_dequant_int8_groups(q: *const c_void, scale: *const f32, n: c_int, k: c_int, out: *mut c_void, stream: Stream) -> Error;
         pub fn squash_quantize_int8_groups(w: *const c_void, n: c_int, k: c_int, q: *mut c_void, scale: *mut f32, stream: Stream) -> Error;
         pub fn squash_moe_active(counts: *const i32, active: *mut i32, num_active: *mut i32, stream: Stream) -> Error;
         pub fn squash_topk(x: *const f32, rows: c_int, n: c_int, ld: usize, k: c_int, sort_by_index: c_int, out_idx: *mut i32, out_val: *mut f32, stream: Stream) -> Error;

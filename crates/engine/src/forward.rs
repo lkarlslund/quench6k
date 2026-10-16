@@ -220,6 +220,9 @@ pub struct Workspace {
     /// `buf` (see `CaptureLayout`). Not for captured graphs.
     pub capture: Option<CaptureTarget>,
     score_cols: usize,
+    /// BF16 copy of one INT8-group weight for large batches (see `DEQUANT_MIN_ROWS`); 0 elements without.
+    dq: u64,
+    dq_elems: usize,
     bufs: Vec<DeviceBuffer>,
     pub h: u64,
     /// Output of a projection group, FP32 [T, <= PROJ_WIDTH].
@@ -293,6 +296,20 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// As [`new`](Self::new), with the BF16 weight buffer when `max_tokens` reaches `DEQUANT_MIN_ROWS`.
+    pub fn for_model(model: &Model, max_tokens: usize, capacity: usize) -> Result<Self> {
+        let mut ws = Self::new(max_tokens, capacity)?;
+        let elems = model.max_int8g_elems();
+        if max_tokens >= DEQUANT_MIN_ROWS && elems > 0 && std::env::var("SQUASH_DEQUANT_GEMM").as_deref() != Ok("0") {
+            eprintln!("BF16 weight buffer for prefill GEMMs: {} MiB", (elems * 2) >> 20);
+            let b = DeviceBuffer::new(elems * 2)?;
+            ws.dq = b.addr();
+            ws.dq_elems = elems;
+            ws.bufs.push(b);
+        }
+        Ok(ws)
+    }
+
     pub fn new(max_tokens: usize, capacity: usize) -> Result<Self> {
         let t = max_tokens;
         let pairs = t * TOP_K;
@@ -366,6 +383,8 @@ impl Workspace {
             att_part: alloc(k::qsa_split_floats(k::gemv_max_m()) * 4)?,
             step: alloc(StepLayout::new(t).bytes)?,
             step_host: PinnedBuffer::new(StepLayout::new(t).bytes)?,
+            dq: 0,
+            dq_elems: 0,
             bufs,
         }
         .init()
@@ -440,7 +459,24 @@ fn linear_ws(s: &Stream, ws: &Workspace, x: u64, ldx: usize, w: &Linear, y: u64,
         k::mxfp8_rows(s, x, t, w.k, ldx, ws.xq, scales)?;
         return k::gemm_mx8(s, ws.xq, scales, w.addr, w.scale, y, ldy, t, w.n, w.k);
     }
+    if let Some(bf) = dequantized(s, ws, w, t)? {
+        return linear_ld(s, ws.partial, x, ldx, &bf, y, ldy, t);
+    }
     linear_ld(s, ws.partial, x, ldx, w, y, ldy, t)
+}
+
+/// Batches of at least this many rows multiply INT8-group weights as BF16: the weight is expanded once
+/// into the workspace (memory-bound, a few percent of the GEMM) and the BF16 GEMM, which stages its
+/// tiles with cp.async instead of converting them, runs about 25% faster. Results are identical.
+pub const DEQUANT_MIN_ROWS: usize = 2048;
+
+/// The BF16 workspace copy of `w` for a batch of `t` rows, when that path applies.
+fn dequantized(s: &Stream, ws: &Workspace, w: &Linear, t: usize) -> Result<Option<Linear>> {
+    if w.fmt != k::WeightFormat::Int8Group || t < DEQUANT_MIN_ROWS || w.n * w.k > ws.dq_elems {
+        return Ok(None);
+    }
+    k::dequant_int8_groups(s, w.addr, w.scale, w.n, w.k, ws.dq)?;
+    Ok(Some(Linear { fmt: k::WeightFormat::Bf16, addr: ws.dq, scale: 0, n: w.n, k: w.k }))
 }
 
 /// Computes every member of `proj` for `t` rows of `x` into `out` ([t, proj.n], FP32).
@@ -477,7 +513,8 @@ fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, pending: Opti
             k::fake_mxfp8(s, ws.low_bf, t, hc.up.k, hc.up.k)?;
         }
         if t > 4 * k::gemv_max_m() && std::env::var_os("SQUASH_HC_UNFUSED").is_none() {
-            op!(prof, "hc up+mix", s, k::gemm_hc_up_mix(s, ws.low_bf, hc.up.fmt, hc.up.addr, hc.up.scale, ws.n, hc.norm, out, t, hc.up.k));
+            let up = dequantized(s, ws, &hc.up, t)?.unwrap_or(hc.up);
+            op!(prof, "hc up+mix", s, k::gemm_hc_up_mix(s, ws.low_bf, up.fmt, up.addr, up.scale, ws.n, hc.norm, out, t, up.k));
         } else {
             op!(prof, "hc up", s, linear(s, ws, ws.low_bf, &hc.up, ws.up, t));
             op!(prof, "hc mix", s, k::hc_mix(s, ws.up, ws.n, hc.norm, out, t));
@@ -1215,7 +1252,7 @@ pub fn forward_mtp_staged(model: &Model, state: &SequenceState, ws: &Workspace, 
     op!(prof, "mtp norm h", s, k::grouped_rmsnorm(s, hprev, mtp.norm_hidden, ws.n, t));
     op!(prof, "mtp fc_e", s, linear(s, ws, ws.e_bf, &mtp.fc_embedding, ws.y, t));
     // fc_hidden maps each of the 4 streams: rows of the [t, 4, 2560] input are the 4t stream slices.
-    op!(prof, "mtp fc_h", s, linear_ld(s, ws.partial, ws.n, D, &mtp.fc_hidden, ws.h, D, S * t));
+    op!(prof, "mtp fc_h", s, linear_ws(s, ws, ws.n, D, &mtp.fc_hidden, ws.h, D, S * t));
     op!(prof, "mtp combine", s, k::hc_combine(s, ws.h, ws.y, ws.ones, t));
     let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0, spec: None, steer: None, batch: None, capture: None };
     let mut carry = Carry::new(ws, false);

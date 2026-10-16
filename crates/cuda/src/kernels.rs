@@ -31,6 +31,11 @@ pub fn int8_group() -> usize {
 }
 
 /// BF16 [N, K] -> INT8 [N, K] with scales [N, K / group] = group absmax / 127.
+/// BF16 copy of INT8-group weights ([n, k] codes, [n, k / 64] scales), exactly the values the GEMM stages.
+pub fn dequant_int8_groups(s: &Stream, q: u64, scale: u64, n: usize, k: usize, out: u64) -> Result<()> {
+    check(unsafe { ffi::squash_dequant_int8_groups(p(q), scale as *const f32, n as i32, k as i32, pm(out), s.raw()) }, "dequant_int8_groups")
+}
+
 pub fn quantize_int8_groups(s: &Stream, w: u64, n: usize, k: usize, q: u64, scale: u64) -> Result<()> {
     check(unsafe { ffi::squash_quantize_int8_groups(p(w), n as i32, k as i32, pm(q), scale as *mut f32, s.raw()) }, "quantize_int8_groups")
 }

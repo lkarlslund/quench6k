@@ -571,6 +571,30 @@ fn gemm_tiles_match_cpu(m: usize, n: usize, k: usize) {
     }
 }
 
+/// INT8-group weights expanded to BF16 give the INT8-group GEMM's results bit for bit (large prefill
+/// batches take that path).
+#[test]
+fn dequant_int8_groups_gemm_is_exact() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0xde90_0001);
+    let (m, n, k) = (2304usize, 1056usize, 640usize);
+    let x: Vec<f32> = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect();
+    let w: Vec<f32> = rng.vec(n * k);
+    let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
+    let (wq, wsc, wbf) = (DeviceBuffer::new(n * k).unwrap(), DeviceBuffer::new(n * k / 64 * 4).unwrap(), DeviceBuffer::new(n * k * 2).unwrap());
+    kernels::quantize_int8_groups(&s, dw.addr(), n, k, wq.addr(), wsc.addr()).unwrap();
+    kernels::dequant_int8_groups(&s, wq.addr(), wsc.addr(), n, k, wbf.addr()).unwrap();
+    let run = |fmt, wa, sa| {
+        let dy = DeviceBuffer::zeroed(m * n * 4).unwrap();
+        kernels::gemm_f32(&s, dx.addr(), k, fmt, wa, k, sa, dy.addr(), n, m, n, k, 1.0, false).unwrap();
+        s.download::<f32>(dy.addr(), m * n).unwrap()
+    };
+    let a = run(WeightFormat::Int8Group, wq.addr(), wsc.addr());
+    let b = run(WeightFormat::Bf16, wbf.addr(), 0);
+    assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+}
+
 /// Tensor-core indexer scores against the FP32 kernel; the selected groups barely change.
 #[test]
 fn index_scores_tc_match_fp32() {

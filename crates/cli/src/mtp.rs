@@ -21,7 +21,7 @@ pub fn probe(model_dir: &Path, precision: Precision, fixture: &Path, steps: usiz
     let (model, s) = crate::load(model_dir, precision, true)?;
     let prompt = &seq.tokens[..seq.prompt_len];
     let cap = prompt.len() + steps + DRAFTS + 8;
-    let mut ws = Workspace::new(chunk, cap)?;
+    let mut ws = Workspace::for_model(&model, chunk, cap)?;
     let hw = HeadWorkspace::new(1, 1)?;
     let mut state = SequenceState::with_mtp(cap, true)?;
     let pending = DeviceBuffer::zeroed(H * 4)?;
@@ -100,7 +100,7 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
     let strength = steer.attach(&mut model, &s)?;
     let prompt = &seq.tokens[..seq.prompt_len];
     let cap = prompt.len() + n + (profile_rounds + 1) * (drafts + 1) + 8;
-    let mut ws = Workspace::new(chunk, cap)?;
+    let mut ws = Workspace::for_model(&model, chunk, cap)?;
     let hw = HeadWorkspace::new(1, 1)?;
 
     // Plain greedy decoding.

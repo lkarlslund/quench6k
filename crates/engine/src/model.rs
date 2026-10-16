@@ -244,6 +244,13 @@ fn read_i64s<const N: usize>(ckpt: &Checkpoint, name: &str) -> Result<[i64; N]> 
 }
 
 impl Model {
+    /// Elements of the largest INT8-group projection weight other than the LM head (which keeps its
+    /// INT8 GEMM), 0 without any.
+    pub fn max_int8g_elems(&self) -> usize {
+        let head = self.lm_head.addr;
+        self.weights.tensors.values().filter(|t| t.dtype == DType::I8G && t.addr != head).map(|t| t.shape.iter().product::<usize>()).max().unwrap_or(0)
+    }
+
     pub fn bind(ckpt: &Checkpoint, weights: DeviceWeights, mtp_experts: Option<(ExpertTables, (u64, u64, u64), u64, Vec<DeviceBuffer>)>, stream: &Stream) -> Result<Self> {
         let w = |name: &str| -> Result<u64> { Ok(weights.get(name)?.addr) };
         let lin = |name: &str| -> Result<Linear> {

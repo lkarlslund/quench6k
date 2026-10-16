@@ -254,6 +254,39 @@ extern "C" cudaError_t squash_quantize_int8_groups(const void* w, int N, int K, 
 
 namespace {
 
+// out[n, k] = bf16(q[n, k] * scale[n, k / GROUP]): the BF16 values the GEMM stages from INT8-group
+// weights (same product and rounding), so a BF16 GEMM on them gives identical results. 8 per thread.
+__global__ void dequant_int8_groups_kernel(const int8_t* __restrict__ q, const float* __restrict__ scale, int K, size_t count,
+                                           __nv_bfloat16* out) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const size_t i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * 8;
+    if (i >= count) return;
+    const float s = scale[i / GROUP];  // rows are whole groups: flat index / GROUP is (n, k / GROUP)
+    const uint2 raw = *reinterpret_cast<const uint2*>(q + i);
+    const int8_t* p = reinterpret_cast<const int8_t*>(&raw);
+    uint32_t packed[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const __nv_bfloat162 v = __floats2bfloat162_rn((float)p[2 * j] * s, (float)p[2 * j + 1] * s);
+        packed[j] = *reinterpret_cast<const uint32_t*>(&v);
+    }
+    *reinterpret_cast<uint4*>(out + i) = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+}
+
+}  // namespace
+
+extern "C" cudaError_t squash_dequant_int8_groups(const void* q, const float* scale, int N, int K, void* out, cudaStream_t st) {
+    if (N == 0) return cudaSuccess;
+    if (K % GROUP != 0) return cudaErrorInvalidValue;
+    const size_t count = (size_t)N * K;
+    SQ_CHECK_LAUNCH(sq_launch(dequant_int8_groups_kernel, (unsigned)((count / 8 + 255) / 256), 256, 0, st, static_cast<const int8_t*>(q), scale, K,
+                              count, static_cast<__nv_bfloat16*>(out)));
+    SQ_RETURN_LAUNCH();
+}
+
+namespace {
+
 // W[n, k] = bf16(W[n, k] * (1 + g[k])): folds a (1 + w)-style norm weight into a projection's columns.
 __global__ void fold_norm_kernel(__nv_bfloat16* w, const __nv_bfloat16* __restrict__ g, int K, size_t count) {
     pdl_launch_dependents();
