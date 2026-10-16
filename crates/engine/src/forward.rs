@@ -482,6 +482,69 @@ pub fn prepare_ple(model: &Model, state: &SequenceState, ws: &mut Workspace, t: 
     Ok(layout.used(t))
 }
 
+/// Prepares a batched decode step: token `tokens[b]` for sequence `states[b]` (at most 4 sequences).
+/// Writes each sequence's start at word b of the step block, then tokens, positions and PLE rows per row.
+pub fn prepare_batch(model: &Model, states: &mut [&mut SequenceState], ws: &mut Workspace, tokens: &[i32]) -> Result<usize> {
+    let b = states.len();
+    ensure!(b >= 1 && b <= 4 && tokens.len() == b && b <= ws.max_tokens, "batch of {b} sequences");
+    let layout = StepLayout::new(ws.max_tokens);
+    let ple = model.layers[1].ple.as_ref().expect("layer 1 has PLE");
+    let mut rows = Vec::with_capacity(D);
+    for (j, (st, &tok)) in states.iter_mut().zip(tokens).enumerate() {
+        let p = st.len();
+        ensure!(p < st.capacity, "sequence would exceed its capacity of {}", st.capacity);
+        st.tokens.push(tok);
+        let block = ws.step_host.as_mut_slice();
+        block[4 * j..4 * j + 4].copy_from_slice(&(p as i32).to_le_bytes());
+        block[layout.tokens + 4 * j..layout.tokens + 4 * j + 4].copy_from_slice(&tok.to_le_bytes());
+        for a in 0..3 {
+            let o = layout.pos + 12 * j + 4 * a;
+            block[o..o + 4].copy_from_slice(&(p as i32).to_le_bytes());
+        }
+        let ids = ple_rows(&st.tokens, p, &ple.multipliers, &ple.sizes, &ple.offsets);
+        rows.clear();
+        for &r in &ids {
+            model.ple_table.gather(r, &mut rows);
+        }
+        let o = layout.ple + 2 * D * j;
+        for (d, v) in rows.iter().enumerate() {
+            block[o + 2 * d..o + 2 * d + 2].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    Ok(layout.used(b))
+}
+
+/// Runs a step prepared by [`prepare_batch`] on the device (capturable): one token per sequence, the
+/// weight-bound operations batched over the rows, stateful ones per sequence. `ws.out` row b holds
+/// sequence b's final mixer output.
+pub fn forward_batch(model: &Model, states: &[&SequenceState], ws: &Workspace, s: &Stream, bytes: usize) -> Result<()> {
+    let t = states.len();
+    let layout = StepLayout::new(ws.max_tokens);
+    unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? };
+    for (b, st) in states.iter().enumerate() {
+        k::store_positions(s, ws.step + (layout.pos + 12 * b) as u64, st.pos3.addr(), ws.step + 4 * b as u64, 1)?;
+    }
+    k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h)?;
+    let ctx = LayerCtx {
+        ws,
+        s,
+        t,
+        start: ws.step,
+        pos3: 0,
+        capacity: states[0].capacity,
+        ple_rows: ws.step + layout.ple as u64,
+        ple_state: 0,
+        spec: None,
+        steer: None,
+        batch: Some(states),
+    };
+    let mut carry = Carry::new(ws, false);
+    for i in 0..model.layers.len() {
+        layer_forward(i, &model.layers[i], None, None, None, &ctx, &mut carry, None)?;
+    }
+    final_mixer(&model.final_hc, &ctx, &mut carry, None)
+}
+
 /// Runs the step prepared by [`prepare`] (`t` tokens, `bytes` of step block) entirely on the device:
 /// no host synchronization, so it can be captured into a CUDA graph. Afterwards `ws.out` holds the final
 /// mixer output, BF16 [T, D].
@@ -510,7 +573,7 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
     }
     let spec = state.spec.as_ref().map(|sp| (sp.ctl.addr(), sp.ple_rec.addr(), defer));
     let steer = model.steering.as_ref().map(|p| (p.directions.addr(), p.ranks.addr(), p.masks.addr(), p.norm_preserve, state.steer_strength.addr()));
-    let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr(), spec, steer };
+    let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr(), spec, steer, batch: None };
     if part != Part::FromPle {
         op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, ctx.pos3, ctx.start, t));
         op!(prof, "embed", s, k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h));
@@ -548,6 +611,9 @@ struct LayerCtx<'a> {
     spec: Option<(u64, u64, bool)>,
     /// Steering: (directions, ranks, masks, norm_preserve, strength) when the model has a pack.
     steer: Option<(u64, u64, u64, bool, u64)>,
+    /// Batched decode: row b is the next token of sequence b (with its start position at
+    /// `start + 4 b`); stateful operations run per sequence.
+    batch: Option<&'a [&'a SequenceState]>,
 }
 
 /// Residual bookkeeping carried from layer to layer. Small batches defer each block's residual update to
@@ -589,7 +655,15 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
         op!(prof, "ple.value", s, linear(s, ws, ctx.ple_rows, &ple.value, ws.pv, t));
         op!(prof, "ple_gate", s, k::ple_gate(s, ws.kp, ws.h, ws.pv, ple.norm_key, ple.norm_query, ple.norm_conv, ws.gv, ws.xn, t));
         let spec = ctx.spec.map(|(ctl, rec, defer)| k::Deferral { rec, ctl, defer });
-        op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv, ws.xn, ple.conv, ctx.ple_state, ws.h, t, spec));
+        match ctx.batch {
+            None => op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv, ws.xn, ple.conv, ctx.ple_state, ws.h, t, spec)),
+            Some(seqs) => {
+                for (b, st) in seqs.iter().enumerate() {
+                    let row = (b * H * 4) as u64;
+                    op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv + row, ws.xn + row, ple.conv, st.ple_conv.addr(), ws.h + row, 1, None));
+                }
+            }
+        }
     }
 
     // Steering at the attention-input pre-mix point: the pending block output is committed first
@@ -608,7 +682,7 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
     }
     match &layer.block {
         Block::Gdn(g) => {
-            let st = gdn.expect("GDN layer state");
+            let st = || gdn.expect("GDN layer state");
             let (ld, x) = (g.proj.n, ws.proj);
             let col = |j: usize| x + (g.proj.col(j) * 4) as u64;
             op!(prof, "gdn proj", s, project(s, ws, ws.m, &g.proj, x, t));
@@ -616,25 +690,51 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
                 (Some((ctl, _, defer)), Some(rec)) => Some(k::Deferral { rec, ctl, defer }),
                 _ => None,
             };
-            if t <= k::gemv_max_m() {
-                op!(prof, "gdn_fused_small", s, k::gdn_fused_small(s, x, ld, t, g.conv, st.conv.addr(), st.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, spec));
+            if let Some(seqs) = ctx.batch {
+                for (b, sq) in seqs.iter().enumerate() {
+                    let sg = sq.gdn[index].as_ref().expect("GDN layer state");
+                    let (xr, yr) = (x + (b * ld * 4) as u64, ws.o_bf + (b * GDN_Z * 2) as u64);
+                    op!(prof, "gdn_fused_small", s, k::gdn_fused_small(s, xr, ld, 1, g.conv, sg.conv.addr(), sg.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), yr, None));
+                }
+            } else if t <= k::gemv_max_m() {
+                op!(prof, "gdn_fused_small", s, k::gdn_fused_small(s, x, ld, t, g.conv, st().conv.addr(), st().recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, spec));
             } else {
                 // The chunked prefill kernels work on committed state: replay any pending records first.
                 if let Some(sp) = spec {
-                    op!(prof, "gdn_flush", s, k::gdn_fused_small(s, x, ld, 0, g.conv, st.conv.addr(), st.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, Some(k::Deferral { defer: false, ..sp })));
+                    op!(prof, "gdn_flush", s, k::gdn_fused_small(s, x, ld, 0, g.conv, st().conv.addr(), st().recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, Some(k::Deferral { defer: false, ..sp })));
                 }
-                op!(prof, "gdn_conv", s, k::gdn_conv(s, col(0), ld, ws.conv, st.conv.addr(), g.conv, t));
+                op!(prof, "gdn_conv", s, k::gdn_conv(s, col(0), ld, ws.conv, st().conv.addr(), g.conv, t));
                 op!(prof, "gdn_prep", s, k::gdn_prep(s, ws.conv, col(2), col(3), ld, g.a_log, g.dt_bias, ws.beta, ws.g, t));
-                op!(prof, "gdn_recurrent", s, k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st.recurrent.addr(), ws.o, t, ws.gdn_chunks));
+                op!(prof, "gdn_recurrent", s, k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st().recurrent.addr(), ws.o, t, ws.gdn_chunks));
                 op!(prof, "gdn_gated_norm", s, k::gdn_gated_norm(s, ws.o, col(1), ld, g.norm, ws.o_bf, t));
             }
             op!(prof, "gdn out", s, linear(s, ws, ws.o_bf, &g.out, ws.y, t));
         }
         Block::Qsa(q) => {
-            let c = qsa.expect("QSA layer cache");
             let (ld, x) = (q.proj.n, ws.proj);
             let col = |j: usize| x + (q.proj.col(j) * 4) as u64;
             op!(prof, "qsa proj", s, project(s, ws, ws.m, &q.proj, x, t));
+            if let Some(seqs) = ctx.batch {
+                for (b, sq) in seqs.iter().enumerate() {
+                    let c = sq.qsa[index].as_ref().expect("QSA layer cache");
+                    let (row, start_b, pos3_b) = ((b * ld * 4) as u64, start + 4 * b as u64, sq.pos3.addr());
+                    let colr = |j: usize| col(j) + row;
+                    let (qr, iqr) = (ws.q + (b * QSA_HEADS * QSA_DIM * 4) as u64, ws.iq + (b * 4 * INDEX_DIM * 4) as u64);
+                    let (scores, sel) = (ws.scores + (b * ws.score_cols * 4) as u64, ws.sel + (b * TOP_GROUPS * 4) as u64);
+                    let att = ws.att + (b * QSA_HEADS * QSA_DIM * 2) as u64;
+                    op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, colr(0), colr(1), ld, q.q_norm, q.k_norm, qr, c.k.addr(), c.v.addr(), pos3_b, start_b, 1));
+                    op!(prof, "qsa_index_prep", s, k::qsa_index_prep(s, colr(3), ld, q.index_q_norm, iqr, c.raw.addr(), pos3_b, start_b, 1));
+                    op!(prof, "qsa_pool", s, k::qsa_pool(s, c.raw.addr(), q.index_k_norm, c.pooled.addr(), pos3_b, start_b, 1));
+                    if sq.capacity / 4 > TOP_GROUPS {
+                        op!(prof, "qsa_index_scores", s, k::qsa_index_scores(s, iqr, c.pooled.addr(), scores, ws.score_cols, start_b, 1));
+                        op!(prof, "qsa_select", s, k::qsa_select(s, scores, 1, ws.score_cols, start_b, sel));
+                    }
+                    op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, qr, colr(0), ld, c.k.addr(), c.v.addr(), sel, start_b, 1, ws.att_part, att));
+                }
+                op!(prof, "qsa o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
+                return finish_layer(layer, ctx, carry, prof);
+            }
+            let c = qsa.expect("QSA layer cache");
             op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, col(0), col(1), ld, q.q_norm, q.k_norm, ws.q, c.k.addr(), c.v.addr(), pos3, start, t));
             op!(prof, "qsa_index_prep", s, k::qsa_index_prep(s, col(3), ld, q.index_q_norm, ws.iq, c.raw.addr(), pos3, start, t));
             op!(prof, "qsa_pool", s, k::qsa_pool(s, c.raw.addr(), q.index_k_norm, c.pooled.addr(), pos3, start, t));
@@ -651,6 +751,13 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
             op!(prof, "qsa o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
         }
     }
+    finish_layer(layer, ctx, carry, prof)
+}
+
+/// The second half of a layer: the MLP HyperConnection, the MoE block and its output.
+fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>) -> Result<()> {
+    let (ws, s, t) = (ctx.ws, ctx.s, ctx.t);
+    let small = t <= k::gemv_max_m();
     if small {
         op!(prof, "hc_small", s, hyper_connection_small(s, ws, &layer.mlp_hc, t, Some((ws.y, carry.inj)), carry.inj_next, ws.m));
         std::mem::swap(&mut carry.inj, &mut carry.inj_next);
@@ -747,7 +854,7 @@ pub fn forward_mtp_staged(model: &Model, state: &SequenceState, ws: &Workspace, 
     // fc_hidden maps each of the 4 streams: rows of the [t, 4, 2560] input are the 4t stream slices.
     op!(prof, "mtp fc_h", s, linear_ld(s, ws.partial, ws.n, D, &mtp.fc_hidden, ws.h, D, S * t));
     op!(prof, "mtp combine", s, k::hc_combine(s, ws.h, ws.y, ws.ones, t));
-    let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0, spec: None, steer: None };
+    let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0, spec: None, steer: None, batch: None };
     let mut carry = Carry::new(ws, false);
     layer_forward(LAYERS, &mtp.layer, None, None, Some(cache), &ctx, &mut carry, prof.as_deref_mut())?;
     final_mixer(&mtp.final_hc, &ctx, &mut carry, prof)

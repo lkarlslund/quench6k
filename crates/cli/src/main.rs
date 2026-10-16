@@ -186,6 +186,16 @@ enum Command {
         #[arg(long)]
         cache_dir: Option<PathBuf>,
     },
+    /// Batched decode check: two fixture prompts decoded together must give each one's single-sequence
+    /// greedy tokens, bit for bit; also times both.
+    BatchCheck {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, num_args = 2, required = true)]
+        fixture: Vec<PathBuf>,
+        #[arg(long, default_value_t = 64)]
+        n: usize,
+    },
     /// Measure prefill and greedy decode throughput at the given prompt lengths.
     Bench {
         #[arg(long)]
@@ -312,6 +322,7 @@ fn main() -> Result<()> {
         Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir } => {
             serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir })?
         }
+        Command::BatchCheck { model, fixture, n } => batch_check(&model, &fixture, n)?,
         Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, steer } => {
             chat_once(&model, &prompt, max_tokens, temperature, top_p, top_k, seed, think, context, &steer)?
         }
@@ -536,5 +547,74 @@ fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, tempe
     let total = t1.elapsed().as_secs_f64();
     let ttft = first.map(|d| d.as_secs_f64()).unwrap_or(total);
     println!("\n[{n} tokens, {finish:?}; prompt {} tokens; first token {:.0} ms; {:.1} tok/s after it]", ids.len(), 1e3 * ttft, (n.saturating_sub(1)) as f64 / (total - ttft).max(1e-9));
+    Ok(())
+}
+
+fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> Result<()> {
+    use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
+    #[derive(serde::Deserialize)]
+    struct Sequence {
+        tokens: Vec<i32>,
+        prompt_len: usize,
+    }
+    let (model, s) = load(model_dir, Precision::Int8Group, false)?;
+    let prompts: Vec<Vec<i32>> = fixtures
+        .iter()
+        .map(|f| -> Result<Vec<i32>> {
+            let seq: Sequence = serde_json::from_slice(&std::fs::read(f.join("sequence.json"))?)?;
+            Ok(seq.tokens[..seq.prompt_len].to_vec())
+        })
+        .collect::<Result<_>>()?;
+    let cap = prompts.iter().map(|p| p.len()).max().unwrap() + n + 16;
+    let mut ws = Workspace::new(2048, cap)?;
+    let hw = HeadWorkspace::new(2, 1)?;
+    let out = squash_cuda::DeviceBuffer::new(8)?;
+    // Prefill each sequence; returns (state, first token).
+    let prefill = |ws: &mut Workspace, p: &[i32]| -> Result<(SequenceState, i32)> {
+        let mut st = SequenceState::new(cap)?;
+        for c in p.chunks(2048) {
+            forward::forward(&model, &mut st, ws, &s, c)?;
+        }
+        let last = ws.out + (((p.len() - 1) % 2048) * 2560 * 2) as u64;
+        forward::head_argmax_into(&model, &hw, &s, last, 1, out.addr())?;
+        Ok((st, s.download::<i32>(out.addr(), 1)?[0]))
+    };
+    // Single-sequence reference.
+    let mut single = Vec::new();
+    let t0 = std::time::Instant::now();
+    for p in &prompts {
+        let (mut st, mut tok) = prefill(&mut ws, p)?;
+        let mut got = vec![tok];
+        let t1 = std::time::Instant::now();
+        for _ in 1..n {
+            forward::forward(&model, &mut st, &mut ws, &s, &[tok])?;
+            forward::head_argmax_into(&model, &hw, &s, ws.out, 1, out.addr())?;
+            tok = s.download::<i32>(out.addr(), 1)?[0];
+            got.push(tok);
+        }
+        println!("single: {:.1} tok/s eager", (n - 1) as f64 / t1.elapsed().as_secs_f64());
+        single.push(got);
+    }
+    let _ = t0;
+    // Batched.
+    let (mut a, ta) = prefill(&mut ws, &prompts[0])?;
+    let (mut b, tb) = prefill(&mut ws, &prompts[1])?;
+    let mut toks = [ta, tb];
+    let mut batched = vec![vec![ta], vec![tb]];
+    let t1 = std::time::Instant::now();
+    for _ in 1..n {
+        let bytes = forward::prepare_batch(&model, &mut [&mut a, &mut b], &mut ws, &toks)?;
+        forward::forward_batch(&model, &[&a, &b], &ws, &s, bytes)?;
+        forward::head_argmax_into(&model, &hw, &s, ws.out, 2, out.addr())?;
+        let next: Vec<i32> = s.download(out.addr(), 2)?;
+        toks = [next[0], next[1]];
+        batched[0].push(next[0]);
+        batched[1].push(next[1]);
+    }
+    println!("batched: {:.1} tok/s eager (2 sequences)", 2.0 * (n - 1) as f64 / t1.elapsed().as_secs_f64());
+    for i in 0..2 {
+        let same = batched[i].iter().zip(&single[i]).take_while(|(x, y)| x == y).count();
+        println!("sequence {i}: {same}/{n} tokens identical to single-sequence decoding");
+    }
     Ok(())
 }
