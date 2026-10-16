@@ -148,6 +148,9 @@ impl PleTable {
             rows_per_shard = info.shape[0];
             let file = &ckpt.files[info.file];
             let map = unsafe { Mmap::map(&file.file) }.with_context(|| format!("mapping {}", file.path.display()))?;
+            // Rows are read at random: without this every fault also reads ahead ~128 KiB around a
+            // 320-byte row, and cold prompts become bound by disk bandwidth.
+            map.advise(memmap2::Advice::Random).context("madvise(MADV_RANDOM) on the PLE table")?;
             maps.push((map, info.offset as usize));
         }
         Ok(Self { maps, rows_per_shard })
@@ -159,6 +162,14 @@ impl PleTable {
         let (map, base) = &self.maps[r / self.rows_per_shard];
         let start = base + (r % self.rows_per_shard) * Self::WIDTH * 2;
         let _ = map.advise_range(memmap2::Advice::WillNeed, start, Self::WIDTH * 2);
+    }
+
+    /// Reads row `r`, faulting it into the page cache (blocking).
+    pub fn touch(&self, r: usize) -> u8 {
+        let (map, base) = &self.maps[r / self.rows_per_shard];
+        let start = base + (r % self.rows_per_shard) * Self::WIDTH * 2;
+        // The row may straddle a page boundary.
+        unsafe { std::ptr::read_volatile(&map[start]) ^ std::ptr::read_volatile(&map[start + Self::WIDTH * 2 - 1]) }
     }
 
     /// Appends row `r` (160 BF16 values) to `out`.

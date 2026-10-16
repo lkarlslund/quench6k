@@ -450,6 +450,35 @@ fn hyper_connection_small(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, pending
 }
 
 /// PLE row indices of the token at position `p` given the full token history (SPEC §8.1).
+/// Faults the PLE rows of `tokens[from..]` into the page cache from `threads` threads, in order (blocks
+/// of 64 positions), until done or `stop` is set. Run alongside a prefill, it turns the host gather's
+/// page faults (the table is larger than RAM) into parallel reads ahead of the GPU.
+pub fn warm_ple(model: &Model, tokens: &[i32], from: usize, threads: usize, stop: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let Some(ple) = model.layers[1].ple.as_ref() else { return };
+    const BLOCK: usize = 64;
+    let next = AtomicUsize::new(from);
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| {
+                let mut sink = 0u8;
+                loop {
+                    let p0 = next.fetch_add(BLOCK, Ordering::Relaxed);
+                    if p0 >= tokens.len() || stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    for p in p0..(p0 + BLOCK).min(tokens.len()) {
+                        for r in ple_rows(tokens, p, &ple.multipliers, &ple.sizes, &ple.offsets) {
+                            sink ^= model.ple_table.touch(r);
+                        }
+                    }
+                }
+                std::hint::black_box(sink);
+            });
+        }
+    });
+}
+
 pub fn ple_rows(tokens: &[i32], p: usize, mult: &[i64; 3], sizes: &[i64; 16], offsets: &[i64; 16]) -> [usize; 16] {
     let s0 = tokens[p] as i64;
     let s1 = if p >= 1 && tokens[p - 1] != EOS { tokens[p - 1] } else { EOS } as i64;

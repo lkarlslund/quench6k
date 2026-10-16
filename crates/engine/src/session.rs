@@ -368,25 +368,27 @@ impl Session {
         self.ws.capture = capture;
         // The same step boundaries as a fresh slot-0 prefill (chunks, cut at turn boundaries), so
         // both slots compute identical results for the same prompt.
-        let mut c0 = 0;
-        let mut last_rows = 0;
-        while c0 < prompt.len() {
-            let mut end = (c0 + self.chunk).min(prompt.len());
-            if let Some(&b) = p.boundaries.iter().filter(|&&b| b > c0 && b < prompt.len()).min() {
-                end = end.min(b);
+        let (ws, chunk) = (&mut self.ws, self.chunk);
+        let r = with_ple_warm(model, prompt, 0, || -> Result<usize> {
+            let mut c0 = 0;
+            let mut last_rows = 0;
+            while c0 < prompt.len() {
+                let mut end = (c0 + chunk).min(prompt.len());
+                if let Some(&b) = p.boundaries.iter().filter(|&&b| b > c0 && b < prompt.len()).min() {
+                    end = end.min(b);
+                }
+                forward::forward(model, &mut aux.state, ws, s, &prompt[c0..end])?;
+                last_rows = end - c0;
+                c0 = end;
+                if let Some(f) = &p.progress {
+                    s.synchronize()?;
+                    (f.0)(end, 0);
+                }
             }
-            if let Err(e) = forward::forward(model, &mut aux.state, &mut self.ws, s, &prompt[c0..end]) {
-                self.ws.capture = None;
-                return Err(e);
-            }
-            last_rows = end - c0;
-            c0 = end;
-            if let Some(f) = &p.progress {
-                s.synchronize()?;
-                (f.0)(end, 0);
-            }
-        }
+            Ok(last_rows)
+        });
         self.ws.capture = None;
+        let last_rows = r?;
         let last = self.ws.out + ((last_rows - 1) * crate::model::D * 2) as u64;
         forward::head_logits(model, &self.hw, s, last)?;
         if let Some(c) = capture {
@@ -631,7 +633,8 @@ impl Session {
         pauses.sort_unstable();
         pauses.dedup();
         let snapshots = &mut self.snapshots;
-        self.dec.prefill_from(model, &mut self.state, &mut self.ws, s, prompt, start, self.chunk, &pauses, |state, pos, pending| {
+        let (dec, state, ws, chunk) = (&mut self.dec, &mut self.state, &mut self.ws, self.chunk);
+        with_ple_warm(model, prompt, start, || dec.prefill_from(model, state, ws, s, prompt, start, chunk, &pauses, |state, pos, pending| {
             // Recycle the oldest periodic snapshot first, then the oldest.
             let recycled = if snapshots.len() >= MAX_SNAPSHOTS {
                 let i = snapshots.iter().position(|sn| sn.periodic).unwrap_or(0);
@@ -643,7 +646,7 @@ impl Session {
             snap.periodic = periodic.contains(&pos);
             snapshots.push(snap);
             Ok(())
-        }, report.as_ref().map(|f| f as &(dyn Fn(usize) + Send + Sync)))?;
+        }, report.as_ref().map(|f| f as &(dyn Fn(usize) + Send + Sync))))?;
         self.kv_tokens = key;
         Ok(())
     }
@@ -742,6 +745,22 @@ impl Session {
         }
         Ok(ids[keep - 1])
     }
+}
+
+/// Runs `f` (a prefill of `prompt[start..]`) while threads fault the prompt's PLE rows into the page
+/// cache ahead of it.
+fn with_ple_warm<R>(model: &Model, prompt: &[i32], start: usize, f: impl FnOnce() -> R) -> R {
+    let threads = std::env::var("SQUASH_PLE_WARM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    if prompt.len() - start < 256 || threads == 0 {
+        return f();
+    }
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|sc| {
+        sc.spawn(|| forward::warm_ple(model, prompt, start, threads, &stop));
+        let r = f();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        r
+    })
 }
 
 /// The speculative rounds' sampling parameters for a request (None: greedy).
