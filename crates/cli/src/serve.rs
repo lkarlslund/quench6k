@@ -169,6 +169,10 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
         reused: usize,
         capture: Option<(PathBuf, Value)>,
         generated: Vec<i32>,
+        /// Prompt tokens, prefill seconds, and when decoding started.
+        prompt: usize,
+        prefill: f64,
+        decode_start: std::time::Instant,
     }
     // Sends tokens; Some when the run is over (Cancelled when the client went away).
     fn emit(a: &mut Active, toks: &[i32]) -> Option<Finish> {
@@ -195,6 +199,11 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
                 return;
             }
         }
+        let secs = a.decode_start.elapsed().as_secs_f64();
+        let n = a.generated.len();
+        eprintln!("done: slot {}, prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s), {:?}",
+                  a.run.slot, a.prompt, a.reused, a.prefill, (a.prompt - a.reused) as f64 / a.prefill.max(1e-9), n, secs,
+                  n.saturating_sub(1) as f64 / secs.max(1e-9), f);
         let _ = a.tx.send(Msg::Done(f, a.reused));
     };
     let nslots = if session.has_second_slot() { 2 } else { 1 };
@@ -239,10 +248,11 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
                 }
             }
             let speculate = slots[other].is_none() && queue.is_empty();
+            let t0 = std::time::Instant::now();
             match session.begin(model, s, free, &job.ids, &job.params, speculate) {
                 Ok((run, toks)) => {
-                    let mut a = Active { run, tx: job.tx, reused: if free == 0 { session.reused } else { 0 }, capture: job.capture, generated: Vec::new() };
-                    eprintln!("request: slot {free}, prompt {} tokens, {} reused", job.ids.len(), a.reused);
+                    let mut a = Active { run, tx: job.tx, reused: if free == 0 { session.reused } else { 0 }, capture: job.capture, generated: Vec::new(),
+                                         prompt: job.ids.len(), prefill: t0.elapsed().as_secs_f64(), decode_start: std::time::Instant::now() };
                     if let Some(path) = std::env::var_os("SQUASH_TRACE") {
                         use std::io::Write;
                         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
