@@ -57,7 +57,8 @@ __global__ void mxfp8_rows_kernel(const __nv_bfloat16* __restrict__ x, int rows,
     dst[1] = make_uint4(q[4], q[5], q[6], q[7]);
 }
 
-constexpr int BM = 64, BN = 128, BK = 128, STAGES = 3, THREADS = 256;
+constexpr int BM = 128, BN = 128, BK = 128, STAGES = 3, THREADS = 256;
+constexpr int MI = BM / 32;  // m16 tiles per warp (warps 2 x 4, warp tile BM / 2 x 32)
 
 SQ_DEVICE int swz(int r, int c) { return r * BK + ((c ^ (r & 7)) << 4); }
 
@@ -94,7 +95,7 @@ __global__ void __launch_bounds__(THREADS) mx8_gemm_kernel(const uint8_t* __rest
     auto load = [&](int s, int kt) {
         Stage& g = st[s];
 #pragma unroll
-        for (int i = 0; i < 2; ++i) {  // A: 64 rows x 8 chunks
+        for (int i = 0; i < BM * 8 / THREADS; ++i) {  // A: BM rows x 8 chunks
             const int idx = tid + i * THREADS, r = idx >> 3, c = idx & 7;
             const bool ok = m0 + r < M;
             cp_async16(&g.a[swz(r, c)], A + (size_t)(ok ? m0 + r : 0) * K + kt * BK + c * 16, ok);
@@ -114,7 +115,7 @@ __global__ void __launch_bounds__(THREADS) mx8_gemm_kernel(const uint8_t* __rest
             cp_async4(&g.bs[r], Ws + (size_t)(ok ? n0 + r : 0) * KS + kt * 4, ok);
         }
     };
-    float acc[2][4][4] = {};
+    float acc[MI][4][4] = {};
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < k_tiles) load(s, s);
@@ -128,16 +129,16 @@ __global__ void __launch_bounds__(THREADS) mx8_gemm_kernel(const uint8_t* __rest
         if (next < k_tiles) load(next % STAGES, next);
         cp_async_commit();
         const Stage& g = st[kt % STAGES];
-        uint32_t sa[2], sb[4];
+        uint32_t sa[MI], sb[4];
 #pragma unroll
-        for (int i = 0; i < 2; ++i) sa[i] = g.as[warp_m * 32 + i * 16 + ta];
+        for (int i = 0; i < MI; ++i) sa[i] = g.as[warp_m * (BM / 2) + i * 16 + ta];
 #pragma unroll
         for (int j = 0; j < 4; ++j) sb[j] = g.bs[warp_n * 32 + j * 8 + tb];
         auto step = [&](auto sc) {
             constexpr int s = decltype(sc)::value;
-            uint32_t a[2][4], b[4][2];
+            uint32_t a[MI][4], b[4][2];
 #pragma unroll
-            for (int i = 0; i < 2; ++i) ldmatrix_x4(a[i], &g.a[swz(warp_m * 32 + i * 16 + (lane & 15), s * 2 + (lane >> 4))]);
+            for (int i = 0; i < MI; ++i) ldmatrix_x4(a[i], &g.a[swz(warp_m * (BM / 2) + i * 16 + (lane & 15), s * 2 + (lane >> 4))]);
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
                 uint32_t r4[4];
@@ -145,7 +146,7 @@ __global__ void __launch_bounds__(THREADS) mx8_gemm_kernel(const uint8_t* __rest
                 b[2 * j][0] = r4[0], b[2 * j][1] = r4[1], b[2 * j + 1][0] = r4[2], b[2 * j + 1][1] = r4[3];
             }
 #pragma unroll
-            for (int i = 0; i < 2; ++i)
+            for (int i = 0; i < MI; ++i)
 #pragma unroll
                 for (int j = 0; j < 4; ++j) mma_mx8<s>(acc[i][j], a[i], b[j], sa[i], sb[j]);
         };
@@ -157,10 +158,10 @@ __global__ void __launch_bounds__(THREADS) mx8_gemm_kernel(const uint8_t* __rest
     cp_async_wait<0>();
     const int g8 = lane >> 2, t4 = lane & 3;
 #pragma unroll
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < MI; ++i)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int m = m0 + warp_m * 32 + i * 16 + g8 + h * 8;
+            const int m = m0 + warp_m * (BM / 2) + i * 16 + g8 + h * 8;
             if (m >= M) continue;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
