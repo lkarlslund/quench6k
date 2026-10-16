@@ -94,3 +94,29 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
 - What would close the gap: fewer dependent phases per layer, or a persistent kernel whose phases wait
   on per-tile flags instead of whole-kernel completion, so each consumer starts as soon as its own
   inputs exist and keeps streaming weights while it waits.
+
+## Findings (2026-10-16, later): verify cost, prompt lookup, megakernel
+
+- Decode step time against rows (kbench, 4 layers, 8K context, relative to one row): 2 rows 1.28,
+  4 rows 1.62, 8 rows 2.23, 12 rows 3.32, 16 rows 4.03. Every extra row routes to its own 10 experts,
+  so a verify step costs more weight traffic per row; the step from 8 to 12 rows is out of line.
+- Prompt-lookup drafting (n-gram match in the context, verified with the MTP verify step), simulated on
+  the service trace (6,439 requests, 150K generated tokens) with these step costs: lookup could supply
+  17-23% of the tokens, but on top of MTP (413 tok/s) it gains at most +2-3% overall (+8% on
+  generations over 1,000 tokens), and loses 6-30% without gating it on the drafter's first token. MTP
+  already takes most of the predictable tokens, and long verify steps are expensive. Not implemented.
+- Megakernel prototype (synthetic, one GDN decode layer's 12 phases with their real byte counts and
+  all-to-all dependencies between phases, 113 MB per layer, floor 68.5 us):
+  - one PDL kernel per phase, weights loaded before the dependency wait (the engine's design):
+    103.6 us per layer, matching the engine's GDN layers;
+  - persistent kernel, one CTA per SM, a producer warp streaming the CTA's weights through a 5 x 16 KB
+    shared-memory ring with TMA bulk copies, consumers synchronized by completion counters: 101 us
+    (with the activation reads idealized away), 81.6 us with no dependency waits at all;
+  - persistent kernel with per-thread or TMA bulk L2 lookahead prefetch: 110-128 us.
+  - an all-to-all completion-counter sync costs 0.55-0.6 us per phase (188 CTAs), against 0.46 us for
+    a PDL kernel boundary: flags are not cheaper than PDL.
+  The engine already gets the megakernel's main benefit (weights streaming while the previous phase
+  finishes) from PDL and pre-wait weight loads; what remains is about 1.6 us per all-to-all dependency,
+  whatever the synchronization mechanism. Published megakernel gains (1.5x and more) are measured
+  against engines without that overlap. A full megakernel is not worth its cost here; fewer dependent
+  phases per layer would be.
