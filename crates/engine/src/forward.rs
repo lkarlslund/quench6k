@@ -989,6 +989,8 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
     let col = |j: usize| x + (moe.proj.col(j) * 4) as u64;
     op!(prof, "moe proj", s, project(s, ws, ws.m, &moe.proj, x, t));
     let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
+    // FP4 prefill: the routed experts' down projection is written in BF16 (SQUASH_YD_BF16=0: FP32).
+    let yd_bf16 = t > k::moe_small_tokens() && matches!(fp4_mode(), 1 | 3) && std::env::var("SQUASH_YD_BF16").map_or(true, |v| v != "0");
     if t == 1 {
         op!(prof, "experts t1", s, k::moe_experts_t1(s, ws.m, col(0), tables(&moe.gate), tables(&moe.up), tables(&moe.down), ws.top_i, ws.top_w, ws.pair_row, ws.act, ws.yd));
     } else if t <= k::moe_small_tokens() {
@@ -1009,25 +1011,24 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
             // quantized rows by expert (into xs), FP4 tensor-core GEMMs; the SwiGLU output is
             // quantized into eg (free once SwiGLU has read it).
             let pairs = t * TOP_K;
-            let grouped4 = |proj: &crate::model::ExpertProj, a: u64, y: u64, n: usize, kk: usize| {
-                k::moe_fp4_gemm(s, a, pairs, proj.weights, proj.scales, proj.scale2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, y, n, kk)
-            };
             let mode = fp4_mode();
             if mode != 3 {
                 op!(prof, "fp4 quant", s, k::fp4_quant_rows(s, ws.m, t, D, ws.yd));
                 op!(prof, "fp4 gather", s, k::fp4_gather(s, ws.yd, t, D, ws.pair_row, ws.xs));
-                op!(prof, "experts gate", s, grouped4(&moe.gate, ws.xs, ws.eg, EXPERT_WIDTH, D));
-                op!(prof, "experts up", s, grouped4(&moe.up, ws.xs, ws.eu, EXPERT_WIDTH, D));
+                op!(prof, "experts gate_up", s, k::moe_fp4_gate_up(s, ws.xs, pairs, tables(&moe.gate), tables(&moe.up), ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, ws.act, EXPERT_WIDTH, D));
             } else {
                 k::moe_gather(s, ws.m, ws.pair_row, t, ws.xs)?;
                 k::fake_fp4_act(s, ws.xs, pairs, D)?;
                 grouped(&moe.gate, ws.xs, ws.eg, EXPERT_WIDTH, D)?;
                 grouped(&moe.up, ws.xs, ws.eu, EXPERT_WIDTH, D)?;
             }
-            op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, pairs));
+            if mode == 3 {
+                op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, pairs));
+            }
             if mode == 1 || mode == 3 {
                 op!(prof, "fp4 quant", s, k::fp4_quant_rows(s, ws.act, pairs, EXPERT_WIDTH, ws.eg));
-                op!(prof, "experts down", s, grouped4(&moe.down, ws.eg, ws.yd, D, EXPERT_WIDTH));
+                let down = &moe.down;
+                op!(prof, "experts down", s, k::moe_fp4_gemm_out(s, ws.eg, pairs, down.weights, down.scales, down.scale2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, ws.yd, D, EXPERT_WIDTH, yd_bf16));
             } else {
                 if mode == 2 {
                     k::fake_fp4_act(s, ws.act, pairs, EXPERT_WIDTH)?;
@@ -1056,7 +1057,11 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
     } else {
         op!(prof, "shared swiglu", s, k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
         op!(prof, "shared down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
-        op!(prof, "moe_combine", s, k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
+        if yd_bf16 {
+            op!(prof, "moe_combine", s, k::moe_combine_bf16(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
+        } else {
+            op!(prof, "moe_combine", s, k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
+        }
     }
     if let Some((buf, row)) = rec {
         s.copy_d2d(buf + CaptureLayout::MOE as u64, ws.y + (row * D * 4) as u64, D * 4)?;

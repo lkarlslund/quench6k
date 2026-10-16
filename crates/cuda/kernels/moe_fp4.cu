@@ -6,6 +6,8 @@
 // Quantized rows: codes U8 [rows, K/2] (low nibble first), block scales U8 [rows, K/16], row scales
 // F32 [rows]. Weights per expert: codes U8 [N, K/2], scales F8E4M3 [N, K/16], global scale ws2[e].
 
+#include <type_traits>
+
 #include "fp4.cuh"
 #include "mma.cuh"
 
@@ -112,12 +114,23 @@ struct __align__(16) Stage {
     uint8_t bs[BN * 8];
 };
 
+// GU: gate and up projections together with SwiGLU in the epilogue. The CTA's 128 columns are gate
+// columns n0 .. n0 + 63 (warps 0, 1 of each row) and the same up columns (warps 2, 3); the up values pass
+// through shared memory and act = bf16(silu(gate) * up) is written [rows, N] (as swiglu_kernel).
+struct UpArgs {
+    const uint64_t* w_ptr;
+    const uint64_t* s_ptr;
+    const float* ws2;
+    __nv_bfloat16* act;
+};
+
+template <bool GU = false, typename OT = float>
 __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ As,
                                                            const float* __restrict__ Ar, const uint64_t* __restrict__ w_ptr,
                                                            const uint64_t* __restrict__ s_ptr, const float* __restrict__ ws2,
                                                            const int* __restrict__ offsets, const int* __restrict__ tile_expert,
                                                            const int* __restrict__ tile_row, const int* __restrict__ num_tiles,
-                                                           float* Y, int N, int K) {
+                                                           OT* Y, int N, int K, UpArgs up = {}) {
     pdl_launch_dependents();
     pdl_wait();
     extern __shared__ __align__(16) uint8_t fp4_smem[];
@@ -127,9 +140,15 @@ __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __rest
     const int r_end = min(r0 + BM, offsets[e + 1]);
     const uint8_t* W = reinterpret_cast<const uint8_t*>(w_ptr[e]);
     const uint8_t* Ws = reinterpret_cast<const uint8_t*>(s_ptr[e]);
+    const uint8_t* Wu = GU ? reinterpret_cast<const uint8_t*>(up.w_ptr[e]) : W;
+    const uint8_t* Wus = GU ? reinterpret_cast<const uint8_t*>(up.s_ptr[e]) : Ws;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int warp_m = warp >> 2, warp_n = warp & 3;
-    const int n0 = blockIdx.x * BN;
+    const int n0 = blockIdx.x * (GU ? BN / 2 : BN);
+    // Weight row (and matrix) of the tile's local column r.
+    auto brow = [&](int r) { return GU ? n0 + (r & (BN / 2 - 1)) : n0 + r; };
+    auto bmat = [&](int r) { return GU && r >= BN / 2 ? Wu : W; };
+    auto bsc = [&](int r) { return GU && r >= BN / 2 ? Wus : Ws; };
     const int k_tiles = K / BK, KB = K / 2, KS = K / 16;
 
     auto load = [&](int s, int kt) {
@@ -142,16 +161,17 @@ __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __rest
 #pragma unroll
         for (int i = 0; i < 2; ++i) {  // B: 128 rows x 4 chunks
             const int idx = tid + i * THREADS, r = idx >> 2, c = idx & 3;
-            const bool ok = n0 + r < N;
-            cp_async16(&g.b[swz(r, c)], W + (size_t)(ok ? n0 + r : n0) * KB + kt * RB + c * 16, ok);
+            const int n = brow(r);
+            const bool ok = n < N;
+            cp_async16(&g.b[swz(r, c)], bmat(r) + (size_t)(ok ? n : n0) * KB + kt * RB + c * 16, ok);
         }
         if (tid < BM) {
             const bool ok = r0 + tid < r_end;
             cp_async8(&g.as[tid * 8], As + (size_t)(ok ? r0 + tid : r0) * KS + kt * 8, ok);
         } else if (tid < BM + BN) {
-            const int r = tid - BM;
-            const bool ok = n0 + r < N;
-            cp_async8(&g.bs[r * 8], Ws + (size_t)(ok ? n0 + r : n0) * KS + kt * 8, ok);
+            const int r = tid - BM, n = brow(r);
+            const bool ok = n < N;
+            cp_async8(&g.bs[r * 8], bsc(r) + (size_t)(ok ? n : n0) * KS + kt * 8, ok);
         }
     };
 
@@ -196,6 +216,45 @@ __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __rest
     cp_async_wait<0>();
     const float s2 = ws2[e];
     const int g8 = lane >> 2, t4 = lane & 3;
+    if constexpr (GU) {
+        __syncthreads();
+        constexpr int LDU = BN / 2 + 1;
+        float* su = reinterpret_cast<float*>(fp4_smem);  // [BM][LDU]
+        const float s2u = up.ws2[e];
+        if (warp_n >= 2) {
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int rl = warp_m * 32 + i * 16 + g8 + h * 8, r = r0 + rl;
+                    if (r >= r_end) continue;
+                    const float sc = Ar[r] * s2u;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+#pragma unroll
+                        for (int x = 0; x < 2; ++x) su[rl * LDU + (warp_n - 2) * 32 + j * 8 + 2 * t4 + x] = acc[i][j][2 * h + x] * sc;
+                }
+        }
+        __syncthreads();
+        if (warp_n < 2) {
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int rl = warp_m * 32 + i * 16 + g8 + h * 8, r = r0 + rl;
+                    if (r >= r_end) continue;
+                    const float sc = Ar[r] * s2;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+#pragma unroll
+                        for (int x = 0; x < 2; ++x) {
+                            const int cl = warp_n * 32 + j * 8 + 2 * t4 + x, n = n0 + cl;
+                            if (n < N) up.act[(size_t)r * N + n] = f2bf(silu(acc[i][j][2 * h + x] * sc) * su[rl * LDU + cl]);
+                        }
+                }
+        }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < 2; ++i)
 #pragma unroll
@@ -206,10 +265,18 @@ __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __rest
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int n = n0 + warp_n * 32 + j * 8 + 2 * t4;
-                if (n + 1 < N) {
-                    *reinterpret_cast<float2*>(Y + (size_t)r * N + n) = make_float2(acc[i][j][2 * h] * sc, acc[i][j][2 * h + 1] * sc);
-                } else if (n < N) {
-                    Y[(size_t)r * N + n] = acc[i][j][2 * h] * sc;
+                if constexpr (std::is_same_v<OT, float>) {
+                    if (n + 1 < N) {
+                        *reinterpret_cast<float2*>(Y + (size_t)r * N + n) = make_float2(acc[i][j][2 * h] * sc, acc[i][j][2 * h + 1] * sc);
+                    } else if (n < N) {
+                        Y[(size_t)r * N + n] = acc[i][j][2 * h] * sc;
+                    }
+                } else {
+                    if (n + 1 < N) {
+                        *reinterpret_cast<__nv_bfloat162*>(Y + (size_t)r * N + n) = __floats2bfloat162_rn(acc[i][j][2 * h] * sc, acc[i][j][2 * h + 1] * sc);
+                    } else if (n < N) {
+                        Y[(size_t)r * N + n] = f2bf(acc[i][j][2 * h] * sc);
+                    }
                 }
             }
         }
@@ -238,18 +305,46 @@ extern "C" cudaError_t squash_fp4_gather(const uint8_t* codes, const uint8_t* sc
 
 extern "C" cudaError_t squash_moe_fp4_gemm(const uint8_t* a, const uint8_t* as, const float* ar, const uint64_t* w_ptr,
                                            const uint64_t* s_ptr, const float* ws2, const int* offsets, const int* tile_expert,
-                                           const int* tile_row, const int* num_tiles, int max_tiles, float* y, int N, int K,
-                                           cudaStream_t st) {
+                                           const int* tile_row, const int* num_tiles, int max_tiles, void* y, int N, int K,
+                                           int out_bf16, cudaStream_t st) {
     if (K % BK != 0) return cudaErrorInvalidValue;
     if (max_tiles == 0) return cudaSuccess;
     constexpr size_t smem = STAGES * sizeof(Stage);
     static bool configured = false;
     if (!configured) {
-        cudaError_t err = cudaFuncSetAttribute(fp4_gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        cudaError_t err = cudaFuncSetAttribute(fp4_gemm_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        if (err == cudaSuccess)
+            err = cudaFuncSetAttribute(fp4_gemm_kernel<false, __nv_bfloat16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         if (err != cudaSuccess) return err;
         configured = true;
     }
-    SQ_CHECK_LAUNCH(sq_launch(fp4_gemm_kernel, dim3((N + BN - 1) / BN, max_tiles), THREADS, smem, st, a, as, ar, w_ptr, s_ptr, ws2,
-                              offsets, tile_expert, tile_row, num_tiles, y, N, K));
+    const dim3 grid((N + BN - 1) / BN, max_tiles);
+    if (out_bf16)
+        SQ_CHECK_LAUNCH(sq_launch(fp4_gemm_kernel<false, __nv_bfloat16>, grid, THREADS, smem, st, a, as, ar, w_ptr, s_ptr, ws2, offsets,
+                                  tile_expert, tile_row, num_tiles, static_cast<__nv_bfloat16*>(y), N, K, UpArgs{}));
+    else
+        SQ_CHECK_LAUNCH(sq_launch(fp4_gemm_kernel<false>, grid, THREADS, smem, st, a, as, ar, w_ptr, s_ptr, ws2, offsets, tile_expert,
+                                  tile_row, num_tiles, static_cast<float*>(y), N, K, UpArgs{}));
+    SQ_RETURN_LAUNCH();
+}
+
+// Gate and up projections (weights w_*, u_*) with SwiGLU: act BF16 [rows, N].
+extern "C" cudaError_t squash_moe_fp4_gate_up(const uint8_t* a, const uint8_t* as, const float* ar, const uint64_t* w_ptr,
+                                              const uint64_t* s_ptr, const float* ws2, const uint64_t* u_ptr, const uint64_t* us_ptr,
+                                              const float* us2, const int* offsets, const int* tile_expert, const int* tile_row,
+                                              const int* num_tiles, int max_tiles, void* act, int N, int K, cudaStream_t st) {
+    if (K % BK != 0) return cudaErrorInvalidValue;
+    if (max_tiles == 0) return cudaSuccess;
+    constexpr size_t smem = STAGES * sizeof(Stage);
+    static_assert(BM * (BN / 2 + 1) * sizeof(float) <= smem, "epilogue exchange fits the pipeline buffers");
+    static bool configured = false;
+    if (!configured) {
+        cudaError_t err = cudaFuncSetAttribute(fp4_gemm_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        if (err != cudaSuccess) return err;
+        configured = true;
+    }
+    const UpArgs up{u_ptr, us_ptr, us2, static_cast<__nv_bfloat16*>(act)};
+    SQ_CHECK_LAUNCH(sq_launch(fp4_gemm_kernel<true>, dim3((N + BN / 2 - 1) / (BN / 2), max_tiles), THREADS, smem, st, a, as, ar, w_ptr,
+                              s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, (float*)nullptr, N, K, up));
     SQ_RETURN_LAUNCH();
 }

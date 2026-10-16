@@ -264,7 +264,8 @@ __global__ void swiglu_kernel(const float* __restrict__ gate, const float* __res
 }
 
 // y[t, d] = sum_k w[t, k] * Yd[pair_row[t*10+k], d] + sigmoid(sg[t]) * sh[t, d]
-__global__ void combine_kernel(const float* __restrict__ yd, const int* __restrict__ pair_row,
+template <typename YT>
+__global__ void combine_kernel(const YT* __restrict__ yd, const int* __restrict__ pair_row,
                                const float* __restrict__ top_w, const float* __restrict__ sg, int ld_sg,
                                const float* __restrict__ sh, float* y) {
     pdl_launch_dependents();
@@ -274,7 +275,7 @@ __global__ void combine_kernel(const float* __restrict__ yd, const int* __restri
     for (int d = blockIdx.y * blockDim.x + threadIdx.x; d < D; d += gridDim.y * blockDim.x) {
         float acc = 0;
 #pragma unroll
-        for (int k = 0; k < TOPK; ++k) acc += top_w[t * TOPK + k] * yd[(size_t)pair_row[t * TOPK + k] * D + d];
+        for (int k = 0; k < TOPK; ++k) acc += top_w[t * TOPK + k] * (float)yd[(size_t)pair_row[t * TOPK + k] * D + d];
         y[(size_t)t * D + d] = acc + g * sh[(size_t)t * D + d];
     }
 }
@@ -951,7 +952,16 @@ extern "C" cudaError_t squash_swiglu(const float* gate, const float* up, int ld,
 extern "C" cudaError_t squash_moe_combine(const float* yd, const int* pair_row, const float* top_w, const float* sg,
                                           int ld_sg, const float* sh, float* y, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(combine_kernel, dim3(T, D / 256), 256, 0, st, yd, pair_row, top_w, sg, ld_sg, sh, y));
+    SQ_CHECK_LAUNCH(sq_launch(combine_kernel<float>, dim3(T, D / 256), 256, 0, st, yd, pair_row, top_w, sg, ld_sg, sh, y));
+    SQ_RETURN_LAUNCH();
+}
+
+// As squash_moe_combine with BF16 expert outputs.
+extern "C" cudaError_t squash_moe_combine_bf16(const void* yd, const int* pair_row, const float* top_w, const float* sg,
+                                               int ld_sg, const float* sh, float* y, int T, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(combine_kernel<__nv_bfloat16>, dim3(T, D / 256), 256, 0, st, static_cast<const __nv_bfloat16*>(yd), pair_row,
+                              top_w, sg, ld_sg, sh, y));
     SQ_RETURN_LAUNCH();
 }
 

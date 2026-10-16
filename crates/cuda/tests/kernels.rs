@@ -434,6 +434,21 @@ fn fp4_grouped_gemm_matches_cpu() {
             }
         }
         assert!(worst < 1e-5, "fp4 gemm {m}x{n}x{k}: relative error {worst}");
+        if k == 2560 {
+            // Fused gate/up/SwiGLU equals two GEMMs and swiglu, bit for bit (up: the weights reversed).
+            let wc2: Vec<u8> = wc.iter().rev().copied().collect();
+            let ws2v: Vec<u8> = ws.iter().rev().copied().collect();
+            let (dwc2, dws2) = (upload(&s, &wc2), upload(&s, &ws2v));
+            let (uptr, usptr, us2) = (upload(&s, &[dwc2.addr()]), upload(&s, &[dws2.addr()]), upload(&s, &[0.75f32]));
+            let du = DeviceBuffer::zeroed(m * n * 4).unwrap();
+            kernels::moe_fp4_gemm(&s, qa.addr(), m, uptr.addr(), usptr.addr(), us2.addr(), doff.addr(), te.addr(), tr.addr(), nt.addr(), tiles, du.addr(), n, k).unwrap();
+            let act1 = DeviceBuffer::zeroed(m * n * 2).unwrap();
+            kernels::swiglu(&s, dy.addr(), du.addr(), n, n, act1.addr(), m).unwrap();
+            let act2 = DeviceBuffer::zeroed(m * n * 2).unwrap();
+            kernels::moe_fp4_gate_up(&s, qa.addr(), m, (wptr.addr(), sptr.addr(), ws2.addr()), (uptr.addr(), usptr.addr(), us2.addr()), doff.addr(), te.addr(), tr.addr(), nt.addr(), tiles, act2.addr(), n, k).unwrap();
+            let (x1, x2): (Vec<u16>, Vec<u16>) = (s.download(act1.addr(), m * n).unwrap(), s.download(act2.addr(), m * n).unwrap());
+            assert_eq!(x1, x2, "fused gate/up differs");
+        }
         // The quantized activations approximate x.
         let mut err = 0f64;
         for i in 0..m {

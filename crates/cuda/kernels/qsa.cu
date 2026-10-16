@@ -435,6 +435,9 @@ constexpr size_t MMA_ATT_SMEM = (size_t)(2 * 16 * MPAD + 2 * MT * MPAD + 2 * 16 
 // FP8 caches: each thread prefetches its share of a tile's raw rows into registers (8 chunks of 16 values).
 constexpr int KV8_CHUNKS = MT * HD / 16 / (MW * 32);
 
+// Split q and the probabilities into hi + lo BF16 parts (about 16 mantissa bits); false: single BF16.
+constexpr bool ATT_SPLIT = false;
+
 SQ_DEVICE void split_bf16(float x, __nv_bfloat16& hi, __nv_bfloat16& lo) {
     hi = f2bf(x);
     lo = f2bf(x - bf2f(hi));
@@ -562,7 +565,7 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
                 mma_bf16(sacc[j], ah, &b[j * 2]);
-                mma_bf16(sacc[j], al, &b[j * 2]);
+                if constexpr (ATT_SPLIT) mma_bf16(sacc[j], al, &b[j * 2]);
             }
         }
         const int nk = min(MT, nkeys - tile * MT);
@@ -639,9 +642,9 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
                     const int m = lane >> 3, rr = lane & 7;
                     ldmatrix_x4_trans(b, Vs + (kk + (m & 1) * 8 + rr) * MPAD + warp * 64 + nt * 8 + (m >> 1) * 8);
                     mma_bf16(o[nt], ah, &b[0]);
-                    mma_bf16(o[nt], al, &b[0]);
+                    if constexpr (ATT_SPLIT) mma_bf16(o[nt], al, &b[0]);
                     mma_bf16(o[nt + 1], ah, &b[2]);
-                    mma_bf16(o[nt + 1], al, &b[2]);
+                    if constexpr (ATT_SPLIT) mma_bf16(o[nt + 1], al, &b[2]);
                 }
             }
         }

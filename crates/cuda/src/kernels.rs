@@ -271,10 +271,27 @@ pub fn fp4_gather(s: &Stream, src: u64, t: usize, k: usize, pair_row: u64, dst: 
 /// W4A4 grouped expert GEMM over quantized rows (`rows` of them in an `fp4_rows_layout` buffer at `a`).
 #[allow(clippy::too_many_arguments)]
 pub fn moe_fp4_gemm(s: &Stream, a: u64, rows: usize, w_ptr: u64, s_ptr: u64, ws2: u64, offsets: u64, tile_expert: u64, tile_row: u64, num_tiles: u64, max_tiles: usize, y: u64, n: usize, k: usize) -> Result<()> {
+    moe_fp4_gemm_out(s, a, rows, w_ptr, s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, max_tiles, y, n, k, false)
+}
+
+/// [`moe_fp4_gemm`] with an FP32 (`bf16_out` false) or BF16 output.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_fp4_gemm_out(s: &Stream, a: u64, rows: usize, w_ptr: u64, s_ptr: u64, ws2: u64, offsets: u64, tile_expert: u64, tile_row: u64, num_tiles: u64, max_tiles: usize, y: u64, n: usize, k: usize, bf16_out: bool) -> Result<()> {
     let (c, sc, r) = fp4_rows_layout(a, rows, k);
     launch!(
         "moe_fp4_gemm",
-        ffi::squash_moe_fp4_gemm(c as *const u8, sc as *const u8, f(r), w_ptr as *const u64, s_ptr as *const u64, f(ws2), i(offsets), i(tile_expert), i(tile_row), i(num_tiles), n32(max_tiles), fm(y), n32(n), n32(k), s.raw())
+        ffi::squash_moe_fp4_gemm(c as *const u8, sc as *const u8, f(r), w_ptr as *const u64, s_ptr as *const u64, f(ws2), i(offsets), i(tile_expert), i(tile_row), i(num_tiles), n32(max_tiles), pm(y), n32(n), n32(k), bf16_out as i32, s.raw())
+    )
+}
+
+/// W4A4 gate and up projections with SwiGLU in one grouped GEMM: act BF16 [rows, n] =
+/// silu(gate) * up, as [`moe_fp4_gemm`] twice followed by [`swiglu`].
+#[allow(clippy::too_many_arguments)]
+pub fn moe_fp4_gate_up(s: &Stream, a: u64, rows: usize, gate: (u64, u64, u64), up: (u64, u64, u64), offsets: u64, tile_expert: u64, tile_row: u64, num_tiles: u64, max_tiles: usize, act: u64, n: usize, k: usize) -> Result<()> {
+    let (c, sc, r) = fp4_rows_layout(a, rows, k);
+    launch!(
+        "moe_fp4_gate_up",
+        ffi::squash_moe_fp4_gate_up(c as *const u8, sc as *const u8, f(r), gate.0 as *const u64, gate.1 as *const u64, f(gate.2), up.0 as *const u64, up.1 as *const u64, f(up.2), i(offsets), i(tile_expert), i(tile_row), i(num_tiles), n32(max_tiles), pm(act), n32(n), n32(k), s.raw())
     )
 }
 
@@ -291,6 +308,12 @@ pub fn swiglu(s: &Stream, gate: u64, up: u64, ld: usize, width: usize, act: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
+/// [`moe_combine`] with BF16 expert outputs.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_combine_bf16(s: &Stream, yd: u64, pair_row: u64, top_w: u64, sg: u64, ld_sg: usize, sh: u64, y: u64, t: usize) -> Result<()> {
+    launch!("moe_combine_bf16", ffi::squash_moe_combine_bf16(p(yd), i(pair_row), f(top_w), f(sg), n32(ld_sg), f(sh), fm(y), n32(t), s.raw()))
+}
+
 pub fn moe_combine(s: &Stream, yd: u64, pair_row: u64, top_w: u64, sg: u64, ld_sg: usize, sh: u64, y: u64, t: usize) -> Result<()> {
     launch!("moe_combine", ffi::squash_moe_combine(f(yd), i(pair_row), f(top_w), f(sg), n32(ld_sg), f(sh), fm(y), n32(t), s.raw()))
 }
