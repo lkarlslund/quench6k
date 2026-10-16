@@ -148,8 +148,6 @@ pub struct Session {
     capture_buf: Option<DeviceBuffer>,
     prompt_site: Option<CaptureSite>,
     vision: Option<crate::vision::VisionModel>,
-    /// Image spans of the request being prefilled on slot 0.
-    mm_pending: Vec<std::sync::Arc<forward::MmSpan>>,
     /// Prompt positions whose `kv_tokens` entry is an image's content key instead of its placeholder
     /// ID (the first placeholder of each image), so the cache matches images by content.
     kv_marks: Vec<(usize, i32)>,
@@ -248,7 +246,6 @@ impl Session {
             capture_buf: None,
             prompt_site: None,
             vision: None,
-            mm_pending: Vec::new(),
             kv_marks: Vec::new(),
         })
     }
@@ -312,9 +309,10 @@ impl Session {
 
     /// Encodes the request's images. When device memory runs out, GPU snapshots are freed (periodic
     /// ones first; others are saved to the context store first) and the encoding retried.
-    fn encode_images(&mut self, s: &Stream, p: &GenParams) -> Result<Vec<std::sync::Arc<forward::MmSpan>>> {
+    /// Image spans for a prefill from position `from` (see [`VisionModel::spans`](crate::vision::VisionModel::spans)).
+    fn encode_images(&mut self, s: &Stream, images: &[std::sync::Arc<ImageInput>], from: usize) -> Result<Vec<std::sync::Arc<forward::MmSpan>>> {
         loop {
-            match self.encode_images_once(s, p) {
+            match self.encode_images_once(s, images, from) {
                 Err(e) if format!("{e:#}").contains("out of memory") && !self.snapshots.is_empty() => {
                     let i = self.snapshots.iter().position(|sn| sn.periodic).unwrap_or(0);
                     let pos = self.snapshots[i].pos;
@@ -329,14 +327,14 @@ impl Session {
         }
     }
 
-    fn encode_images_once(&self, s: &Stream, p: &GenParams) -> Result<Vec<std::sync::Arc<forward::MmSpan>>> {
-        if p.images.is_empty() {
+    fn encode_images_once(&self, s: &Stream, images: &[std::sync::Arc<ImageInput>], from: usize) -> Result<Vec<std::sync::Arc<forward::MmSpan>>> {
+        if images.is_empty() {
             return Ok(Vec::new());
         }
         let vm = self.vision.as_ref().ok_or_else(|| anyhow::anyhow!("image input needs the vision tower (--vision)"))?;
         let mut spans = Vec::new();
-        for im in &p.images {
-            spans.extend(vm.spans(s, &im.input, &im.starts)?.into_iter().map(std::sync::Arc::new));
+        for im in images {
+            spans.extend(vm.spans(s, &im.input, &im.starts, from)?.into_iter().map(std::sync::Arc::new));
         }
         spans.sort_by_key(|sp| sp.start);
         Ok(spans)
@@ -356,9 +354,7 @@ impl Session {
         let speculate = speculate && !p.capture;
         self.prompt_site = None;
         let capture = if p.capture { Some(forward::CaptureTarget { pos: prompt.len() - 1, buf: self.capture_buf()? }) } else { None };
-        let spans = self.encode_images(s, p)?;
         if slot == 0 {
-            self.mm_pending = spans;
             self.state.reset(s)?;
             self.state.set_steering_strength(s, p.steering_strength)?;
             self.ws.capture = capture;
@@ -382,6 +378,7 @@ impl Session {
             run.pending = tok;
             return Ok((run, vec![tok]));
         }
+        let spans = self.encode_images(s, &p.images, 0)?;
         let aux = self.aux.as_mut().expect("second slot");
         aux.state.reset(s)?;
         aux.state.mm = spans;
@@ -627,7 +624,6 @@ impl Session {
         // Snapshots past the common prefix describe tokens the new prompt overwrites.
         self.snapshots.retain(|sn| sn.pos <= lcp);
         self.state.reset(s)?;
-        self.state.mm = std::mem::take(&mut self.mm_pending);
         self.kv_marks = marks;
         let best = self.snapshots.iter().enumerate().filter(|(_, sn)| sn.pos < prompt.len()).max_by_key(|(_, sn)| sn.pos).map(|(i, _)| i);
         let start = match best {
@@ -645,6 +641,8 @@ impl Session {
             }
         };
         self.reused = start;
+        // Images are encoded only from the restored position on.
+        self.state.mm = self.encode_images(s, images, start)?;
         if let Some(f) = progress {
             (f.0)(start, start);
         }
@@ -716,7 +714,6 @@ impl Session {
         if budget == 0 {
             return Ok((Finish::Length, 0));
         }
-        self.mm_pending = self.encode_images(s, p)?;
         self.prefill(model, s, prompt, &p.images, &p.boundaries, p.steering_strength, p.progress.as_ref())?;
         if p.temperature <= 0.0 || !p.capture {
             if p.temperature > 0.0 {

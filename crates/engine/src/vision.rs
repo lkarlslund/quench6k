@@ -263,11 +263,14 @@ pub fn preprocess_image(bytes: &[u8], min_pixels: usize, max_pixels: usize) -> R
 impl VisionModel {
     /// Encodes `input` into one span of placeholder tokens per temporal group (an image has one),
     /// starting at the given sequence indices (each group is its own MRoPE grid with t = 1).
-    pub fn spans(&self, s: &Stream, input: &VisionInput, starts: &[usize]) -> Result<Vec<crate::forward::MmSpan>> {
+    /// The image's spans in the text sequence. It is encoded only when a span reaches position `from`
+    /// or later (earlier ones lie in a restored prefix and need only their geometry, for positions).
+    pub fn spans(&self, s: &Stream, input: &VisionInput, starts: &[usize], from: usize) -> Result<Vec<crate::forward::MmSpan>> {
         let [t, h, w] = input.grid;
         ensure!(starts.len() == t, "{} span starts for {t} temporal groups", starts.len());
-        let emb = std::sync::Arc::new(self.encode(s, input)?);
         let (gh, gw) = (h / MERGE, w / MERGE);
+        let needed = starts.iter().any(|&st| st + gh * gw > from);
+        let emb = if needed { Some(std::sync::Arc::new(self.encode(s, input)?)) } else { None };
         let offsets: Vec<[i32; 3]> = (0..gh).flat_map(|r| (0..gw).map(move |c| [0, r as i32, c as i32])).collect();
         Ok(starts
             .iter()

@@ -74,7 +74,8 @@ pub struct SequenceState {
 pub struct MmSpan {
     pub start: usize,
     /// Merger output, FP32 [rows, 2560]; this span's rows start at `row`.
-    pub emb: std::sync::Arc<DeviceBuffer>,
+    /// None for an image inside a restored prefix (its rows are never embedded again).
+    pub emb: Option<std::sync::Arc<DeviceBuffer>>,
     pub row: usize,
     /// (t, h, w) offsets of each token from the span's base position.
     pub offsets: Vec<[i32; 3]>,
@@ -849,7 +850,8 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
         for sp in &state.mm {
             let (a, b) = (sp.start.max(first), (sp.start + sp.len()).min(first + t));
             if a < b {
-                k::embed_rows(s, sp.emb.addr() + ((sp.row + a - sp.start) * D * 4) as u64, b - a, ws.h + ((a - first) * H * 4) as u64)?;
+                let emb = sp.emb.as_ref().ok_or_else(|| anyhow::anyhow!("image span at {} was not encoded", sp.start))?;
+                k::embed_rows(s, emb.addr() + ((sp.row + a - sp.start) * D * 4) as u64, b - a, ws.h + ((a - first) * H * 4) as u64)?;
             }
         }
     }
