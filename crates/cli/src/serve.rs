@@ -40,7 +40,8 @@ struct Job {
 
 enum Msg {
     Token(i32),
-    Done(Finish),
+    /// Finished, with the prompt tokens served from the prefix cache.
+    Done(Finish, usize),
     Error(String),
 }
 
@@ -80,7 +81,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
             let tx = job.tx.clone();
             let result = session.generate(&model, &stream, &job.ids, &job.params, |tok| tx.send(Msg::Token(tok)).is_ok());
             let _ = match result {
-                Ok((finish, _)) => job.tx.send(Msg::Done(finish)),
+                Ok((finish, _)) => job.tx.send(Msg::Done(finish, session.reused)),
                 Err(e) => job.tx.send(Msg::Error(format!("{e:#}"))),
             };
         }
@@ -146,7 +147,7 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
         Some(a) => a as f32,
         None => app.default_strength,
     };
-    let params = GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength };
+    let params = GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids) };
     Ok(Prepared { ids, params, stops, thinking, tools, stream: req.get("stream").and_then(Value::as_bool).unwrap_or(false) })
 }
 
@@ -241,6 +242,7 @@ async fn full_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, id:
     let mut stream = TextStream::default();
     let (mut text, mut n, mut finish) = (String::new(), 0usize, Finish::Stop);
     let mut stopped = false;
+    let mut cached = 0usize;
     while let Some(msg) = rx.recv().await {
         match msg {
             Msg::Token(t) => {
@@ -256,8 +258,9 @@ async fn full_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, id:
                     }
                 }
             }
-            Msg::Done(f) => {
+            Msg::Done(f, c) => {
                 finish = f;
+                cached = c;
                 break;
             }
             Msg::Error(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -275,7 +278,8 @@ async fn full_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, id:
     Json(json!({
         "id": id, "object": "chat.completion", "created": now(), "model": app.name,
         "choices": [{"index": 0, "message": message, "finish_reason": reason}],
-        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n},
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n,
+                  "prompt_tokens_details": {"cached_tokens": cached}},
     }))
     .into_response()
 }
@@ -297,6 +301,7 @@ async fn stream_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, i
         let mut content_started = false;
         let mut finish = Finish::Stop;
         let mut stopped = false;
+        let mut cached = 0usize;
         while let Some(msg) = rx.recv().await {
             match msg {
                 Msg::Token(t) => {
@@ -346,8 +351,9 @@ async fn stream_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, i
                         break;
                     }
                 }
-                Msg::Done(f) => {
+                Msg::Done(f, c) => {
                     finish = f;
+                    cached = c;
                     break;
                 }
                 Msg::Error(e) => {
@@ -374,7 +380,8 @@ async fn stream_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, i
         let reason = if stopped { "stop" } else { finish_reason(finish, !calls.is_empty()) };
         let mut last = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": app.name,
                               "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]});
-        last["usage"] = json!({"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n});
+        last["usage"] = json!({"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n,
+                               "prompt_tokens_details": {"cached_tokens": cached}});
         let _ = out_tx.send(Ok(Event::default().data(last.to_string())));
         let _ = out_tx.send(Ok(Event::default().data("[DONE]")));
     });

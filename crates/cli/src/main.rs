@@ -503,7 +503,7 @@ fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, tempe
     let messages = serde_json::json!([{"role": "user", "content": prompt}]);
     let text = chat.render(&messages, None, Some(think), None)?;
     let ids = chat.encode(&text)?;
-    let params = squash_engine::session::GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: chat.stop_tokens.clone(), steering_strength: strength };
+    let params = squash_engine::session::GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: chat.stop_tokens.clone(), steering_strength: strength, boundaries: chat.boundaries(&ids) };
     let mut out = chat::TextStream::default();
     let t1 = std::time::Instant::now();
     let mut first = None;

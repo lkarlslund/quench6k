@@ -10,6 +10,7 @@ pub struct Chat {
     env: minijinja::Environment<'static>,
     /// Generation stops at these tokens (`generation_config.json` eos ids and `<|im_end|>`).
     pub stop_tokens: Vec<i32>,
+    im_start: Option<i32>,
 }
 
 impl Chat {
@@ -37,7 +38,8 @@ impl Chat {
                 stop_tokens.push(id as i32);
             }
         }
-        Ok(Self { tokenizer, env, stop_tokens })
+        let im_start = tokenizer.token_to_id("<|im_start|>").map(|i| i as i32);
+        Ok(Self { tokenizer, env, stop_tokens, im_start })
     }
 
     /// Renders `messages` (OpenAI-style JSON) with an open assistant turn.
@@ -67,6 +69,12 @@ impl Chat {
             ctx.insert("reasoning_effort".into(), Value::String(r.into()));
         }
         Ok(tmpl.render(minijinja::Value::from_serialize(&ctx))?)
+    }
+
+    /// Snapshot positions for prefix reuse: the start of the prompt's final turn (its last
+    /// `<|im_start|>`), which the next request of the same conversation shares.
+    pub fn boundaries(&self, ids: &[i32]) -> Vec<usize> {
+        self.im_start.and_then(|t| ids.iter().rposition(|&i| i == t)).into_iter().filter(|&p| p > 0).collect()
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<i32>> {

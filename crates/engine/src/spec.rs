@@ -56,14 +56,29 @@ impl SpecDecoder {
     /// Prefills a new `prompt` into the (reset) `state`, reusing this decoder's buffers so graphs captured
     /// for it stay valid.
     pub fn restart(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], chunk: usize) -> Result<()> {
-        ensure!(!prompt.is_empty(), "empty prompt");
         s.memset(self.pending.addr(), 0, H * 4)?;
+        self.prefill_from(model, state, ws, s, prompt, 0, chunk, &[], |_, _, _| Ok(()))
+    }
+
+    /// Prefills `prompt[start..]` into `state`, which already holds `prompt[..start]` (target and MTP
+    /// caches, recurrent state, and the pending row: see `pending_addr`). At each position in
+    /// `pauses` (ascending, in start..len) the chunking breaks and `at_pause(state, pos, pending)` runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_from(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], start: usize, chunk: usize, pauses: &[usize], mut at_pause: impl FnMut(&SequenceState, usize, u64) -> Result<()>) -> Result<()> {
+        ensure!(start < prompt.len(), "nothing to prefill");
+        ensure!(state.len() == start, "state holds {} tokens, expected {start}", state.len());
         let mut next = 0;
-        for c0 in (0..prompt.len()).step_by(chunk) {
-            let c = &prompt[c0..(c0 + chunk).min(prompt.len())];
+        let mut c0 = start;
+        let mut pause = pauses.iter().copied().filter(|&p| p > start && p < prompt.len()).peekable();
+        while c0 < prompt.len() {
+            let mut end = (c0 + chunk).min(prompt.len());
+            if let Some(&p) = pause.peek() {
+                end = end.min(p);
+            }
+            let c = &prompt[c0..end];
             let t = c.len();
             forward::forward(model, state, ws, s, c)?;
-            if c0 + t == prompt.len() {
+            if end == prompt.len() {
                 next = argmax_rows(model, &self.head, s, ws.out + ((t - 1) * D * 2) as u64, 1)?[0];
             }
             s.copy_d2d(ws.mtp_hin, self.pending.addr(), H * 4)?;
@@ -71,6 +86,11 @@ impl SpecDecoder {
             s.copy_d2d(self.pending.addr(), ws.h + (t - 1) as u64 * ROW, H * 4)?;
             forward::prepare_mtp(ws, c0, c)?;
             forward::forward_mtp(model, state, ws, s, t, ws.mtp_hin, None)?;
+            if pause.peek() == Some(&end) {
+                pause.next();
+                at_pause(state, end, self.pending.addr())?;
+            }
+            c0 = end;
         }
         s.synchronize()?;
         self.next = next;
@@ -80,6 +100,16 @@ impl SpecDecoder {
         self.draft_secs = 0.0;
         self.verify_secs = 0.0;
         Ok(())
+    }
+
+    /// Device address of the pending row (the target residual of the last committed position, H f32).
+    pub fn pending_addr(&self) -> u64 {
+        self.pending.addr()
+    }
+
+    /// Device address of the LM-head logits of the last prefilled prompt row (VOCAB f32).
+    pub fn last_logits_addr(&self) -> u64 {
+        self.head.logits_addr()
     }
 
     /// One draft-and-verify round; returns the tokens committed to the sequence (the previous `next`
