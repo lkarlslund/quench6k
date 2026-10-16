@@ -14,9 +14,11 @@ pub struct Chat {
 }
 
 impl Chat {
-    pub fn load(model_dir: &Path) -> Result<Self> {
+    /// `template`: a chat template file overriding the model's `chat_template.jinja`.
+    pub fn load(model_dir: &Path, template: Option<&Path>) -> Result<Self> {
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer.json: {e}"))?;
-        let source = std::fs::read_to_string(model_dir.join("chat_template.jinja")).context("chat_template.jinja")?;
+        let template_path = template.map(Path::to_path_buf).unwrap_or_else(|| model_dir.join("chat_template.jinja"));
+        let source = std::fs::read_to_string(&template_path).with_context(|| format!("chat template {}", template_path.display()))?;
         let mut env = minijinja::Environment::new();
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -77,6 +79,10 @@ impl Chat {
         self.im_start.and_then(|t| ids.iter().rposition(|&i| i == t)).into_iter().filter(|&p| p > 0).collect()
     }
 
+    pub fn token_id(&self, text: &str) -> Option<i32> {
+        self.tokenizer.token_to_id(text).map(|i| i as i32)
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<i32>> {
         let enc = self.tokenizer.encode(text, false).map_err(|e| anyhow!("tokenize: {e}"))?;
         Ok(enc.get_ids().iter().map(|&i| i as i32).collect())
@@ -97,6 +103,16 @@ pub struct TextStream {
 }
 
 impl TextStream {
+    /// A stream continuing after `ids` (already shown).
+    pub fn after(chat: &Chat, ids: &[i32]) -> Result<Self> {
+        let sent = chat.decode(ids, true)?.len();
+        Ok(Self { ids: ids.to_vec(), sent })
+    }
+
+    pub fn ids(&self) -> &[i32] {
+        &self.ids
+    }
+
     pub fn push(&mut self, chat: &Chat, id: i32) -> Result<String> {
         self.ids.push(id);
         let text = chat.decode(&self.ids, true)?;

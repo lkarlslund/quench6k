@@ -185,6 +185,13 @@ enum Command {
         /// Directory for the disk tier of stored contexts, kept across restarts.
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+        /// Chat template file overriding the model's chat_template.jinja.
+        #[arg(long)]
+        chat_template: Option<PathBuf>,
+        /// Regenerations of a tool call that fails validation (parse, declared function, required
+        /// parameters, schema types) before the output is returned as is.
+        #[arg(long, default_value_t = 2)]
+        tool_retries: usize,
     },
     /// Batched decode check: two fixture prompts decoded together must give each one's single-sequence
     /// greedy tokens, bit for bit; also times both.
@@ -319,8 +326,8 @@ fn main() -> Result<()> {
             }
         }
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, &steer)?,
-        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir } => {
-            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir })?
+        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries } => {
+            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries })?
         }
         Command::BatchCheck { model, fixture, n } => batch_check(&model, &fixture, n)?,
         Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, steer } => {
@@ -513,7 +520,7 @@ fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathB
 #[allow(clippy::too_many_arguments)]
 fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32, top_k: usize, seed: u64, think: bool, context: usize, steer: &SteerArgs) -> Result<()> {
     use std::io::Write;
-    let chat = chat::Chat::load(model_dir)?;
+    let chat = chat::Chat::load(model_dir, None)?;
     let (mut model, stream) = load(model_dir, Precision::Int8Group, true)?;
     let strength = steer.attach(&mut model, &stream)?;
     let t0 = std::time::Instant::now();

@@ -31,6 +31,8 @@ pub struct ServeOptions {
     pub steer: crate::SteerArgs,
     pub cache_host_gib: f64,
     pub cache_dir: Option<PathBuf>,
+    pub chat_template: Option<PathBuf>,
+    pub tool_retries: usize,
 }
 
 /// Identity of the served model and numerics for stored contexts: config.json plus the profile.
@@ -71,10 +73,13 @@ struct App {
     /// Steering strength used when a request carries none (the loaded pack's, or 0).
     default_strength: f32,
     steering: bool,
+    tool_retries: usize,
+    tool_call_token: Option<i32>,
 }
 
 pub fn run(opts: ServeOptions) -> Result<()> {
-    let chat = Chat::load(&opts.model)?;
+    let chat = Chat::load(&opts.model, opts.chat_template.as_deref())?;
+    let tool_call_token = chat.token_id("<tool_call>");
     let (jobs_tx, jobs_rx) = mpsc::channel::<Work>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<f32>>();
     let (model_dir, context, drafts, steer) = (opts.model.clone(), opts.context, opts.drafts, opts.steer.clone());
@@ -122,7 +127,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         }
     });
     let default_strength = ready_rx.recv().context("worker thread")??;
-    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering });
+    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, tool_retries: opts.tool_retries, tool_call_token });
     let router = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -221,9 +226,21 @@ fn parse_output(text: &str, thinking: bool, tools: Option<&Value>) -> (Option<St
     (reasoning, content.to_string(), calls)
 }
 
-/// `<function=NAME>` then `<parameter=ARG>\nvalue\n</parameter>` blocks. Values are kept as strings
+/// `<function=NAME>` then `<parameter=ARG>\nvalue\n</parameter>` blocks (or a JSON object). Values are kept as strings
 /// when the tool schema says so, otherwise parsed as JSON when they are valid JSON.
 fn parse_tool_call(body: &str, tools: Option<&Value>) -> Option<Value> {
+    // JSON style (hermes): {"name": ..., "arguments": {...}}.
+    if body.trim_start().starts_with('{') {
+        let v: Value = serde_json::from_str(body.trim()).ok()?;
+        let name = v.get("name")?.as_str()?.to_string();
+        let args = match v.get("arguments") {
+            Some(Value::String(a)) => serde_json::from_str::<Value>(a).ok()?,
+            Some(a @ Value::Object(_)) => a.clone(),
+            None => json!({}),
+            _ => return None,
+        };
+        return Some(json!({"name": name, "arguments": args.to_string()}));
+    }
     let f = body.find("<function=")? + "<function=".len();
     let name_end = body[f..].find('>')? + f;
     let name = body[f..name_end].trim().to_string();
@@ -260,13 +277,8 @@ async fn chat_completions(State(app): State<Arc<App>>, Json(req): Json<Value>) -
         Ok(p) => p,
         Err(r) => return r,
     };
-    let (tx, rx) = tmpsc::unbounded_channel();
-    let prompt_tokens = p.ids.len();
-    if app.jobs.send(Work::Generate(Job { ids: p.ids, params: p.params, tx })).is_err() {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "generation worker stopped");
-    }
     let id = format!("chatcmpl-{}", now());
-    if p.stream { stream_response(app, rx, id, prompt_tokens, p.stops, p.thinking, p.tools).await } else { full_response(app, rx, id, prompt_tokens, p.stops, p.thinking, p.tools).await }
+    if p.stream { stream_response(app, p, id).await } else { full_response(app, p, id).await }
 }
 
 /// Appends `piece` to `text` and reports whether a stop string now occurs (text cut before it).
@@ -280,35 +292,13 @@ fn apply_stops(text: &mut String, stops: &[String]) -> bool {
     false
 }
 
-async fn full_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, id: String, prompt_tokens: usize, stops: Vec<String>, thinking: bool, tools: Option<Value>) -> Response {
-    let mut stream = TextStream::default();
-    let (mut text, mut n, mut finish) = (String::new(), 0usize, Finish::Stop);
-    let mut stopped = false;
-    let mut cached = 0usize;
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            Msg::Token(t) => {
-                n += 1;
-                if !stopped {
-                    match stream.push(&app.chat, t) {
-                        Ok(piece) => text.push_str(&piece),
-                        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-                    }
-                    if apply_stops(&mut text, &stops) {
-                        stopped = true;
-                        rx.close();
-                    }
-                }
-            }
-            Msg::Done(f, c) => {
-                finish = f;
-                cached = c;
-                break;
-            }
-            Msg::Error(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
-        }
-    }
-    let (reasoning, content, calls) = parse_output(&text, thinking, tools.as_ref());
+async fn full_response(app: Arc<App>, p: Prepared, id: String) -> Response {
+    let (seg, n, finish, cached) = match generate(&app, &p, |_| {}).await {
+        Ok(r) => r,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let prompt_tokens = p.ids.len();
+    let (reasoning, content, calls) = parse_output(&seg.text, p.thinking, p.tools.as_ref());
     let mut message = json!({"role": "assistant", "content": if content.is_empty() && !calls.is_empty() { Value::Null } else { Value::String(content) }});
     if let Some(r) = reasoning {
         message["reasoning_content"] = Value::String(r);
@@ -316,7 +306,7 @@ async fn full_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, id:
     if !calls.is_empty() {
         message["tool_calls"] = Value::Array(calls.clone());
     }
-    let reason = if stopped { "stop" } else { finish_reason(finish, !calls.is_empty()) };
+    let reason = if seg.stopped { "stop" } else { finish_reason(finish, !calls.is_empty()) };
     Json(json!({
         "id": id, "object": "chat.completion", "created": now(), "model": app.name,
         "choices": [{"index": 0, "message": message, "finish_reason": reason}],
@@ -409,11 +399,9 @@ impl Segmenter {
     }
 }
 
-/// Receives the generation, feeding decoded text to `on_seg`; returns (segmenter, tokens, finish,
-/// cached prompt tokens) or an error message.
-async fn drive(app: &App, rx: &mut tmpsc::UnboundedReceiver<Msg>, stops: &[String], thinking: bool, mut on_seg: impl FnMut(Seg)) -> Result<(Segmenter, usize, Finish, usize), String> {
-    let mut stream = TextStream::default();
-    let mut seg = Segmenter::new(thinking);
+/// Receives one generation job's tokens, feeding decoded text through the segmenter to `on_seg`;
+/// returns (tokens, finish, cached prompt tokens) or an error message.
+async fn drive(app: &App, rx: &mut tmpsc::UnboundedReceiver<Msg>, stops: &[String], seg: &mut Segmenter, stream: &mut TextStream, on_seg: &mut impl FnMut(Seg)) -> Result<(usize, Finish, usize), String> {
     let mut n = 0usize;
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -430,14 +418,108 @@ async fn drive(app: &App, rx: &mut tmpsc::UnboundedReceiver<Msg>, stops: &[Strin
                     rx.close();
                 }
             }
-            Msg::Done(f, c) => return Ok((seg, n, f, c)),
+            Msg::Done(f, c) => return Ok((n, f, c)),
             Msg::Error(e) => return Err(e),
         }
     }
-    Ok((seg, n, Finish::Cancelled, 0))
+    Ok((n, Finish::Cancelled, 0))
 }
 
-async fn stream_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, id: String, prompt_tokens: usize, stops: Vec<String>, thinking: bool, tools: Option<Value>) -> Response {
+/// Runs a prepared request to completion. When the output contains tool calls that fail validation,
+/// the text before the first `<tool_call>` is kept and the call is regenerated from there (sampled, a
+/// new seed per attempt) up to `tool_retries` times, so a malformed call is retried instead of being
+/// returned as text. Returns (segmenter, generated tokens, finish, cached prompt tokens).
+async fn generate(app: &App, p: &Prepared, mut on_seg: impl FnMut(Seg)) -> Result<(Segmenter, usize, Finish, usize), String> {
+    let mut seg = Segmenter::new(p.thinking);
+    let mut stream = TextStream::default();
+    let (mut total, mut cached_first) = (0usize, None);
+    let mut params = p.params.clone();
+    let mut ids = p.ids.clone();
+    for attempt in 0..=app.tool_retries {
+        let (tx, mut rx) = tmpsc::unbounded_channel();
+        app.jobs.send(Work::Generate(Job { ids: ids.clone(), params: params.clone(), tx })).map_err(|_| "generation worker stopped".to_string())?;
+        let (n, finish, cached) = drive(app, &mut rx, &p.stops, &mut seg, &mut stream, &mut on_seg).await?;
+        total += n;
+        cached_first.get_or_insert(cached);
+        let (Some(tools), Some(tc)) = (p.tools.as_ref(), app.tool_call_token) else { return Ok((seg, total, finish, cached_first.unwrap_or(0))) };
+        let body = if p.thinking { seg.text.find("</think>").map(|i| &seg.text[i + "</think>".len()..]).unwrap_or("") } else { seg.text.as_str() };
+        let problem = match validate_calls(body, tools) {
+            // SQUASH_TEST_TOOL_RETRY: treat the first attempt's tool calls as invalid (exercises retries).
+            Ok(()) if attempt == 0 && body.contains("<tool_call>") && std::env::var_os("SQUASH_TEST_TOOL_RETRY").is_some() => Some("forced by SQUASH_TEST_TOOL_RETRY".to_string()),
+            Ok(()) => None,
+            Err(e) => Some(e),
+        };
+        let Some(problem) = problem else { return Ok((seg, total, finish, cached_first.unwrap_or(0))) };
+        let generated = stream.ids().to_vec();
+        let Some(at) = generated.iter().position(|&t| t == tc) else { return Ok((seg, total, finish, cached_first.unwrap_or(0))) };
+        if attempt == app.tool_retries || params.max_tokens <= n {
+            eprintln!("tool call still invalid after {attempt} retries: {problem}");
+            return Ok((seg, total, finish, cached_first.unwrap_or(0)));
+        }
+        eprintln!("tool call invalid ({problem}); regenerating it (attempt {})", attempt + 1);
+        // Rewind to just before the tool call and continue from there.
+        let prefix = &generated[..at];
+        // Everything generated before <tool_call> (reasoning included) stays as shown.
+        seg.text = app.chat.decode(prefix, true).map_err(|e| format!("{e:#}"))?;
+        seg.sent = seg.sent.min(seg.text.len());
+        seg.stopped = false;
+        stream = TextStream::after(&app.chat, prefix).map_err(|e| format!("{e:#}"))?;
+        ids = p.ids.iter().chain(prefix).copied().collect();
+        params.max_tokens -= at.min(params.max_tokens);
+        params.temperature = params.temperature.max(0.7);
+        params.seed = params.seed.wrapping_add(0x9e37_79b9 * (attempt as u64 + 1));
+    }
+    unreachable!()
+}
+
+/// Checks every `<tool_call>` block: it parses, is closed, names a declared function, has the required
+/// parameters, and its values match the schema types.
+fn validate_calls(body: &str, tools: &Value) -> Result<(), String> {
+    let mut cursor = 0;
+    while let Some(start) = body[cursor..].find("<tool_call>") {
+        let b0 = cursor + start + "<tool_call>".len();
+        let end = body[b0..].find("</tool_call>").ok_or("unterminated <tool_call>")?;
+        let block = &body[b0..b0 + end];
+        let call = parse_tool_call(block, Some(tools)).ok_or("unparsable tool call")?;
+        if !block.contains("</function>") && !block.trim_start().starts_with('{') {
+            return Err("missing </function>".into());
+        }
+        let name = call["name"].as_str().unwrap_or("");
+        let schema = tools
+            .as_array()
+            .and_then(|a| a.iter().find(|t| t.pointer("/function/name").and_then(Value::as_str) == Some(name)))
+            .ok_or_else(|| format!("unknown function {name:?}"))?;
+        let args: Value = serde_json::from_str(call["arguments"].as_str().unwrap_or("{}")).map_err(|e| format!("arguments: {e}"))?;
+        let params = schema.pointer("/function/parameters");
+        for req in params.and_then(|p| p.get("required")).and_then(Value::as_array).into_iter().flatten() {
+            let r = req.as_str().unwrap_or("");
+            if args.get(r).is_none() {
+                return Err(format!("{name}: missing required parameter {r:?}"));
+            }
+        }
+        if let Some(props) = params.and_then(|p| p.get("properties")).and_then(Value::as_object) {
+            for (k, v) in args.as_object().into_iter().flatten() {
+                let Some(ty) = props.get(k).and_then(|p| p.get("type")).and_then(Value::as_str) else { continue };
+                let ok = match ty {
+                    "string" => v.is_string(),
+                    "integer" => v.is_i64() || v.is_u64(),
+                    "number" => v.is_number(),
+                    "boolean" => v.is_boolean(),
+                    "array" => v.is_array(),
+                    "object" => v.is_object(),
+                    _ => true,
+                };
+                if !ok {
+                    return Err(format!("{name}: parameter {k:?} is not a {ty}"));
+                }
+            }
+        }
+        cursor = b0 + end + "</tool_call>".len();
+    }
+    Ok(())
+}
+
+async fn stream_response(app: Arc<App>, p: Prepared, id: String) -> Response {
     let (out_tx, out_rx) = tmpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
     tokio::spawn(async move {
         let created = now();
@@ -447,7 +529,7 @@ async fn stream_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, i
             Ok(Event::default().data(data.to_string()))
         };
         let _ = out_tx.send(chunk(json!({"role": "assistant"}), None));
-        let result = drive(&app, &mut rx, &stops, thinking, |s| {
+        let result = generate(&app, &p, |s| {
             let delta = match s {
                 Seg::Reasoning(t) => json!({"reasoning_content": t}),
                 Seg::Content(t) => json!({"content": t}),
@@ -462,6 +544,7 @@ async fn stream_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, i
                 return;
             }
         };
+        let (thinking, tools, prompt_tokens) = (p.thinking, p.tools.clone(), p.ids.len());
         let (_, content, calls) = parse_output(&seg.text, thinking, tools.as_ref());
         if let Some(t) = seg.tail(&content) {
             let _ = out_tx.send(chunk(json!({"content": t}), None));
@@ -576,15 +659,11 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
         Ok(p) => p,
         Err(r) => return r,
     };
-    let (tx, mut rx) = tmpsc::unbounded_channel();
     let prompt_tokens = p.ids.len();
-    if app.jobs.send(Work::Generate(Job { ids: p.ids, params: p.params, tx })).is_err() {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "generation worker stopped");
-    }
     let id = format!("msg_{}", now());
-    let (thinking, tools, stops) = (p.thinking, p.tools, p.stops);
+    let (thinking, tools) = (p.thinking, p.tools.clone());
     if !p.stream {
-        let (seg, n, finish, cached) = match drive(&app, &mut rx, &stops, thinking, |_| {}).await {
+        let (seg, n, finish, cached) = match generate(&app, &p, |_| {}).await {
             Ok(r) => r,
             Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
         };
@@ -625,7 +704,7 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
             let delta = if reasoning { json!({"type": "thinking_delta", "thinking": text}) } else { json!({"type": "text_delta", "text": text}) };
             let _ = out_tx.send(ev("content_block_delta", json!({"type": "content_block_delta", "index": i, "delta": delta})));
         };
-        let result = drive(&app, &mut rx, &stops, thinking, |s| match s {
+        let result = generate(&app, &p, |s| match s {
             Seg::Reasoning(t) => emit(true, t),
             Seg::Content(t) => emit(false, t),
         })
@@ -658,4 +737,31 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
         let _ = out_tx.send(ev("message_stop", json!({"type": "message_stop"})));
     });
     Sse::new(UnboundedReceiverStream::new(out_rx)).keep_alive(KeepAlive::default()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tools() -> Value {
+        json!([{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}}])
+    }
+
+    #[test]
+    fn tool_call_validation() {
+        let ok = "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+        assert!(validate_calls(ok, &tools()).is_ok());
+        assert!(validate_calls("plain answer", &tools()).is_ok());
+        let unterminated = "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>";
+        assert!(validate_calls(unterminated, &tools()).is_err());
+        let unknown = "<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
+        assert!(validate_calls(unknown, &tools()).unwrap_err().contains("unknown function"));
+        let missing = "<tool_call>\n<function=get_weather>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+        assert!(validate_calls(missing, &tools()).unwrap_err().contains("missing required"));
+        let mistyped = "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n<parameter=days>\nthree\n</parameter>\n</function>\n</tool_call>";
+        assert!(validate_calls(mistyped, &tools()).unwrap_err().contains("not a integer"));
+        let json_style = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n</tool_call>";
+        assert!(validate_calls(json_style, &tools()).is_ok(), "{:?}", validate_calls(json_style, &tools()));
+    }
 }
