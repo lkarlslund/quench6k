@@ -174,3 +174,10 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
 - Full model after this session (FP8 KV): 8K prefill 14.7K tok/s, plain decode 190 tok/s, greedy MTP
   416 tok/s; 32K: 14.4K / 189 / 408 tok/s. Sampled MTP (temperature 1.0, top_p 0.95, top_k 20) on
   the service: 236-350 tok/s at 2.3-3.7 tokens per round, depending on the text.
+- Small-batch MoE routing uses warp-shuffle scans for its expert offsets and active list (-0.34% per
+  4-row verify step, exact).
+- Candidates left (larger work): verify-row attention sharing K/V gathers across the rows (the
+  prefill multi-query kernel does this for 4 queries, but verify rows must keep plain decode's per-row
+  arithmetic); a split multi-query attention for decode; per-expert dependencies between the expert
+  gate/up and down kernels (the 1-row version was 1.8% slower); the prefill multi-query attention
+  with 8 queries per block needs about 122 KB of shared memory, over the 99 KB limit.
