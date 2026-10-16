@@ -687,9 +687,16 @@ pub fn prepare_tokens(state: &mut SequenceState, ws: &mut Workspace, new_tokens:
 /// Second half of [`prepare`]: gathers the PLE rows of the last `t` tokens of `state`. Returns the bytes
 /// of step block to transfer.
 pub fn prepare_ple(model: &Model, state: &SequenceState, ws: &mut Workspace, t: usize) -> Result<usize> {
-    let start = state.len() - t;
     let layout = StepLayout::new(t);
-    let block = ws.step_host.as_mut_slice();
+    let region = &mut ws.step_host.as_mut_slice()[layout.ple..layout.ple + 2 * D * t];
+    gather_ple(model, state, t, 0, region);
+    Ok(layout.used(t))
+}
+
+/// Writes the PLE rows (BF16 [n, 2560]) of tokens j0 .. j0 + n of the last `t` tokens of `state` into
+/// `out`. Large ranges (prefill chunks) gather on several threads, each a contiguous range of tokens.
+fn gather_ple(model: &Model, state: &SequenceState, t: usize, j0: usize, out: &mut [u8]) {
+    let start = state.len() - t;
     let ple = model.layers[1].ple.as_ref().expect("layer 1 has PLE");
     let gather = |j0: usize, out: &mut [u8]| {
         let n = out.len() / (2 * D);
@@ -711,21 +718,35 @@ pub fn prepare_ple(model: &Model, state: &SequenceState, ws: &mut Workspace, t: 
             }
         }
     };
-    let region = &mut block[layout.ple..layout.ple + 2 * D * t];
-    // Large steps (prefill chunks) gather on several threads, each a contiguous range of tokens.
     const THREADS: usize = 16;
-    if t >= 256 {
-        let per = t.div_ceil(THREADS);
+    let n = out.len() / (2 * D);
+    if n >= 256 {
+        let per = n.div_ceil(THREADS);
         std::thread::scope(|sc| {
-            for (i, part) in region.chunks_mut(2 * D * per).enumerate() {
+            for (i, part) in out.chunks_mut(2 * D * per).enumerate() {
                 let gather = &gather;
-                sc.spawn(move || gather(i * per, part));
+                sc.spawn(move || gather(j0 + i * per, part));
             }
         });
     } else {
-        gather(0, region);
+        gather(j0, out);
     }
-    Ok(layout.used(t))
+}
+
+/// As [`prepare_ple`], uploading the rows on the side stream as they are gathered, in pieces of
+/// `PIECE` tokens (the upload of a piece, at the PCIe link's 3.6 GB/s, overlaps the gather of the
+/// next). The caller makes the main stream wait for `ws.join` before reading the rows.
+fn upload_ple(model: &Model, state: &SequenceState, ws: &mut Workspace, t: usize) -> Result<()> {
+    const PIECE: usize = 1024;
+    let layout = StepLayout::new(t);
+    let host = ws.step_host.as_mut_slice();
+    for j0 in (0..t).step_by(PIECE) {
+        let n = PIECE.min(t - j0);
+        let (o, len) = (layout.ple + 2 * D * j0, 2 * D * n);
+        gather_ple(model, state, t, j0, &mut host[o..o + len]);
+        unsafe { ws.side.copy_h2d(ws.step + o as u64, host.as_ptr().add(o), len)? };
+    }
+    ws.join.record(&ws.side)
 }
 
 /// Prepares a batched decode step: token `tokens[b]` for sequence `states[b]` (at most 4 sequences).
@@ -859,6 +880,8 @@ pub enum Part {
     Whole,
     BeforePle,
     FromPle,
+    /// As FromPle, with the PLE rows already uploaded (see [`forward`]).
+    Staged,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -870,13 +893,15 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
         Part::Whole => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? },
         Part::BeforePle => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), layout.ple)? },
         Part::FromPle => unsafe { s.copy_h2d(ws.step + layout.ple as u64, ws.step_host.as_ptr().add(layout.ple), bytes - layout.ple)? },
+        Part::Staged => {}
     }
+    let from_ple = matches!(part, Part::FromPle | Part::Staged);
     let spec = state.spec.as_ref().map(|sp| (sp.ctl.addr(), sp.ple_rec.addr(), defer));
     let steer = model.steering.as_ref().map(|p| (p.directions.addr(), p.ranks.addr(), p.masks.addr(), p.norm_preserve, state.steer_strength.addr()));
     let first = state.len() - t;
     let capture = ws.capture.filter(|c| c.pos >= first && c.pos < first + t).map(|c| (c.buf, c.pos - first));
     let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr(), spec, steer, batch: None, capture };
-    if part != Part::FromPle {
+    if !from_ple {
         op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, ctx.pos3, ctx.start, t));
         op!(prof, "embed", s, k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h));
         for sp in &state.mm {
@@ -888,11 +913,11 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
         }
     }
     // After layer 0 the deferred update is the MoE output in ws.y with weights in ws.inj.
-    let mut carry = Carry::new(ws, part == Part::FromPle);
+    let mut carry = Carry::new(ws, from_ple);
     let layers = match part {
         Part::Whole => 0..model.layers.len(),
         Part::BeforePle => 0..1,
-        Part::FromPle => 1..model.layers.len(),
+        Part::FromPle | Part::Staged => 1..model.layers.len(),
     };
     // Small batches (decode, verify rounds): optionally prefetch the next layer's static weights into L2
     // on a side stream while this layer runs (kbench variant l2.prefetch = MiB per layer, 0: off).
@@ -1364,13 +1389,16 @@ pub fn step_bytes(t: usize) -> usize {
 
 /// Eager step: [`prepare`] then [`forward_device`].
 /// The step is launched in two parts: token IDs, the embedding and layer 0 first, then (after the host
-/// gathers the PLE rows, overlapping layer 0 on the GPU) the PLE rows and the remaining layers.
+/// gathers the PLE rows, overlapping layer 0 on the GPU) the remaining layers. The PLE rows go up on the
+/// side stream piece by piece as they are gathered (see [`upload_ple`]); the main stream waits for
+/// them before layer 1, their first reader.
 pub fn forward(model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, new_tokens: &[i32]) -> Result<()> {
     let t = new_tokens.len();
     prepare_tokens(state, ws, new_tokens)?;
     forward_part(model, state, ws, s, t, 0, Part::BeforePle, false, None)?;
-    let bytes = prepare_ple(model, state, ws, t)?;
-    forward_part(model, state, ws, s, t, bytes, Part::FromPle, false, None)?;
+    upload_ple(model, state, ws, t)?;
+    s.wait(&ws.join)?;
+    forward_part(model, state, ws, s, t, 0, Part::Staged, false, None)?;
     // The pinned step block may be overwritten by the next prepare only after this step consumed it.
     s.synchronize()
 }
