@@ -776,3 +776,31 @@ fn ple_conv_tiled_matches_sequential() {
     assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "outputs differ");
     assert!(sa.iter().zip(&sb).all(|(x, y)| x.to_bits() == y.to_bits()), "state differs");
 }
+
+/// The fused MoE combine + residual update + norm equals moe_combine_bf16 then hc_combine_norm.
+#[test]
+fn hc_moe_combine_norm_matches() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x30e0_0001);
+    let t = 21usize;
+    let pairs = t * 10;
+    let yd = upload(&s, &to_bf16(&rng.vec(pairs * 2560)));
+    let pr: Vec<i32> = (0..pairs as i32).map(|i| (i * 7) % pairs as i32).collect();
+    let dpr = upload(&s, &pr);
+    let tw = upload(&s, &rng.vec(pairs));
+    let sg = upload(&s, &rng.vec(t * 5));
+    let sh = upload(&s, &rng.vec(t * 2560));
+    let inj = upload(&s, &rng.vec(t * 4));
+    let h0 = rng.vec(t * 10240);
+    let (ha, hb) = (upload(&s, &h0), upload(&s, &h0));
+    let (na, nb) = (DeviceBuffer::new(t * 10240 * 2).unwrap(), DeviceBuffer::new(t * 10240 * 2).unwrap());
+    let y = DeviceBuffer::new(t * 2560 * 4).unwrap();
+    kernels::moe_combine_bf16(&s, yd.addr(), dpr.addr(), tw.addr(), sg.addr(), 5, sh.addr(), y.addr(), t).unwrap();
+    kernels::hc_combine_norm(&s, ha.addr(), y.addr(), inj.addr(), na.addr(), t).unwrap();
+    kernels::hc_moe_combine_norm(&s, hb.addr(), yd.addr(), dpr.addr(), tw.addr(), sg.addr(), 5, sh.addr(), inj.addr(), nb.addr(), t).unwrap();
+    let (a, b): (Vec<f32>, Vec<f32>) = (s.download(ha.addr(), t * 10240).unwrap(), s.download(hb.addr(), t * 10240).unwrap());
+    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "residuals differ");
+    let (a, b): (Vec<u16>, Vec<u16>) = (s.download(na.addr(), t * 10240).unwrap(), s.download(nb.addr(), t * 10240).unwrap());
+    assert_eq!(a, b, "norms differ");
+}

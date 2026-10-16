@@ -160,6 +160,12 @@ pub fn hc_combine_norm(s: &Stream, h: u64, y: u64, inj: u64, n: u64, t: usize) -
     launch!("hc_combine_norm", ffi::squash_hc_combine_norm(fm(h), f(y), f(inj), pm(n), n32(t), s.raw()))
 }
 
+/// [`moe_combine_bf16`] then [`hc_combine_norm`] in one pass (same results; y is not written).
+#[allow(clippy::too_many_arguments)]
+pub fn hc_moe_combine_norm(s: &Stream, h: u64, yd: u64, pair_row: u64, top_w: u64, sg: u64, ld_sg: usize, sh: u64, inj: u64, n: u64, t: usize) -> Result<()> {
+    launch!("hc_moe_combine_norm", ffi::squash_hc_moe_combine_norm(fm(h), p(yd), i(pair_row), f(top_w), f(sg), n32(ld_sg), f(sh), f(inj), pm(n), n32(t), s.raw()))
+}
+
 pub fn hc_combine(s: &Stream, h: u64, y: u64, inj: u64, t: usize) -> Result<()> {
     launch!("hc_combine", ffi::squash_hc_combine(fm(h), f(y), f(inj), n32(t), s.raw()))
 }

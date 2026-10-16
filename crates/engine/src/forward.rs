@@ -460,12 +460,13 @@ fn project(s: &Stream, ws: &Workspace, x: u64, proj: &Proj, out: u64, t: usize) 
 /// injects, the injection weights to `ws.inj`.
 /// `pending`: the previous block's output, still to be added to the residual with the injection
 /// weights in `ws.inj` (fused with the norm).
-fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, pending: Option<u64>, out: u64, mut prof: Option<&mut Profiler>) -> Result<()> {
+fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, pending: Option<u64>, moe: Option<(u64, usize)>, out: u64, mut prof: Option<&mut Profiler>) -> Result<()> {
     let inj = if hc.injects { ws.inj } else { 0 };
     {
-        match pending {
-            Some(y) => op!(prof, "hc combine+norm", s, k::hc_combine_norm(s, ws.h, y, ws.inj, ws.n, t)),
-            None => op!(prof, "hc norm", s, k::grouped_rmsnorm(s, ws.h, 0, ws.n, t)),
+        match (pending, moe) {
+            (_, Some((sg, ld))) => op!(prof, "hc moe+combine+norm", s, k::hc_moe_combine_norm(s, ws.h, ws.yd, ws.pair_row, ws.top_w, sg, ld, ws.sh, ws.inj, ws.n, t)),
+            (Some(y), None) => op!(prof, "hc combine+norm", s, k::hc_combine_norm(s, ws.h, y, ws.inj, ws.n, t)),
+            (None, None) => op!(prof, "hc norm", s, k::grouped_rmsnorm(s, ws.h, 0, ws.n, t)),
         }
         if t > k::gemv_max_m() && fake_set("hc") {
             k::fake_mxfp8(s, ws.n, t, H, H)?;
@@ -827,6 +828,8 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
         layer_forward(i, &model.layers[i], state.gdn[i].as_ref(), rec, state.qsa[i].as_ref(), &ctx, &mut carry, prof.as_deref_mut())?;
     }
     if part == Part::BeforePle {
+        // The second part starts from ws.y.
+        carry.materialize(s, ws, t)?;
         return Ok(());
     }
     final_mixer(&model.final_hc, &ctx, &mut carry, prof)
@@ -860,13 +863,26 @@ struct LayerCtx<'a> {
 /// injection weights while writing its own.
 struct Carry {
     pending: Option<u64>,
+    /// The pending update is the MoE output still to be combined (BF16 expert outputs in ws.yd; the
+    /// shared-expert gate column and its row stride): the next HyperConnection combines it with its
+    /// norm, other readers materialize it into ws.y first.
+    moe: Option<(u64, usize)>,
     inj: u64,
     inj_next: u64,
 }
 
 impl Carry {
     fn new(ws: &Workspace, after_layer0: bool) -> Self {
-        Self { pending: if after_layer0 { Some(ws.y) } else { None }, inj: ws.inj, inj_next: ws.inj2 }
+        Self { pending: if after_layer0 { Some(ws.y) } else { None }, moe: None, inj: ws.inj, inj_next: ws.inj2 }
+    }
+
+    /// Turns a pending MoE combine into ws.y.
+    fn materialize(&mut self, s: &Stream, ws: &Workspace, t: usize) -> Result<()> {
+        if let Some((sg, ld)) = self.moe.take() {
+            k::moe_combine_bf16(s, ws.yd, ws.pair_row, ws.top_w, sg, ld, ws.sh, ws.y, t)?;
+            self.pending = Some(ws.y);
+        }
+        Ok(())
     }
 }
 
@@ -876,7 +892,7 @@ fn final_mixer(hc: &Hc, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut
         op!(prof, "hc_small", s, hyper_connection_small(s, ws, hc, t, carry.pending.take().map(|y| (y, carry.inj)), carry.inj_next, ws.out));
         Ok(())
     } else {
-        hyper_connection(s, ws, hc, t, carry.pending.take(), ws.out, prof)
+        hyper_connection(s, ws, hc, t, carry.pending.take(), carry.moe.take(), ws.out, prof)
     }
 }
 
@@ -887,6 +903,7 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
     let (ws, s, t, start, pos3) = (ctx.ws, ctx.s, ctx.t, ctx.start, ctx.pos3);
     let small = t <= k::gemv_max_m();
     if let Some(ple) = &layer.ple {
+        carry.materialize(s, ws, t)?;
         if let Some(y) = carry.pending.take() {
             op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, carry.inj, t));
         }
@@ -908,6 +925,7 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
     // Steering at the attention-input pre-mix point: the pending block output is committed first
     // (the same FMA the HC kernels would apply), so a zero strength leaves every value unchanged.
     if let Some((dirs, ranks, masks, norm_preserve, strength)) = ctx.steer.filter(|_| index < LAYERS) {
+        carry.materialize(s, ws, t)?;
         if let Some(y) = carry.pending.take() {
             op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, carry.inj, t));
         }
@@ -915,6 +933,7 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
     }
     let rec = ctx.capture.filter(|_| index < LAYERS).map(|(buf, row)| (buf + (index * CaptureLayout::BYTES) as u64, row));
     if let Some((buf, row)) = rec {
+        carry.materialize(s, ws, t)?;
         if let Some(y) = carry.pending.take() {
             op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, carry.inj, t));
         }
@@ -924,7 +943,7 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
         op!(prof, "hc_small", s, hyper_connection_small(s, ws, &layer.attn_hc, t, carry.pending.map(|y| (y, carry.inj)), carry.inj_next, ws.m));
         std::mem::swap(&mut carry.inj, &mut carry.inj_next);
     } else {
-        hyper_connection(s, ws, &layer.attn_hc, t, carry.pending.take(), ws.m, prof.as_deref_mut())?;
+        hyper_connection(s, ws, &layer.attn_hc, t, carry.pending.take(), carry.moe.take(), ws.m, prof.as_deref_mut())?;
     }
     if let Some((buf, row)) = rec {
         s.copy_d2d(buf + CaptureLayout::MIX as u64, ws.m + (row * D * 2) as u64, D * 2)?;
@@ -1044,7 +1063,7 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
         op!(prof, "hc_small", s, hyper_connection_small(s, ws, &layer.mlp_hc, t, Some((ws.y, carry.inj)), carry.inj_next, ws.m));
         std::mem::swap(&mut carry.inj, &mut carry.inj_next);
     } else {
-        hyper_connection(s, ws, &layer.mlp_hc, t, Some(ws.y), ws.m, prof.as_deref_mut())?;
+        hyper_connection(s, ws, &layer.mlp_hc, t, Some(ws.y), None, ws.m, prof.as_deref_mut())?;
     }
     let moe = &layer.moe;
     let (ld, x) = (moe.proj.n, ws.proj);
@@ -1129,7 +1148,10 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
     } else {
         op!(prof, "shared swiglu", s, k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
         op!(prof, "shared down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
-        if yd_bf16 {
+        if yd_bf16 && rec.is_none() {
+            // Combined by the next HyperConnection's norm kernel (or materialized by another reader).
+            carry.moe = Some((col(3), ld));
+        } else if yd_bf16 {
             op!(prof, "moe_combine", s, k::moe_combine_bf16(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
         } else {
             op!(prof, "moe_combine", s, k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
@@ -1143,7 +1165,9 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
     }
     // The block output is added to the residual by whatever reads it next (the next HyperConnection
     // fuses it with its norm).
-    carry.pending = Some(ws.y);
+    if carry.moe.is_none() {
+        carry.pending = Some(ws.y);
+    }
     Ok(())
 }
 

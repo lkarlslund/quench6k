@@ -187,6 +187,60 @@ extern "C" cudaError_t squash_hc_mix(const float* u, const void* n, const void* 
     SQ_RETURN_LAUNCH();
 }
 
+namespace {
+
+// The MoE combine (as combine_kernel with BF16 expert outputs) and hc_combine_norm in one pass: one
+// block of 256 per token computes y[t, :] = sum_k w[t, k] yd[row(t, k), :] + sigmoid(sg[t]) sh[t, :] in
+// registers, then for each stream h[t, s, :] += y * inj[t, s] and n = rmsnorm(h[t, s, :]). The same
+// arithmetic as the three kernels.
+constexpr int MOE_TOPK = 10;
+__global__ void __launch_bounds__(256) hc_moe_combine_norm_kernel(float* h, const __nv_bfloat16* __restrict__ yd,
+                                                                  const int* __restrict__ pair_row, const float* __restrict__ top_w,
+                                                                  const float* __restrict__ sg, int ld_sg, const float* __restrict__ sh,
+                                                                  const float* __restrict__ inj, __nv_bfloat16* n) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ float scratch[32];
+    const int t = blockIdx.x;
+    constexpr int PER = D / 256;
+    const float g = sigmoidf(sg[(size_t)t * ld_sg]);
+    float y[PER];
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int d = threadIdx.x + i * 256;
+        float acc = 0;
+#pragma unroll
+        for (int k = 0; k < MOE_TOPK; ++k) acc += top_w[t * MOE_TOPK + k] * (float)yd[(size_t)pair_row[t * MOE_TOPK + k] * D + d];
+        y[i] = acc + g * sh[(size_t)t * D + d];
+    }
+    for (int s = 0; s < S; ++s) {
+        float* x = h + (size_t)t * H + s * D;
+        const float a = inj[t * S + s];
+        float v[PER];
+        float ss = 0;
+#pragma unroll
+        for (int i = 0; i < PER; ++i) {
+            const int d = threadIdx.x + i * 256;
+            v[i] = __fmaf_rn(y[i], a, x[d]);
+            x[d] = v[i];
+            ss = __fmaf_rn(v[i], v[i], ss);
+        }
+        const float r = rsqrtf(block_sum(ss, scratch) / D + EPS);
+#pragma unroll
+        for (int i = 0; i < PER; ++i) n[(size_t)t * H + s * D + threadIdx.x + i * 256] = f2bf(__fmul_rn(__fmul_rn(v[i], r), 1.0f));
+    }
+}
+
+}  // namespace
+
+extern "C" cudaError_t squash_hc_moe_combine_norm(float* h, const void* yd, const int* pair_row, const float* top_w, const float* sg,
+                                                  int ld_sg, const float* sh, const float* inj, void* n, int T, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(hc_moe_combine_norm_kernel, T, 256, 0, st, h, static_cast<const __nv_bfloat16*>(yd), pair_row, top_w, sg, ld_sg,
+                              sh, inj, static_cast<__nv_bfloat16*>(n)));
+    SQ_RETURN_LAUNCH();
+}
+
 extern "C" cudaError_t squash_hc_combine_norm(float* h, const float* y, const float* inj, void* n, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     static_assert(D % 256 == 0, "D must be a multiple of 256");

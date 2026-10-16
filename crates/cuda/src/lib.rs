@@ -128,6 +128,7 @@ pub mod ffi {
         pub fn squash_moe_plan(top_i: *const i32, t: c_int, counts: *mut i32, cursor: *mut i32, offsets: *mut i32, tile_expert: *mut i32, tile_row: *mut i32, num_tiles: *mut i32, pair_row: *mut i32, tile_rows: c_int, stream: Stream) -> Error;
         pub fn squash_moe_gather(m: *const c_void, pair_row: *const i32, t: c_int, xs: *mut c_void, stream: Stream) -> Error;
         pub fn squash_fp4_tile_rows() -> c_int;
+        pub fn squash_hc_moe_combine_norm(h: *mut f32, yd: *const c_void, pair_row: *const i32, top_w: *const f32, sg: *const f32, ld_sg: c_int, sh: *const f32, inj: *const f32, n: *mut c_void, t: c_int, stream: Stream) -> Error;
         pub fn squash_gdn_conv_prep(x: *const f32, ldx: c_int, out: *mut f32, state: *mut f32, w: *const c_void, a: *const f32, b: *const f32, ldab: c_int, a_log: *const c_void, dt_bias: *const c_void, beta: *mut f32, g: *mut f32, t: c_int, stream: Stream) -> Error;
         pub fn squash_gemm_wide(x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, scale: *const f32, y: *mut f32, ldy: c_int, m: c_int, n: c_int, k: c_int, stream: Stream) -> Error;
         pub fn squash_gemm_bf16_f32_split(fmt: c_int, x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, scale: *const f32, y: *mut f32, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, partial: *mut f32, splits: c_int, stream: Stream) -> Error;
