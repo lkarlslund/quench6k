@@ -141,51 +141,75 @@ impl VisionModel {
         let n = input.patches();
         ensure!(input.pixels.len() == n * PATCH_DIM, "{} pixel values for {n} patches", input.pixels.len());
         let (pos, cos, sin) = self.tables(input.grid);
+        // Only the residual stream, q / k / v, the attention output and the RoPE tables are per patch
+        // (about 21 KB each: 350 MB for the largest default image); every row-wise step runs in blocks of
+        // ROWS patches through fixed buffers. Each output row's arithmetic is the same either way.
+        const ROWS: usize = 2048;
         let f32buf = |count: usize| DeviceBuffer::new(count * 4);
-        let pix = f32buf(n * PATCH_DIM)?;
-        s.upload(&pix, &input.pixels)?;
-        let (pos_d, cos_d, sin_d) = (f32buf(n * W)?, f32buf(n * HEAD_DIM)?, f32buf(n * HEAD_DIM)?);
-        s.upload(&pos_d, &pos)?;
-        s.upload(&cos_d, &cos)?;
-        s.upload(&sin_d, &sin)?;
-        let xb = DeviceBuffer::new(n * PATCH_DIM.max(FF_PAD) * 2)?;
-        let mb = DeviceBuffer::zeroed(n * FF_PAD * 2)?;
         let hbuf = f32buf(n * W)?;
-        let y = f32buf(n * 3 * W.max(FF))?;
         let (q, kk, v) = (f32buf(n * W)?, f32buf(n * W)?, f32buf(n * W)?);
         let att = DeviceBuffer::new(n * W * 2)?;
+        let (cos_d, sin_d) = (f32buf(n * HEAD_DIM)?, f32buf(n * HEAD_DIM)?);
+        s.upload(&cos_d, &cos)?;
+        s.upload(&sin_d, &sin)?;
+        let r = ROWS.min(n);
+        let xb = DeviceBuffer::new(r * PATCH_DIM.max(W) * 2)?;
+        // GEMM outputs: qkv [r, 3W], fc1 [r, FF], and smaller.
+        let y = f32buf(r * (3 * W).max(FF))?;
+        let mb = DeviceBuffer::zeroed(r * FF_PAD * 2)?;
         let gemm = |x: u64, wt: u64, out: u64, m: usize, nn: usize, kd: usize| k::gemm_f32(s, x, kd, WeightFormat::Bf16, wt, kd, 0, out, nn, m, nn, kd, 1.0, false);
+        let blocks = || (0..n).step_by(ROWS).map(move |r0| (r0, ROWS.min(n - r0)));
+        let f32_at = |b: &DeviceBuffer, row: usize, width: usize| b.addr() + (row * width * 4) as u64;
 
         // Patch embedding (Conv3d with stride = kernel, i.e. a linear map of each patch) + position.
-        k::to_bf16(s, pix.addr(), n * PATCH_DIM, xb.addr())?;
-        gemm(xb.addr(), self.w("patch_embed.proj.weight")?, y.addr(), n, W, PATCH_DIM)?;
-        k::vit_residual(s, hbuf.addr(), y.addr(), self.w("patch_embed.proj.bias")?, pos_d.addr(), n, W, true)?;
+        {
+            let (pix, pos_d) = (f32buf(r * PATCH_DIM)?, f32buf(r * W)?);
+            for (r0, m) in blocks() {
+                s.upload(&pix, &input.pixels[r0 * PATCH_DIM..(r0 + m) * PATCH_DIM])?;
+                s.upload(&pos_d, &pos[r0 * W..(r0 + m) * W])?;
+                k::to_bf16(s, pix.addr(), m * PATCH_DIM, xb.addr())?;
+                gemm(xb.addr(), self.w("patch_embed.proj.weight")?, y.addr(), m, W, PATCH_DIM)?;
+                k::vit_residual(s, f32_at(&hbuf, r0, W), y.addr(), self.w("patch_embed.proj.bias")?, pos_d.addr(), m, W, true)?;
+            }
+            // The uploads read host memory asynchronously: finish before the buffers are freed.
+            s.synchronize()?;
+        }
 
         let seg = h * w;
         for b in 0..DEPTH {
             let p = |name: &str| self.w(&format!("blocks.{b}.{name}"));
-            k::vit_layernorm(s, hbuf.addr(), n, W, p("norm1.weight")?, p("norm1.bias")?, xb.addr())?;
-            gemm(xb.addr(), p("attn.qkv.weight")?, y.addr(), n, 3 * W, W)?;
-            k::vit_qkv_rope(s, y.addr(), p("attn.qkv.bias")?, cos_d.addr(), sin_d.addr(), n, q.addr(), kk.addr(), v.addr())?;
+            for (r0, m) in blocks() {
+                k::vit_layernorm(s, f32_at(&hbuf, r0, W), m, W, p("norm1.weight")?, p("norm1.bias")?, xb.addr())?;
+                gemm(xb.addr(), p("attn.qkv.weight")?, y.addr(), m, 3 * W, W)?;
+                k::vit_qkv_rope(s, y.addr(), p("attn.qkv.bias")?, f32_at(&cos_d, r0, HEAD_DIM), f32_at(&sin_d, r0, HEAD_DIM), m, f32_at(&q, r0, W),
+                                f32_at(&kk, r0, W), f32_at(&v, r0, W))?;
+            }
             k::vit_attention(s, q.addr(), kk.addr(), v.addr(), n, seg, att.addr())?;
-            gemm(att.addr(), p("attn.proj.weight")?, y.addr(), n, W, W)?;
-            k::vit_residual(s, hbuf.addr(), y.addr(), p("attn.proj.bias")?, 0, n, W, false)?;
-            k::vit_layernorm(s, hbuf.addr(), n, W, p("norm2.weight")?, p("norm2.bias")?, xb.addr())?;
-            gemm(xb.addr(), p("mlp.linear_fc1.weight")?, y.addr(), n, FF, W)?;
-            k::vit_bias_act(s, y.addr(), n, FF, p("mlp.linear_fc1.bias")?, VitAct::GeluTanh, mb.addr(), FF_PAD)?;
-            gemm(mb.addr(), self.fc2[b].addr(), y.addr(), n, W, FF_PAD)?;
-            k::vit_residual(s, hbuf.addr(), y.addr(), p("mlp.linear_fc2.bias")?, 0, n, W, false)?;
+            for (r0, m) in blocks() {
+                let hrow = f32_at(&hbuf, r0, W);
+                gemm(att.addr() + (r0 * W * 2) as u64, p("attn.proj.weight")?, y.addr(), m, W, W)?;
+                k::vit_residual(s, hrow, y.addr(), p("attn.proj.bias")?, 0, m, W, false)?;
+                k::vit_layernorm(s, hrow, m, W, p("norm2.weight")?, p("norm2.bias")?, xb.addr())?;
+                gemm(xb.addr(), p("mlp.linear_fc1.weight")?, y.addr(), m, FF, W)?;
+                k::vit_bias_act(s, y.addr(), m, FF, p("mlp.linear_fc1.bias")?, VitAct::GeluTanh, mb.addr(), FF_PAD)?;
+                gemm(mb.addr(), self.fc2[b].addr(), y.addr(), m, W, FF_PAD)?;
+                k::vit_residual(s, hrow, y.addr(), p("mlp.linear_fc2.bias")?, 0, m, W, false)?;
+            }
         }
 
-        // Merger: LayerNorm per patch, then 4 consecutive patches form one 4608-wide row.
+        // Merger: LayerNorm per patch, then 4 consecutive patches form one 4608-wide row (blocks are
+        // multiples of 4 patches).
         let tokens = n / (MERGE * MERGE);
         let mw = W * MERGE * MERGE;
-        k::vit_layernorm(s, hbuf.addr(), n, W, self.w("merger.norm.weight")?, self.w("merger.norm.bias")?, xb.addr())?;
-        gemm(xb.addr(), self.w("merger.linear_fc1.weight")?, y.addr(), tokens, mw, mw)?;
-        k::vit_bias_act(s, y.addr(), tokens, mw, self.w("merger.linear_fc1.bias")?, VitAct::GeluErf, mb.addr(), mw)?;
-        gemm(mb.addr(), self.w("merger.linear_fc2.weight")?, y.addr(), tokens, OUT, mw)?;
         let out = f32buf(tokens * OUT)?;
-        k::vit_residual(s, out.addr(), y.addr(), self.w("merger.linear_fc2.bias")?, 0, tokens, OUT, true)?;
+        for (r0, m) in blocks() {
+            let (t0, tm) = (r0 / (MERGE * MERGE), m / (MERGE * MERGE));
+            k::vit_layernorm(s, f32_at(&hbuf, r0, W), m, W, self.w("merger.norm.weight")?, self.w("merger.norm.bias")?, xb.addr())?;
+            gemm(xb.addr(), self.w("merger.linear_fc1.weight")?, y.addr(), tm, mw, mw)?;
+            k::vit_bias_act(s, y.addr(), tm, mw, self.w("merger.linear_fc1.bias")?, VitAct::GeluErf, mb.addr(), mw)?;
+            gemm(mb.addr(), self.w("merger.linear_fc2.weight")?, y.addr(), tm, OUT, mw)?;
+            k::vit_residual(s, f32_at(&out, t0, OUT), y.addr(), self.w("merger.linear_fc2.bias")?, 0, tm, OUT, true)?;
+        }
         s.synchronize()?;
         Ok(out)
     }

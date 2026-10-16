@@ -310,7 +310,26 @@ impl Session {
         self.vision.is_some()
     }
 
-    fn encode_images(&self, s: &Stream, p: &GenParams) -> Result<Vec<std::sync::Arc<forward::MmSpan>>> {
+    /// Encodes the request's images. When device memory runs out, GPU snapshots are freed (periodic
+    /// ones first; others are saved to the context store first) and the encoding retried.
+    fn encode_images(&mut self, s: &Stream, p: &GenParams) -> Result<Vec<std::sync::Arc<forward::MmSpan>>> {
+        loop {
+            match self.encode_images_once(s, p) {
+                Err(e) if format!("{e:#}").contains("out of memory") && !self.snapshots.is_empty() => {
+                    let i = self.snapshots.iter().position(|sn| sn.periodic).unwrap_or(0);
+                    let pos = self.snapshots[i].pos;
+                    if !self.snapshots[i].periodic {
+                        self.stash(pos)?;
+                    }
+                    self.snapshots.remove(i);
+                    eprintln!("image encoder out of memory: freed the snapshot at {pos}, retrying");
+                }
+                r => return r,
+            }
+        }
+    }
+
+    fn encode_images_once(&self, s: &Stream, p: &GenParams) -> Result<Vec<std::sync::Arc<forward::MmSpan>>> {
         if p.images.is_empty() {
             return Ok(Vec::new());
         }
