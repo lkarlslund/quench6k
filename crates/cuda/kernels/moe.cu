@@ -377,31 +377,37 @@ __global__ void __launch_bounds__(512) route_small_kernel(const float* __restric
         }
     }
     __syncthreads();
-    // exclusive scan of counts -> offsets; compact active experts
+    // Inclusive scans over the 512 experts (counts -> offsets; 0/1 flags -> active list): warp
+    // scans, then the warp totals (integer sums: the same results as any scan order).
     const int c = s_count[tid];
-    s_scan[tid] = c;
-    __syncthreads();
-    for (int off = 1; off < E; off <<= 1) {
-        const int a = tid >= off ? s_scan[tid - off] : 0;
-        __syncthreads();
-        s_scan[tid] += a;
-        __syncthreads();
-    }
-    offsets[tid] = s_scan[tid] - c;
-    if (tid == E - 1) offsets[E] = s_scan[tid];
-    __syncthreads();
-    // active list: reuse s_count as a 0/1 flag scan
     const int flag = c > 0;
-    s_count[tid] = flag;
-    __syncthreads();
-    for (int off = 1; off < E; off <<= 1) {
-        const int a = tid >= off ? s_count[tid - off] : 0;
-        __syncthreads();
-        s_count[tid] += a;
-        __syncthreads();
+    __shared__ int s_wc[E / 32], s_wf[E / 32];
+    int ic = c, ifl = flag;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int yc = __shfl_up_sync(0xffffffff, ic, o), yf = __shfl_up_sync(0xffffffff, ifl, o);
+        if (lane >= o) ic += yc, ifl += yf;
     }
-    if (flag) active[s_count[tid] - 1] = tid;
-    if (tid == E - 1) *num_active = s_count[tid];
+    if (lane == 31) s_wc[warp] = ic, s_wf[warp] = ifl;
+    __syncthreads();
+    if (warp == 0) {
+        int wc = lane < E / 32 ? s_wc[lane] : 0, wf = lane < E / 32 ? s_wf[lane] : 0;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int yc = __shfl_up_sync(0xffffffff, wc, o), yf = __shfl_up_sync(0xffffffff, wf, o);
+            if (lane >= o) wc += yc, wf += yf;
+        }
+        if (lane < E / 32) s_wc[lane] = wc - s_wc[lane], s_wf[lane] = wf - s_wf[lane];  // exclusive
+    }
+    __syncthreads();
+    ic += s_wc[warp];
+    ifl += s_wf[warp];
+    s_scan[tid] = ic;
+    offsets[tid] = ic - c;
+    if (tid == E - 1) offsets[E] = ic;
+    if (flag) active[ifl - 1] = tid;
+    if (tid == E - 1) *num_active = ifl;
+    __syncthreads();
     // rows: pairs ordered by (expert, token, slot) deterministically
     const int pairs = T * TOPK;
     if (tid < pairs) {
