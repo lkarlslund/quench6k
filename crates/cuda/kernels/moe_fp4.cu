@@ -58,13 +58,15 @@ __global__ void __launch_bounds__(256) quant_rows_kernel(const __nv_bfloat16* __
         const uint4 u1 = *reinterpret_cast<const uint4*>(xr + 8);
         const __nv_bfloat16* h0 = reinterpret_cast<const __nv_bfloat16*>(&u0);
         const __nv_bfloat16* h1 = reinterpret_cast<const __nv_bfloat16*>(&u1);
+        const float irs = rs > 0.0f ? 1.0f / rs : 0.0f;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) v[j] = rs > 0.0f ? bf2f(h0[j]) / rs : 0.0f, v[8 + j] = rs > 0.0f ? bf2f(h1[j]) / rs : 0.0f;
+        for (int j = 0; j < 8; ++j) v[j] = bf2f(h0[j]) * irs, v[8 + j] = bf2f(h1[j]) * irs;
         const int code = rs > 0.0f ? fp4_block_scale(v) : 0;
         const float bs = ue4m3_value(code);
         uint32_t q[2] = {0, 0};
+        const float ibs = bs > 0.0f ? 1.0f / bs : 0.0f;
 #pragma unroll
-        for (int j = 0; j < 16; ++j) q[j / 8] |= (uint32_t)(bs > 0.0f ? e2m1_code(v[j] / bs) : 0) << (4 * (j % 8));
+        for (int j = 0; j < 16; ++j) q[j / 8] |= (uint32_t)e2m1_code(v[j] * ibs) << (4 * (j % 8));
         *reinterpret_cast<uint2*>(codes + (size_t)row * (K / 2) + 8 * b) = make_uint2(q[0], q[1]);
         scales[(size_t)row * (K / 16) + b] = (uint8_t)code;
     }

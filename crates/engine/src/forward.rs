@@ -467,8 +467,14 @@ fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, pending: Opti
             Some(y) => op!(prof, "hc combine+norm", s, k::hc_combine_norm(s, ws.h, y, ws.inj, ws.n, t)),
             None => op!(prof, "hc norm", s, k::grouped_rmsnorm(s, ws.h, 0, ws.n, t)),
         }
+        if t > k::gemv_max_m() && fake_set("hc") {
+            k::fake_mxfp8(s, ws.n, t, H, H)?;
+        }
         op!(prof, "hc down", s, project(s, ws, ws.n, &hc.down, ws.proj, t));
         op!(prof, "hc act", s, k::hc_act(s, ws.proj, hc.down.n, ws.low_bf, inj, t));
+        if t > k::gemv_max_m() && fake_set("hc") {
+            k::fake_mxfp8(s, ws.low_bf, t, hc.up.k, hc.up.k)?;
+        }
         if t > 4 * k::gemv_max_m() && std::env::var_os("SQUASH_HC_UNFUSED").is_none() {
             op!(prof, "hc up+mix", s, k::gemm_hc_up_mix(s, ws.low_bf, hc.up.fmt, hc.up.addr, hc.up.scale, ws.n, hc.norm, out, t, hc.up.k));
         } else {

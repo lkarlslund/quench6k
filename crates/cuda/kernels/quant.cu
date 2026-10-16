@@ -97,7 +97,7 @@ __global__ void fp4_act_kernel(__nv_bfloat16* x, int rows, int cols) {
         for (int i = 0; i < 16; ++i) v[i] = bf2f(xr[16 * b + i]) / rs;
         const float bs = ue4m3_value(fp4_block_scale(v));
 #pragma unroll
-        for (int i = 0; i < 16; ++i) xr[16 * b + i] = f2bf(bs > 0.0f ? e2m1_value(e2m1_code(v[i] / bs)) * bs * rs : 0.0f);
+        for (int i = 0; i < 16; ++i) xr[16 * b + i] = f2bf(bs > 0.0f ? e2m1_value(e2m1_code(v[i] * (1.0f / bs))) * bs * rs : 0.0f);
     }
 }
 

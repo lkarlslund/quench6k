@@ -33,6 +33,7 @@ __global__ void route_kernel(const float* __restrict__ logits, int ld, int T, in
 #pragma unroll
     for (int j = 0; j < E / 32; ++j) {
         v[j] = __expf(v[j] - mx);
+        if (!(v[j] >= 0.0f)) v[j] = 0.0f;  // NaN logits: never pick an out-of-range expert
         sum += v[j];
     }
     sum = warp_sum(sum);
@@ -330,6 +331,7 @@ __global__ void __launch_bounds__(512) route_small_kernel(const float* __restric
 #pragma unroll
         for (int j = 0; j < E / 32; ++j) {
             v[j] = __expf(v[j] - mx);
+            if (!(v[j] >= 0.0f)) v[j] = 0.0f;  // NaN logits: never pick an out-of-range expert
             sum += v[j];
         }
         sum = warp_sum(sum);
@@ -738,6 +740,7 @@ SQ_DEVICE void route_one(const float* logits, int lane, int* s_top, float* s_w) 
 #pragma unroll
     for (int j = 0; j < E / 32; ++j) {
         v[j] = __expf(v[j] - mx);
+        if (!(v[j] >= 0.0f)) v[j] = 0.0f;  // NaN logits: never pick an out-of-range expert
         sum += v[j];
     }
     sum = warp_sum(sum);

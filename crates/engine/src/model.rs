@@ -529,6 +529,7 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
                 "gdn" => n.contains(".linear_attn.in_proj"),
                 "gdnout" => n.contains(".linear_attn.out_proj"),
                 "attn" => n.contains(".self_attn."),
+                "hc" => n.contains("hyper_connection."),
                 _ => false,
             }),
         };
