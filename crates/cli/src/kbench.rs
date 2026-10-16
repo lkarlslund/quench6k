@@ -160,6 +160,13 @@ pub fn run(model_dir: &Path, o: &Options) -> Result<()> {
         quantile(&mut v, 0.5)
     };
     println!("baseline: {} layers, {} row(s), context {}: {:.1} us per step ({:.1} us per layer)", o.layers, o.rows, o.ctx, base_us, base_us / o.layers as f64);
+    // Bandwidth floor of the step: static weights plus 10 routed experts per layer and row (2.76 MB
+    // each in NVFP4, an upper bound when rows share experts), at the measured 1.647 TB/s read rate.
+    let static_bytes: u64 = ws.layer_weight_bytes.iter().sum();
+    let expert_bytes = (o.layers * o.rows.min(4) * 10) as f64 * 3.0 * 640.0 * 2560.0 * 0.5625;
+    let floor = (static_bytes as f64 + expert_bytes) / 1.647e6;
+    println!("weights per step: {:.1} MB static ({:?} MB per layer) + {:.1} MB experts; floor {:.1} us ({:.0}% of it reached)",
+             static_bytes as f64 / 1e6, ws.layer_weight_bytes.iter().map(|b| b / 1_000_000).collect::<Vec<_>>(), expert_bytes / 1e6, floor, 100.0 * floor / base_us);
 
     // Cartesian product of the sweep values.
     let mut configs: Vec<Vec<(String, i32)>> = vec![Vec::new()];

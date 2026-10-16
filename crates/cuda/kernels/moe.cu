@@ -9,6 +9,7 @@
 #include <cuda_fp8.h>
 
 #include "mma.cuh"
+#include "variants.cuh"
 #include "wfmt.cuh"
 
 namespace {
@@ -776,7 +777,9 @@ SQ_DEVICE void route_one(const float* logits, int lane, int* s_top, float* s_w) 
 
 // grid (640 / 16, 10 routing slots). Each block routes the token itself, then computes
 // act[slot, n] = silu(gate_e . m) * (up_e . m) for expert e = top[slot]; block (0, 0) publishes
-// top_i/top_w and pair_row[k] = k for the down and combine kernels.
+// top_i/top_w and pair_row[k] = k for the down and combine kernels. EARLY: the dependent kernel may
+// launch right after the routing (down_t1_kernel<true> routes itself and prefetches its weights).
+template <bool EARLY>
 __global__ void __launch_bounds__(EW * 32) gate_up_t1_kernel(const __nv_bfloat16* __restrict__ m,
                                                              const float* __restrict__ logits,
                                                              const uint64_t* __restrict__ gw, const uint64_t* __restrict__ gs,
@@ -791,6 +794,7 @@ __global__ void __launch_bounds__(EW * 32) gate_up_t1_kernel(const __nv_bfloat16
     pdl_wait();
     if (warp == 0) route_one(logits, lane, s_top, s_w);
     __syncthreads();
+    if (EARLY) pdl_launch_dependents();
     if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x < TOPK) {
         top_i[threadIdx.x] = s_top[threadIdx.x];
         top_w[threadIdx.x] = s_w[threadIdx.x];
@@ -821,7 +825,7 @@ __global__ void __launch_bounds__(EW * 32) gate_up_t1_kernel(const __nv_bfloat16
             chunk_dot(w, m + k, acc[f]);
         }
     }
-    pdl_launch_dependents();
+    if (!EARLY) pdl_launch_dependents();
     const float sg = g2[e], su = u2[e];
 #pragma unroll
     for (int f = 0; f < FEAT; ++f) {
@@ -833,14 +837,24 @@ __global__ void __launch_bounds__(EW * 32) gate_up_t1_kernel(const __nv_bfloat16
     }
 }
 
-// grid (2560 / 64, 10 slots): yd[slot, n] = down_e[n] . act[slot] with e = top_i[slot].
+// grid (2560 / 64, 10 slots): yd[slot, n] = down_e[n] . act[slot] with e = top_i[slot]. PRE: the
+// block routes the token itself from the router logits (final: the gate/up kernel passed its own wait
+// on their producer before launching this one), so the expert's weights load before the wait.
+template <bool PRE>
 __global__ void __launch_bounds__(EW * 32) down_t1_kernel(const __nv_bfloat16* __restrict__ act,
                                                           const uint64_t* __restrict__ dw, const uint64_t* __restrict__ ds,
                                                           const float* __restrict__ d2, const int* __restrict__ top_i,
-                                                          float* yd) {
+                                                          float* yd, const float* __restrict__ logits) {
     constexpr int K = 640, CHUNKS = K / 32 / 4;
-    pdl_wait();
-    const int slot = blockIdx.y, e = top_i[slot];
+    __shared__ int s_top[TOPK];
+    __shared__ float s_w[TOPK];
+    if constexpr (PRE) {
+        if (threadIdx.x < 32) route_one(logits, threadIdx.x, s_top, s_w);
+        __syncthreads();
+    } else {
+        pdl_wait();
+    }
+    const int slot = blockIdx.y, e = PRE ? s_top[slot] : top_i[slot];
     const int lane = threadIdx.x & 31, q = lane & 3;
     const int n = (blockIdx.x * EW + (threadIdx.x >> 5)) * 8 + (lane >> 2);
     const uint8_t* W = reinterpret_cast<const uint8_t*>(dw[e]) + (size_t)n * (K / 2);
@@ -853,6 +867,7 @@ __global__ void __launch_bounds__(EW * 32) down_t1_kernel(const __nv_bfloat16* _
         codes[c] = __ldg(reinterpret_cast<const uint4*>(W + k / 2));
         scales[c] = __ldg(reinterpret_cast<const uint16_t*>(Sc + k / 16));
     }
+    if (PRE) pdl_wait();
     float acc = 0;
 #pragma unroll
     for (int c = 0; c < CHUNKS; ++c) {
@@ -1054,10 +1069,19 @@ extern "C" cudaError_t squash_moe_experts_t1(const void* m, const float* logits,
                                             float* top_w, int* pair_row, void* act, float* yd, cudaStream_t st) {
     const auto* mb = static_cast<const __nv_bfloat16*>(m);
     auto* ab = static_cast<__nv_bfloat16*>(act);
-    SQ_CHECK_LAUNCH(sq_launch(gate_up_t1_kernel, dim3(640 / (EW * 2), TOPK), EW * 32, 0, st, mb, logits, gw, gs, g2, uw, us,
-                              u2, top_i, top_w, pair_row, ab));
-    SQ_CHECK_LAUNCH(sq_launch(down_t1_kernel, dim3(D / (EW * 8), TOPK), EW * 32, 0, st, static_cast<const __nv_bfloat16*>(ab),
-                              dw, ds, d2, static_cast<const int*>(top_i), yd));
+    // moe.t1_prefetch (kbench variant): the down kernel routes itself and prefetches its weights while
+    // gate/up runs.
+    if (sq_variant("moe.t1_prefetch", 0)) {
+        SQ_CHECK_LAUNCH(sq_launch(gate_up_t1_kernel<true>, dim3(640 / (EW * 2), TOPK), EW * 32, 0, st, mb, logits, gw, gs, g2, uw, us,
+                                  u2, top_i, top_w, pair_row, ab));
+        SQ_CHECK_LAUNCH(sq_launch(down_t1_kernel<true>, dim3(D / (EW * 8), TOPK), EW * 32, 0, st, static_cast<const __nv_bfloat16*>(ab),
+                                  dw, ds, d2, static_cast<const int*>(top_i), yd, logits));
+    } else {
+        SQ_CHECK_LAUNCH(sq_launch(gate_up_t1_kernel<false>, dim3(640 / (EW * 2), TOPK), EW * 32, 0, st, mb, logits, gw, gs, g2, uw, us,
+                                  u2, top_i, top_w, pair_row, ab));
+        SQ_CHECK_LAUNCH(sq_launch(down_t1_kernel<false>, dim3(D / (EW * 8), TOPK), EW * 32, 0, st, static_cast<const __nv_bfloat16*>(ab),
+                                  dw, ds, d2, static_cast<const int*>(top_i), yd, logits));
+    }
     SQ_RETURN_LAUNCH();
 }
 

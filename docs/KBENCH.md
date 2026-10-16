@@ -76,3 +76,21 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
   and proves exactness.
 - Prefill kernels need captured 8K-token batches (about 1 GB of activations per layer); the same
   structure applies, with R = chunk rows, but the first version covers decode.
+
+## Findings (2026-10-16)
+
+- Method check: a sweep over an unread key gives 1.000 +-0.1%; achievable DRAM read rate on this card
+  (600 W) is 1.647 TB/s; a dependent kernel boundary costs 0.45-0.54 us with PDL (0.68 us without).
+- Decode floor: a 4-layer step reads 318 MB of static weights (80 MB per GDN layer, 75 per attention
+  layer) plus about 110 MB of routed experts: 260 us at 1.647 TB/s against 490 us measured (53%). Per
+  layer of the full model: about 102 us against a 65 us floor.
+- The gap is not kernel boundaries (about 6.5 us per layer for 13 dependent phases) and not idle DRAM
+  (L2 prefetch of the next layer's weights gains at most 1%, and hurts above 32 MiB): it is the latency
+  of each phase's dependent part (fresh activations from L2, compute, reduction, store), 2-3 us per
+  phase whatever its size.
+- Variants (default off): `gemv.pre/warps/rows` (four-row steps now default to 2 rows per warp, -1.2%),
+  `moe.t1_prefetch` (+1.8%: the early down blocks slow gate/up), `l2.prefetch` (MiB per layer; -1% at 1
+  row, +0.7% at 4 rows).
+- What would close the gap: fewer dependent phases per layer, or a persistent kernel whose phases wait
+  on per-tile flags instead of whole-kernel completion, so each consumer starts as soon as its own
+  inputs exist and keeps streaming weights while it waits.

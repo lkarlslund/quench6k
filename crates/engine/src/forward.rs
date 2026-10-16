@@ -1,7 +1,7 @@
 //! Eager forward pass of the text model over a chunk of new tokens for one sequence.
 
 use anyhow::{Result, ensure};
-use squash_cuda::{DeviceBuffer, PinnedBuffer, Stream, kernels as k};
+use squash_cuda::{DeviceBuffer, Event, PinnedBuffer, Stream, kernels as k};
 
 use crate::profile::Profiler;
 
@@ -224,6 +224,15 @@ pub struct Workspace {
     /// BF16 copy of one INT8-group weight for large batches (see `DEQUANT_MIN_ROWS`); 0 elements without.
     dq: u64,
     dq_elems: usize,
+    /// Decode-time L2 prefetch of the next layer's static weights (kbench variant `l2.prefetch` = MiB
+    /// per layer): a side stream forked from the step, the fork / join events, and per layer the device
+    /// list of (address, bytes) ranges with the running byte total of each prefix.
+    side: Stream,
+    fork: Event,
+    join: Event,
+    prefetch: Vec<(u64, Vec<u64>)>,
+    /// Static weight bytes per layer (the sums of the prefetch lists).
+    pub layer_weight_bytes: Vec<u64>,
     bufs: Vec<DeviceBuffer>,
     pub h: u64,
     /// Output of a projection group, FP32 [T, <= PROJ_WIDTH].
@@ -300,6 +309,21 @@ impl Workspace {
     /// As [`new`](Self::new), with the BF16 weight buffer when `max_tokens` reaches `DEQUANT_MIN_ROWS`.
     pub fn for_model(model: &Model, max_tokens: usize, capacity: usize) -> Result<Self> {
         let mut ws = Self::new(max_tokens, capacity)?;
+        for layer in &model.layers {
+            let ranges = layer_weight_ranges(layer);
+            let flat: Vec<u64> = ranges.iter().flat_map(|&(a, b)| [a, b]).collect();
+            let b = DeviceBuffer::new(flat.len() * 8)?;
+            Stream::new()?.upload(&b, &flat)?;
+            let mut total = 0;
+            let prefix = ranges.iter().map(|&(_, n)| {
+                total += n;
+                total
+            });
+            let prefix: Vec<u64> = prefix.collect();
+            ws.layer_weight_bytes.push(prefix.last().copied().unwrap_or(0));
+            ws.prefetch.push((b.addr(), prefix));
+            ws.bufs.push(b);
+        }
         let elems = model.max_int8g_elems();
         if max_tokens >= DEQUANT_MIN_ROWS && elems > 0 && std::env::var("SQUASH_DEQUANT_GEMM").as_deref() != Ok("0") {
             eprintln!("BF16 weight buffer for prefill GEMMs: {} MiB", (elems * 2) >> 20);
@@ -386,6 +410,11 @@ impl Workspace {
             step_host: PinnedBuffer::new(StepLayout::new(t).bytes)?,
             dq: 0,
             dq_elems: 0,
+            side: Stream::new()?,
+            fork: Event::new()?,
+            join: Event::new()?,
+            prefetch: Vec::new(),
+            layer_weight_bytes: Vec::new(),
             bufs,
         }
         .init()
@@ -862,9 +891,27 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
         Part::BeforePle => 0..1,
         Part::FromPle => 1..model.layers.len(),
     };
+    // Small batches (decode, verify rounds): optionally prefetch the next layer's static weights into L2
+    // on a side stream while this layer runs (kbench variant l2.prefetch = MiB per layer, 0: off).
+    let prefetch_mib = if t <= k::gemv_max_m() { squash_cuda::variants::get("l2.prefetch", 0) } else { 0 };
+    let mut forked = false;
     for i in layers {
+        if prefetch_mib > 0 && i + 1 < model.layers.len() && i + 1 < ws.prefetch.len() {
+            let (list, prefix) = &ws.prefetch[i + 1];
+            let n = prefix.iter().take_while(|&&b| b <= (prefetch_mib as u64) << 20).count();
+            if n > 0 {
+                ws.fork.record(s)?;
+                ws.side.wait(&ws.fork)?;
+                k::l2_prefetch(&ws.side, *list, n)?;
+                forked = true;
+            }
+        }
         let rec = state.spec.as_ref().and_then(|sp| sp.gdn_rec[i].as_ref().map(|b| b.addr()));
         layer_forward(i, &model.layers[i], state.gdn[i].as_ref(), rec, state.qsa[i].as_ref(), &ctx, &mut carry, prof.as_deref_mut())?;
+    }
+    if forked {
+        ws.join.record(&ws.side)?;
+        s.wait(&ws.join)?;
     }
     if part == Part::BeforePle {
         // The second part starts from ws.y.
@@ -872,6 +919,43 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
         return Ok(());
     }
     final_mixer(&model.final_hc, &ctx, &mut carry, prof)
+}
+
+/// Device byte ranges of a layer's static weights (projections and their scales), in the order the
+/// layer reads them; the routed experts depend on the token and are left out.
+fn layer_weight_ranges(layer: &crate::model::Layer) -> Vec<(u64, u64)> {
+    fn linear(v: &mut Vec<(u64, u64)>, l: &Linear) {
+        let n = (l.n * l.k) as u64;
+        match l.fmt {
+            k::WeightFormat::Bf16 => v.push((l.addr, 2 * n)),
+            k::WeightFormat::Int8Group => v.extend([(l.addr, n), (l.scale, n / k::int8_group() as u64 * 4)]),
+            k::WeightFormat::Mxfp8 => v.extend([(l.addr, n), (l.scale, n / 32)]),
+        }
+    }
+    fn proj(v: &mut Vec<(u64, u64)>, p: &Proj) {
+        match &p.fused {
+            Some(l) => linear(v, l),
+            None => p.parts.iter().for_each(|(l, _)| linear(v, l)),
+        }
+    }
+    let mut v = Vec::new();
+    proj(&mut v, &layer.attn_hc.down);
+    linear(&mut v, &layer.attn_hc.up);
+    match &layer.block {
+        Block::Qsa(q) => {
+            proj(&mut v, &q.proj);
+            linear(&mut v, &q.o);
+        }
+        Block::Gdn(g) => {
+            proj(&mut v, &g.proj);
+            linear(&mut v, &g.out);
+        }
+    }
+    proj(&mut v, &layer.mlp_hc.down);
+    linear(&mut v, &layer.mlp_hc.up);
+    proj(&mut v, &layer.moe.proj);
+    linear(&mut v, &layer.moe.shared_down);
+    v
 }
 
 /// What one step's layers share.

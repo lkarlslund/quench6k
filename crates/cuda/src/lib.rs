@@ -44,6 +44,9 @@ pub mod ffi {
         pub fn cudaEventDestroy(event: Event) -> Error;
         pub fn cudaEventRecord(event: Event, stream: Stream) -> Error;
         pub fn cudaEventSynchronize(event: Event) -> Error;
+        pub fn cudaStreamWaitEvent(stream: Stream, event: Event, flags: c_uint) -> Error;
+        pub fn squash_variant_get(key: *const c_char, fallback: c_int) -> c_int;
+        pub fn squash_l2_prefetch(ranges: *const u64, n: c_int, stream: Stream) -> Error;
         pub fn cudaEventElapsedTime(ms: *mut f32, start: Event, end: Event) -> Error;
 
         pub fn cudaStreamBeginCapture(stream: Stream, mode: c_int) -> Error;
@@ -170,6 +173,12 @@ pub mod variants {
     /// Removes every key (including those from SQUASH_VARIANTS).
     pub fn clear() {
         unsafe { super::ffi::squash_clear_variants() }
+    }
+
+    /// The value of `key`, or `fallback` when it is not set.
+    pub fn get(key: &str, fallback: i32) -> i32 {
+        let k = std::ffi::CString::new(key).expect("variant key without NUL");
+        unsafe { super::ffi::squash_variant_get(k.as_ptr(), fallback) }
     }
 }
 
@@ -305,6 +314,11 @@ impl Stream {
 
     pub fn raw(&self) -> ffi::Stream {
         self.0
+    }
+
+    /// Makes later work on this stream wait for `event` (recorded on another stream).
+    pub fn wait(&self, event: &Event) -> Result<()> {
+        check(unsafe { ffi::cudaStreamWaitEvent(self.0, event.0, 0) }, "cudaStreamWaitEvent")
     }
 
     pub fn synchronize(&self) -> Result<()> {

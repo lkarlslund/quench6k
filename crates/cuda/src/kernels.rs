@@ -648,3 +648,8 @@ pub fn mxfp8_rows(s: &Stream, x: u64, rows: usize, cols: usize, ld: usize, codes
 pub fn gemm_mx8(s: &Stream, a: u64, a_scales: u64, w: u64, w_scales: u64, y: u64, ldy: usize, m: usize, n: usize, k: usize) -> Result<()> {
     launch!("gemm_mx8", ffi::squash_gemm_mx8(a as *const u8, a_scales as *const u8, w as *const u8, w_scales as *const u8, fm(y), n32(ldy), n32(m), n32(n), n32(k), s.raw()))
 }
+
+/// Bulk L2 prefetch of `n` device byte ranges (`ranges`: n (address, bytes) u64 pairs on the device).
+pub fn l2_prefetch(s: &Stream, ranges: u64, n: usize) -> Result<()> {
+    launch!("l2_prefetch", ffi::squash_l2_prefetch(ranges as *const u64, n32(n), s.raw()))
+}

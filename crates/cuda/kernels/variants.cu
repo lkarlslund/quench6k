@@ -47,6 +47,8 @@ extern "C" void squash_set_variant(const char* key, int value) {
     table()[key] = value;
 }
 
+extern "C" int squash_variant_get(const char* key, int fallback) { return sq_variant(key, fallback); }
+
 extern "C" void squash_clear_variants() {
     std::lock_guard<std::mutex> lock(mutex);
     table().clear();
