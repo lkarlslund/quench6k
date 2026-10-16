@@ -206,6 +206,9 @@ enum Command {
         /// parameters, schema types) before the output is returned as is.
         #[arg(long, default_value_t = 2)]
         tool_retries: usize,
+        /// Completion limit for requests that do not set max_tokens (capped by the context).
+        #[arg(long, default_value_t = 65536)]
+        default_max_tokens: usize,
         /// Concurrent requests decoded together (1 or 2).
         #[arg(long, default_value_t = 2)]
         slots: usize,
@@ -371,8 +374,8 @@ fn main() -> Result<()> {
         }
         Command::VisionCheck { model, reference, max_pixels } => vision_check(&model, &reference, max_pixels)?,
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, batch2, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, batch2, &steer)?,
-        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir, no_vision, image_max_pixels, video_max_frames } => {
-            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir, vision: !no_vision, image_max_pixels, video_max_frames })?
+        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, default_max_tokens, slots, capture_dir, no_vision, image_max_pixels, video_max_frames } => {
+            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, default_max_tokens, slots, capture_dir, vision: !no_vision, image_max_pixels, video_max_frames })?
         }
         Command::BatchCheck { model, fixture, n } => batch_check(&model, &fixture, n)?,
         Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, image, video, steer } => {

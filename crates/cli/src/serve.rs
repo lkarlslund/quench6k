@@ -33,6 +33,7 @@ pub struct ServeOptions {
     pub cache_dir: Option<PathBuf>,
     pub chat_template: Option<PathBuf>,
     pub tool_retries: usize,
+    pub default_max_tokens: usize,
     /// Concurrent requests decoded together (1 or 2).
     pub slots: usize,
     pub capture_dir: Option<PathBuf>,
@@ -83,6 +84,7 @@ struct App {
     default_strength: f32,
     steering: bool,
     tool_retries: usize,
+    default_max_tokens: usize,
     tool_call_token: Option<i32>,
     capture_dir: Option<PathBuf>,
     model_id: String,
@@ -134,7 +136,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         schedule(&model, &stream, &mut session, &jobs_rx);
     });
     let default_strength = ready_rx.recv().context("worker thread")??;
-    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, tool_retries: opts.tool_retries, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model), vision, image_max_pixels: opts.image_max_pixels, video_max_frames: opts.video_max_frames });
+    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, tool_retries: opts.tool_retries, default_max_tokens: opts.default_max_tokens, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model), vision, image_max_pixels: opts.image_max_pixels, video_max_frames: opts.video_max_frames });
     let router = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -312,7 +314,7 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
     let thinking = text.ends_with("<think>\n");
     let ids = app.chat.encode(&text).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let (ids, images) = app.chat.expand_media(&ids, images, videos).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let max_tokens = req.get("max_completion_tokens").or_else(|| req.get("max_tokens")).and_then(Value::as_u64).unwrap_or(4096) as usize;
+    let max_tokens = req.get("max_completion_tokens").or_else(|| req.get("max_tokens")).and_then(Value::as_u64).map_or(app.default_max_tokens, |n| n as usize);
     let temperature = req.get("temperature").and_then(Value::as_f64).unwrap_or(1.0) as f32;
     let top_p = req.get("top_p").and_then(Value::as_f64).unwrap_or(0.95) as f32;
     let top_k = req.get("top_k").and_then(Value::as_u64).unwrap_or(20) as usize;
@@ -829,12 +831,12 @@ fn from_anthropic(req: &Value) -> Value {
                                                          "parameters": t.get("input_schema").cloned().unwrap_or(json!({"type": "object"}))}}))
         .collect();
     let thinking = req.get("thinking").and_then(|t| t.get("type")).and_then(Value::as_str) == Some("enabled");
-    let mut out = json!({"messages": messages, "max_tokens": req.get("max_tokens").cloned().unwrap_or(json!(4096)),
+    let mut out = json!({"messages": messages,
                          "chat_template_kwargs": {"enable_thinking": thinking}, "stream": req.get("stream").cloned().unwrap_or(json!(false))});
     if !tools.is_empty() {
         out["tools"] = Value::Array(tools);
     }
-    for (from, to) in [("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("stop_sequences", "stop"), ("steering", "steering")] {
+    for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("stop_sequences", "stop"), ("steering", "steering")] {
         if let Some(v) = req.get(from) {
             out[to] = v.clone();
         }
