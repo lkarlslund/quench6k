@@ -37,24 +37,49 @@ impl SpecDecoder {
     pub fn prefill(model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], drafts: usize, chunk: usize) -> Result<Self> {
         ensure!(state.spec.is_some() && model.mtp.is_some(), "speculative decoding needs the MTP drafter and a sequence with MTP state");
         ensure!((1..=8).contains(&drafts), "draft length {drafts} out of range");
-        let pending = DeviceBuffer::zeroed(H * 4)?;
-        let head = HeadWorkspace::new(drafts + 1, 1)?;
+        let mut dec = Self {
+            drafts,
+            pending: DeviceBuffer::zeroed(H * 4)?,
+            verified: DeviceBuffer::new((drafts + 1) * H * 4)?,
+            catch_up: Vec::new(),
+            head: HeadWorkspace::new(drafts + 1, 1)?,
+            next: 0,
+            rounds: 0,
+            accepted: 0,
+            draft_secs: 0.0,
+            verify_secs: 0.0,
+        };
+        dec.restart(model, state, ws, s, prompt, chunk)?;
+        Ok(dec)
+    }
+
+    /// Prefills a new `prompt` into the (reset) `state`, reusing this decoder's buffers so graphs captured
+    /// for it stay valid.
+    pub fn restart(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], chunk: usize) -> Result<()> {
+        ensure!(!prompt.is_empty(), "empty prompt");
+        s.memset(self.pending.addr(), 0, H * 4)?;
         let mut next = 0;
         for c0 in (0..prompt.len()).step_by(chunk) {
             let c = &prompt[c0..(c0 + chunk).min(prompt.len())];
             let t = c.len();
             forward::forward(model, state, ws, s, c)?;
             if c0 + t == prompt.len() {
-                next = argmax_rows(model, &head, s, ws.out + ((t - 1) * D * 2) as u64, 1)?[0];
+                next = argmax_rows(model, &self.head, s, ws.out + ((t - 1) * D * 2) as u64, 1)?[0];
             }
-            s.copy_d2d(ws.mtp_hin, pending.addr(), H * 4)?;
+            s.copy_d2d(ws.mtp_hin, self.pending.addr(), H * 4)?;
             s.copy_d2d(ws.mtp_hin + ROW, ws.h, (t - 1) * H * 4)?;
-            s.copy_d2d(pending.addr(), ws.h + (t - 1) as u64 * ROW, H * 4)?;
+            s.copy_d2d(self.pending.addr(), ws.h + (t - 1) as u64 * ROW, H * 4)?;
             forward::prepare_mtp(ws, c0, c)?;
             forward::forward_mtp(model, state, ws, s, t, ws.mtp_hin, None)?;
         }
         s.synchronize()?;
-        Ok(Self { drafts, pending, verified: DeviceBuffer::new((drafts + 1) * H * 4)?, catch_up: Vec::new(), head, next, rounds: 0, accepted: 0, draft_secs: 0.0, verify_secs: 0.0 })
+        self.next = next;
+        self.catch_up.clear();
+        self.rounds = 0;
+        self.accepted = 0;
+        self.draft_secs = 0.0;
+        self.verify_secs = 0.0;
+        Ok(())
     }
 
     /// One draft-and-verify round; returns the tokens committed to the sequence (the previous `next`
@@ -260,6 +285,11 @@ impl SpecGraphs {
         // Round state: next token at position len(state), nothing to catch up yet.
         s.upload_to(rc.addr(), &[state.len() as i32, dec.next, 0, 0])?;
         Ok(Self { sets, _rc: rc, rc_host, policy: DraftPolicy::new(lengths) })
+    }
+
+    /// Points the round control at a decoder restarted on a new prompt.
+    pub fn restart(&self, state: &SequenceState, dec: &SpecDecoder, s: &Stream) -> Result<()> {
+        s.upload_to(self._rc.addr(), &[state.len() as i32, dec.next, 0, 0])
     }
 
     fn rc_word(&self, i: usize) -> i32 {

@@ -4,6 +4,7 @@ pub mod loader;
 pub mod model;
 pub mod oracle;
 pub mod profile;
+pub mod session;
 pub mod spec;
 pub mod steering;
 

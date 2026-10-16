@@ -128,6 +128,24 @@ impl SequenceState {
         })
     }
 
+    /// Empties the sequence for a new prompt: recurrent and convolution state zeroed, speculative
+    /// bookkeeping cleared (attention caches are position-indexed and need nothing). Buffer addresses
+    /// stay, so graphs captured for this state remain valid.
+    pub fn reset(&mut self, s: &Stream) -> Result<()> {
+        self.tokens.clear();
+        for g in self.gdn.iter().flatten() {
+            s.memset(g.conv.addr(), 0, g.conv.bytes())?;
+            s.memset(g.recurrent.addr(), 0, g.recurrent.bytes())?;
+        }
+        s.memset(self.ple_conv.addr(), 0, self.ple_conv.bytes())?;
+        if let Some(sp) = &mut self.spec {
+            s.memset(sp.ctl.addr(), 0, sp.ctl.bytes())?;
+            sp.replay = 0;
+            sp.parity = 0;
+        }
+        s.synchronize()
+    }
+
     /// Sets this sequence's steering strength (read on the device by every later step).
     pub fn set_steering_strength(&self, s: &Stream, strength: f32) -> Result<()> {
         s.upload(&self.steer_strength, &[strength])?;
@@ -815,6 +833,11 @@ pub fn draft_head_argmax_into(model: &Model, hw: &HeadWorkspace, s: &Stream, hid
     k::draft_head_argmax(s, hidden, mtp.draft_sketch, mtp.draft_head, hw.logits.addr(), hw.pick.addr(), VOCAB, out)
 }
 
+/// LM-head logits of one hidden row into the head workspace (row 0).
+pub fn head_logits(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64) -> Result<()> {
+    linear_ld(s, hw.partial.addr(), hidden, D, &model.lm_head, hw.logits.addr(), VOCAB, 1)
+}
+
 /// Greedy next token for one hidden state: LM head, argmax, and a copy of the token to `hw.token_host`.
 pub fn head_argmax(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64) -> Result<()> {
     linear_ld(s, hw.partial.addr(), hidden, D, &model.lm_head, hw.logits.addr(), VOCAB, 1)?;
@@ -846,6 +869,11 @@ pub struct HeadWorkspace {
 }
 
 impl HeadWorkspace {
+    /// Device address of the logits ([rows, VOCAB] F32).
+    pub fn logits_addr(&self) -> u64 {
+        self.logits.addr()
+    }
+
     pub fn new(rows: usize, top_k: usize) -> Result<Self> {
         Ok(Self {
             rows,

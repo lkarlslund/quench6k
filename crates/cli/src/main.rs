@@ -1,4 +1,5 @@
 mod bench;
+mod chat;
 mod mtp;
 
 use std::path::PathBuf;
@@ -133,6 +134,33 @@ enum Command {
         #[command(flatten)]
         steer: SteerArgs,
     },
+    /// One chat turn from the command line through the serving session (tokenizer, chat template,
+    /// greedy MTP or sampled decoding), streamed to stdout.
+    Chat {
+        #[arg(long)]
+        model: PathBuf,
+        /// The user message.
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 512)]
+        max_tokens: usize,
+        /// 0: greedy (speculative).
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        #[arg(long, default_value_t = 0.95)]
+        top_p: f32,
+        #[arg(long, default_value_t = 20)]
+        top_k: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Let the model think (the template's enable_thinking).
+        #[arg(long)]
+        think: bool,
+        #[arg(long, default_value_t = 32768)]
+        context: usize,
+        #[command(flatten)]
+        steer: SteerArgs,
+    },
     /// Measure prefill and greedy decode throughput at the given prompt lengths.
     Bench {
         #[arg(long)]
@@ -256,6 +284,9 @@ fn main() -> Result<()> {
             }
         }
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, &steer)?,
+        Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, steer } => {
+            chat_once(&model, &prompt, max_tokens, temperature, top_p, top_k, seed, think, context, &steer)?
+        }
         Command::Generate { model, precision, fixture, tie, steer } => generate(&model, precision.into(), &fixture, tie, &steer)?,
         Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
         Command::SpecCheck { model, precision, fixture, n, drafts, chunk, graphs, adaptive, profile_rounds, steer } => mtp::check(&model, precision.into(), &fixture, n, drafts, chunk, graphs, adaptive, profile_rounds, &steer)?,
@@ -437,5 +468,45 @@ fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathB
     if !all_ok {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32, top_k: usize, seed: u64, think: bool, context: usize, steer: &SteerArgs) -> Result<()> {
+    use std::io::Write;
+    let chat = chat::Chat::load(model_dir)?;
+    let (mut model, stream) = load(model_dir, Precision::Int8Group, true)?;
+    let strength = steer.attach(&mut model, &stream)?;
+    let t0 = std::time::Instant::now();
+    let mut session = squash_engine::session::Session::new(&model, &stream, context, 8192, 6)?;
+    println!("session ready in {:.1}s", t0.elapsed().as_secs_f64());
+    let messages = serde_json::json!([{"role": "user", "content": prompt}]);
+    let text = chat.render(&messages, None, Some(think), None)?;
+    let ids = chat.encode(&text)?;
+    let params = squash_engine::session::GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: chat.stop_tokens.clone(), steering_strength: strength };
+    let mut out = chat::TextStream::default();
+    let t1 = std::time::Instant::now();
+    let mut first = None;
+    let mut err = None;
+    let (finish, n) = session.generate(&model, &stream, &ids, &params, |tok| {
+        first.get_or_insert_with(|| t1.elapsed());
+        match out.push(&chat, tok) {
+            Ok(piece) => {
+                print!("{piece}");
+                let _ = std::io::stdout().flush();
+                true
+            }
+            Err(e) => {
+                err = Some(e);
+                false
+            }
+        }
+    })?;
+    if let Some(e) = err {
+        return Err(e);
+    }
+    let total = t1.elapsed().as_secs_f64();
+    let ttft = first.map(|d| d.as_secs_f64()).unwrap_or(total);
+    println!("\n[{n} tokens, {finish:?}; prompt {} tokens; first token {:.0} ms; {:.1} tok/s after it]", ids.len(), 1e3 * ttft, (n.saturating_sub(1)) as f64 / (total - ttft).max(1e-9));
     Ok(())
 }
