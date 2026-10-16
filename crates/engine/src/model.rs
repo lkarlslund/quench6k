@@ -252,6 +252,7 @@ impl Model {
             let fmt = match t.dtype {
                 DType::BF16 => WeightFormat::Bf16,
                 DType::I8G => WeightFormat::Int8Group,
+                DType::MX8 => WeightFormat::Mxfp8,
                 other => anyhow::bail!("{name}: {other:?} is not a projection weight format"),
             };
             Ok(Linear { fmt, addr: t.addr, scale: t.scale, n: t.shape[0], k: t.shape[1] })

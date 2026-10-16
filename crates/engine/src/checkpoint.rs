@@ -17,6 +17,8 @@ pub enum DType {
     U8,
     /// Not a checkpoint dtype: INT8 weights produced at load, with a scale per 64 weights.
     I8G,
+    /// Not a checkpoint dtype: MXFP8 weights produced at load (E4M3, a UE8M0 scale per 32 weights).
+    MX8,
     I32,
     I64,
 }
@@ -37,7 +39,7 @@ impl DType {
 
     pub fn size(self) -> usize {
         match self {
-            Self::F8E4M3 | Self::U8 | Self::I8G => 1,
+            Self::F8E4M3 | Self::U8 | Self::I8G | Self::MX8 => 1,
             Self::BF16 | Self::F16 => 2,
             Self::F32 | Self::I32 => 4,
             Self::I64 => 8,

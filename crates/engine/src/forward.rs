@@ -234,6 +234,9 @@ pub struct Workspace {
     conv: u64,
     /// Chunked GDN recurrence scratch (prefill workspaces).
     gdn_chunks: u64,
+    /// MXFP8 activations for the FP8 projections: codes [T, D] then scale bytes [T, D / 32].
+    xq: u64,
+    xq_bytes: usize,
     beta: u64,
     g: u64,
     o: u64,
@@ -347,6 +350,8 @@ impl Workspace {
             xn: alloc(t * H * 4)?,
             out: alloc(t * D * 2)?,
             partial: alloc(PARTIAL_FLOATS * 4)?,
+            xq: alloc((t * D).div_ceil(256) * 256 + t * D / 32)?,
+            xq_bytes: t * D,
             active: alloc(EXPERTS * 4)?,
             num_active: alloc(4)?,
             row_token: alloc(k::moe_small_tokens() * TOP_K * 4)?,
@@ -411,16 +416,29 @@ fn linear_ld(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, l
 }
 
 fn linear(s: &Stream, ws: &Workspace, x: u64, w: &Linear, y: u64, t: usize) -> Result<()> {
-    linear_ld(s, ws.partial, x, w.k, w, y, w.n, t)
+    linear_ws(s, ws, x, w.k, w, y, w.n, t)
+}
+
+/// As [`linear_ld`], with MXFP8 weights on prefill-sized batches: the activations are quantized to MXFP8
+/// in the workspace and multiplied on the FP8 tensor cores.
+#[allow(clippy::too_many_arguments)]
+fn linear_ws(s: &Stream, ws: &Workspace, x: u64, ldx: usize, w: &Linear, y: u64, ldy: usize, t: usize) -> Result<()> {
+    if w.fmt == k::WeightFormat::Mxfp8 && t > 4 * k::gemv_max_m() {
+        ensure!(t * w.k <= ws.xq_bytes, "MXFP8 activation buffer holds {} bytes", ws.xq_bytes);
+        let scales = ws.xq + (t * w.k).div_ceil(256) as u64 * 256;
+        k::mxfp8_rows(s, x, t, w.k, ldx, ws.xq, scales)?;
+        return k::gemm_mx8(s, ws.xq, scales, w.addr, w.scale, y, ldy, t, w.n, w.k);
+    }
+    linear_ld(s, ws.partial, x, ldx, w, y, ldy, t)
 }
 
 /// Computes every member of `proj` for `t` rows of `x` into `out` ([t, proj.n], FP32).
 fn project(s: &Stream, ws: &Workspace, x: u64, proj: &Proj, out: u64, t: usize) -> Result<()> {
     match &proj.fused {
-        Some(w) => linear_ld(s, ws.partial, x, w.k, w, out, proj.n, t),
+        Some(w) => linear_ws(s, ws, x, w.k, w, out, proj.n, t),
         None => {
             for (w, col) in &proj.parts {
-                linear_ld(s, ws.partial, x, w.k, w, out + (*col * 4) as u64, proj.n, t)?;
+                linear_ws(s, ws, x, w.k, w, out + (*col * 4) as u64, proj.n, t)?;
             }
             Ok(())
         }

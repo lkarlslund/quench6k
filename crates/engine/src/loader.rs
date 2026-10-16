@@ -70,7 +70,11 @@ pub fn upload_quantized(
     use squash_cuda::kernels::{self as k, WeightFormat};
     anyhow::ensure!(format == WeightFormat::Int8Group, "upload_quantized produces group-scaled INT8 only");
     let start = Instant::now();
-    let scales_per_row = |kk: usize| kk / k::int8_group();
+    // GDN input projections become MXFP8 (gate PASS; FP8 tensor cores for prefill), the rest INT8 with
+    // group scales. SQUASH_GDN_MXFP8=0 keeps them INT8.
+    let mx8_on = std::env::var("SQUASH_GDN_MXFP8").map_or(true, |v| v != "0");
+    let is_mx8 = |group: Option<&str>| mx8_on && group.is_some_and(|g| g.ends_with(".linear_attn.squash.in_proj"));
+    let scale_bytes = |mx8: bool, rows: usize, kk: usize| if mx8 { rows * kk / 32 } else { rows * (kk / k::int8_group()) * 4 };
 
     // Units of contiguous placement: a group's members, or a single tensor.
     let mut grouped = std::collections::HashSet::new();
@@ -113,14 +117,15 @@ pub fn upload_quantized(
             let kk = ckpt.tensors[members[0]].shape[1];
             let rows: usize = members.iter().map(|m| ckpt.tensors[*m].shape[0]).sum();
             let (q, sc) = (total, total + (rows * kk).div_ceil(256) * 256);
-            total = sc + (rows * scales_per_row(kk) * 4).div_ceil(256) * 256;
+            total = sc + scale_bytes(is_mx8(unit_list[u].0), rows, kk).div_ceil(256) * 256;
             placements.push((u, q, sc, rows, kk));
         }
         let arena = DeviceBuffer::new(total)?;
         for (u, q, sc, rows, kk) in placements {
             let (group, members) = &unit_list[u];
             let (mut qa, mut sa) = (arena.addr() + q as u64, arena.addr() + sc as u64);
-            let dtype = DType::I8G;
+            let mx8 = is_mx8(*group);
+            let dtype = if mx8 { DType::MX8 } else { DType::I8G };
             if let Some(g) = group {
                 out.tensors.insert(g.to_string(), DeviceTensor { addr: qa, bytes: (rows * kk) as u64, dtype, shape: vec![rows, kk], scale: sa });
             }
@@ -128,11 +133,16 @@ pub fn upload_quantized(
                 let src = staged.get(name)?;
                 let n = src.shape[0];
                 prep(name, src.addr, n, kk)?;
-                anyhow::ensure!(kk % k::int8_group() == 0, "{name}: K {kk} is not a multiple of the INT8 group");
-                k::quantize_int8_groups(stream, src.addr, n, kk, qa, sa)?;
+                if mx8 {
+                    anyhow::ensure!(kk % 128 == 0, "{name}: K {kk} is not a multiple of 128");
+                    k::mxfp8_rows(stream, src.addr, n, kk, kk, qa, sa)?;
+                } else {
+                    anyhow::ensure!(kk % k::int8_group() == 0, "{name}: K {kk} is not a multiple of the INT8 group");
+                    k::quantize_int8_groups(stream, src.addr, n, kk, qa, sa)?;
+                }
                 out.tensors.insert(name.to_string(), DeviceTensor { addr: qa, bytes: (n * kk) as u64, dtype, shape: src.shape.clone(), scale: sa });
                 qa += (n * kk) as u64;
-                sa += (n * scales_per_row(kk) * 4) as u64;
+                sa += scale_bytes(mx8, n, kk) as u64;
             }
         }
         stream.synchronize()?;

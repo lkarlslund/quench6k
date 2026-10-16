@@ -603,3 +603,55 @@ fn index_scores_tc_match_fp32() {
     assert!(worst < 1e-4, "score error {worst}");
     assert!(same as f64 / (t * 512) as f64 > 0.999, "selection overlap {same}");
 }
+
+/// MXFP8 GEMM against the CPU product of the dequantized operands; the GEMV reads the same weights.
+#[test]
+fn mxfp8_gemm_matches_cpu() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x88f8_0001);
+    let (m, n, k) = (200usize, 300usize, 512usize);
+    let x: Vec<f32> = rng.vec(m * k).iter().enumerate().map(|(i, &v)| bf16::round(v * (1.0 + (i % 97) as f32 * 0.1))).collect();
+    let w: Vec<f32> = rng.vec(n * k).iter().map(|&v| bf16::round(v * 0.05)).collect();
+    let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
+    let quant = |d: &DeviceBuffer, rows: usize| {
+        let c = DeviceBuffer::zeroed(rows * k).unwrap();
+        let sc = DeviceBuffer::zeroed(rows * k / 32).unwrap();
+        kernels::mxfp8_rows(&s, d.addr(), rows, k, k, c.addr(), sc.addr()).unwrap();
+        let cv: Vec<u8> = s.download(c.addr(), rows * k).unwrap();
+        let sv: Vec<u8> = s.download(sc.addr(), rows * k / 32).unwrap();
+        (c, sc, cv, sv)
+    };
+    let (ca, sa, cav, sav) = quant(&dx, m);
+    let (cw, sw, cwv, swv) = quant(&dw, n);
+    let deq = |c: &[u8], sc: &[u8], r: usize, t: usize| fp8_e4m3(c[r * k + t]) * 2f32.powi(sc[r * k / 32 + t / 32] as i32 - 127);
+    let dy = DeviceBuffer::zeroed(m * n * 4).unwrap();
+    kernels::gemm_mx8(&s, ca.addr(), sa.addr(), cw.addr(), sw.addr(), dy.addr(), n, m, n, k).unwrap();
+    let y: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
+    let mut worst = 0f64;
+    for i in 0..m {
+        for j in 0..n {
+            let (mut dot, mut mag) = (0f64, 0f64);
+            for t in 0..k {
+                let p = deq(&cav, &sav, i, t) as f64 * deq(&cwv, &swv, j, t) as f64;
+                dot += p;
+                mag += p.abs();
+            }
+            worst = worst.max((y[i * n + j] as f64 - dot).abs() / mag.max(1e-30));
+        }
+    }
+    assert!(worst < 1e-5, "mxfp8 gemm relative error {worst}");
+    // GEMV with MXFP8 weights (fmt 4) on BF16 activations.
+    let yg = DeviceBuffer::zeroed(3 * n * 4).unwrap();
+    let partial = DeviceBuffer::zeroed(1 << 20).unwrap();
+    kernels::gemv(&s, 3, dx.addr(), k, WeightFormat::Mxfp8, cw.addr(), sw.addr(), yg.addr(), n, partial.addr(), n, k, 1, 1.0, false).unwrap();
+    let g: Vec<f32> = s.download(yg.addr(), 3 * n).unwrap();
+    let mut gw = 0f64;
+    for i in 0..3 {
+        for j in 0..n {
+            let dot: f64 = (0..k).map(|t| x[i * k + t] as f64 * deq(&cwv, &swv, j, t) as f64).sum();
+            gw = gw.max((g[i * n + j] as f64 - dot).abs() / (k as f64).sqrt());
+        }
+    }
+    assert!(gw < 1e-4, "mxfp8 gemv error {gw}");
+}

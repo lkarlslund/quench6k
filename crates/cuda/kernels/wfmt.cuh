@@ -5,7 +5,11 @@
 
 #include "common.cuh"
 
-enum class WFmt { BF16 = 0, FP8 = 1, INT8 = 2, INT8G = 3 };
+// MX8: FP8 E4M3 with a power-of-two scale per 32 consecutive weights of a row (scale bytes [N, K / 32],
+// UE8M0: 2^(byte - 127)).
+enum class WFmt { BF16 = 0, FP8 = 1, INT8 = 2, INT8G = 3, MX8 = 4 };
+
+SQ_DEVICE float ue8m0_value(uint8_t b) { return __uint_as_float((uint32_t)b << 23); }
 
 // INT8G: INT8 with one FP32 scale per GROUP consecutive weights of a row (scales [N, K / GROUP]).
 constexpr int GROUP = 64;
@@ -129,7 +133,7 @@ SQ_DEVICE void decode_raw16(const Raw16<F>& r, float* w) {
                 w[8 * h + 2 * i + 1] = f.y;
             }
         }
-    } else if constexpr (F == WFmt::FP8) {
+    } else if constexpr (F == WFmt::FP8 || F == WFmt::MX8) {
         const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&r.v[0]);
 #pragma unroll
         for (int i = 0; i < 8; ++i) {

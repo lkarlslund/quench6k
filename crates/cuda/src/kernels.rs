@@ -21,7 +21,10 @@ pub enum WeightFormat {
     Bf16 = 0,
     /// INT8 with an FP32 scale per [`int8_group`] consecutive weights of a row.
     Int8Group = 3,
+    /// FP8 E4M3 with a power-of-two (UE8M0 byte) scale per 32 consecutive weights of a row.
+    Mxfp8 = 4,
 }
+
 
 pub fn int8_group() -> usize {
     unsafe { ffi::squash_int8_group() as usize }
@@ -586,4 +589,16 @@ pub fn pad_cols(s: &Stream, src: u64, n: usize, k: usize, dst: u64, ldd: usize) 
 /// Replaces `rows` embedded residual rows (h [rows, 4 x 2560] FP32) with BF16-rounded vision embeddings.
 pub fn embed_rows(s: &Stream, emb: u64, rows: usize, h: u64) -> Result<()> {
     check(unsafe { ffi::squash_embed_rows(emb as *const f32, rows as i32, h as *mut f32, s.raw()) }, "embed_rows")
+}
+
+/// MXFP8 rows: x BF16 [rows, cols] (row stride `ld`) -> codes [rows, cols] and scale bytes [rows, cols / 32].
+/// Also the weight conversion at load (ld = cols).
+pub fn mxfp8_rows(s: &Stream, x: u64, rows: usize, cols: usize, ld: usize, codes: u64, scales: u64) -> Result<()> {
+    launch!("mxfp8_rows", ffi::squash_mxfp8_rows(p(x), n32(rows), n32(cols), n32(ld), codes as *mut u8, scales as *mut u8, s.raw()))
+}
+
+/// Y [m, n] (row stride ldy, FP32) = MXFP8 A [m, k] . MXFP8 W [n, k]^T.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_mx8(s: &Stream, a: u64, a_scales: u64, w: u64, w_scales: u64, y: u64, ldy: usize, m: usize, n: usize, k: usize) -> Result<()> {
+    launch!("gemm_mx8", ffi::squash_gemm_mx8(a as *const u8, a_scales as *const u8, w as *const u8, w_scales as *const u8, fm(y), n32(ldy), n32(m), n32(n), n32(k), s.raw()))
 }

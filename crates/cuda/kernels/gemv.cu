@@ -49,6 +49,8 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X,
                 pre[r][c] = load_raw16<F>(rows[r], k);
                 if constexpr (F == WFmt::INT8G)
                     pre_gs[r][c] = __ldg(row_scale + (size_t)min(n0 + r, N - 1) * (K / GROUP) + k / GROUP);
+                if constexpr (F == WFmt::MX8)
+                    pre_gs[r][c] = ue8m0_value(reinterpret_cast<const uint8_t*>(row_scale)[(size_t)min(n0 + r, N - 1) * (K / 32) + k / 32]);
             }
     }
     pdl_wait();
@@ -74,7 +76,7 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X,
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             decode_raw16<F>(pre[r][c], w[r]);
-            if constexpr (F == WFmt::INT8G)
+            if constexpr (F == WFmt::INT8G || F == WFmt::MX8)
 #pragma unroll
                 for (int i = 0; i < 16; ++i) w[r][i] *= pre_gs[r][c];
         }
@@ -87,6 +89,11 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X,
             decode_raw16<F>(load_raw16<F>(rows[r], k), w[r]);
             if constexpr (F == WFmt::INT8G) {
                 const float gs = __ldg(row_scale + (size_t)min(n0 + r, N - 1) * (K / GROUP) + k / GROUP);
+#pragma unroll
+                for (int i = 0; i < 16; ++i) w[r][i] *= gs;
+            }
+            if constexpr (F == WFmt::MX8) {
+                const float gs = ue8m0_value(reinterpret_cast<const uint8_t*>(row_scale)[(size_t)min(n0 + r, N - 1) * (K / 32) + k / 32]);
 #pragma unroll
                 for (int i = 0; i < 16; ++i) w[r][i] *= gs;
             }
@@ -203,6 +210,8 @@ extern "C" cudaError_t squash_gemv(int fmt, int M, const void* X, int ldx, const
     if (fmt == 0) return launch<WFmt::BF16>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
     if (fmt == 3 && K % GROUP == 0)
         return launch<WFmt::INT8G>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
+    if (fmt == 4 && K % 32 == 0)
+        return launch<WFmt::MX8>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
     return cudaErrorInvalidValue;
 }
 
