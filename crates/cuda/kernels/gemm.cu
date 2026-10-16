@@ -42,14 +42,16 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
     const int k_tiles = K / BK;
 
+    auto load_a = [&](int stage, int kt) {  // A: 64 rows x 4 chunks of 8 elements
+        const int k = kt * BK;
+        const int r = tid >> 2, c = (tid & 3) * 8;
+        const int gm = m0 + r;
+        const bool ok = gm < M;
+        cp_async16(&sA[stage][r * LDS + c], X + (size_t)(ok ? gm : 0) * ldx + k + c, ok);
+    };
     auto load = [&](int stage, int kt) {
         const int k = kt * BK;
-        {  // A: 64 rows x 4 chunks of 8 elements
-            const int r = tid >> 2, c = (tid & 3) * 8;
-            const int gm = m0 + r;
-            const bool ok = gm < M;
-            cp_async16(&sA[stage][r * LDS + c], X + (size_t)(ok ? gm : 0) * ldx + k + c, ok);
-        }
+        load_a(stage, kt);
         if constexpr (WF == 0) {
 #pragma unroll
             for (int i = 0; i < 2; ++i) {  // B: 128 rows x 4 chunks
@@ -89,9 +91,48 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
 
     float acc[2][4][4] = {};
 
+    // 8-bit weights: the raw 16 bytes (and group scale) of the tile STAGES - 1 ahead are fetched into
+    // registers before this tile's MMAs and converted into shared memory after them.
+    uint4 braw = make_uint4(0, 0, 0, 0);
+    float bgs = 1.0f;
+    const int br = tid >> 1, bc = (tid & 1) * 16, bgn = n0 + br;
+    auto fetch_b = [&](int kt) {
+        if (bgn < N) {
+            const int k = kt * BK;
+            braw = __ldg(reinterpret_cast<const uint4*>(W8 + (size_t)bgn * ldw + k + bc));
+            if constexpr (WF == 3) bgs = row_scale[(size_t)bgn * (K / 64) + (k + bc) / 64];
+        }
+    };
+    auto store_b = [&](int stage) {
+        __nv_bfloat16* dst = &sB[stage][br * LDS + bc];
+        if (bgn < N) {
+            const int8_t* p = reinterpret_cast<const int8_t*>(&braw);
+            uint32_t packed[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const __nv_bfloat162 v = __floats2bfloat162_rn((float)p[2 * i] * bgs, (float)p[2 * i + 1] * bgs);
+                packed[i] = *reinterpret_cast<const uint32_t*>(&v);
+            }
+            *reinterpret_cast<uint4*>(dst) = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+            *reinterpret_cast<uint4*>(dst + 8) = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+        } else {
+            *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
+        }
+    };
+    constexpr bool PIPE_B = WF == 2 || WF == 3;
+
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
-        if (s < k_tiles) load(s, s);
+        if (s < k_tiles) {
+            if constexpr (PIPE_B) {
+                load_a(s, s);
+                fetch_b(s);
+                store_b(s);
+            } else {
+                load(s, s);
+            }
+        }
         cp_async_commit();
     }
 
@@ -99,7 +140,14 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
         cp_async_wait<STAGES - 2>();
         __syncthreads();
         const int next = kt + STAGES - 1;
-        if (next < k_tiles) load(next % STAGES, next);
+        if (next < k_tiles) {
+            if constexpr (PIPE_B) {
+                load_a(next % STAGES, next);
+                fetch_b(next);
+            } else {
+                load(next % STAGES, next);
+            }
+        }
         cp_async_commit();
 
         const __nv_bfloat16* a_tile = sA[kt % STAGES];
@@ -124,6 +172,9 @@ __global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __re
 #pragma unroll
                 for (int j = 0; j < 4; ++j) mma_bf16(acc[i][j], a[i], &b[j >> 1][(j & 1) * 2]);
         }
+        // Stage `next` was last read by tile kt - 1's MMAs, finished before this tile's barrier.
+        if constexpr (PIPE_B)
+            if (next < k_tiles) store_b(next % STAGES);
     }
     cp_async_wait<0>();
 
