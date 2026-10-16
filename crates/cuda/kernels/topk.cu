@@ -394,7 +394,7 @@ __global__ void __launch_bounds__(SEL_THREADS) qsa_select_kernel(const float* __
 namespace cg = cooperative_groups;
 constexpr int CL = 8, CL_THREADS = 512, CL_SLICE_BINS = SEL_BINS / CL;
 // Rows up to SOLO_N groups are selected by the cluster's first block alone (no cluster barriers).
-constexpr int SOLO_N = 8192;
+constexpr int SOLO_N = 20480;
 
 __global__ void __launch_bounds__(CL_THREADS) qsa_select_cluster_kernel(const float* __restrict__ scores, size_t ld,
                                                                         const int* __restrict__ start_ptr, int group,
