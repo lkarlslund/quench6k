@@ -74,6 +74,44 @@ __global__ void prep_kernel(float* qkv, const float* __restrict__ a, const float
     }
 }
 
+// conv_kernel then prep_kernel in one pass (prefill): one block of 128 threads per (token, key head)
+// computes the causal conv of that head's q and k channels and of its three value heads' channels
+// (thread i: channel i of each), l2-normalizes q and k, and computes beta and g of the three value
+// heads; the same arithmetic as the two kernels. The conv state is advanced afterwards.
+__global__ void __launch_bounds__(DK) conv_prep_kernel(const float* __restrict__ x, int ldx, float* out, const float* __restrict__ state,
+                                                       const __nv_bfloat16* __restrict__ w, const float* __restrict__ a,
+                                                       const float* __restrict__ b, int ldab, const __nv_bfloat16* __restrict__ a_log,
+                                                       const __nv_bfloat16* __restrict__ dt_bias, float* beta, float* g) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ float scratch[32];
+    const int t = blockIdx.x / KH, h = blockIdx.x % KH, i = threadIdx.x;
+    auto conv = [&](int c) {
+        const float w0 = bf2f(w[c * TAPS]), w1 = bf2f(w[c * TAPS + 1]), w2 = bf2f(w[c * TAPS + 2]), w3 = bf2f(w[c * TAPS + 3]);
+        auto input = [&](int tt) { return tt >= 0 ? x[(size_t)tt * ldx + c] : state[(3 + tt) * C + c]; };
+        const float p0 = input(t - 3), p1 = input(t - 2), p2 = input(t - 1), cur = x[(size_t)t * ldx + c];
+        return silu(w0 * p0 + w1 * p1 + w2 * p2 + w3 * cur);
+    };
+    const int cq = h * DK + i, ck = KH * DK + h * DK + i;
+    const float qv = conv(cq), kv = conv(ck);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int cv = 2 * KH * DK + (h * 3 + j) * DV + i;
+        out[(size_t)t * C + cv] = conv(cv);
+    }
+    const float qn = rsqrtf(block_sum(qv * qv, scratch) + EPS);
+    const float kn = rsqrtf(block_sum(kv * kv, scratch) + EPS);
+    out[(size_t)t * C + cq] = qv * qn * rsqrtf((float)DK);
+    out[(size_t)t * C + ck] = kv * kn;
+    if (i < 3) {
+        const int vh = h * 3 + i;
+        const float xa = a[(size_t)t * ldab + vh] + bf2f(dt_bias[vh]);
+        const float softplus = xa > 20.0f ? xa : log1pf(__expf(xa));
+        g[t * VH + vh] = -__expf(bf2f(a_log[vh])) * softplus;
+        beta[t * VH + vh] = sigmoidf(b[(size_t)t * ldab + vh]);
+    }
+}
+
 // Token-sequential delta rule. Each thread owns one value column of one head's state in registers;
 // grid (48 heads, 4 column groups) x 32 threads.
 __global__ void __launch_bounds__(32) recurrent_kernel(const float* __restrict__ qkv, const float* __restrict__ beta,
@@ -381,6 +419,16 @@ extern "C" cudaError_t squash_gdn_conv(const float* x, int ldx, float* out, floa
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(conv_kernel, dim3(C / 256, (T + CONV_TT - 1) / CONV_TT), 256, 0, st, x, ldx, out,
                               static_cast<const float*>(state), static_cast<const __nv_bfloat16*>(w), T));
+    SQ_CHECK_LAUNCH(sq_launch(advance_conv_kernel, C / 256, 256, 0, st, x, ldx, state, T));
+    SQ_RETURN_LAUNCH();
+}
+
+extern "C" cudaError_t squash_gdn_conv_prep(const float* x, int ldx, float* out, float* state, const void* w, const float* a, const float* b,
+                                            int ldab, const void* a_log, const void* dt_bias, float* beta, float* g, int T, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(conv_prep_kernel, T * KH, DK, 0, st, x, ldx, out, static_cast<const float*>(state),
+                              static_cast<const __nv_bfloat16*>(w), a, b, ldab, static_cast<const __nv_bfloat16*>(a_log),
+                              static_cast<const __nv_bfloat16*>(dt_bias), beta, g));
     SQ_CHECK_LAUNCH(sq_launch(advance_conv_kernel, C / 256, 256, 0, st, x, ldx, state, T));
     SQ_RETURN_LAUNCH();
 }

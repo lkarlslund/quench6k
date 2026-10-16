@@ -177,6 +177,12 @@ pub fn gdn_conv(s: &Stream, x: u64, ldx: usize, out: u64, state: u64, w: u64, t:
 }
 
 #[allow(clippy::too_many_arguments)]
+/// [`gdn_conv`] followed by [`gdn_prep`] in one pass (same results).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_conv_prep(s: &Stream, x: u64, ldx: usize, out: u64, state: u64, w: u64, a: u64, b: u64, ldab: usize, a_log: u64, dt_bias: u64, beta: u64, g: u64, t: usize) -> Result<()> {
+    launch!("gdn_conv_prep", ffi::squash_gdn_conv_prep(f(x), n32(ldx), fm(out), fm(state), p(w), f(a), f(b), n32(ldab), p(a_log), p(dt_bias), fm(beta), fm(g), n32(t), s.raw()))
+}
+
 pub fn gdn_prep(s: &Stream, qkv: u64, a: u64, b: u64, ldab: usize, a_log: u64, dt_bias: u64, beta: u64, g: u64, t: usize) -> Result<()> {
     launch!("gdn_prep", ffi::squash_gdn_prep(fm(qkv), f(a), f(b), n32(ldab), p(a_log), p(dt_bias), fm(beta), fm(g), n32(t), s.raw()))
 }

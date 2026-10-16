@@ -955,8 +955,7 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
                 if let Some(sp) = spec {
                     op!(prof, "gdn_flush", s, k::gdn_fused_small(s, x, ld, 0, g.conv, st().conv.addr(), st().recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, Some(k::Deferral { defer: false, ..sp })));
                 }
-                op!(prof, "gdn_conv", s, k::gdn_conv(s, col(0), ld, ws.conv, st().conv.addr(), g.conv, t));
-                op!(prof, "gdn_prep", s, k::gdn_prep(s, ws.conv, col(2), col(3), ld, g.a_log, g.dt_bias, ws.beta, ws.g, t));
+                op!(prof, "gdn_conv_prep", s, k::gdn_conv_prep(s, col(0), ld, ws.conv, st().conv.addr(), g.conv, col(2), col(3), ld, g.a_log, g.dt_bias, ws.beta, ws.g, t));
                 if t >= 64 && gdn_tc() {
                     op!(prof, "gdn_chunked_tc", s, k::gdn_chunked_tc(s, ws.conv, ws.beta, ws.g, st().recurrent.addr(), ws.o, t, ws.gdn_chunks));
                 } else {

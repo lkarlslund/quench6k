@@ -708,3 +708,36 @@ fn gemm_wide_matches_cpu() {
     }
     assert!(worst < 1e-4, "wide gemm error {worst}");
 }
+
+/// The fused GDN conv + prep equals the two kernels, bit for bit (outputs, beta, g and conv state).
+#[test]
+fn gdn_conv_prep_fused_matches() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0xc0a7_0001);
+    let (t, ld) = (37usize, 10240 + 2 * 48 + 16);
+    let x = upload(&s, &rng.vec(t * ld));
+    let w = upload(&s, &to_bf16(&rng.vec(10240 * 4)));
+    let state0 = rng.vec(3 * 10240);
+    let alog = upload(&s, &to_bf16(&rng.vec(48)));
+    let dtb = upload(&s, &to_bf16(&rng.vec(48)));
+    let (a, b) = (x.addr() + 10240 * 4, x.addr() + (10240 + 48) * 4);
+    let run = |fused: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let st = upload(&s, &state0);
+        let out = DeviceBuffer::zeroed(t * 10240 * 4).unwrap();
+        let (beta, g) = (DeviceBuffer::zeroed(t * 48 * 4).unwrap(), DeviceBuffer::zeroed(t * 48 * 4).unwrap());
+        if fused {
+            kernels::gdn_conv_prep(&s, x.addr(), ld, out.addr(), st.addr(), w.addr(), a, b, ld, alog.addr(), dtb.addr(), beta.addr(), g.addr(), t).unwrap();
+        } else {
+            kernels::gdn_conv(&s, x.addr(), ld, out.addr(), st.addr(), w.addr(), t).unwrap();
+            kernels::gdn_prep(&s, out.addr(), a, b, ld, alog.addr(), dtb.addr(), beta.addr(), g.addr(), t).unwrap();
+        }
+        (s.download(out.addr(), t * 10240).unwrap(), s.download(beta.addr(), t * 48).unwrap(), s.download(g.addr(), t * 48).unwrap(), s.download(st.addr(), 3 * 10240).unwrap())
+    };
+    let (o0, b0, g0, s0) = run(false);
+    let (o1, b1, g1, s1) = run(true);
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+    assert!(same(&o0, &o1), "outputs differ");
+    assert!(same(&b0, &b1) && same(&g0, &g1), "beta/g differ");
+    assert!(same(&s0, &s1), "state differs");
+}
