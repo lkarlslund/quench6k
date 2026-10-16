@@ -297,3 +297,47 @@ fn qsa_select_matches_cpu() {
         }
     }
 }
+
+/// The chunked GDN recurrence (used from 64 tokens) matches the token-sequential kernel.
+#[test]
+fn gdn_chunked_matches_sequential() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x6d6e_1234_abcd);
+    const C: usize = 10240;
+    const KH: usize = 16;
+    const VH: usize = 48;
+    const DK: usize = 128;
+    for &t in &[64usize, 100, 333] {
+        let mut qkv = rng.vec(t * C);
+        // unit q / k per key head, as gdn_prep leaves them (q also / sqrt(128))
+        for r in 0..t {
+            for h in 0..2 * KH {
+                let row = &mut qkv[r * C + h * DK..r * C + (h + 1) * DK];
+                let n = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let sc = if h < KH { 1.0 / (n * (DK as f32).sqrt()) } else { 1.0 / n };
+                row.iter_mut().for_each(|v| *v *= sc);
+            }
+        }
+        let beta: Vec<f32> = (0..t * VH).map(|_| 0.5 + 0.49 * rng.next()).collect();
+        let g: Vec<f32> = (0..t * VH).map(|_| -0.3 * (1.0 + rng.next())).collect();
+        let state0: Vec<f32> = rng.vec(VH * DK * DK).iter().map(|v| v * 0.3).collect();
+        let (dq, db, dg) = (upload(&s, &qkv), upload(&s, &beta), upload(&s, &g));
+        let run = |sequential: bool| -> (Vec<f32>, Vec<f32>) {
+            let st = upload(&s, &state0);
+            let out = DeviceBuffer::new(t * VH * DK * 4).unwrap();
+            let scratch = DeviceBuffer::new(kernels::gdn_chunk_scratch_floats(t) * 4).unwrap();
+            kernels::gdn_recurrent(&s, dq.addr(), db.addr(), dg.addr(), st.addr(), out.addr(), t, if sequential { 0 } else { scratch.addr() }).unwrap();
+            (s.download(out.addr(), t * VH * DK).unwrap(), s.download(st.addr(), VH * DK * DK).unwrap())
+        };
+        let (o0, s0) = run(true);
+        let (o1, s1) = run(false);
+        let err = |a: &[f32], b: &[f32]| {
+            let scale = a.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-6);
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale
+        };
+        let (eo, es) = (err(&o0, &o1), err(&s0, &s1));
+        println!("T={t}: output error {eo:.2e}, state error {es:.2e}");
+        assert!(eo < 1e-4 && es < 1e-4, "T={t}: output {eo}, state {es}");
+    }
+}

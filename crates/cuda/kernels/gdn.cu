@@ -116,6 +116,251 @@ __global__ void __launch_bounds__(32) recurrent_kernel(const float* __restrict__
     for (int j = 0; j < DK; ++j) st[j * DV + col] = s[j];
 }
 
+// Chunked delta rule (WY form), mathematically equal to recurrent_kernel. Per chunk of L tokens with
+// chunk-initial state S0 [k][v] and cumulative log decays G_i (sum of g over the chunk up to i):
+//   A[i][j] = beta_i exp(G_i - G_j) (k_i . k_j) for j < i;  T = (I + A)^-1 (unit lower triangular)
+//   W = T (beta exp(G) * K),  U = T (beta * V),  Vn = U - W S0          (the per-token updates u_i)
+//   O[i] = exp(G_i) S0^T q_i + sum_{j <= i} exp(G_i - G_j) (q_i . k_j) Vn[j]
+//   S = exp(G_L) S0 + sum_j exp(G_L - G_j) k_j Vn[j]^T
+// chunk_prep_kernel computes the state-independent W, U and P[i][j] = exp(G_i - G_j) (q_i . k_j)
+// for every (chunk, head) in parallel; chunk_state_kernel walks the chunks of each (head, column
+// group) with the state. FP32 throughout.
+constexpr int CL = 32, CW = 32, CT = 256, KP = DK + 1;  // padded rows: conflict-free column reads
+constexpr int NV = CL * CW / CT, NS = DK * CW / CT;  // per-thread outputs: Vn / O, state
+constexpr int CHUNK_W = CL * DK, CHUNK_U = CL * DV, CHUNK_P = CL * CL, CHUNK_FLOATS = CHUNK_W + CHUNK_U + CHUNK_P;
+constexpr size_t PREP_SMEM = (2 * CL * KP + CL * DV + 3 * CL * (CL + 1)) * sizeof(float);
+constexpr size_t STATE_SMEM = (DK * CW + 3 * CL * KP + 3 * CL * CW + CL * CL) * sizeof(float);
+
+// Inclusive prefix sum of g over the chunk (warp 0 lanes = rows) and the derived factors.
+SQ_DEVICE void chunk_decays(const float* __restrict__ g, const float* __restrict__ beta, int t0, int len, int vh,
+                            float* Gs, float* Bs) {
+    const int r = threadIdx.x & 31;
+    float gv = r < len ? g[(t0 + r) * VH + vh] : 0.0f;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const float n = __shfl_up_sync(0xffffffff, gv, o);
+        if (r >= o) gv += n;
+    }
+    Gs[r] = gv;
+    if (Bs) Bs[r] = r < len ? beta[(t0 + r) * VH + vh] : 0.0f;
+}
+
+// grid (chunks, VH), CT threads.
+__global__ void __launch_bounds__(CT) chunk_prep_kernel(const float* __restrict__ qkv, const float* __restrict__ beta,
+                                                        const float* __restrict__ g, float* scratch, int T) {
+    pdl_launch_dependents();
+    pdl_wait();
+    extern __shared__ float sm[];
+    float* Ks = sm;                  // [CL][KP]
+    float* Qs = Ks + CL * KP;        // [CL][KP]
+    float* Vs = Qs + CL * KP;        // [CL][DV]
+    float* Tm = Vs + CL * DV;        // [CL][CL + 1]: A, then T
+    float* TB = Tm + CL * (CL + 1);  // T[i][j] beta_j exp(G_j)
+    float* TV = TB + CL * (CL + 1);  // T[i][j] beta_j
+    __shared__ float Gs[CL], Bs[CL];
+    const int ch = blockIdx.x, vh = blockIdx.y, kh = vh / 3, t0 = ch * CL, len = min(CL, T - t0);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    float* outw = scratch + ((size_t)ch * VH + vh) * CHUNK_FLOATS;
+    float* outu = outw + CHUNK_W;
+    float* outp = outu + CHUNK_U;
+    for (int i = tid; i < CL * DK; i += CT) {
+        const int r = i / DK, d = i % DK;
+        const bool ok = r < len;
+        const float* row = qkv + (size_t)(t0 + r) * C;
+        Qs[r * KP + d] = ok ? row[kh * DK + d] : 0.0f;
+        Ks[r * KP + d] = ok ? row[KH * DK + kh * DK + d] : 0.0f;
+        Vs[i] = ok ? row[2 * KH * DK + vh * DV + d] : 0.0f;
+    }
+    if (warp == 0) chunk_decays(g, beta, t0, len, vh, Gs, Bs);
+    __syncthreads();
+    // A (strictly lower) and P (lower incl. diagonal): thread (i, 4 consecutive j).
+    {
+        const int i = tid / 8, j0 = (tid % 8) * 4;
+        float kk[4] = {}, qk[4] = {};
+#pragma unroll 4
+        for (int d = 0; d < DK; ++d) {
+            const float ki = Ks[i * KP + d], qi = Qs[i * KP + d];
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                const float kj = Ks[(j0 + jj) * KP + d];
+                kk[jj] = fmaf(ki, kj, kk[jj]);
+                qk[jj] = fmaf(qi, kj, qk[jj]);
+            }
+        }
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) {
+            const int j = j0 + jj;
+            const float dec = j <= i ? __expf(Gs[i] - Gs[j]) : 0.0f;
+            Tm[i * (CL + 1) + j] = j < i ? Bs[i] * dec * kk[jj] : 0.0f;
+            outp[i * CL + j] = j <= i ? dec * qk[jj] : 0.0f;
+        }
+    }
+    __syncthreads();
+    // T = (I + A)^-1 by forward substitution: lane j owns column j.
+    if (warp == 0) {
+        const int j = lane;
+        for (int i = 1; i < CL; ++i) {
+            float v = 0.0f;
+            if (i > j) {
+                v = -Tm[i * (CL + 1) + j];
+                for (int m = j + 1; m < i; ++m) v = fmaf(-Tm[i * (CL + 1) + m], Tm[m * (CL + 1) + j], v);
+            }
+            __syncwarp();
+            if (i > j) Tm[i * (CL + 1) + j] = v;
+            __syncwarp();
+        }
+        Tm[j * (CL + 1) + j] = 1.0f;
+    }
+    __syncthreads();
+    for (int e = tid; e < CL * CL; e += CT) {
+        const int i = e / CL, j = e % CL;
+        const float t = Tm[i * (CL + 1) + j];
+        TB[i * (CL + 1) + j] = t * Bs[j] * __expf(Gs[j]);
+        TV[i * (CL + 1) + j] = t * Bs[j];
+    }
+    __syncthreads();
+    // W = TB K and U = TV V: thread (row i, 16 consecutive columns).
+    {
+        const int i = tid / 8, d0 = (tid % 8) * 16;
+        float w[16] = {}, u[16] = {};
+        for (int j = 0; j <= i; ++j) {
+            const float tb = TB[i * (CL + 1) + j], tv = TV[i * (CL + 1) + j];
+#pragma unroll
+            for (int x = 0; x < 16; ++x) {
+                w[x] = fmaf(tb, Ks[j * KP + d0 + x], w[x]);
+                u[x] = fmaf(tv, Vs[j * DV + d0 + x], u[x]);
+            }
+        }
+#pragma unroll
+        for (int x = 0; x < 16; x += 4) {
+            *reinterpret_cast<float4*>(outw + i * DK + d0 + x) = make_float4(w[x], w[x + 1], w[x + 2], w[x + 3]);
+            *reinterpret_cast<float4*>(outu + i * DV + d0 + x) = make_float4(u[x], u[x + 1], u[x + 2], u[x + 3]);
+        }
+    }
+}
+
+// grid (VH, DV / CW), CT threads: the chunks in order, state columns [c0, c0 + CW) in shared memory.
+__global__ void __launch_bounds__(CT) chunk_state_kernel(const float* __restrict__ qkv, const float* __restrict__ g,
+                                                         const float* __restrict__ scratch, float* state, float* out,
+                                                         int T) {
+    pdl_launch_dependents();
+    pdl_wait();
+    extern __shared__ float sm[];
+    float* Ss = sm;                  // [DK][CW]
+    float* Ws = Ss + DK * CW;        // [CL][KP]
+    float* Qd = Ws + CL * KP;        // [CL][KP] exp(G_i) q_i
+    float* Kd = Qd + CL * KP;        // [CL][KP] exp(G_L - G_j) k_j
+    float* Us = Kd + CL * KP;        // [CL][CW]
+    float* Vn = Us + CL * CW;        // [CL][CW]
+    float* Pm = Vn + CL * CW;        // [CL][CL]
+    __shared__ float Gs[CL];
+    const int vh = blockIdx.x, kh = vh / 3, c0 = blockIdx.y * CW, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    float* st = state + (size_t)vh * DK * DV;
+    for (int i = tid; i < DK * CW; i += CT) Ss[i] = st[(i / CW) * DV + c0 + i % CW];
+    const int chunks = (T + CL - 1) / CL;
+    // The next chunk's inputs are loaded into registers while the current one is computed.
+    constexpr int NW = CL * DK / CT, NU = CL * CW / CT, NP = CL * CL / CT;
+    float pw[NW], pq[NW], pk[NW], pu[NU], pp[NP], pg = 0.0f;
+    auto prefetch = [&](int ch) {
+        if (ch >= chunks) return;
+        const int t0 = ch * CL, len = min(CL, T - t0);
+        const float* sw = scratch + ((size_t)ch * VH + vh) * CHUNK_FLOATS;
+#pragma unroll
+        for (int n = 0; n < NW; ++n) {
+            const int e = tid + n * CT, r = e / DK, d = e % DK;
+            const bool ok = r < len;
+            const float* row = qkv + (size_t)(t0 + r) * C;
+            pw[n] = sw[e];
+            pq[n] = ok ? row[kh * DK + d] : 0.0f;
+            pk[n] = ok ? row[KH * DK + kh * DK + d] : 0.0f;
+        }
+#pragma unroll
+        for (int n = 0; n < NU; ++n) {
+            const int e = tid + n * CT;
+            pu[n] = sw[CHUNK_W + (e / CW) * DV + c0 + e % CW];
+        }
+#pragma unroll
+        for (int n = 0; n < NP; ++n) pp[n] = sw[CHUNK_W + CHUNK_U + tid + n * CT];
+        if (warp == 0) pg = lane < len ? g[(t0 + lane) * VH + vh] : 0.0f;
+    };
+    prefetch(0);
+    for (int ch = 0; ch < chunks; ++ch) {
+        const int t0 = ch * CL, len = min(CL, T - t0);
+        if (warp == 0) {
+            float gv = pg;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const float n = __shfl_up_sync(0xffffffff, gv, o);
+                if (lane >= o) gv += n;
+            }
+            Gs[lane] = gv;
+        }
+        __syncthreads();  // also: the previous chunk is done with every buffer
+        const float GL = Gs[CL - 1];
+#pragma unroll
+        for (int n = 0; n < NW; ++n) {
+            const int e = tid + n * CT, r = e / DK, d = e % DK;
+            Ws[r * KP + d] = pw[n];
+            Qd[r * KP + d] = __expf(Gs[r]) * pq[n];
+            Kd[r * KP + d] = __expf(GL - Gs[r]) * pk[n];
+        }
+#pragma unroll
+        for (int n = 0; n < NU; ++n) Us[tid + n * CT] = pu[n];
+#pragma unroll
+        for (int n = 0; n < NP; ++n) Pm[tid + n * CT] = pp[n];
+        __syncthreads();
+        prefetch(ch + 1);
+        const int i = tid / (CW / NV), cc = (tid % (CW / NV)) * NV;
+        // Vn = U - W S0 and Q S0: thread (row i, NV consecutive columns).
+        float ws[NV] = {}, qs[NV] = {};
+#pragma unroll 4
+        for (int d = 0; d < DK; ++d) {
+            const float wv = Ws[i * KP + d], qv = Qd[i * KP + d];
+#pragma unroll
+            for (int x = 0; x < NV; ++x) {
+                const float sv = Ss[d * CW + cc + x];
+                ws[x] = fmaf(wv, sv, ws[x]);
+                qs[x] = fmaf(qv, sv, qs[x]);
+            }
+        }
+#pragma unroll
+        for (int x = 0; x < NV; ++x) Vn[i * CW + cc + x] = Us[i * CW + cc + x] - ws[x];
+        __syncthreads();
+        // O = exp(G) Q S0 + P Vn
+        {
+            float o[NV];
+#pragma unroll
+            for (int x = 0; x < NV; ++x) o[x] = qs[x];
+            for (int j = 0; j <= i; ++j) {
+                const float p = Pm[i * CL + j];
+#pragma unroll
+                for (int x = 0; x < NV; ++x) o[x] = fmaf(p, Vn[j * CW + cc + x], o[x]);
+            }
+            if (i < len)
+#pragma unroll
+                for (int x = 0; x < NV; ++x) out[(size_t)(t0 + i) * VH * DV + vh * DV + c0 + cc + x] = o[x];
+        }
+        // S = exp(G_L) S0 + Kd^T Vn: thread (row d, NS consecutive columns).
+        {
+            const int d = tid / (CW / NS), cs = (tid % (CW / NS)) * NS;
+            const float eg = __expf(GL);
+            float sv[NS];
+#pragma unroll
+            for (int x = 0; x < NS; ++x) sv[x] = eg * Ss[d * CW + cs + x];
+            for (int j = 0; j < len; ++j) {
+                const float kd = Kd[j * KP + d];
+#pragma unroll
+                for (int x = 0; x < NS; ++x) sv[x] = fmaf(kd, Vn[j * CW + cs + x], sv[x]);
+            }
+            __syncthreads();  // every thread has read S0
+#pragma unroll
+            for (int x = 0; x < NS; ++x) Ss[d * CW + cs + x] = sv[x];
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < DK * CW; i += CT) st[(i / CW) * DV + c0 + i % CW] = Ss[i];
+}
+
 // y[t, h, :] = bf16(rms(o[t, h, :]) * w * sigmoid(z[t, h, :])); one block of 128 per (t, head).
 __global__ void gated_norm_kernel(const float* __restrict__ o, const float* __restrict__ z, int ldz,
                                   const __nv_bfloat16* __restrict__ w, __nv_bfloat16* y) {
@@ -148,8 +393,27 @@ extern "C" cudaError_t squash_gdn_prep(float* qkv, const float* a, const float* 
     SQ_RETURN_LAUNCH();
 }
 
+extern "C" size_t squash_gdn_chunk_scratch_floats(int T) { return (size_t)((T + CL - 1) / CL) * VH * CHUNK_FLOATS; }
+
+// With `scratch` (squash_gdn_chunk_scratch_floats(T) floats) and T >= 64: the chunked form.
 extern "C" cudaError_t squash_gdn_recurrent(const float* qkv, const float* beta, const float* g, float* state, float* out,
-                                            int T, cudaStream_t st) {
+                                            int T, float* scratch, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    if (scratch && T >= 64) {
+        static bool configured = false;
+        if (!configured) {
+            cudaError_t e = cudaFuncSetAttribute(chunk_prep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PREP_SMEM);
+            if (e == cudaSuccess)
+                e = cudaFuncSetAttribute(chunk_state_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)STATE_SMEM);
+            if (e != cudaSuccess) return e;
+            configured = true;
+        }
+        const int chunks = (T + CL - 1) / CL;
+        SQ_CHECK_LAUNCH(sq_launch(chunk_prep_kernel, dim3(chunks, VH), CT, PREP_SMEM, st, qkv, beta, g, scratch, T));
+        SQ_CHECK_LAUNCH(sq_launch(chunk_state_kernel, dim3(VH, DV / CW), CT, STATE_SMEM, st, qkv, g,
+                                  static_cast<const float*>(scratch), state, out, T));
+        SQ_RETURN_LAUNCH();
+    }
     SQ_CHECK_LAUNCH(sq_launch(recurrent_kernel, dim3(VH, DV / 32), 32, 0, st, qkv, beta, g, state, out, T));
     SQ_RETURN_LAUNCH();
 }

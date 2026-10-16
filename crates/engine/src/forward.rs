@@ -150,6 +150,8 @@ pub struct Workspace {
     y: u64,
     // GDN
     conv: u64,
+    /// Chunked GDN recurrence scratch (prefill workspaces).
+    gdn_chunks: u64,
     beta: u64,
     g: u64,
     o: u64,
@@ -232,6 +234,7 @@ impl Workspace {
             conv: alloc(t * GDN_CONV * 4)?,
             beta: alloc(t * GDN_HEADS * 4)?,
             g: alloc(t * GDN_HEADS * 4)?,
+            gdn_chunks: alloc(if t >= 64 { k::gdn_chunk_scratch_floats(t) * 4 } else { 4 })?,
             o: alloc(t * GDN_Z * 4)?,
             o_bf: alloc(t * GDN_Z * 2)?,
             q: alloc(t * QSA_HEADS * QSA_DIM * 4)?,
@@ -583,7 +586,7 @@ fn layer_forward(layer: &crate::model::Layer, gdn: Option<&GdnState>, gdn_rec: O
                 }
                 op!(prof, "gdn_conv", s, k::gdn_conv(s, col(0), ld, ws.conv, st.conv.addr(), g.conv, t));
                 op!(prof, "gdn_prep", s, k::gdn_prep(s, ws.conv, col(2), col(3), ld, g.a_log, g.dt_bias, ws.beta, ws.g, t));
-                op!(prof, "gdn_recurrent", s, k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st.recurrent.addr(), ws.o, t));
+                op!(prof, "gdn_recurrent", s, k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st.recurrent.addr(), ws.o, t, ws.gdn_chunks));
                 op!(prof, "gdn_gated_norm", s, k::gdn_gated_norm(s, ws.o, col(1), ld, g.norm, ws.o_bf, t));
             }
             op!(prof, "gdn out", s, linear(s, ws, ws.o_bf, &g.out, ws.y, t));

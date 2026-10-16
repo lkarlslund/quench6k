@@ -150,8 +150,15 @@ pub fn gdn_prep(s: &Stream, qkv: u64, a: u64, b: u64, ldab: usize, a_log: u64, d
     launch!("gdn_prep", ffi::squash_gdn_prep(fm(qkv), f(a), f(b), n32(ldab), p(a_log), p(dt_bias), fm(beta), fm(g), n32(t), s.raw()))
 }
 
-pub fn gdn_recurrent(s: &Stream, qkv: u64, beta: u64, g: u64, state: u64, out: u64, t: usize) -> Result<()> {
-    launch!("gdn_recurrent", ffi::squash_gdn_recurrent(f(qkv), f(beta), f(g), fm(state), fm(out), n32(t), s.raw()))
+/// Token-sequential GDN delta rule over `t` tokens; with `scratch` ([`gdn_chunk_scratch_floats`] floats,
+/// 0 for none) the chunked form is used from 64 tokens.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent(s: &Stream, qkv: u64, beta: u64, g: u64, state: u64, out: u64, t: usize, scratch: u64) -> Result<()> {
+    launch!("gdn_recurrent", ffi::squash_gdn_recurrent(f(qkv), f(beta), f(g), fm(state), fm(out), n32(t), fm(scratch), s.raw()))
+}
+
+pub fn gdn_chunk_scratch_floats(t: usize) -> usize {
+    unsafe { ffi::squash_gdn_chunk_scratch_floats(t as i32) }
 }
 
 pub fn gdn_gated_norm(s: &Stream, o: u64, z: u64, ldz: usize, w: u64, y: u64, t: usize) -> Result<()> {
