@@ -109,3 +109,33 @@ extern "C" cudaError_t squash_fake_fp4_act(void* x, int rows, int cols, cudaStre
     SQ_CHECK_LAUNCH(sq_launch(fp4_act_kernel, (rows + 7) / 8, 256, 0, st, (__nv_bfloat16*)x, rows, cols));
     SQ_RETURN_LAUNCH();
 }
+
+namespace {
+
+// MXFP8 quantize-dequantize in place (experiments): per 32 consecutive values of a row, a power-of-two
+// scale 2^ceil(log2(amax / 448)) and E4M3 values (round to nearest, saturating). One thread per block.
+__global__ void fake_mxfp8_kernel(__nv_bfloat16* x, int rows, int cols, int ld) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const int per = cols / 32;
+    if (i >= (size_t)rows * per) return;
+    __nv_bfloat16* p = x + (i / per) * (size_t)ld + (i % per) * 32;
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(bf2f(p[j])));
+    if (amax == 0.0f) return;
+    const float scale = exp2f(ceilf(log2f(amax / 448.0f)));
+#pragma unroll
+    for (int j = 0; j < 32; ++j) p[j] = f2bf(float(__nv_fp8_e4m3(bf2f(p[j]) / scale)) * scale);
+}
+
+}  // namespace
+
+extern "C" cudaError_t squash_fake_mxfp8(void* x, int rows, int cols, int ld, cudaStream_t st) {
+    if (cols % 32 != 0) return cudaErrorInvalidValue;
+    const size_t n = (size_t)rows * (cols / 32);
+    if (n == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(fake_mxfp8_kernel, (unsigned)((n + 255) / 256), 256, 0, st, (__nv_bfloat16*)x, rows, cols, ld));
+    SQ_RETURN_LAUNCH();
+}

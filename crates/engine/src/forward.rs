@@ -397,6 +397,9 @@ fn linear_ld(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, l
         }
         return Ok(());
     }
+    if t > k::gemv_max_m() && std::env::var_os("SQUASH_FAKE_MXFP8").is_some() && w.k % 32 == 0 {
+        k::fake_mxfp8(s, x, t, w.k, ldx)?;
+    }
     if t <= k::gemv_max_m() {
         // Split K only when even one row per warp leaves fewer CTAs than SMs.
         let ctas = w.n.div_ceil(8);

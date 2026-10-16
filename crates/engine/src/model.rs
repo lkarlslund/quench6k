@@ -519,6 +519,16 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
             let t = weights.get(&name)?;
             fold(&name, t.addr, t.shape[0], t.shape[1])?;
         }
+        // Experiment: the projections that would be 8-bit rounded to MXFP8 in place.
+        if std::env::var_os("SQUASH_FAKE_MXFP8").is_some() {
+            let names: Vec<String> = weights.tensors.keys().filter(|n| selection::eight_bit(n)).cloned().collect();
+            for name in names {
+                let t = weights.get(&name)?;
+                if t.shape.len() == 2 && t.shape[1] % 32 == 0 {
+                    squash_cuda::kernels::fake_mxfp8(stream, t.addr, t.shape[0], t.shape[1], t.shape[1])?;
+                }
+            }
+        }
         stream.synchronize()?;
     } else {
         let (converted, s) = loader::upload_quantized(ckpt, |n| wanted(n) && quantized(n), format, &projection_groups(mtp), &fold, opts, stream)?;

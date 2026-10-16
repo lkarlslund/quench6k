@@ -482,6 +482,11 @@ pub fn spec_accept(s: &Stream, rc: u64, ctl: u64, n: usize) -> Result<()> {
     launch!("spec_accept", ffi::squash_spec_accept(im(rc), im(ctl), n32(n), s.raw()))
 }
 
+/// MXFP8 (E4M3, power-of-two scale per 32) quantize-dequantize of BF16 rows in place (experiments).
+pub fn fake_mxfp8(s: &Stream, x: u64, rows: usize, cols: usize, ld: usize) -> Result<()> {
+    launch!("fake_mxfp8", ffi::squash_fake_mxfp8(x as *mut std::ffi::c_void, n32(rows), n32(cols), n32(ld), s.raw()))
+}
+
 /// NVFP4 quantize-dequantize of BF16 activations in place (experiments): per-row scale, per-16 E4M3
 /// block scale chosen by least squared error.
 pub fn fake_fp4_act(s: &Stream, x: u64, rows: usize, cols: usize) -> Result<()> {
