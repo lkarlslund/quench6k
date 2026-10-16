@@ -4,14 +4,16 @@ RTX PRO 6000 Blackwell at 600 W, same machine as the NInfer 6000 baseline (GOAL.
 greedy, BF16 KV, `bench/context.ids` corpus, decode = 256 generated tokens after a prompt of the
 given length (`squash bench --generate 256`; 256K is measured at 260,000 tokens, the corpus length).
 Every run first checks 64 greedy tokens of the code fixture against the reference (all passed).
+Decode and prefill columns: after the 128x128 GEMM tiles (09:15); 512 is the second, warm measurement
+(the first, cold one: 2,919 prefill, 179.8 decode). MTP columns: 08:15 run.
 
 | Context | Decode | NInfer | MTP3 (LM-head draft) | NInfer MTP3 + LM-head draft | Adaptive MTP (≤6) | Prefill | NInfer prefill |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 512 | **177.6** | 172.0 | **317.8** | 274.8 | 325.7 | 2,702 (1,643 cold) | 5,905 |
-| 8K | **185.0** | 170.6 | **403.6** | 401.3 | 509.8 | 5,873 | 13,908 |
-| 64K | **178.5** | 153.9 | **389.0** | 380.3 | 484.2 | 6,314 | 12,171 |
-| 128K | **176.4** | 149.8 | **385.4** | 368.0 | 478.8 | 5,989 | 11,032 |
-| 256K | **172.9** | 149.0 | **376.1** | 360.6 | 468.5 | 5,484 | 9,154 |
+| 512 | **189.6** | 172.0 | **317.8** | 274.8 | 325.7 | 3,209 | 5,905 |
+| 8K | **184.7** | 170.6 | **403.6** | 401.3 | 509.8 | 7,049 | 13,908 |
+| 64K | **178.2** | 153.9 | **389.0** | 380.3 | 484.2 | 6,768 | 12,171 |
+| 128K | **176.1** | 149.8 | **385.4** | 368.0 | 478.8 | 6,427 | 11,032 |
+| 256K | **172.8** | 149.0 | **376.1** | 360.6 | 468.5 | 5,844 | 9,154 |
 
 - Decode and MTP beat every NInfer cell. The corpus repeats few distinct tokens, so its draft
   acceptance is near 100% (4.0 tokens per MTP3 round); on the oracle fixtures adaptive drafting

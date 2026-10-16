@@ -75,3 +75,4 @@ previous one stopped.
 - 2026-10-16 08:40 M8: periodic recurrent snapshots on chunk boundaries (at most 8 per prompt, interval a multiple of the prefill chunk so restored prefills keep the cold chunking; recycled before turn-boundary snapshots; GPU pool 12): a 63.6K-token prompt edited at ~75% reuses 40,960 tokens (3.8 s vs 10.2 s cold) with the same answer; multiturn reuse unchanged.
 - 2026-10-16 09:00 M6: dense GEMM tile 64x128 -> 128x128 (warp tiles 64x32, dynamic shared memory): prefill 8K 6963 tok/s (comparable earlier run 6491), 64K 6811 (6314), 512 2922; per-output accumulation order unchanged, decode scoring byte-identical on all 6 fixtures; kernel tests pass.
 - 2026-10-16 09:10 M6: tried 128x256 GEMM tiles (warp 64x64): 8K prefill 6880 vs 6963 for 128x128, kept 128x128.
+- 2026-10-16 09:20 M12: plain row re-measured after the GEMM change: decode 189.6/184.7/178.2/176.1/172.8, prefill 3209/7049/6768/6427/5844 (512 warm; cold 2919).
