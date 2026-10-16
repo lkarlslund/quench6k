@@ -1,3 +1,4 @@
+#include <cstdlib>
 // QSA attention (SPEC §6): projections' epilogues, caches, the group indexer and selected attention.
 //
 // Per-sequence, per-layer cache (indexed by absolute position p):
@@ -184,6 +185,93 @@ __global__ void index_score_kernel(const float* __restrict__ iq, const __nv_bflo
         out *= rsqrtf((float)ID);
     }
     scores[(size_t)t * ld + g] = out;
+}
+
+// Prefill scores on the tensor cores: tile of 64 query rows x 128 groups, per indexer head
+// C_h = q_h . pooled^T with q split into hi + lo BF16 parts (pooled is BF16, so the products keep about
+// 16 mantissa bits), FP32 accumulation; score = sum_h relu(C_h) / sqrt(128), written for the groups a
+// row can select (g < complete, rows past the dense threshold). 8 warps of 32 x 32.
+constexpr int ST_BM = 64, ST_BN = 128, ST_LD = ID + 8;
+constexpr size_t SCORE_TC_SMEM = (size_t)(ST_BN + 2 * ST_BM) * ST_LD * 2;
+__global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __restrict__ iq, const __nv_bfloat16* __restrict__ pooled,
+                                                             float* scores, int ld, const int* __restrict__ start_ptr, int T) {
+    pdl_launch_dependents();
+    pdl_wait();
+    extern __shared__ __align__(16) unsigned char sc_smem[];
+    __nv_bfloat16* Bs = reinterpret_cast<__nv_bfloat16*>(sc_smem);  // [ST_BN][ST_LD]
+    __nv_bfloat16* Ah = Bs + ST_BN * ST_LD;                          // [ST_BM][ST_LD]
+    __nv_bfloat16* Al = Ah + ST_BM * ST_LD;
+    const int start = *start_ptr, t0 = blockIdx.y * ST_BM, g0 = blockIdx.x * ST_BN;
+    const int cmax = (start + min(t0 + ST_BM, T)) / GROUP;
+    if (cmax <= TOPG || g0 >= cmax) return;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, warp_m = warp >> 2, warp_n = warp & 3;
+    for (int c = tid; c < ST_BN * (ID / 8); c += 256) {
+        const int r = c / (ID / 8), col = (c % (ID / 8)) * 8, g = g0 + r;
+        const bool ok = g < cmax && g < ld;
+        cp_async16(Bs + r * ST_LD + col, pooled + (size_t)(ok ? g : 0) * ID + col, ok);
+    }
+    cp_async_commit();
+    float o[2][4][4] = {};
+    for (int h = 0; h < IH; ++h) {
+        __syncthreads();  // the previous head's fragments are read
+        for (int c = tid; c < ST_BM * (ID / 4); c += 256) {
+            const int r = c / (ID / 4), col = (c % (ID / 4)) * 4, t = t0 + r;
+            const float4 v = t < T ? *reinterpret_cast<const float4*>(iq + (size_t)t * IH * ID + h * ID + col) : make_float4(0.f, 0.f, 0.f, 0.f);
+            const float f[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const __nv_bfloat16 hi = f2bf(f[e]);
+                Ah[r * ST_LD + col + e] = hi;
+                Al[r * ST_LD + col + e] = f2bf(f[e] - bf2f(hi));
+            }
+        }
+        cp_async_wait<0>();
+        __syncthreads();
+        float c4[2][4][4] = {};
+#pragma unroll
+        for (int kk = 0; kk < ID; kk += 16) {
+            uint32_t ah[2][4], al[2][4], b[2][4];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int r = warp_m * 32 + i * 16 + (lane & 15), c = kk + (lane >> 4) * 8;
+                ldmatrix_x4(ah[i], Ah + r * ST_LD + c);
+                ldmatrix_x4(al[i], Al + r * ST_LD + c);
+            }
+#pragma unroll
+            for (int j = 0; j < 2; ++j)
+                ldmatrix_x4(b[j], Bs + (warp_n * 32 + j * 16 + (lane & 7) + ((lane >> 4) << 3)) * ST_LD + kk + ((lane >> 3) & 1) * 8);
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    mma_bf16(c4[i][j], ah[i], &b[j >> 1][(j & 1) * 2]);
+                    mma_bf16(c4[i][j], al[i], &b[j >> 1][(j & 1) * 2]);
+                }
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) o[i][j][e] += fmaxf(c4[i][j][e], 0.0f);
+    }
+    const int gq = lane >> 2, t4 = lane & 3;
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int t = t0 + warp_m * 32 + i * 16 + gq + h * 8;
+            if (t >= T) continue;
+            const int complete = (start + t + 1) / GROUP;
+            if (complete <= TOPG) continue;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+#pragma unroll
+                for (int x = 0; x < 2; ++x) {
+                    const int g = g0 + warp_n * 32 + j * 8 + t4 * 2 + x;
+                    if (g < complete && g < ld) scores[(size_t)t * ld + g] = o[i][j][h * 2 + x] * rsqrtf((float)ID);
+                }
+        }
 }
 
 // Small batches (T <= 16): one thread per group g scores every row t from a single read of pooled[g],
@@ -416,6 +504,17 @@ extern "C" cudaError_t squash_qsa_index_scores(const float* iq, const void* pool
     if (T == 0 || ld == 0) return cudaSuccess;
     if (T <= SCORE_MAXT) {
         SQ_CHECK_LAUNCH(sq_launch(index_score_small_kernel, (ld + 255) / 256, 256, 0, st, iq,
+                                  static_cast<const __nv_bfloat16*>(pooled), scores, ld, start, T));
+        SQ_RETURN_LAUNCH();
+    }
+    if (std::getenv("SQUASH_SCORE_FP32") == nullptr) {
+        static bool configured = false;
+        if (!configured) {
+            const cudaError_t e = cudaFuncSetAttribute(index_score_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SCORE_TC_SMEM);
+            if (e != cudaSuccess) return e;
+            configured = true;
+        }
+        SQ_CHECK_LAUNCH(sq_launch(index_score_tc_kernel, dim3((ld + ST_BN - 1) / ST_BN, (T + ST_BM - 1) / ST_BM), 256, SCORE_TC_SMEM, st, iq,
                                   static_cast<const __nv_bfloat16*>(pooled), scores, ld, start, T));
         SQ_RETURN_LAUNCH();
     }

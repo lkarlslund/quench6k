@@ -565,3 +565,41 @@ fn gemm_tall_tiles_match_cpu() {
         assert!(worst < 1e-4, "{fmt:?}: error {worst}");
     }
 }
+
+/// Tensor-core indexer scores against the FP32 kernel; the selected groups barely change.
+#[test]
+fn index_scores_tc_match_fp32() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x5c0e_0001);
+    let (t, start, ld) = (130usize, 6000usize, 1600usize);
+    let iq: Vec<f32> = rng.vec(t * 512);
+    let pooled: Vec<f32> = rng.vec(ld * 128).iter().map(|&v| bf16::round(v)).collect();
+    let (diq, dp) = (upload(&s, &iq), upload(&s, &to_bf16(&pooled)));
+    let dstart = upload(&s, &[start as i32]);
+    let run = |fp32: bool| -> (Vec<f32>, Vec<i32>) {
+        unsafe {
+            if fp32 { std::env::set_var("SQUASH_SCORE_FP32", "1") } else { std::env::remove_var("SQUASH_SCORE_FP32") }
+        }
+        let sc = DeviceBuffer::zeroed(t * ld * 4).unwrap();
+        kernels::qsa_index_scores(&s, diq.addr(), dp.addr(), sc.addr(), ld, dstart.addr(), t).unwrap();
+        let sel = DeviceBuffer::zeroed(t * 512 * 4).unwrap();
+        kernels::qsa_select(&s, sc.addr(), t, ld, dstart.addr(), sel.addr()).unwrap();
+        (s.download(sc.addr(), t * ld).unwrap(), s.download(sel.addr(), t * 512).unwrap())
+    };
+    let (a, sa) = run(true);
+    let (b, sb) = run(false);
+    let mut worst = 0f32;
+    let mut same = 0usize;
+    for r in 0..t {
+        let complete = (start + r + 1) / 4;
+        for g in 0..complete.min(ld) {
+            worst = worst.max((a[r * ld + g] - b[r * ld + g]).abs() / (1.0 + a[r * ld + g].abs()));
+        }
+        let set: std::collections::HashSet<i32> = sa[r * 512..(r + 1) * 512].iter().copied().collect();
+        same += sb[r * 512..(r + 1) * 512].iter().filter(|g| set.contains(g)).count();
+    }
+    println!("score error {worst:.2e}, selection overlap {:.5}", same as f64 / (t * 512) as f64);
+    assert!(worst < 1e-4, "score error {worst}");
+    assert!(same as f64 / (t * 512) as f64 > 0.999, "selection overlap {same}");
+}
