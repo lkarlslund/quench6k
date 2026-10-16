@@ -242,6 +242,13 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
             match session.begin(model, s, free, &job.ids, &job.params, speculate) {
                 Ok((run, toks)) => {
                     let mut a = Active { run, tx: job.tx, reused: if free == 0 { session.reused } else { 0 }, capture: job.capture, generated: Vec::new() };
+                    eprintln!("request: slot {free}, prompt {} tokens, {} reused", job.ids.len(), a.reused);
+                    if let Some(path) = std::env::var_os("SQUASH_TRACE") {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                            let _ = writeln!(f, "{}", json!({"slot": free, "reused": a.reused, "ids": job.ids}));
+                        }
+                    }
                     match emit(&mut a, &toks) {
                         Some(f) => complete(a, f, session),
                         None => slots[free] = Some(a),
