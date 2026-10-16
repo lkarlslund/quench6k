@@ -603,22 +603,39 @@ pub fn prepare_ple(model: &Model, state: &SequenceState, ws: &mut Workspace, t: 
     let layout = StepLayout::new(ws.max_tokens);
     let block = ws.step_host.as_mut_slice();
     let ple = model.layers[1].ple.as_ref().expect("layer 1 has PLE");
-    let row_ids: Vec<[usize; 16]> = (0..t).map(|j| ple_rows(&state.tokens, start + j, &ple.multipliers, &ple.sizes, &ple.offsets)).collect();
-    for ids in &row_ids {
-        for &r in ids {
-            model.ple_table.prefetch(r);
+    let gather = |j0: usize, out: &mut [u8]| {
+        let n = out.len() / (2 * D);
+        let row_ids: Vec<[usize; 16]> = (j0..j0 + n).map(|j| ple_rows(&state.tokens, start + j, &ple.multipliers, &ple.sizes, &ple.offsets)).collect();
+        for ids in &row_ids {
+            for &r in ids {
+                model.ple_table.prefetch(r);
+            }
         }
-    }
-    let mut rows = Vec::with_capacity(D);
-    for (j, ids) in row_ids.iter().enumerate() {
-        rows.clear();
-        for &r in ids {
-            model.ple_table.gather(r, &mut rows);
+        let mut rows = Vec::with_capacity(D);
+        for (j, ids) in row_ids.iter().enumerate() {
+            rows.clear();
+            for &r in ids {
+                model.ple_table.gather(r, &mut rows);
+            }
+            let o = 2 * D * j;
+            for (d, v) in rows.iter().enumerate() {
+                out[o + 2 * d..o + 2 * d + 2].copy_from_slice(&v.to_le_bytes());
+            }
         }
-        let o = layout.ple + 2 * D * j;
-        for (d, v) in rows.iter().enumerate() {
-            block[o + 2 * d..o + 2 * d + 2].copy_from_slice(&v.to_le_bytes());
-        }
+    };
+    let region = &mut block[layout.ple..layout.ple + 2 * D * t];
+    // Large steps (prefill chunks) gather on several threads, each a contiguous range of tokens.
+    const THREADS: usize = 16;
+    if t >= 256 {
+        let per = t.div_ceil(THREADS);
+        std::thread::scope(|sc| {
+            for (i, part) in region.chunks_mut(2 * D * per).enumerate() {
+                let gather = &gather;
+                sc.spawn(move || gather(i * per, part));
+            }
+        });
+    } else {
+        gather(0, region);
     }
     Ok(layout.used(t))
 }
@@ -1172,8 +1189,14 @@ pub fn step_bytes(ws: &Workspace, t: usize) -> usize {
 
 /// Eager step: [`prepare`] then [`forward_device`].
 pub fn forward(model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, new_tokens: &[i32]) -> Result<()> {
+    let t0 = std::time::Instant::now();
     let bytes = prepare(model, state, ws, new_tokens)?;
+    let t1 = std::time::Instant::now();
     forward_device(model, state, ws, s, new_tokens.len(), bytes, None)?;
+    if new_tokens.len() > 1000 && std::env::var_os("SQUASH_TIME_PREP").is_some() {
+        s.synchronize()?;
+        eprintln!("forward {} tokens: prepare {:.1} ms, device {:.1} ms", new_tokens.len(), (t1 - t0).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3);
+    }
     // The pinned step block may be overwritten by the next prepare only after this step consumed it.
     s.synchronize()
 }
