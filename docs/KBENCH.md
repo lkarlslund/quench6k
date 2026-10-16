@@ -183,6 +183,7 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
   with 8 queries per block needs about 122 KB of shared memory, over the 99 KB limit.
 - Fusing hc_down and hc_finish for one token with whole rows per block (4 rows x 4 streams, the same
   split partials and sums, so bitwise identical) is 6% slower per decode step: 81 blocks instead of
-  420 and a serial 4-thread finish. The three-kernel HC stays.
+  420 and a serial 4-thread finish (with 162 two-row blocks: 5.6% slower; every block stages the
+  whole 40 KB residual, where hc_down stages 2 KB per block). The three-kernel HC stays.
 - Draft length policy: forced fixed lengths (2, 4, 6 drafts) are 7-10% slower than the adaptive
   policy on sampled requests; its decay (0.75-0.95) makes no measurable difference.
