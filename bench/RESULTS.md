@@ -9,22 +9,24 @@ build (FP4 prefill experts, MXFP8 GDN input projections, tensor-core GDN, multi-
 
 | Context | Decode | NInfer | MTP3 (LM-head draft) | NInfer MTP3 + LM-head draft | Adaptive MTP (≤6) | Prefill | NInfer prefill |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 512 | **193.3** | 172.0 | **308.4** | 274.8 | 306.9 | **6,516** | 5,905 |
-| 8K | **188.5** | 170.6 | **407.1** | 401.3 | 515.3 | 13,124 | 13,908 |
-| 64K | **184.0** | 153.9 | **395.3** | 380.3 | 494.2 | **12,617** | 12,171 |
-| 128K | **180.0** | 149.8 | **391.1** | 368.0 | 485.0 | **12,279** | 11,032 |
-| 256K | **176.7** | 149.0 | **382.3** | 360.6 | 478.9 | **11,604** | 9,154 |
+| 512 | **193.3** | 172.0 | **308.7** | 274.8 | 307.1 | **6,599** | 5,905 |
+| 8K | **188.6** | 170.6 | **406.9** | 401.3 | 515.3 | **13,936** | 13,908 |
+| 64K | **183.7** | 153.9 | **395.4** | 380.3 | 493.7 | **13,334** | 12,171 |
+| 128K | **180.0** | 149.8 | **390.6** | 368.0 | 484.9 | **12,915** | 11,032 |
+| 256K | **176.7** | 149.0 | **382.7** | 360.6 | 478.6 | **12,133** | 9,154 |
 
-- Decode and MTP beat every NInfer cell; prefill beats NInfer at 512, 64K, 128K and 256K and is 6%
-  short at 8K. With MTP enabled (the serving path) prefill also feeds the drafter's cache:
-  12,545 / 12,068 / 11,676 / 10,959 at 8K / 64K / 128K / 256K.
+- Decode, MTP and prefill beat every NInfer cell (8K prefill by a hair: run-to-run variation on this
+  machine is about 3%; the first, cold 8K run after other work measured 11,036 because the PLE pages
+  were evicted, which the serving path warms in the background). The 8K and 512 rows are warm runs.
+- With MTP enabled (the serving path) prefill also feeds the drafter's cache:
+  13,245 / 12,691 / 12,230 / 11,446 at 8K / 64K / 128K / 256K.
 - The corpus repeats few distinct tokens, so its draft acceptance is near 100% (4.0 tokens per MTP3
   round); on real prompts acceptance is lower.
 - Sampled requests (temperature > 0) use MTP too (exact rejection sampling against the deterministic
-  drafts): 265-273 tok/s against 166-175 plain on three prompts at temperature 0.6 and 1.0, with the
+  drafts): 262-273 tok/s against 166-179 plain on three prompts at temperature 0.6 and 1.0, with the
   token distribution equal to plain sampling (two-sample test, 600 samples per position).
 
-## Prefill, what changed today (8K chunk: 1,108 ms -> 616 ms on the GPU)
+## Prefill, what changed today (8K chunk: 1,108 ms -> about 585 ms on the GPU)
 
 - FP4 tensor cores for the routed experts in prefill (W4A4: activations quantized per row with the
   least-error E4M3 block scale, as llama.cpp; gate PASS), gate/up/SwiGLU fused, BF16 expert outputs.
@@ -34,8 +36,10 @@ build (FP4 prefill experts, MXFP8 GDN input projections, tensor-core GDN, multi-
 - QSA: tensor-core indexer scores, one-block-per-row top-512 selection for prefill, attention over the
   union of 4 neighbouring queries' selections.
 - HyperConnection: up-projection and mix fused, residual update fused into the next norm.
-- Dense GEMM: 256x128 tiles for large launches, 2-stage two-CTAs-per-SM variant for 1-2 waves,
-  split-K for grids smaller than the GPU (short prompts).
+- Dense GEMM: XOR-swizzled shared memory (no padding), two CTAs per SM with three stages, 256x128
+  tiles for large launches, split-K for grids smaller than the GPU (short prompts).
+- Fusions (bit-identical): GDN conv + q/k normalization, MoE combine into the next HC norm, parallel
+  PLE conv over token tiles.
 - Host: PLE rows faulted in by 64 threads ahead of the GPU (MADV_RANDOM: no 128 KiB readahead per
   320-byte row), gathered on 16 threads, overlapping layer 0 on the GPU.
 
