@@ -1,36 +1,43 @@
-# Final benchmark (M12), 2026-10-16
+# Benchmark, 2026-10-16 (afternoon)
 
 RTX PRO 6000 Blackwell at 600 W, same machine as the NInfer 6000 baseline (GOAL.md §2). One request,
 greedy, BF16 KV, `bench/context.ids` corpus, decode = 256 generated tokens after a prompt of the
 given length (`squash bench --generate 256`; 256K is measured at 260,000 tokens, the corpus length).
-Every run first checks 64 greedy tokens of the code fixture against the reference (all passed).
-Decode and prefill columns: after the 128x128 GEMM tiles (09:15); 512 is the second, warm measurement
-(the first, cold one: 2,919 prefill, 179.8 decode). MTP columns: 08:15 run.
+Every run first checks 64 greedy tokens of the code fixture against the reference (all passed). The 512
+row is the second, warm measurement. Correctness gate (GOAL.md §1): PASS on all fixtures for this
+build (FP4 prefill experts, MXFP8 GDN input projections, tensor-core GDN, multi-query attention).
 
 | Context | Decode | NInfer | MTP3 (LM-head draft) | NInfer MTP3 + LM-head draft | Adaptive MTP (≤6) | Prefill | NInfer prefill |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 512 | **189.6** | 172.0 | **317.8** | 274.8 | 325.7 | 3,209 | 5,905 |
-| 8K | **184.7** | 170.6 | **403.6** | 401.3 | 509.8 | 7,049 | 13,908 |
-| 64K | **178.2** | 153.9 | **389.0** | 380.3 | 484.2 | 6,768 | 12,171 |
-| 128K | **176.1** | 149.8 | **385.4** | 368.0 | 478.8 | 6,427 | 11,032 |
-| 256K | **172.8** | 149.0 | **376.1** | 360.6 | 468.5 | 5,844 | 9,154 |
+| 512 | **193.3** | 172.0 | **308.4** | 274.8 | 306.9 | **6,516** | 5,905 |
+| 8K | **188.5** | 170.6 | **407.1** | 401.3 | 515.3 | 13,124 | 13,908 |
+| 64K | **184.0** | 153.9 | **395.3** | 380.3 | 494.2 | **12,617** | 12,171 |
+| 128K | **180.0** | 149.8 | **391.1** | 368.0 | 485.0 | **12,279** | 11,032 |
+| 256K | **176.7** | 149.0 | **382.3** | 360.6 | 478.9 | **11,604** | 9,154 |
 
-- Decode and MTP beat every NInfer cell. The corpus repeats few distinct tokens, so its draft
-  acceptance is near 100% (4.0 tokens per MTP3 round); on the oracle fixtures adaptive drafting
-  gives 454 (code), 282 (multiturn), 335 (math), 340 (tool) tok/s.
-- Prefill does not beat NInfer: the correctness gate rejects low-precision activations (NVFP4 W4A4
-  and INT8 activations both fail it in fake-quant experiments), so prefill GEMMs run on BF16
-  activations.
-- FP8 KV (`--kv fp8`, 47% less K/V memory) passes the gate and measures the same decode speed
-  (185.2 / 173.3 plain, 404.1 / 376.6 MTP3 at 8K / 260K) with prefill within 1%.
+- Decode and MTP beat every NInfer cell; prefill beats NInfer at 512, 64K, 128K and 256K and is 6%
+  short at 8K. With MTP enabled (the serving path) prefill also feeds the drafter's cache:
+  12,545 / 12,068 / 11,676 / 10,959 at 8K / 64K / 128K / 256K.
+- The corpus repeats few distinct tokens, so its draft acceptance is near 100% (4.0 tokens per MTP3
+  round); on real prompts acceptance is lower.
+- Sampled requests (temperature > 0) use MTP too (exact rejection sampling against the deterministic
+  drafts): 265-273 tok/s against 166-175 plain on three prompts at temperature 0.6 and 1.0, with the
+  token distribution equal to plain sampling (two-sample test, 600 samples per position).
 
-Batch of two (`squash batch-check`, code + multiturn prompts): 271.1 tok/s eager, 277.8 tok/s
-graph-captured over 512 tokens each (245.6 over 256, where the first graph launches weigh in), both
-sequences token-identical to single-sequence decoding; the gate
-passes at batch 2 with distributions byte-identical to batch 1. Through `squash serve --slots 2`:
-236 tok/s aggregate with both responses identical to their solo runs.
+## Prefill, what changed today (8K chunk: 1,108 ms -> 616 ms on the GPU)
 
-Restart (`squash serve`, GPU empty): 31.3 s to the first answered request, of which 27.7 s loads
-72.67 GiB of weights (INT8 conversion included). The raw loader reads 77.35 GiB at 3.3 GiB/s with
-8, 16 or 32 threads, O_DIRECT or buffered alike: the checkpoint does not fit the ~40 GiB page cache
-this machine has free, so restart is bound by NVMe reads.
+- FP4 tensor cores for the routed experts in prefill (W4A4: activations quantized per row with the
+  least-error E4M3 block scale, as llama.cpp; gate PASS), gate/up/SwiGLU fused, BF16 expert outputs.
+- MXFP8 (E4M3, power-of-two scale per 32) for the GDN input projections, prefill and decode (gate PASS;
+  MXFP8 on all dense projections, or on the HyperConnections, fails the gate).
+- Tensor-core chunked GDN (3xTF32, 32-token chunks, cp.async prefetch, one wave of CTAs).
+- QSA: tensor-core indexer scores, one-block-per-row top-512 selection for prefill, attention over the
+  union of 4 neighbouring queries' selections.
+- HyperConnection: up-projection and mix fused, residual update fused into the next norm.
+- Dense GEMM: 256x128 tiles for large launches, 2-stage two-CTAs-per-SM variant for 1-2 waves,
+  split-K for grids smaller than the GPU (short prompts).
+- Host: PLE rows faulted in by 64 threads ahead of the GPU (MADV_RANDOM: no 128 KiB readahead per
+  320-byte row), gathered on 16 threads, overlapping layer 0 on the GPU.
+
+Restart (`squash serve`, GPU empty): about 31 s to the first answered request, most of it loading
+72.5 GiB of weights from NVMe (the checkpoint does not fit the free page cache).
