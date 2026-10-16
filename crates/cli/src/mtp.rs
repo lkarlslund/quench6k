@@ -87,7 +87,8 @@ pub fn probe(model_dir: &Path, precision: Precision, fixture: &Path, steps: usiz
 
 /// Generates `n` tokens after a fixture prompt with plain greedy decoding and with MTP speculative
 /// decoding, and checks that both produce exactly the same tokens.
-pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, drafts: usize, chunk: usize, graphs: bool, adaptive: bool, profile_rounds: usize) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, drafts: usize, chunk: usize, graphs: bool, adaptive: bool, profile_rounds: usize, steer: &crate::SteerArgs) -> Result<()> {
     use squash_engine::spec::SpecDecoder;
     #[derive(serde::Deserialize)]
     struct Sequence {
@@ -95,7 +96,8 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
         prompt_len: usize,
     }
     let seq: Sequence = serde_json::from_slice(&std::fs::read(fixture.join("sequence.json"))?)?;
-    let (model, s) = crate::load(model_dir, precision, true)?;
+    let (mut model, s) = crate::load(model_dir, precision, true)?;
+    let strength = steer.attach(&mut model, &s)?;
     let prompt = &seq.tokens[..seq.prompt_len];
     let cap = prompt.len() + n + (profile_rounds + 1) * (drafts + 1) + 8;
     let mut ws = Workspace::new(chunk, cap)?;
@@ -103,6 +105,7 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
 
     // Plain greedy decoding.
     let mut state = SequenceState::new(cap)?;
+    state.set_steering_strength(&s, strength)?;
     for c in prompt.chunks(chunk) {
         forward::forward(&model, &mut state, &mut ws, &s, c)?;
     }
@@ -120,6 +123,7 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
 
     // Speculative decoding.
     let mut state = SequenceState::with_mtp(cap, true)?;
+    state.set_steering_strength(&s, strength)?;
     let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &s, prompt, drafts, chunk)?;
     let mut g = if graphs { Some(squash_engine::spec::SpecGraphs::capture(&model, &state, &mut ws, &dec, &s, adaptive)?) } else { None };
     let t0 = std::time::Instant::now();
