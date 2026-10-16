@@ -833,3 +833,40 @@ fn hc_moe_combine_norm_matches() {
     let (a, b): (Vec<u16>, Vec<u16>) = (s.download(na.addr(), t * 10240).unwrap(), s.download(nb.addr(), t * 10240).unwrap());
     assert_eq!(a, b, "norms differ");
 }
+
+/// Every row of an M-row GEMV (M = 1 ..= 16) is bitwise the single-row result, for each weight format,
+/// with and without split K.
+#[test]
+fn gemv_rows_are_independent_of_m() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x0dd_ba11);
+    let (n, k) = (1000usize, 2560usize);
+    let x: Vec<f32> = rng.vec(16 * k).iter().map(|&v| bf16::round(v)).collect();
+    let w: Vec<f32> = rng.vec(n * k).iter().map(|&v| bf16::round(v)).collect();
+    let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
+    let g = kernels::int8_group();
+    let (dq, dgs) = (DeviceBuffer::new(n * k).unwrap(), DeviceBuffer::new(n * (k / g) * 4).unwrap());
+    kernels::quantize_int8_groups(&s, dw.addr(), n, k, dq.addr(), dgs.addr()).unwrap();
+    // MXFP8: finite E4M3 codes (no 0x7f / 0xff) and power-of-two scales near 1.
+    let codes: Vec<u8> = (0..n * k).map(|_| (rng.next().to_bits() as u8) & 0xf7).collect();
+    let scales: Vec<u8> = (0..n * k / 32).map(|_| 120 + (rng.next().to_bits() % 14) as u8).collect();
+    let (dc, ds) = (upload(&s, &codes), upload(&s, &scales));
+    let formats = [(WeightFormat::Bf16, dw.addr(), 0), (WeightFormat::Int8Group, dq.addr(), dgs.addr()), (WeightFormat::Mxfp8, dc.addr(), ds.addr())];
+    let dy = DeviceBuffer::new(16 * n * 4).unwrap();
+    let partial = DeviceBuffer::new(4 * 16 * n * 4).unwrap();
+    for (fmt, wa, sa) in formats {
+        for splits in [1, 4] {
+            let mut single = Vec::with_capacity(16 * n);
+            for r in 0..16 {
+                kernels::gemv(&s, 1, dx.addr() + (r * k * 2) as u64, k, fmt, wa, sa, dy.addr(), n, partial.addr(), n, k, splits, 1.0, false).unwrap();
+                single.extend(s.download::<u32>(dy.addr(), n).unwrap());
+            }
+            for m in 1..=16 {
+                kernels::gemv(&s, m, dx.addr(), k, fmt, wa, sa, dy.addr(), n, partial.addr(), n, k, splits, 1.0, false).unwrap();
+                let got: Vec<u32> = s.download(dy.addr(), m * n).unwrap();
+                assert!(got == single[..m * n], "{fmt:?} M = {m}, splits {splits}: rows differ from single-row results");
+            }
+        }
+    }
+}

@@ -336,7 +336,7 @@ impl SpecGraphs {
                 })?;
                 mtp.push(g);
             }
-            let bytes = forward::step_bytes(ws, n + 1);
+            let bytes = forward::step_bytes(n + 1);
             let verify_before_ple = squash_cuda::Graph::capture(s, |s| forward::forward_part(model, state, ws, s, n + 1, bytes, Part::BeforePle, true, None))?;
             let verify_from_ple = squash_cuda::Graph::capture(s, |s| {
                 forward::forward_part(model, state, ws, s, n + 1, bytes, Part::FromPle, true, None)?;

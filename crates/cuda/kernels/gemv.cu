@@ -205,7 +205,7 @@ cudaError_t launch_m(const __nv_bfloat16* X, int ldx, const uint8_t* W, const fl
     return cudaGetLastError();
 }
 
-// M in 1..8 or 16.
+// M in 1..16.
 template <WFmt F>
 cudaError_t launch_rows(int M, const __nv_bfloat16* X, int ldx, const uint8_t* W, const float* scale, float* Y, int ldy,
                         float* partial, int N, int K, int splits, float alpha, int accumulate, cudaStream_t st) {
@@ -213,7 +213,8 @@ cudaError_t launch_rows(int M, const __nv_bfloat16* X, int ldx, const uint8_t* W
 #define SQ_CASE(m) \
     case m:        \
         return launch_m<F, m>(X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
-        SQ_CASE(1) SQ_CASE(2) SQ_CASE(3) SQ_CASE(4) SQ_CASE(5) SQ_CASE(6) SQ_CASE(7) SQ_CASE(8) SQ_CASE(16)
+        SQ_CASE(1) SQ_CASE(2) SQ_CASE(3) SQ_CASE(4) SQ_CASE(5) SQ_CASE(6) SQ_CASE(7) SQ_CASE(8)
+        SQ_CASE(9) SQ_CASE(10) SQ_CASE(11) SQ_CASE(12) SQ_CASE(13) SQ_CASE(14) SQ_CASE(15) SQ_CASE(16)
 #undef SQ_CASE
         default:
             return cudaErrorInvalidValue;
@@ -226,12 +227,6 @@ cudaError_t launch(int M, const void* Xv, int ldx, const void* Wv, const float* 
     if (K % 16 != 0 || ldx % 8 != 0) return cudaErrorInvalidValue;
     const auto* X = static_cast<const __nv_bfloat16*>(Xv);
     const auto* W = static_cast<const uint8_t*>(Wv);
-    if (M > 8 && M < 16) {  // eight rows, then the rest
-        const cudaError_t e = launch_rows<F>(8, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
-        if (e != cudaSuccess) return e;
-        return launch_rows<F>(M - 8, X + (size_t)8 * ldx, ldx, W, scale, Y + (size_t)8 * ldy, ldy, partial, N, K, splits,
-                              alpha, accumulate, st);
-    }
     return launch_rows<F>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
 }
 

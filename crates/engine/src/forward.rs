@@ -632,6 +632,9 @@ impl CaptureLayout {
 }
 
 /// Byte offsets inside the step block: [start: i32 | pad][tokens: i32 x max][pos3: i32 x 3 x max][PLE rows: BF16 x D x max].
+/// The main step block holds the layout of the step's own token count `t` (so a small step transfers
+/// only what it uses); it is allocated for the workspace's largest step. MTP step blocks use the
+/// largest layout.
 struct StepLayout {
     tokens: usize,
     pos: usize,
@@ -667,7 +670,7 @@ pub fn prepare_tokens(state: &mut SequenceState, ws: &mut Workspace, new_tokens:
     ensure!(t > 0 && t <= ws.max_tokens, "step of {t} tokens exceeds the workspace ({})", ws.max_tokens);
     ensure!(start + t <= state.capacity, "sequence would exceed its capacity of {}", state.capacity);
     state.tokens.extend_from_slice(new_tokens);
-    let layout = StepLayout::new(ws.max_tokens);
+    let layout = StepLayout::new(t);
     let block = ws.step_host.as_mut_slice();
     block[0..4].copy_from_slice(&(start as i32).to_le_bytes());
     for (j, tok) in new_tokens.iter().enumerate() {
@@ -685,7 +688,7 @@ pub fn prepare_tokens(state: &mut SequenceState, ws: &mut Workspace, new_tokens:
 /// of step block to transfer.
 pub fn prepare_ple(model: &Model, state: &SequenceState, ws: &mut Workspace, t: usize) -> Result<usize> {
     let start = state.len() - t;
-    let layout = StepLayout::new(ws.max_tokens);
+    let layout = StepLayout::new(t);
     let block = ws.step_host.as_mut_slice();
     let ple = model.layers[1].ple.as_ref().expect("layer 1 has PLE");
     let gather = |j0: usize, out: &mut [u8]| {
@@ -730,7 +733,7 @@ pub fn prepare_ple(model: &Model, state: &SequenceState, ws: &mut Workspace, t: 
 pub fn prepare_batch(model: &Model, states: &mut [&mut SequenceState], ws: &mut Workspace, tokens: &[i32]) -> Result<usize> {
     let b = states.len();
     ensure!(b >= 1 && b <= 4 && tokens.len() == b && b <= ws.max_tokens, "batch of {b} sequences");
-    let layout = StepLayout::new(ws.max_tokens);
+    let layout = StepLayout::new(b);
     let ple = model.layers[1].ple.as_ref().expect("layer 1 has PLE");
     let mut rows = Vec::with_capacity(D);
     for (j, (st, &tok)) in states.iter_mut().zip(tokens).enumerate() {
@@ -763,7 +766,7 @@ pub fn prepare_batch(model: &Model, states: &mut [&mut SequenceState], ws: &mut 
 /// sequence b's final mixer output.
 pub fn forward_batch(model: &Model, states: &[&SequenceState], ws: &Workspace, s: &Stream, bytes: usize) -> Result<()> {
     let t = states.len();
-    let layout = StepLayout::new(ws.max_tokens);
+    let layout = StepLayout::new(t);
     unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? };
     for (b, st) in states.iter().enumerate() {
         k::store_positions(s, ws.step + (layout.pos + 12 * b) as u64, st.pos3.addr(), ws.step + 4 * b as u64, 1)?;
@@ -824,7 +827,7 @@ pub struct BatchGraph {
 
 impl BatchGraph {
     pub fn capture(model: &Model, states: &[&SequenceState], ws: &Workspace, hw: &HeadWorkspace, s: &Stream, out: u64) -> Result<Self> {
-        let bytes = StepLayout::new(ws.max_tokens).used(states.len());
+        let bytes = StepLayout::new(states.len()).used(states.len());
         let graph = squash_cuda::Graph::capture(s, |s| {
             forward_batch(model, states, ws, s, bytes)?;
             head_argmax_into(model, hw, s, ws.out, states.len(), out)
@@ -862,7 +865,7 @@ pub enum Part {
 /// With `defer` (speculative verification, needs `state.spec`), the recurrent layers record this step's
 /// tokens instead of committing them; see [`Spec`].
 pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, bytes: usize, part: Part, defer: bool, mut prof: Option<&mut Profiler>) -> Result<()> {
-    let layout = StepLayout::new(ws.max_tokens);
+    let layout = StepLayout::new(t);
     match part {
         Part::Whole => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? },
         Part::BeforePle => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), layout.ple)? },
@@ -1355,8 +1358,8 @@ pub fn forward_profiled(model: &Model, state: &mut SequenceState, ws: &mut Works
 }
 
 /// Bytes of step block a step of `t` tokens transfers.
-pub fn step_bytes(ws: &Workspace, t: usize) -> usize {
-    StepLayout::new(ws.max_tokens).used(t)
+pub fn step_bytes(t: usize) -> usize {
+    StepLayout::new(t).used(t)
 }
 
 /// Eager step: [`prepare`] then [`forward_device`].
@@ -1385,7 +1388,7 @@ pub struct DecodeGraph {
 
 impl DecodeGraph {
     pub fn capture(model: &Model, state: &SequenceState, ws: &Workspace, hw: &HeadWorkspace, s: &Stream) -> Result<Self> {
-        let bytes = StepLayout::new(ws.max_tokens).used(1);
+        let bytes = StepLayout::new(1).used(1);
         let before_ple = squash_cuda::Graph::capture(s, |s| forward_part(model, state, ws, s, 1, bytes, Part::BeforePle, false, None))?;
         let from_ple = squash_cuda::Graph::capture(s, |s| {
             forward_part(model, state, ws, s, 1, bytes, Part::FromPle, false, None)?;

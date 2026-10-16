@@ -120,3 +120,10 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
   whatever the synchronization mechanism. Published megakernel gains (1.5x and more) are measured
   against engines without that overlap. A full megakernel is not worth its cost here; fewer dependent
   phases per layer would be.
+- Verify-step follow-up: GEMV for 9-15 rows now runs in one pass instead of 8 rows plus the rest
+  (exact; little gain: those steps are dominated by expert traffic and dense GEMV compute). The main
+  step block now uses the layout of its own token count, so a decode step uploads about 5 KB instead of
+  136 KB (token and position areas sized for 8,192 tokens): -28 us per plain step and -44 us per 4-row
+  verify step at this host's PCIe link (Gen 3 x4, 3.6 GB/s measured; exact). Tried and dropped: a
+  register cap for the 4-row GEMV (`__launch_bounds__` min blocks 2-4: 1.4-15% slower) and the fused
+  shared-expert tail for multi-row steps (2.5% slower at 4 rows: every block recomputes the SwiGLU input).
