@@ -35,6 +35,16 @@ pub struct QsaCache {
     pub v: DeviceBuffer,
     pub raw: DeviceBuffer,
     pub pooled: DeviceBuffer,
+    /// K and V rows are FP8 E4M3 with a per-(position, KV head) scale (272 bytes) instead of BF16.
+    pub fp8: bool,
+}
+
+/// KV cache format for sequences created from now on (false: BF16, true: FP8 E4M3 with scales).
+pub static KV_FP8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Bytes per position of one K or V cache.
+pub fn kv_row_bytes(fp8: bool) -> usize {
+    if fp8 { QSA_KV * (QSA_DIM + 16) } else { QSA_KV * QSA_DIM * 2 }
 }
 
 pub struct GdnState {
@@ -78,24 +88,21 @@ impl SequenceState {
 
     pub fn with_mtp(capacity: usize, mtp: bool) -> Result<Self> {
         let capacity = capacity.div_ceil(4) * 4;
+        let fp8 = KV_FP8.load(std::sync::atomic::Ordering::Relaxed);
         let qsa_cache = || -> Result<QsaCache> {
             Ok(QsaCache {
-                k: DeviceBuffer::new(capacity * QSA_KV * QSA_DIM * 2)?,
-                v: DeviceBuffer::new(capacity * QSA_KV * QSA_DIM * 2)?,
+                k: DeviceBuffer::new(capacity * kv_row_bytes(fp8))?,
+                v: DeviceBuffer::new(capacity * kv_row_bytes(fp8))?,
                 raw: DeviceBuffer::new(capacity * INDEX_DIM * 2)?,
                 pooled: DeviceBuffer::new(capacity / 4 * INDEX_DIM * 2)?,
+                fp8,
             })
         };
         let mut qsa = Vec::with_capacity(LAYERS);
         let mut gdn = Vec::with_capacity(LAYERS);
         for layer in 0..LAYERS {
             if is_attention(layer) {
-                qsa.push(Some(QsaCache {
-                    k: DeviceBuffer::new(capacity * QSA_KV * QSA_DIM * 2)?,
-                    v: DeviceBuffer::new(capacity * QSA_KV * QSA_DIM * 2)?,
-                    raw: DeviceBuffer::new(capacity * INDEX_DIM * 2)?,
-                    pooled: DeviceBuffer::new(capacity / 4 * INDEX_DIM * 2)?,
-                }));
+                qsa.push(Some(qsa_cache()?));
                 gdn.push(None);
             } else {
                 qsa.push(None);
@@ -818,20 +825,20 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
                     let (qr, iqr) = (ws.q + (b * QSA_HEADS * QSA_DIM * 4) as u64, ws.iq + (b * 4 * INDEX_DIM * 4) as u64);
                     let (scores, sel) = (ws.scores + (b * ws.score_cols * 4) as u64, ws.sel + (b * TOP_GROUPS * 4) as u64);
                     let att = ws.att + (b * QSA_HEADS * QSA_DIM * 2) as u64;
-                    op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, colr(0), colr(1), ld, q.q_norm, q.k_norm, qr, c.k.addr(), c.v.addr(), pos3_b, start_b, 1));
+                    op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, colr(0), colr(1), ld, q.q_norm, q.k_norm, qr, c.k.addr(), c.v.addr(), pos3_b, start_b, 1, c.fp8));
                     op!(prof, "qsa_index_prep", s, k::qsa_index_prep(s, colr(3), ld, q.index_q_norm, iqr, c.raw.addr(), pos3_b, start_b, 1));
                     op!(prof, "qsa_pool", s, k::qsa_pool(s, c.raw.addr(), q.index_k_norm, c.pooled.addr(), pos3_b, start_b, 1));
                     if sq.capacity / 4 > TOP_GROUPS {
                         op!(prof, "qsa_index_scores", s, k::qsa_index_scores(s, iqr, c.pooled.addr(), scores, ws.score_cols, start_b, 1));
                         op!(prof, "qsa_select", s, k::qsa_select(s, scores, 1, ws.score_cols, start_b, sel));
                     }
-                    op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, qr, colr(0), ld, c.k.addr(), c.v.addr(), sel, start_b, 1, ws.att_part, att));
+                    op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, qr, colr(0), ld, c.k.addr(), c.v.addr(), sel, start_b, 1, c.fp8, ws.att_part, att));
                 }
                 op!(prof, "qsa o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
                 return finish_layer(layer, ctx, carry, prof, None);
             }
             let c = qsa.expect("QSA layer cache");
-            op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, col(0), col(1), ld, q.q_norm, q.k_norm, ws.q, c.k.addr(), c.v.addr(), pos3, start, t));
+            op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, col(0), col(1), ld, q.q_norm, q.k_norm, ws.q, c.k.addr(), c.v.addr(), pos3, start, t, c.fp8));
             op!(prof, "qsa_index_prep", s, k::qsa_index_prep(s, col(3), ld, q.index_q_norm, ws.iq, c.raw.addr(), pos3, start, t));
             op!(prof, "qsa_pool", s, k::qsa_pool(s, c.raw.addr(), q.index_k_norm, c.pooled.addr(), pos3, start, t));
             // Rows whose query sees at most 512 complete groups attend densely and skip selection.
@@ -840,9 +847,9 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
                 op!(prof, "qsa_select", s, k::qsa_select(s, ws.scores, t, ws.score_cols, start, ws.sel));
             }
             if t <= k::gemv_max_m() {
-                op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, ws.q, col(0), ld, c.k.addr(), c.v.addr(), ws.sel, start, t, ws.att_part, ws.att));
+                op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, ws.q, col(0), ld, c.k.addr(), c.v.addr(), ws.sel, start, t, c.fp8, ws.att_part, ws.att));
             } else {
-                op!(prof, "qsa_attention", s, k::qsa_attention(s, ws.q, col(0), ld, c.k.addr(), c.v.addr(), ws.sel, start, t, ws.att));
+                op!(prof, "qsa_attention", s, k::qsa_attention(s, ws.q, col(0), ld, c.k.addr(), c.v.addr(), ws.sel, start, t, c.fp8, ws.att));
             }
             op!(prof, "qsa o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
         }

@@ -166,8 +166,8 @@ pub fn gdn_gated_norm(s: &Stream, o: u64, z: u64, ldz: usize, w: u64, y: u64, t:
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_qkv_prep(s: &Stream, qg: u64, kv: u64, ld: usize, q_norm: u64, k_norm: u64, q: u64, kcache: u64, vcache: u64, pos3: u64, start: u64, t: usize) -> Result<()> {
-    launch!("qsa_qkv_prep", ffi::squash_qsa_qkv_prep(f(qg), f(kv), n32(ld), p(q_norm), p(k_norm), fm(q), pm(kcache), pm(vcache), i(pos3), i(start), n32(t), s.raw()))
+pub fn qsa_qkv_prep(s: &Stream, qg: u64, kv: u64, ld: usize, q_norm: u64, k_norm: u64, q: u64, kcache: u64, vcache: u64, pos3: u64, start: u64, t: usize, fp8: bool) -> Result<()> {
+    launch!("qsa_qkv_prep", ffi::squash_qsa_qkv_prep(f(qg), f(kv), n32(ld), p(q_norm), p(k_norm), fm(q), pm(kcache), pm(vcache), i(pos3), i(start), n32(t), fp8 as i32, s.raw()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -193,8 +193,8 @@ pub fn store_positions(s: &Stream, src: u64, pos3: u64, start: u64, t: usize) ->
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_attention(s: &Stream, q: u64, qg: u64, ld: usize, kcache: u64, vcache: u64, sel: u64, start: u64, t: usize, out: u64) -> Result<()> {
-    launch!("qsa_attention", ffi::squash_qsa_attention(f(q), f(qg), n32(ld), p(kcache), p(vcache), i(sel), i(start), n32(t), pm(out), s.raw()))
+pub fn qsa_attention(s: &Stream, q: u64, qg: u64, ld: usize, kcache: u64, vcache: u64, sel: u64, start: u64, t: usize, fp8: bool, out: u64) -> Result<()> {
+    launch!("qsa_attention", ffi::squash_qsa_attention(f(q), f(qg), n32(ld), p(kcache), p(vcache), i(sel), i(start), n32(t), fp8 as i32, pm(out), s.raw()))
 }
 
 pub fn moe_tile_rows() -> usize {
@@ -301,8 +301,8 @@ pub fn qsa_split_floats(t: usize) -> usize {
 
 /// Key-split attention for small batches; `part` holds [`qsa_split_floats`]`(t)` floats.
 #[allow(clippy::too_many_arguments)]
-pub fn qsa_attention_split(s: &Stream, q: u64, qg: u64, ld: usize, kcache: u64, vcache: u64, sel: u64, start: u64, t: usize, part: u64, out: u64) -> Result<()> {
-    launch!("qsa_attention_split", ffi::squash_qsa_attention_split(f(q), f(qg), n32(ld), p(kcache), p(vcache), i(sel), i(start), n32(t), fm(part), pm(out), s.raw()))
+pub fn qsa_attention_split(s: &Stream, q: u64, qg: u64, ld: usize, kcache: u64, vcache: u64, sel: u64, start: u64, t: usize, fp8: bool, part: u64, out: u64) -> Result<()> {
+    launch!("qsa_attention_split", ffi::squash_qsa_attention_split(f(q), f(qg), n32(ld), p(kcache), p(vcache), i(sel), i(start), n32(t), fp8 as i32, fm(part), pm(out), s.raw()))
 }
 
 /// Zeroed u32 words the small-batch GDN kernel needs after the conv history [3, 10240] FP32.

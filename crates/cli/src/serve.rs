@@ -42,7 +42,8 @@ pub struct ServeOptions {
 pub fn model_id(model_dir: &std::path::Path) -> String {
     let config = std::fs::read(model_dir.join("config.json")).unwrap_or_default();
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for b in config.iter().chain(b"int8g/squash-1".iter()) {
+    let kv: &[u8] = if squash_engine::forward::KV_FP8.load(std::sync::atomic::Ordering::Relaxed) { b"/kv8" } else { b"" };
+    for b in config.iter().chain(b"int8g/squash-1".iter()).chain(kv) {
         h ^= *b as u64;
         h = h.wrapping_mul(0x100_0000_01b3);
     }

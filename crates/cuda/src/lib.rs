@@ -86,13 +86,13 @@ pub mod ffi {
         pub fn squash_gdn_record_floats() -> usize;
         pub fn squash_ple_record_floats() -> usize;
         pub fn squash_gdn_gated_norm(o: *const f32, z: *const f32, ldz: c_int, w: *const c_void, y: *mut c_void, t: c_int, stream: Stream) -> Error;
-        pub fn squash_qsa_qkv_prep(qg: *const f32, kv: *const f32, ld: c_int, q_norm: *const c_void, k_norm: *const c_void, q: *mut f32, kcache: *mut c_void, vcache: *mut c_void, pos3: *const i32, start: *const i32, t: c_int, stream: Stream) -> Error;
+        pub fn squash_qsa_qkv_prep(qg: *const f32, kv: *const f32, ld: c_int, q_norm: *const c_void, k_norm: *const c_void, q: *mut f32, kcache: *mut c_void, vcache: *mut c_void, pos3: *const i32, start: *const i32, t: c_int, fp8: c_int, stream: Stream) -> Error;
         pub fn squash_qsa_index_prep(idx: *const f32, ld: c_int, q_ln: *const c_void, iq: *mut f32, raw: *mut c_void, pos3: *const i32, start: *const i32, t: c_int, stream: Stream) -> Error;
         pub fn squash_qsa_pool(raw: *const c_void, k_ln: *const c_void, pooled: *mut c_void, pos3: *const i32, start: *const i32, t: c_int, stream: Stream) -> Error;
         pub fn squash_qsa_index_scores(iq: *const f32, pooled: *const c_void, scores: *mut f32, ld: c_int, start: *const i32, t: c_int, stream: Stream) -> Error;
         pub fn squash_qsa_select(scores: *const f32, t: c_int, ld: usize, start: *const i32, sel: *mut i32, stream: Stream) -> Error;
         pub fn squash_store_positions(src: *const i32, pos3: *mut i32, start: *const i32, t: c_int, stream: Stream) -> Error;
-        pub fn squash_qsa_attention(q: *const f32, qg: *const f32, ld: c_int, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: *const i32, t: c_int, out: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_qsa_attention(q: *const f32, qg: *const f32, ld: c_int, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: *const i32, t: c_int, fp8: c_int, out: *mut c_void, stream: Stream) -> Error;
         pub fn squash_moe_tile_rows() -> c_int;
         pub fn squash_moe_small_tokens() -> c_int;
         pub fn squash_moe_route_small(logits: *const f32, ld: c_int, t: c_int, top_i: *mut i32, top_w: *mut f32, offsets: *mut i32, pair_row: *mut i32, row_token: *mut i32, active: *mut i32, num_active: *mut i32, stream: Stream) -> Error;
@@ -112,7 +112,7 @@ pub mod ffi {
         pub fn squash_draft_head_argmax(x: *const c_void, sketch: *const c_void, codes: *const c_void, scales: *const c_void, scale2: *const f32, ys: *mut f32, pick: *mut c_void, n: c_int, out: *mut i32, stream: Stream) -> Error;
         pub fn squash_nvfp4_dense_gemv(x: *const c_void, codes: *const c_void, scales: *const c_void, scale2: *const f32, y: *mut f32, n: c_int, stream: Stream) -> Error;
         pub fn squash_qsa_split_floats(t: c_int) -> usize;
-        pub fn squash_qsa_attention_split(q: *const f32, qg: *const f32, ld: c_int, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: *const i32, t: c_int, part: *mut f32, out: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_qsa_attention_split(q: *const f32, qg: *const f32, ld: c_int, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: *const i32, t: c_int, fp8: c_int, part: *mut f32, out: *mut c_void, stream: Stream) -> Error;
         pub fn squash_moe_route(logits: *const f32, ld: c_int, t: c_int, top_i: *mut i32, top_w: *mut f32, stream: Stream) -> Error;
         pub fn squash_moe_plan(top_i: *const i32, t: c_int, counts: *mut i32, cursor: *mut i32, offsets: *mut i32, tile_expert: *mut i32, tile_row: *mut i32, num_tiles: *mut i32, pair_row: *mut i32, stream: Stream) -> Error;
         pub fn squash_moe_gather(m: *const c_void, pair_row: *const i32, t: c_int, xs: *mut c_void, stream: Stream) -> Error;

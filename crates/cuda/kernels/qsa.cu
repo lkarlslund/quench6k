@@ -1,11 +1,14 @@
 // QSA attention (SPEC §6): projections' epilogues, caches, the group indexer and selected attention.
 //
 // Per-sequence, per-layer cache (indexed by absolute position p):
-//   K, V        BF16 [ctx, 2, 256]
+//   K, V        BF16 [ctx, 2, 256], or with FP8 KV rows of 272 bytes per (position, KV head): 256 E4M3
+//               values, then their FP32 scale (amax / 448) and 12 bytes of padding
 //   raw index   BF16 [ctx, 128]
 //   pooled      BF16 [ctx / 4, 128]   (rotated, normalized group keys; group g = positions 4g..4g+3)
 // and per sequence: pos3 I32 [ctx, 3] MRoPE positions (t, h, w).
 // A step processes T new tokens at positions start .. start + T - 1.
+
+#include <cuda_fp8.h>
 
 #include "mma.cuh"
 
@@ -13,6 +16,29 @@ namespace {
 
 constexpr int QH = 24, KVH = 2, HD = 256, ROT = 64, IH = 4, ID = 128, GROUP = 4, TOPG = 512;
 constexpr float EPS = 1e-6f;
+constexpr int KV8_ROW = HD + 16;  // bytes per FP8 (position, KV head) row
+
+// Address of the (position, KV head) row; BF16 rows hold HD values, FP8 rows KV8_ROW bytes.
+template <bool FP8>
+SQ_DEVICE const unsigned char* kv_row(const void* cache, int key, int kvh) {
+    return static_cast<const unsigned char*>(cache) + ((size_t)key * KVH + kvh) * (FP8 ? KV8_ROW : HD * 2);
+}
+
+// Dequantizes 16 E4M3 values (row + col) to BF16 in dst: value * scale, rounded once to BF16.
+SQ_DEVICE void kv8_load16(const unsigned char* row, int col, __nv_bfloat16* dst) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(row + col);
+    const float scale = *reinterpret_cast<const float*>(row + HD);
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&raw);
+    __align__(16) __nv_bfloat16 out[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        __nv_fp8_e4m3 v;
+        v.__x = b[i];
+        out[i] = f2bf(float(v) * scale);
+    }
+    reinterpret_cast<uint4*>(dst)[0] = reinterpret_cast<const uint4*>(out)[0];
+    reinterpret_cast<uint4*>(dst)[1] = reinterpret_cast<const uint4*>(out)[1];
+}
 
 SQ_DEVICE int rope_axis(int pair) {
     if (pair % 3 == 1 && pair < 33) return 1;
@@ -38,8 +64,8 @@ SQ_DEVICE void rope_inplace(float* x, const int* pos3) {
 // j - 24 into the K cache and store the matching V. 256 threads.
 __global__ void qkv_prep_kernel(const float* __restrict__ qg, const float* __restrict__ kv, int ld,
                                 const __nv_bfloat16* __restrict__ q_norm, const __nv_bfloat16* __restrict__ k_norm,
-                                float* q, __nv_bfloat16* kcache, __nv_bfloat16* vcache, const int* __restrict__ pos3,
-                                const int* __restrict__ start_ptr) {
+                                float* q, void* kcache, void* vcache, const int* __restrict__ pos3,
+                                const int* __restrict__ start_ptr, int fp8) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float x[HD];
@@ -58,8 +84,22 @@ __global__ void qkv_prep_kernel(const float* __restrict__ qg, const float* __res
         q[(size_t)t * QH * HD + j * HD + i] = x[i];
     } else {
         const int h = j - QH;
-        kcache[((size_t)p * KVH + h) * HD + i] = f2bf(x[i]);
-        vcache[((size_t)p * KVH + h) * HD + i] = f2bf(kv[(size_t)t * ld + KVH * HD + h * HD + i]);
+        const float vv = kv[(size_t)t * ld + KVH * HD + h * HD + i];
+        if (fp8) {
+            const float ks = fmaxf(block_max(fabsf(x[i]), scratch), 1e-30f) / 448.f;
+            const float vs = fmaxf(block_max(fabsf(vv), scratch), 1e-30f) / 448.f;
+            unsigned char* krow = static_cast<unsigned char*>(kcache) + ((size_t)p * KVH + h) * KV8_ROW;
+            unsigned char* vrow = static_cast<unsigned char*>(vcache) + ((size_t)p * KVH + h) * KV8_ROW;
+            krow[i] = __nv_fp8_e4m3(x[i] / ks).__x;
+            vrow[i] = __nv_fp8_e4m3(vv / vs).__x;
+            if (i == 0) {
+                *reinterpret_cast<float*>(krow + HD) = ks;
+                *reinterpret_cast<float*>(vrow + HD) = vs;
+            }
+        } else {
+            static_cast<__nv_bfloat16*>(kcache)[((size_t)p * KVH + h) * HD + i] = f2bf(x[i]);
+            static_cast<__nv_bfloat16*>(vcache)[((size_t)p * KVH + h) * HD + i] = f2bf(vv);
+        }
     }
 }
 
@@ -201,9 +241,10 @@ SQ_DEVICE int key_at(int i, bool dense, const int* sel_row, int tail_begin) {
 
 // Partial attention of one (query t, KV head, key chunk): writes the chunk's running max and sum per
 // head and the unnormalized output [12, 256] to part[(t, kvh, split)].
+template <bool FP8>
 __global__ void __launch_bounds__(ATT_THREADS) attention_split_kernel(const float* __restrict__ q,
-                                                                       const __nv_bfloat16* __restrict__ kcache,
-                                                                       const __nv_bfloat16* __restrict__ vcache,
+                                                                       const void* __restrict__ kcache,
+                                                                       const void* __restrict__ vcache,
                                                                        const int* __restrict__ sel,
                                                                        const int* __restrict__ start_ptr, float* part) {
     pdl_launch_dependents();
@@ -244,11 +285,18 @@ __global__ void __launch_bounds__(ATT_THREADS) attention_split_kernel(const floa
         const int nk = min(KT, k_end - k0);
         if (tid < nk) keys[tid] = key_at(k0 + tid, dense, sel_row, tail_begin);
         __syncthreads();
-        for (int i = tid; i < nk * HD / 8; i += ATT_THREADS) {
-            const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
-            const size_t src = ((size_t)keys[r] * KVH + kvh) * HD + c;
-            *reinterpret_cast<uint4*>(&sk[r][c]) = *reinterpret_cast<const uint4*>(kcache + src);
-            *reinterpret_cast<uint4*>(&sv[r][c]) = *reinterpret_cast<const uint4*>(vcache + src);
+        if constexpr (FP8) {
+            for (int i = tid; i < nk * HD / 16; i += ATT_THREADS) {
+                const int r = i / (HD / 16), c = (i % (HD / 16)) * 16;
+                kv8_load16(kv_row<true>(kcache, keys[r], kvh), c, &sk[r][c]);
+                kv8_load16(kv_row<true>(vcache, keys[r], kvh), c, &sv[r][c]);
+            }
+        } else {
+            for (int i = tid; i < nk * HD / 8; i += ATT_THREADS) {
+                const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
+                *reinterpret_cast<uint4*>(&sk[r][c]) = *reinterpret_cast<const uint4*>(kv_row<false>(kcache, keys[r], kvh) + c * 2);
+                *reinterpret_cast<uint4*>(&sv[r][c]) = *reinterpret_cast<const uint4*>(kv_row<false>(vcache, keys[r], kvh) + c * 2);
+            }
         }
         __syncthreads();
         for (int r = warp; r < nk; r += ATT_THREADS / 32) {
@@ -338,12 +386,10 @@ __global__ void attention_merge_kernel(const float* __restrict__ part, const flo
 
 extern "C" cudaError_t squash_qsa_qkv_prep(const float* qg, const float* kv, int ld, const void* q_norm, const void* k_norm,
                                            float* q, void* kcache, void* vcache, const int* pos3, const int* start, int T,
-                                           cudaStream_t st) {
+                                           int fp8, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(qkv_prep_kernel, T * (QH + KVH), HD, 0, st, qg, kv, ld, static_cast<const __nv_bfloat16*>(q_norm),
-                                                   static_cast<const __nv_bfloat16*>(k_norm), q,
-                                                   static_cast<__nv_bfloat16*>(kcache), static_cast<__nv_bfloat16*>(vcache),
-                                                   pos3, start));
+                                                   static_cast<const __nv_bfloat16*>(k_norm), q, kcache, vcache, pos3, start, fp8));
     SQ_RETURN_LAUNCH();
 }
 
@@ -386,15 +432,18 @@ namespace {
 // into hi + lo BF16 parts, so products keep about 16 mantissa bits; accumulation is FP32.
 constexpr int MT = 64, MW = 4, MPAD = HD + 8, PPAD = MT + 8;
 constexpr size_t MMA_ATT_SMEM = (size_t)(2 * 16 * MPAD + 2 * MT * MPAD + 2 * 16 * PPAD) * 2 + 16 * (MT + 4) * 4;
+// FP8 caches: each thread prefetches its share of a tile's raw rows into registers (8 chunks of 16 values).
+constexpr int KV8_CHUNKS = MT * HD / 16 / (MW * 32);
 
 SQ_DEVICE void split_bf16(float x, __nv_bfloat16& hi, __nv_bfloat16& lo) {
     hi = f2bf(x);
     lo = f2bf(x - bf2f(hi));
 }
 
+template <bool FP8>
 __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __restrict__ q, const float* __restrict__ qg, int ld,
-                                                                const __nv_bfloat16* __restrict__ kcache,
-                                                                const __nv_bfloat16* __restrict__ vcache,
+                                                                const void* __restrict__ kcache,
+                                                                const void* __restrict__ vcache,
                                                                 const int* __restrict__ sel,
                                                                 const int* __restrict__ start_ptr, __nv_bfloat16* out) {
     pdl_launch_dependents();
@@ -439,11 +488,54 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
             keys[tile & 1][tid] = i < nkeys ? key_of(i) : -1;
         }
     };
-    auto load_rows = [&](int tile, __nv_bfloat16* dst, const __nv_bfloat16* cache) {
-        for (int c = tid; c < MT * HD / 8; c += MW * 32) {
-            const int r = c / (HD / 8), col = (c % (HD / 8)) * 8;
-            const int key = keys[tile & 1][r];
-            cp_async16(dst + r * MPAD + col, cache + ((size_t)max(key, 0) * KVH + kvh) * HD + col, key >= 0);
+    // FP8 rows go to registers (thread: rows tid / 16 + 8 i, columns (tid % 16) * 16 ..); dequant() then
+    // fills dst. Chunk c = tid + i * 128 covers row c / 16.
+    uint4 kraw[KV8_CHUNKS], vraw[KV8_CHUNKS];
+    float kscl[KV8_CHUNKS], vscl[KV8_CHUNKS];
+    auto load_rows = [&](int tile, __nv_bfloat16* dst, const void* cache) {
+        if constexpr (FP8) {
+            uint4* raw = dst == Ks ? kraw : vraw;
+            float* scl = dst == Ks ? kscl : vscl;
+#pragma unroll
+            for (int i = 0; i < KV8_CHUNKS; ++i) {
+                const int r = tid / 16 + i * (MW * 32 / 16), col = (tid % 16) * 16;
+                const int key = keys[tile & 1][r];
+                if (key >= 0) {
+                    const unsigned char* row = kv_row<true>(cache, key, kvh);
+                    raw[i] = *reinterpret_cast<const uint4*>(row + col);
+                    scl[i] = *reinterpret_cast<const float*>(row + HD);
+                } else {
+                    raw[i] = make_uint4(0, 0, 0, 0);
+                    scl[i] = 0.0f;
+                }
+            }
+        } else {
+            for (int c = tid; c < MT * HD / 8; c += MW * 32) {
+                const int r = c / (HD / 8), col = (c % (HD / 8)) * 8;
+                const int key = keys[tile & 1][r];
+                cp_async16(dst + r * MPAD + col, kv_row<false>(cache, max(key, 0), kvh) + col * 2, key >= 0);
+            }
+        }
+    };
+    auto dequant = [&](__nv_bfloat16* dst) {
+        if constexpr (FP8) {
+            const uint4* raw = dst == Ks ? kraw : vraw;
+            const float* scl = dst == Ks ? kscl : vscl;
+#pragma unroll
+            for (int i = 0; i < KV8_CHUNKS; ++i) {
+                const int r = tid / 16 + i * (MW * 32 / 16), col = (tid % 16) * 16;
+                const unsigned char* b = reinterpret_cast<const unsigned char*>(&raw[i]);
+                __align__(16) __nv_bfloat16 v[16];
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    __nv_fp8_e4m3 e;
+                    e.__x = b[j];
+                    v[j] = f2bf(float(e) * scl[i]);
+                }
+                reinterpret_cast<uint4*>(dst + r * MPAD + col)[0] = reinterpret_cast<const uint4*>(v)[0];
+                reinterpret_cast<uint4*>(dst + r * MPAD + col)[1] = reinterpret_cast<const uint4*>(v)[1];
+            }
+            __syncthreads();
         }
     };
     load_keys(0);
@@ -458,6 +550,7 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
     for (int tile = 0; tile < tiles; ++tile) {
         cp_async_wait<1>();  // K of this tile
         __syncthreads();
+        dequant(Ks);
         // S = Q K^T / 16 for this warp's 16 keys (two n-tiles), hi and lo parts of Q.
         float sacc[2][4] = {};
 #pragma unroll
@@ -524,6 +617,7 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
         }
         cp_async_wait<1>();  // V of this tile
         __syncthreads();
+        dequant(Vs);
         // O = O * scale + P V for this warp's 64 output columns (8 n-tiles).
         {
             const float s0 = rscale[g], s1 = rscale[g + 8];
@@ -576,17 +670,18 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
 }  // namespace
 
 extern "C" cudaError_t squash_qsa_attention(const float* q, const float* qg, int ld, const void* kcache, const void* vcache,
-                                            const int* sel, const int* start, int T, void* out, cudaStream_t st) {
+                                            const int* sel, const int* start, int T, int fp8, void* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     static bool configured = false;
     if (!configured) {
-        const cudaError_t e = cudaFuncSetAttribute(attention_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)MMA_ATT_SMEM);
-        if (e != cudaSuccess) return e;
+        for (auto kern : {attention_mma_kernel<false>, attention_mma_kernel<true>}) {
+            const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)MMA_ATT_SMEM);
+            if (e != cudaSuccess) return e;
+        }
         configured = true;
     }
-    SQ_CHECK_LAUNCH(sq_launch(attention_mma_kernel, dim3(T, KVH), MW * 32, MMA_ATT_SMEM, st, q, qg, ld,
-                              static_cast<const __nv_bfloat16*>(kcache), static_cast<const __nv_bfloat16*>(vcache), sel,
-                              start, static_cast<__nv_bfloat16*>(out)));
+    SQ_CHECK_LAUNCH(sq_launch(fp8 ? attention_mma_kernel<true> : attention_mma_kernel<false>, dim3(T, KVH), MW * 32, MMA_ATT_SMEM, st,
+                              q, qg, ld, kcache, vcache, sel, start, static_cast<__nv_bfloat16*>(out)));
     SQ_RETURN_LAUNCH();
 }
 
@@ -612,12 +707,11 @@ extern "C" size_t squash_qsa_split_floats(int T) { return (size_t)T * KVH * SPLI
 
 // Attention for small batches: key-split partials into `part` (squash_qsa_split_floats(T) floats), then merge.
 extern "C" cudaError_t squash_qsa_attention_split(const float* q, const float* qg, int ld, const void* kcache, const void* vcache,
-                                                  const int* sel, const int* start, int T, float* part, void* out,
+                                                  const int* sel, const int* start, int T, int fp8, float* part, void* out,
                                                   cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(attention_split_kernel, dim3(T, KVH, SPLITS), ATT_THREADS, 0, st, q, static_cast<const __nv_bfloat16*>(kcache),
-                                                                        static_cast<const __nv_bfloat16*>(vcache), sel,
-                                                                        start, part));
+    SQ_CHECK_LAUNCH(sq_launch(fp8 ? attention_split_kernel<true> : attention_split_kernel<false>, dim3(T, KVH, SPLITS), ATT_THREADS, 0, st,
+                              q, kcache, vcache, sel, start, part));
     SQ_CHECK_LAUNCH(sq_launch(attention_merge_kernel, dim3(T, QH), HD, 0, st, part, qg, ld, start, static_cast<__nv_bfloat16*>(out)));
     SQ_RETURN_LAUNCH();
 }

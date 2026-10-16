@@ -71,6 +71,10 @@ pub fn load(model_dir: &std::path::Path, precision: Precision, mtp: bool) -> Res
 #[derive(Parser)]
 #[command(name = "squash", about = "Qwen3.8 Flash-Next inference engine")]
 struct Cli {
+    /// KV cache format for attention layers: bf16, or fp8 (E4M3 with a per-position, per-head scale;
+    /// about half the memory).
+    #[arg(long, global = true, default_value = "bf16", value_parser = ["bf16", "fp8"])]
+    kv: String,
     #[command(subcommand)]
     command: Command,
 }
@@ -295,7 +299,9 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    squash_engine::forward::KV_FP8.store(cli.kv == "fp8", std::sync::atomic::Ordering::Relaxed);
+    match cli.command {
         Command::Load { model, mtp, vision, threads, chunk_mib, buffered, verify } => {
             squash_cuda::set_device(0)?;
             let t = std::time::Instant::now();

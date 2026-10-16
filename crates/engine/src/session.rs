@@ -265,14 +265,24 @@ impl Session {
         aux.state.reset(s)?;
         aux.state.set_steering_strength(s, p.steering_strength)?;
         self.ws.capture = capture;
-        for c in prompt.chunks(self.chunk) {
-            if let Err(e) = forward::forward(model, &mut aux.state, &mut self.ws, s, c) {
+        // The same step boundaries as a fresh slot-0 prefill (chunks, cut at turn boundaries), so
+        // both slots compute identical results for the same prompt.
+        let mut c0 = 0;
+        let mut last_rows = 0;
+        while c0 < prompt.len() {
+            let mut end = (c0 + self.chunk).min(prompt.len());
+            if let Some(&b) = p.boundaries.iter().filter(|&&b| b > c0 && b < prompt.len()).min() {
+                end = end.min(b);
+            }
+            if let Err(e) = forward::forward(model, &mut aux.state, &mut self.ws, s, &prompt[c0..end]) {
                 self.ws.capture = None;
                 return Err(e);
             }
+            last_rows = end - c0;
+            c0 = end;
         }
         self.ws.capture = None;
-        let last = self.ws.out + (((prompt.len() - 1) % self.chunk) * crate::model::D * 2) as u64;
+        let last = self.ws.out + ((last_rows - 1) * crate::model::D * 2) as u64;
         forward::head_logits(model, &self.hw, s, last)?;
         if let Some(c) = capture {
             self.prompt_site = Some(self.read_site(s, "prompt_last", c.buf, c.pos, prompt[c.pos], self.hw.logits_addr())?);
