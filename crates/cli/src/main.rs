@@ -117,6 +117,10 @@ enum Command {
         /// Run the completion one token per step (decode) after prefilling the prompt.
         #[arg(long)]
         decode: bool,
+        /// With --decode: decode each fixture in a batch of two, next to the following fixture
+        /// (teacher-forced with its own tokens), through the batched forward.
+        #[arg(long, requires = "decode")]
+        batch2: bool,
         #[command(flatten)]
         steer: SteerArgs,
     },
@@ -331,7 +335,7 @@ fn main() -> Result<()> {
                 println!("verified {checked} tensors byte-exact");
             }
         }
-        Command::Score { model, precision, fixture, out, suffix, chunk, decode, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, &steer)?,
+        Command::Score { model, precision, fixture, out, suffix, chunk, decode, batch2, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, batch2, &steer)?,
         Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir } => {
             serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir })?
         }
@@ -385,7 +389,8 @@ fn main() -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf], out: &std::path::Path, suffix: &str, chunk: usize, decode: bool, steer: &SteerArgs) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf], out: &std::path::Path, suffix: &str, chunk: usize, decode: bool, batch2: bool, steer: &SteerArgs) -> Result<()> {
     use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
 
     #[derive(serde::Deserialize)]
@@ -403,13 +408,25 @@ fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf]
         .iter()
         .map(|f| Ok((f.clone(), serde_json::from_slice(&std::fs::read(f.join("sequence.json"))?)?)))
         .collect::<Result<_>>()?;
-    let capacity = seqs.iter().map(|(_, s)| s.tokens.len()).max().unwrap_or(0);
+    let longest = seqs.iter().map(|(_, s)| s.tokens.len()).max().unwrap_or(0);
+    let capacity = if batch2 { 2 * longest } else { longest };
     let mut ws = Workspace::new(chunk, capacity)?;
     let hw = HeadWorkspace::new(256, TOP_K)?;
     println!("workspace {:.2} GiB", ws.bytes() as f64 / 1073741824.0);
 
-    for (dir, seq) in &seqs {
+    for (i, (dir, seq)) in seqs.iter().enumerate() {
         let t0 = std::time::Instant::now();
+        // Batch-2 partner: the next fixture's prompt, then its own tokens (cyclically) as inputs.
+        let mut partner = None;
+        if batch2 {
+            let other = &seqs[(i + 1) % seqs.len()].1;
+            let mut st = SequenceState::new(other.prompt_len + seq.tokens.len())?;
+            st.set_steering_strength(&stream, strength)?;
+            for c in other.tokens[..other.prompt_len].chunks(chunk) {
+                forward::forward(&model, &mut st, &mut ws, &stream, c)?;
+            }
+            partner = Some((st, other));
+        }
         let mut state = SequenceState::new(seq.tokens.len())?;
         state.set_steering_strength(&stream, strength)?;
         let positions = seq.tokens.len() - 1;
@@ -432,7 +449,15 @@ fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf]
             let step = if decode && c0 >= seq.prompt_len { 1 } else { chunk };
             let limit = if decode && c0 < seq.prompt_len { seq.prompt_len } else { seq.tokens.len() };
             let c1 = (c0 + step).min(limit);
-            forward::forward(&model, &mut state, &mut ws, &stream, &seq.tokens[c0..c1])?;
+            match &mut partner {
+                Some((st, other)) if step == 1 => {
+                    let k = c0 - seq.prompt_len;
+                    let toks = [seq.tokens[c0], other.tokens[(other.prompt_len + k) % other.tokens.len()]];
+                    let bytes = forward::prepare_batch(&model, &mut [&mut state, st], &mut ws, &toks)?;
+                    forward::forward_batch(&model, &[&state, st], &ws, &stream, bytes)?;
+                }
+                _ => forward::forward(&model, &mut state, &mut ws, &stream, &seq.tokens[c0..c1])?,
+            }
             let rows = c1.min(positions) - c0.min(positions);
             if rows > 0 {
                 let h = forward::head_stats(&model, &hw, &stream, ws.out, &seq.tokens[c0 + 1..c0 + 1 + rows], TOP_K)?;
