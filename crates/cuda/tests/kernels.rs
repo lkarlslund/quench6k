@@ -746,3 +746,33 @@ fn gdn_conv_prep_fused_matches() {
     assert!(same(&b0, &b1) && same(&g0, &g1), "beta/g differ");
     assert!(same(&s0, &s1), "state differs");
 }
+
+/// The parallel prefill PLE conv equals the sequential kernel (one 100-token step vs two of 50).
+#[test]
+fn ple_conv_tiled_matches_sequential() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x91e0_0001);
+    let (t, h) = (100usize, 10240usize);
+    let gv = upload(&s, &rng.vec(t * h));
+    let xn = upload(&s, &rng.vec(t * h));
+    let w = upload(&s, &to_bf16(&rng.vec(h * 4)));
+    let state0 = rng.vec(9 * h);
+    let h0 = rng.vec(t * h);
+    let run = |split: bool| -> (Vec<f32>, Vec<f32>) {
+        let st = upload(&s, &state0);
+        let hb = upload(&s, &h0);
+        if split {
+            kernels::ple_conv(&s, gv.addr(), xn.addr(), w.addr(), st.addr(), hb.addr(), 50, None).unwrap();
+            let off = (50 * h * 4) as u64;
+            kernels::ple_conv(&s, gv.addr() + off, xn.addr() + off, w.addr(), st.addr(), hb.addr() + off, 50, None).unwrap();
+        } else {
+            kernels::ple_conv(&s, gv.addr(), xn.addr(), w.addr(), st.addr(), hb.addr(), t, None).unwrap();
+        }
+        (s.download(hb.addr(), t * h).unwrap(), s.download(st.addr(), 9 * h).unwrap())
+    };
+    let (a, sa) = run(true);
+    let (b, sb) = run(false);
+    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "outputs differ");
+    assert!(sa.iter().zip(&sb).all(|(x, y)| x.to_bits() == y.to_bits()), "state differs");
+}

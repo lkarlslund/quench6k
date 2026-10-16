@@ -89,6 +89,43 @@ __global__ void conv_kernel(const float* __restrict__ gv, const float* __restric
         for (int j = 0; j < HIST; ++j) state[j * H + c] = hist[j];
 }
 
+// Prefill form of conv_kernel (committed history, no records): the filter reads only inputs, so tiles
+// of PT tokens run in parallel; grid (H / 256, ceil(T / PT)). The state is advanced afterwards.
+constexpr int PT = 16;
+__global__ void conv_tiled_kernel(const float* __restrict__ gv, const float* __restrict__ xn, const __nv_bfloat16* __restrict__ w,
+                                  const float* __restrict__ state, float* h, int T) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t0 = blockIdx.y * PT;
+    if (c >= H) return;
+    float hist[HIST];
+#pragma unroll
+    for (int j = 0; j < HIST; ++j) {
+        const int t = t0 - HIST + j;
+        hist[j] = t >= 0 ? xn[(size_t)t * H + c] : state[(HIST + t) * H + c];
+    }
+    const float w0 = bf2f(w[c * 4]), w1 = bf2f(w[c * 4 + 1]), w2 = bf2f(w[c * 4 + 2]), w3 = bf2f(w[c * 4 + 3]);
+    const int t1 = min(T, t0 + PT);
+    for (int t = t0; t < t1; ++t) {
+        const size_t i = (size_t)t * H + c;
+        const float cur = xn[i];
+        h[i] += gv[i] + silu(w0 * hist[0] + w1 * hist[3] + w2 * hist[6] + w3 * cur);
+#pragma unroll
+        for (int j = 0; j < HIST - 1; ++j) hist[j] = hist[j + 1];
+        hist[HIST - 1] = cur;
+    }
+}
+
+// state <- the last HIST inputs (T >= HIST).
+__global__ void conv_advance_kernel(const float* __restrict__ xn, float* state, int T) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= H) return;
+#pragma unroll
+    for (int j = 0; j < HIST; ++j) state[j * H + c] = xn[(size_t)(T - HIST + j) * H + c];
+}
+
 }  // namespace
 
 extern "C" cudaError_t squash_ple_gate(const float* kp, const float* h, const float* v, const void* wk, const void* wq,
@@ -106,6 +143,17 @@ extern "C" size_t squash_ple_record_floats() { return (size_t)2 * REC_TOKENS * H
 extern "C" cudaError_t squash_ple_conv(const float* gv, const float* xn, const void* w, float* state, float* h, int T,
                                        float* rec, const int* ctl, int defer, cudaStream_t st) {
     if (T > REC_TOKENS && rec && defer) return cudaErrorInvalidValue;
+    if (T >= 64 && !defer) {
+        // Prefill: commit any pending speculative records into the state first (a zero-token step),
+        // then the token tiles in parallel and the state update.
+        if (rec)
+            SQ_CHECK_LAUNCH(sq_launch(conv_kernel, H / 256, 256, 0, st, gv, xn, static_cast<const __nv_bfloat16*>(w), state, h, 0, rec, ctl,
+                                      0));
+        SQ_CHECK_LAUNCH(sq_launch(conv_tiled_kernel, dim3(H / 256, (T + PT - 1) / PT), 256, 0, st, gv, xn,
+                                  static_cast<const __nv_bfloat16*>(w), static_cast<const float*>(state), h, T));
+        SQ_CHECK_LAUNCH(sq_launch(conv_advance_kernel, H / 256, 256, 0, st, xn, state, T));
+        SQ_RETURN_LAUNCH();
+    }
     SQ_CHECK_LAUNCH(sq_launch(conv_kernel, H / 256, 256, 0, st, gv, xn, static_cast<const __nv_bfloat16*>(w), state, h, T,
                               rec, ctl, defer));
     SQ_RETURN_LAUNCH();
