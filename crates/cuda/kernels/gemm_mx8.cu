@@ -57,7 +57,8 @@ __global__ void mxfp8_rows_kernel(const __nv_bfloat16* __restrict__ x, int rows,
     dst[1] = make_uint4(q[4], q[5], q[6], q[7]);
 }
 
-constexpr int BM = 128, BN = 128, BK = 128, STAGES = 3, THREADS = 256;
+constexpr int BM = 128, BN = 256, BK = 128, STAGES = 2, THREADS = 256;
+constexpr int WTN = BN / 4, NJ = WTN / 8;  // warp tile columns, n8 tiles per warp
 constexpr int MI = BM / 32;  // m16 tiles per warp (warps 2 x 4, warp tile BM / 2 x 32)
 
 SQ_DEVICE int swz(int r, int c) { return r * BK + ((c ^ (r & 7)) << 4); }
@@ -101,21 +102,21 @@ __global__ void __launch_bounds__(THREADS) mx8_gemm_kernel(const uint8_t* __rest
             cp_async16(&g.a[swz(r, c)], A + (size_t)(ok ? m0 + r : 0) * K + kt * BK + c * 16, ok);
         }
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {  // B: 128 rows x 8 chunks
+        for (int i = 0; i < BN * 8 / THREADS; ++i) {  // B: BN rows x 8 chunks
             const int idx = tid + i * THREADS, r = idx >> 3, c = idx & 7;
             const bool ok = n0 + r < N;
             cp_async16(&g.b[swz(r, c)], W + (size_t)(ok ? n0 + r : 0) * K + kt * BK + c * 16, ok);
         }
-        if (tid < BM) {
-            const bool ok = m0 + tid < M;
-            cp_async4(&g.as[tid], As + (size_t)(ok ? m0 + tid : 0) * KS + kt * 4, ok);
-        } else if (tid < BM + BN) {
-            const int r = tid - BM;
+        for (int r = tid - BM; r >= 0 && r < BN; r += THREADS - BM) {  // B scales: threads BM.. loop
             const bool ok = n0 + r < N;
             cp_async4(&g.bs[r], Ws + (size_t)(ok ? n0 + r : 0) * KS + kt * 4, ok);
         }
+        if (tid < BM) {
+            const bool ok = m0 + tid < M;
+            cp_async4(&g.as[tid], As + (size_t)(ok ? m0 + tid : 0) * KS + kt * 4, ok);
+        }
     };
-    float acc[MI][4][4] = {};
+    float acc[MI][NJ][4] = {};
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < k_tiles) load(s, s);
@@ -129,26 +130,26 @@ __global__ void __launch_bounds__(THREADS) mx8_gemm_kernel(const uint8_t* __rest
         if (next < k_tiles) load(next % STAGES, next);
         cp_async_commit();
         const Stage& g = st[kt % STAGES];
-        uint32_t sa[MI], sb[4];
+        uint32_t sa[MI], sb[NJ];
 #pragma unroll
         for (int i = 0; i < MI; ++i) sa[i] = g.as[warp_m * (BM / 2) + i * 16 + ta];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) sb[j] = g.bs[warp_n * 32 + j * 8 + tb];
+        for (int j = 0; j < NJ; ++j) sb[j] = g.bs[warp_n * WTN + j * 8 + tb];
         auto step = [&](auto sc) {
             constexpr int s = decltype(sc)::value;
-            uint32_t a[MI][4], b[4][2];
+            uint32_t a[MI][4], b[NJ][2];
 #pragma unroll
             for (int i = 0; i < MI; ++i) ldmatrix_x4(a[i], &g.a[swz(warp_m * (BM / 2) + i * 16 + (lane & 15), s * 2 + (lane >> 4))]);
 #pragma unroll
-            for (int j = 0; j < 2; ++j) {
+            for (int j = 0; j < NJ / 2; ++j) {
                 uint32_t r4[4];
-                ldmatrix_x4(r4, &g.b[swz(warp_n * 32 + j * 16 + (lane & 7) + ((lane >> 4) << 3), s * 2 + ((lane >> 3) & 1))]);
+                ldmatrix_x4(r4, &g.b[swz(warp_n * WTN + j * 16 + (lane & 7) + ((lane >> 4) << 3), s * 2 + ((lane >> 3) & 1))]);
                 b[2 * j][0] = r4[0], b[2 * j][1] = r4[1], b[2 * j + 1][0] = r4[2], b[2 * j + 1][1] = r4[3];
             }
 #pragma unroll
             for (int i = 0; i < MI; ++i)
 #pragma unroll
-                for (int j = 0; j < 4; ++j) mma_mx8<s>(acc[i][j], a[i], b[j], sa[i], sb[j]);
+                for (int j = 0; j < NJ; ++j) mma_mx8<s>(acc[i][j], a[i], b[j], sa[i], sb[j]);
         };
         step(std::integral_constant<int, 0>{});
         step(std::integral_constant<int, 1>{});
@@ -164,8 +165,8 @@ __global__ void __launch_bounds__(THREADS) mx8_gemm_kernel(const uint8_t* __rest
             const int m = m0 + warp_m * (BM / 2) + i * 16 + g8 + h * 8;
             if (m >= M) continue;
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int n = n0 + warp_n * 32 + j * 8 + 2 * t4;
+            for (int j = 0; j < NJ; ++j) {
+                const int n = n0 + warp_n * WTN + j * 8 + 2 * t4;
                 if (n < N) Y[(size_t)m * ldy + n] = acc[i][j][2 * h];
                 if (n + 1 < N) Y[(size_t)m * ldy + n + 1] = acc[i][j][2 * h + 1];
             }
