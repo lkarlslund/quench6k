@@ -209,6 +209,13 @@ enum Command {
         /// Directory for activation captures requested per request ("capture": {"name": ...}).
         #[arg(long)]
         capture_dir: Option<PathBuf>,
+        /// Do not load the vision tower (requests with images are rejected).
+        #[arg(long)]
+        no_vision: bool,
+        /// Largest image area after resizing, in pixels (the checkpoint's processor allows 16777216;
+        /// each 32x32 block becomes one token).
+        #[arg(long, default_value_t = 4194304)]
+        image_max_pixels: usize,
     },
     /// Batched decode check: two fixture prompts decoded together must give each one's single-sequence
     /// greedy tokens, bit for bit; also times both.
@@ -358,8 +365,8 @@ fn main() -> Result<()> {
         }
         Command::VisionCheck { model, reference, max_pixels } => vision_check(&model, &reference, max_pixels)?,
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, batch2, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, batch2, &steer)?,
-        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir } => {
-            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir })?
+        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir, no_vision, image_max_pixels } => {
+            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir, vision: !no_vision, image_max_pixels })?
         }
         Command::BatchCheck { model, fixture, n } => batch_check(&model, &fixture, n)?,
         Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, image, steer } => {

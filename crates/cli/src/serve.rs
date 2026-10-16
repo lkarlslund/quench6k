@@ -36,6 +36,8 @@ pub struct ServeOptions {
     /// Concurrent requests decoded together (1 or 2).
     pub slots: usize,
     pub capture_dir: Option<PathBuf>,
+    pub vision: bool,
+    pub image_max_pixels: usize,
 }
 
 /// Identity of the served model and numerics for stored contexts: config.json plus the profile.
@@ -83,6 +85,8 @@ struct App {
     tool_call_token: Option<i32>,
     capture_dir: Option<PathBuf>,
     model_id: String,
+    vision: bool,
+    image_max_pixels: usize,
 }
 
 pub fn run(opts: ServeOptions) -> Result<()> {
@@ -97,11 +101,16 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         model_id: model_id(&opts.model),
     };
     let steering = steer.steering.is_some();
+    let vision = opts.vision;
     std::thread::spawn(move || {
         let setup = (|| -> Result<_> {
             let (mut model, stream) = crate::load(&model_dir, Precision::Int8Group, true)?;
             let strength = steer.attach(&mut model, &stream)?;
-            let session = Session::new(&model, &stream, context, 8192, drafts, store)?;
+            let mut session = Session::new(&model, &stream, context, 8192, drafts, store)?;
+            if vision {
+                let ckpt = squash_engine::checkpoint::Checkpoint::open(&model_dir)?;
+                session.set_vision(squash_engine::vision::VisionModel::load(&ckpt, squash_engine::loader::LoadOptions::default(), &stream)?);
+            }
             println!("context store: {} stored contexts", session.stored_contexts());
             Ok((model, stream, session, strength))
         })();
@@ -123,7 +132,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         schedule(&model, &stream, &mut session, &jobs_rx);
     });
     let default_strength = ready_rx.recv().context("worker thread")??;
-    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, tool_retries: opts.tool_retries, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model) });
+    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, tool_retries: opts.tool_retries, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model), vision, image_max_pixels: opts.image_max_pixels });
     let router = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -296,9 +305,11 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
     let enable_thinking = kwargs.get("enable_thinking").and_then(Value::as_bool);
     let effort = kwargs.get("reasoning_effort").or_else(|| req.get("reasoning_effort")).and_then(Value::as_str);
     let tools = req.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty())).cloned();
-    let text = app.chat.render(messages, tools.as_ref(), enable_thinking, effort).map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
+    let (messages, images) = extract_images(app, messages)?;
+    let text = app.chat.render(&messages, tools.as_ref(), enable_thinking, effort).map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
     let thinking = text.ends_with("<think>\n");
     let ids = app.chat.encode(&text).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let (ids, images) = app.chat.expand_images(&ids, images).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let max_tokens = req.get("max_completion_tokens").or_else(|| req.get("max_tokens")).and_then(Value::as_u64).unwrap_or(4096) as usize;
     let temperature = req.get("temperature").and_then(Value::as_f64).unwrap_or(1.0) as f32;
     let top_p = req.get("top_p").and_then(Value::as_f64).unwrap_or(0.95) as f32;
@@ -327,11 +338,40 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
             Some((dir.join(format!("{name}.safetensors")), meta))
         }
     };
-    let params = GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids), capture: capture.is_some(), images: Vec::new() };
+    let params = GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids), capture: capture.is_some(), images };
     Ok(Prepared { capture, ids, params, stops, thinking, tools, stream: req.get("stream").and_then(Value::as_bool).unwrap_or(false) })
 }
 
 /// Splits generated text into (reasoning, content, tool calls).
+/// Replaces image parts of message contents (OpenAI `image_url` with a data URL, or `image` with
+/// base64 `data`) by template placeholders and preprocesses the images, in order.
+fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<squash_engine::vision::VisionInput>), Response> {
+    use base64::Engine;
+    let mut out = messages.clone();
+    let mut images = Vec::new();
+    for m in out.as_array_mut().into_iter().flatten() {
+        let Some(parts) = m.get_mut("content").and_then(Value::as_array_mut) else { continue };
+        for part in parts.iter_mut() {
+            let url = match part.get("type").and_then(Value::as_str) {
+                Some("image_url") => part.get("image_url").and_then(|u| u.get("url").or(Some(u))).and_then(Value::as_str).map(str::to_owned),
+                Some("image") => part.get("image").and_then(Value::as_str).map(str::to_owned),
+                _ => continue,
+            };
+            if !app.vision {
+                return Err(error(StatusCode::BAD_REQUEST, "this server has no vision tower (started with --no-vision)"));
+            }
+            let url = url.ok_or_else(|| error(StatusCode::BAD_REQUEST, "image part without a URL"))?;
+            let data = url.strip_prefix("data:").and_then(|r| r.split_once(";base64,")).map(|(_, d)| d)
+                .ok_or_else(|| error(StatusCode::BAD_REQUEST, "images must be data URLs (data:<type>;base64,...)"))?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|e| error(StatusCode::BAD_REQUEST, format!("image base64: {e}")))?;
+            let input = squash_engine::vision::preprocess_image(&bytes, 65536, app.image_max_pixels).map_err(|e| error(StatusCode::BAD_REQUEST, format!("image: {e:#}")))?;
+            images.push(input);
+            *part = json!({"type": "image"});
+        }
+    }
+    Ok((out, images))
+}
+
 fn parse_output(text: &str, thinking: bool, tools: Option<&Value>) -> (Option<String>, String, Vec<Value>) {
     let (reasoning, rest) = if thinking {
         match text.find("</think>") {
@@ -719,8 +759,21 @@ fn from_anthropic(req: &Value) -> Value {
         match m.get("content") {
             Some(Value::Array(blocks)) => {
                 let (mut text, mut reasoning, mut calls) = (String::new(), String::new(), Vec::new());
+                // User content with images keeps its parts in order (OpenAI content-part form).
+                let mut parts: Vec<Value> = Vec::new();
                 for b in blocks {
                     match b.get("type").and_then(Value::as_str) {
+                        Some("image") => {
+                            if !text.is_empty() {
+                                parts.push(json!({"type": "text", "text": std::mem::take(&mut text)}));
+                            }
+                            let src = b.get("source").cloned().unwrap_or(Value::Null);
+                            let url = match src.get("type").and_then(Value::as_str) {
+                                Some("base64") => format!("data:{};base64,{}", src.get("media_type").and_then(Value::as_str).unwrap_or("image/png"), src.get("data").and_then(Value::as_str).unwrap_or("")),
+                                _ => src.get("url").and_then(Value::as_str).unwrap_or("").to_owned(),
+                            };
+                            parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                        }
                         Some("text") => text.push_str(b.get("text").and_then(Value::as_str).unwrap_or("")),
                         Some("thinking") => reasoning.push_str(b.get("thinking").and_then(Value::as_str).unwrap_or("")),
                         Some("tool_use") => calls.push(json!({"id": b["id"], "type": "function",
@@ -744,6 +797,11 @@ fn from_anthropic(req: &Value) -> Value {
                         msg["tool_calls"] = Value::Array(calls);
                     }
                     messages.push(msg);
+                } else if !parts.is_empty() {
+                    if !text.is_empty() {
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
+                    messages.push(json!({"role": role, "content": parts}));
                 } else if !text.is_empty() {
                     messages.push(json!({"role": role, "content": text}));
                 }

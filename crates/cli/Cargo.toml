@@ -21,3 +21,4 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal"] }
 tokio-stream = "0.1"
 axum = "0.8"
+base64 = "0.22"
