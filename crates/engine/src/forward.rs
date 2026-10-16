@@ -545,6 +545,29 @@ pub fn forward_batch(model: &Model, states: &[&SequenceState], ws: &Workspace, s
     final_mixer(&model.final_hc, &ctx, &mut carry, None)
 }
 
+/// Commits a speculative sequence's deferred recurrent state (the accepted tokens of its last round,
+/// recorded but not yet applied) so that it can continue with plain steps.
+pub fn flush_spec(model: &Model, state: &mut SequenceState, ws: &Workspace, s: &Stream) -> Result<()> {
+    let Some(sp) = state.spec.as_ref() else { return Ok(()) };
+    for (i, layer) in model.layers.iter().enumerate() {
+        if let (Block::Gdn(g), Some(st), Some(rec)) = (&layer.block, state.gdn[i].as_ref(), sp.gdn_rec[i].as_ref()) {
+            let flush = k::Deferral { rec: rec.addr(), ctl: sp.ctl.addr(), defer: false };
+            k::gdn_fused_small(s, ws.proj, g.proj.n, 0, g.conv, st.conv.addr(), st.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, Some(flush))?;
+        }
+        if let Some(ple) = &layer.ple {
+            let flush = k::Deferral { rec: sp.ple_rec.addr(), ctl: sp.ctl.addr(), defer: false };
+            k::ple_conv(s, ws.gv, ws.xn, ple.conv, state.ple_conv.addr(), ws.h, 0, Some(flush))?;
+        }
+    }
+    // Nothing left to replay.
+    s.memset(sp.ctl.addr(), 0, 4)?;
+    s.synchronize()?;
+    if let Some(sp) = state.spec.as_mut() {
+        sp.replay = 0;
+    }
+    Ok(())
+}
+
 /// A captured batched decode step for fixed sequences (their buffers are baked in): the step block
 /// is prepared on the host with [`prepare_batch`], then one graph runs the forward pass and the
 /// greedy argmax of every row into `out` (i32 per sequence).

@@ -5,7 +5,7 @@
 use anyhow::{Result, ensure};
 use squash_cuda::{DeviceBuffer, Stream};
 
-use crate::forward::{DecodeGraph, HeadWorkspace, SequenceState, Workspace};
+use crate::forward::{self, BatchGraph, DecodeGraph, HeadWorkspace, SequenceState, Workspace};
 use crate::model::{Model, VOCAB};
 use crate::context_store::{ContextStore, StoreOptions};
 use crate::spec::{SpecDecoder, SpecGraphs};
@@ -57,6 +57,47 @@ pub struct Session {
     kv_strength: f32,
     /// Host and disk tiers of stored contexts.
     store: ContextStore,
+    /// The second, plain-decoding slot for a concurrent request.
+    aux: Option<Aux>,
+}
+
+struct Aux {
+    state: SequenceState,
+    graph: DecodeGraph,
+    batch: BatchGraph,
+    hw2: HeadWorkspace,
+    _out2: DeviceBuffer,
+}
+
+/// A request in progress on a slot (0: the main slot with MTP and the prefix cache; 1: the plain slot).
+pub struct Run {
+    pub slot: usize,
+    pub params: GenParams,
+    pub produced: usize,
+    /// Speculative (slot 0, greedy, alone) or plain one-token steps.
+    spec: bool,
+    /// Plain mode: the token to feed next (already emitted).
+    pending: i32,
+    rng: Rng,
+    budget: usize,
+}
+
+impl Run {
+    /// Accounts an emitted token; returns why the run ends, if it does.
+    pub fn accept(&mut self, tok: i32) -> Option<Finish> {
+        self.produced += 1;
+        if self.params.stop_tokens.contains(&tok) {
+            return Some(Finish::Stop);
+        }
+        if self.produced >= self.budget {
+            return Some(Finish::Length);
+        }
+        None
+    }
+
+    pub fn is_spec(&self) -> bool {
+        self.spec
+    }
 }
 
 /// The recurrent state at a position: every GDN layer's conv history and delta-rule state, the PLE conv
@@ -99,7 +140,106 @@ impl Session {
             reused: 0,
             kv_strength: 0.0,
             store: ContextStore::open(store)?,
+            aux: None,
         })
+    }
+
+    /// Adds the second slot (plain decoding, batched with the main slot when both are busy).
+    pub fn enable_second_slot(&mut self, model: &Model, s: &Stream) -> Result<()> {
+        let mut state = SequenceState::new(self.state.capacity)?;
+        forward::forward(model, &mut state, &mut self.ws, s, &[0])?;
+        let graph = DecodeGraph::capture(model, &state, &self.ws, &self.hw, s)?;
+        let hw2 = HeadWorkspace::new(2, MAX_TOP_K)?;
+        let out2 = DeviceBuffer::new(8)?;
+        let batch = BatchGraph::capture(model, &[&self.state, &state], &self.ws, &hw2, s, out2.addr())?;
+        self.aux = Some(Aux { state, graph, batch, hw2, _out2: out2 });
+        Ok(())
+    }
+
+    pub fn has_second_slot(&self) -> bool {
+        self.aux.is_some()
+    }
+
+    /// Starts a request on `slot`: prefills and returns the run with the tokens to emit now (none for a
+    /// speculative run, whose first round emits).
+    pub fn begin(&mut self, model: &Model, s: &Stream, slot: usize, prompt: &[i32], p: &GenParams, speculate: bool) -> Result<(Run, Vec<i32>)> {
+        ensure!(!prompt.is_empty(), "empty prompt");
+        ensure!(prompt.len() < self.capacity, "prompt of {} tokens exceeds the context of {}", prompt.len(), self.capacity);
+        let budget = p.max_tokens.min(self.capacity - prompt.len());
+        let mut run = Run { slot, params: p.clone(), produced: 0, spec: false, pending: 0, rng: Rng(p.seed ^ 0x9e37_79b9_7f4a_7c15), budget };
+        if slot == 0 {
+            self.state.reset(s)?;
+            self.state.set_steering_strength(s, p.steering_strength)?;
+            self.prefill(model, s, prompt, &p.boundaries, p.steering_strength)?;
+            if p.temperature <= 0.0 && speculate {
+                self.spec.restart(&self.state, &self.dec, s)?;
+                run.spec = true;
+                return Ok((run, Vec::new()));
+            }
+            let tok = if p.temperature <= 0.0 { self.dec.next } else { self.sample(s, self.dec.last_logits_addr(), p, &mut run.rng)? };
+            run.pending = tok;
+            return Ok((run, vec![tok]));
+        }
+        let aux = self.aux.as_mut().expect("second slot");
+        aux.state.reset(s)?;
+        aux.state.set_steering_strength(s, p.steering_strength)?;
+        for c in prompt.chunks(self.chunk) {
+            forward::forward(model, &mut aux.state, &mut self.ws, s, c)?;
+        }
+        let last = self.ws.out + (((prompt.len() - 1) % self.chunk) * crate::model::D * 2) as u64;
+        forward::head_logits(model, &self.hw, s, last)?;
+        let tok = self.sample(s, self.hw.logits_addr(), p, &mut run.rng)?;
+        run.pending = tok;
+        Ok((run, vec![tok]))
+    }
+
+    /// Switches a speculative run to plain steps (when another request starts): commits the deferred
+    /// state and returns the target's next token, which is emitted now.
+    pub fn to_plain(&mut self, model: &Model, s: &Stream, run: &mut Run) -> Result<Vec<i32>> {
+        if !run.spec {
+            return Ok(Vec::new());
+        }
+        forward::flush_spec(model, &mut self.state, &self.ws, s)?;
+        run.spec = false;
+        run.pending = self.dec.next;
+        Ok(vec![self.dec.next])
+    }
+
+    /// One step of the given runs (one, or one per slot, both plain); returns each run's new tokens.
+    pub fn step(&mut self, model: &Model, s: &Stream, runs: &mut [&mut Run]) -> Result<Vec<Vec<i32>>> {
+        match runs {
+            [run] if run.spec => {
+                let committed = self.spec.round(model, &mut self.state, &mut self.ws, &mut self.dec, s)?;
+                self.kv_tokens = self.state.tokens.clone();
+                Ok(vec![committed])
+            }
+            [run] => {
+                if run.slot == 0 {
+                    self.graph.step(model, &mut self.state, &mut self.ws, &self.hw, s, run.pending)?;
+                    self.kv_tokens = self.state.tokens.clone();
+                } else {
+                    let aux = self.aux.as_mut().expect("second slot");
+                    aux.graph.step(model, &mut aux.state, &mut self.ws, &self.hw, s, run.pending)?;
+                }
+                let tok = self.sample(s, self.hw.logits_addr(), &run.params.clone(), &mut run.rng)?;
+                run.pending = tok;
+                Ok(vec![vec![tok]])
+            }
+            [a, b] => {
+                ensure!(!a.spec && !b.spec && a.slot == 0 && b.slot == 1, "batched steps need both slots in plain mode");
+                let aux = self.aux.as_mut().expect("second slot");
+                aux.batch.step(model, &mut [&mut self.state, &mut aux.state], &mut self.ws, s, &[a.pending, b.pending])?;
+                s.synchronize()?;
+                self.kv_tokens = self.state.tokens.clone();
+                let logits = self.aux.as_ref().unwrap().hw2.logits_addr();
+                let ta = self.sample(s, logits, &a.params.clone(), &mut a.rng)?;
+                let tb = self.sample(s, logits + (VOCAB * 4) as u64, &b.params.clone(), &mut b.rng)?;
+                a.pending = ta;
+                b.pending = tb;
+                Ok(vec![vec![ta], vec![tb]])
+            }
+            _ => anyhow::bail!("step takes one run, or one per slot"),
+        }
     }
 
     /// Stored contexts (host and disk tiers).
@@ -336,7 +476,7 @@ impl Session {
 
     /// Samples from a logits row (VOCAB f32 at `logits`): top-k, temperature, top-p.
     fn sample(&self, s: &Stream, logits: u64, p: &GenParams, rng: &mut Rng) -> Result<i32> {
-        let k = if p.top_k == 0 { MAX_TOP_K } else { p.top_k.min(MAX_TOP_K) };
+        let k = if p.temperature <= 0.0 { 1 } else if p.top_k == 0 { MAX_TOP_K } else { p.top_k.min(MAX_TOP_K) };
         squash_cuda::kernels::topk(s, logits, 1, VOCAB, VOCAB, k, false, self.top_idx.addr(), self.top_val.addr())?;
         let ids: Vec<i32> = s.download(self.top_idx.addr(), k)?;
         let vals: Vec<f32> = s.download(self.top_val.addr(), k)?;

@@ -33,6 +33,8 @@ pub struct ServeOptions {
     pub cache_dir: Option<PathBuf>,
     pub chat_template: Option<PathBuf>,
     pub tool_retries: usize,
+    /// Concurrent requests decoded together (1 or 2).
+    pub slots: usize,
 }
 
 /// Identity of the served model and numerics for stored contexts: config.json plus the profile.
@@ -82,7 +84,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     let tool_call_token = chat.token_id("<tool_call>");
     let (jobs_tx, jobs_rx) = mpsc::channel::<Work>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<f32>>();
-    let (model_dir, context, drafts, steer) = (opts.model.clone(), opts.context, opts.drafts, opts.steer.clone());
+    let (model_dir, context, drafts, steer, slots) = (opts.model.clone(), opts.context, opts.drafts, opts.steer.clone(), opts.slots);
     let store = squash_engine::context_store::StoreOptions {
         host_bytes: (opts.cache_host_gib * 1073741824.0) as usize,
         dir: opts.cache_dir.clone(),
@@ -107,24 +109,12 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                 return;
             }
         };
-        for work in jobs_rx {
-            let job = match work {
-                Work::Generate(job) => job,
-                Work::Persist(ack) => {
-                    if let Err(e) = session.persist() {
-                        eprintln!("persisting contexts: {e:#}");
-                    }
-                    let _ = ack.send(());
-                    continue;
-                }
-            };
-            let tx = job.tx.clone();
-            let result = session.generate(&model, &stream, &job.ids, &job.params, |tok| tx.send(Msg::Token(tok)).is_ok());
-            let _ = match result {
-                Ok((finish, _)) => job.tx.send(Msg::Done(finish, session.reused)),
-                Err(e) => job.tx.send(Msg::Error(format!("{e:#}"))),
-            };
+        if slots > 1 {
+            if let Err(e) = session.enable_second_slot(&model, &stream) {
+                eprintln!("second slot unavailable: {e:#}");
+            }
         }
+        schedule(&model, &stream, &mut session, &jobs_rx);
     });
     let default_strength = ready_rx.recv().context("worker thread")??;
     let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, tool_retries: opts.tool_retries, tool_call_token });
@@ -146,6 +136,111 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         println!("stopped");
         Ok(())
     })
+}
+
+/// The GPU worker: admits queued requests into free slots and steps the running ones, one alone
+/// (speculatively when it started alone) or both batched.
+fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, session: &mut Session, jobs: &mpsc::Receiver<Work>) {
+    use squash_engine::session::Run;
+    struct Active {
+        run: Run,
+        tx: tmpsc::UnboundedSender<Msg>,
+        reused: usize,
+    }
+    // Sends tokens; true when the run is over (stop, length, or the client went away).
+    fn emit(a: &mut Active, toks: &[i32]) -> bool {
+        for &t in toks {
+            if a.tx.send(Msg::Token(t)).is_err() {
+                return true;
+            }
+            if let Some(f) = a.run.accept(t) {
+                let _ = a.tx.send(Msg::Done(f, a.reused));
+                return true;
+            }
+        }
+        false
+    }
+    let nslots = if session.has_second_slot() { 2 } else { 1 };
+    let mut slots: [Option<Active>; 2] = [None, None];
+    let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
+    let take = |w: Work, queue: &mut std::collections::VecDeque<Job>, session: &mut Session| match w {
+        Work::Generate(job) => queue.push_back(job),
+        Work::Persist(ack) => {
+            if let Err(e) = session.persist() {
+                eprintln!("persisting contexts: {e:#}");
+            }
+            let _ = ack.send(());
+        }
+    };
+    loop {
+        if slots.iter().all(Option::is_none) && queue.is_empty() {
+            match jobs.recv() {
+                Ok(w) => take(w, &mut queue, session),
+                Err(_) => return,
+            }
+        }
+        while let Ok(w) = jobs.try_recv() {
+            take(w, &mut queue, session);
+        }
+        // Admit queued requests into free slots (the main slot first: MTP and the prefix cache).
+        while let Some(free) = (0..nslots).find(|&i| slots[i].is_none()) {
+            let Some(job) = queue.pop_front() else { break };
+            let other = 1 - free;
+            if let Some(a) = slots[other].as_mut() {
+                if a.run.is_spec() {
+                    match session.to_plain(model, s, &mut a.run) {
+                        Ok(toks) => {
+                            if emit(a, &toks) {
+                                slots[other] = None;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = a.tx.send(Msg::Error(format!("{e:#}")));
+                            slots[other] = None;
+                        }
+                    }
+                }
+            }
+            let speculate = slots[other].is_none() && queue.is_empty();
+            match session.begin(model, s, free, &job.ids, &job.params, speculate) {
+                Ok((run, toks)) => {
+                    let mut a = Active { run, tx: job.tx, reused: if free == 0 { session.reused } else { 0 } };
+                    if !emit(&mut a, &toks) {
+                        slots[free] = Some(a);
+                    }
+                }
+                Err(e) => {
+                    let _ = job.tx.send(Msg::Error(format!("{e:#}")));
+                }
+            }
+        }
+        // Step the running requests.
+        let result = match &mut slots {
+            [Some(a), Some(b)] => session.step(model, s, &mut [&mut a.run, &mut b.run]),
+            [Some(a), None] | [None, Some(a)] => session.step(model, s, &mut [&mut a.run]),
+            [None, None] => continue,
+        };
+        match result {
+            Ok(toks) => {
+                let mut k = 0;
+                for slot in slots.iter_mut() {
+                    if let Some(a) = slot {
+                        if emit(a, &toks[k]) {
+                            *slot = None;
+                        }
+                        k += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                for slot in slots.iter_mut() {
+                    if let Some(a) = slot.take() {
+                        let _ = a.tx.send(Msg::Error(format!("{e:#}")));
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
