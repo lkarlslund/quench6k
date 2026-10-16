@@ -91,6 +91,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     let router = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(messages))
         .with_state(app);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -284,6 +285,117 @@ async fn full_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, id:
     .into_response()
 }
 
+/// A piece of streamed output.
+enum Seg {
+    Reasoning(String),
+    Content(String),
+}
+
+/// Splits the growing output text into streamable pieces: reasoning until `</think>` (thinking turns),
+/// then content; text from `<tool_call>` on is held back for the final tool calls, and possible partial
+/// tags and trailing reasoning whitespace wait for more text.
+struct Segmenter {
+    text: String,
+    sent: usize,
+    thinking: bool,
+    in_reasoning: bool,
+    content_started: bool,
+    stopped: bool,
+}
+
+impl Segmenter {
+    fn new(thinking: bool) -> Self {
+        Self { text: String::new(), sent: 0, thinking, in_reasoning: thinking, content_started: false, stopped: false }
+    }
+
+    fn feed(&mut self, piece: &str, stops: &[String]) -> Vec<Seg> {
+        let mut out = Vec::new();
+        if self.stopped {
+            return out;
+        }
+        self.text.push_str(piece);
+        if apply_stops(&mut self.text, stops) {
+            self.stopped = true;
+        }
+        let (text, mut sent) = (&self.text, self.sent);
+        loop {
+            if self.in_reasoning {
+                let (end, done) = match text[sent..].find("</think>") {
+                    Some(i) => (sent + i, true),
+                    None => (text.len().saturating_sub("</think>".len()).max(sent), false),
+                };
+                let end = (sent..=end).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(sent);
+                let end = sent + text[sent..end].trim_end().len();
+                if end > sent {
+                    out.push(Seg::Reasoning(text[sent..end].to_string()));
+                    sent = end;
+                }
+                if done {
+                    sent = text[sent..].find("</think>").map(|i| sent + i).unwrap_or(sent) + "</think>".len();
+                    self.in_reasoning = false;
+                    continue;
+                }
+            } else if !text[sent..].contains("<tool_call>") {
+                if !self.content_started {
+                    sent += text[sent..].len() - text[sent..].trim_start().len();
+                }
+                let end = text.len().saturating_sub("<tool_call>".len()).max(sent);
+                let end = (sent..=end).rev().find(|&i| text.is_char_boundary(i) && !text[i..].starts_with('<')).unwrap_or(sent);
+                let end = if self.stopped { text.len() } else { end };
+                if end > sent {
+                    out.push(Seg::Content(text[sent..end].to_string()));
+                    sent = end;
+                    self.content_started = true;
+                }
+            }
+            break;
+        }
+        self.sent = sent;
+        out
+    }
+
+    /// The content held back until the end (as a possible tag start), given the parsed content.
+    fn tail(&self, content: &str) -> Option<String> {
+        if self.in_reasoning {
+            return None;
+        }
+        let text = &self.text;
+        let body = if self.thinking { text.find("</think>").map(|i| &text[i + "</think>".len()..]).unwrap_or("") } else { text.as_str() };
+        let lead = body.len() - body.trim_start().len();
+        let body_start = text.len() - body.len() + lead;
+        let shown = self.sent.saturating_sub(body_start).min(content.len());
+        (shown < content.len() && content.is_char_boundary(shown)).then(|| content[shown..].to_string())
+    }
+}
+
+/// Receives the generation, feeding decoded text to `on_seg`; returns (segmenter, tokens, finish,
+/// cached prompt tokens) or an error message.
+async fn drive(app: &App, rx: &mut tmpsc::UnboundedReceiver<Msg>, stops: &[String], thinking: bool, mut on_seg: impl FnMut(Seg)) -> Result<(Segmenter, usize, Finish, usize), String> {
+    let mut stream = TextStream::default();
+    let mut seg = Segmenter::new(thinking);
+    let mut n = 0usize;
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            Msg::Token(t) => {
+                n += 1;
+                if seg.stopped {
+                    continue;
+                }
+                let piece = stream.push(&app.chat, t).map_err(|e| format!("{e:#}"))?;
+                for s in seg.feed(&piece, stops) {
+                    on_seg(s);
+                }
+                if seg.stopped {
+                    rx.close();
+                }
+            }
+            Msg::Done(f, c) => return Ok((seg, n, f, c)),
+            Msg::Error(e) => return Err(e),
+        }
+    }
+    Ok((seg, n, Finish::Cancelled, 0))
+}
+
 async fn stream_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, id: String, prompt_tokens: usize, stops: Vec<String>, thinking: bool, tools: Option<Value>) -> Response {
     let (out_tx, out_rx) = tmpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
     tokio::spawn(async move {
@@ -294,96 +406,215 @@ async fn stream_response(app: Arc<App>, mut rx: tmpsc::UnboundedReceiver<Msg>, i
             Ok(Event::default().data(data.to_string()))
         };
         let _ = out_tx.send(chunk(json!({"role": "assistant"}), None));
-        let mut stream = TextStream::default();
-        // Text is emitted as reasoning until </think> (thinking turns), then as content; anything from
-        // <tool_call> on is held back and sent as tool calls at the end.
-        let (mut text, mut sent, mut in_reasoning, mut n) = (String::new(), 0usize, thinking, 0usize);
-        let mut content_started = false;
-        let mut finish = Finish::Stop;
-        let mut stopped = false;
-        let mut cached = 0usize;
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                Msg::Token(t) => {
-                    n += 1;
-                    if stopped {
-                        continue;
-                    }
-                    let Ok(piece) = stream.push(&app.chat, t) else { break };
-                    text.push_str(&piece);
-                    if apply_stops(&mut text, &stops) {
-                        stopped = true;
-                        rx.close();
-                    }
-                    loop {
-                        if in_reasoning {
-                            let (end, done) = match text[sent..].find("</think>") {
-                                Some(i) => (sent + i, true),
-                                // keep a possible partial tag back
-                                None => (text.len().saturating_sub("</think>".len()).max(sent), false),
-                            };
-                            let end = (sent..=end).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(sent);
-                            // Trailing whitespace waits for more text (and is dropped before </think>).
-                            let end = sent + text[sent..end].trim_end().len();
-                            if end > sent {
-                                let _ = out_tx.send(chunk(json!({"reasoning_content": &text[sent..end]}), None));
-                                sent = end;
-                            }
-                            if done {
-                                sent = text[sent..].find("</think>").map(|i| sent + i).unwrap_or(sent) + "</think>".len();
-                                in_reasoning = false;
-                                continue;
-                            }
-                        } else if !text[sent..].contains("<tool_call>") {
-                            if !content_started {
-                                // Content starts at its first non-whitespace character.
-                                sent += text[sent..].len() - text[sent..].trim_start().len();
-                            }
-                            let end = text.len().saturating_sub("<tool_call>".len()).max(sent);
-                            let end = (sent..=end).rev().find(|&i| text.is_char_boundary(i) && !text[i..].starts_with('<')).unwrap_or(sent);
-                            let end = if stopped { text.len() } else { end };
-                            if end > sent {
-                                let _ = out_tx.send(chunk(json!({"content": &text[sent..end]}), None));
-                                sent = end;
-                                content_started = true;
-                            }
-                        }
-                        break;
-                    }
-                }
-                Msg::Done(f, c) => {
-                    finish = f;
-                    cached = c;
-                    break;
-                }
-                Msg::Error(e) => {
-                    let _ = out_tx.send(Ok(Event::default().data(json!({"error": {"message": e}}).to_string())));
-                    return;
-                }
+        let result = drive(&app, &mut rx, &stops, thinking, |s| {
+            let delta = match s {
+                Seg::Reasoning(t) => json!({"reasoning_content": t}),
+                Seg::Content(t) => json!({"content": t}),
+            };
+            let _ = out_tx.send(chunk(delta, None));
+        })
+        .await;
+        let (seg, n, finish, cached) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = out_tx.send(Ok(Event::default().data(json!({"error": {"message": e}}).to_string())));
+                return;
             }
-        }
-        let (_, content, calls) = parse_output(&text, thinking, tools.as_ref());
-        // Flush content held back as a possible tag start: the parsed content minus what was sent.
-        if !in_reasoning {
-            let body = if thinking { text.find("</think>").map(|i| &text[i + "</think>".len()..]).unwrap_or("") } else { text.as_str() };
-            let lead = body.len() - body.trim_start().len();
-            let body_start = text.len() - body.len() + lead;
-            let shown = sent.saturating_sub(body_start).min(content.len());
-            if shown < content.len() && content.is_char_boundary(shown) {
-                let _ = out_tx.send(chunk(json!({"content": &content[shown..]}), None));
-            }
+        };
+        let (_, content, calls) = parse_output(&seg.text, thinking, tools.as_ref());
+        if let Some(t) = seg.tail(&content) {
+            let _ = out_tx.send(chunk(json!({"content": t}), None));
         }
         if !calls.is_empty() {
             let deltas: Vec<Value> = calls.iter().enumerate().map(|(i, c)| json!({"index": i, "id": c["id"], "type": "function", "function": c["function"]})).collect();
             let _ = out_tx.send(chunk(json!({"tool_calls": deltas}), None));
         }
-        let reason = if stopped { "stop" } else { finish_reason(finish, !calls.is_empty()) };
+        let reason = if seg.stopped { "stop" } else { finish_reason(finish, !calls.is_empty()) };
         let mut last = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": app.name,
                               "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]});
         last["usage"] = json!({"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n,
                                "prompt_tokens_details": {"cached_tokens": cached}});
         let _ = out_tx.send(Ok(Event::default().data(last.to_string())));
         let _ = out_tx.send(Ok(Event::default().data("[DONE]")));
+    });
+    Sse::new(UnboundedReceiverStream::new(out_rx)).keep_alive(KeepAlive::default()).into_response()
+}
+
+// ---- Anthropic Messages API ---------------------------------------------------------------------
+
+/// Text of an Anthropic content value (a string or text blocks).
+fn anthropic_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(""),
+        _ => String::new(),
+    }
+}
+
+/// An Anthropic `/v1/messages` request as the equivalent chat-completions request.
+fn from_anthropic(req: &Value) -> Value {
+    let mut messages = Vec::new();
+    if let Some(system) = req.get("system") {
+        messages.push(json!({"role": "system", "content": anthropic_text(system)}));
+    }
+    for m in req.get("messages").and_then(Value::as_array).into_iter().flatten() {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+        match m.get("content") {
+            Some(Value::Array(blocks)) => {
+                let (mut text, mut reasoning, mut calls) = (String::new(), String::new(), Vec::new());
+                for b in blocks {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("text") => text.push_str(b.get("text").and_then(Value::as_str).unwrap_or("")),
+                        Some("thinking") => reasoning.push_str(b.get("thinking").and_then(Value::as_str).unwrap_or("")),
+                        Some("tool_use") => calls.push(json!({"id": b["id"], "type": "function",
+                            "function": {"name": b["name"], "arguments": b.get("input").cloned().unwrap_or(json!({}))}})),
+                        Some("tool_result") => {
+                            if !text.is_empty() {
+                                messages.push(json!({"role": role, "content": std::mem::take(&mut text)}));
+                            }
+                            messages.push(json!({"role": "tool", "tool_call_id": b["tool_use_id"],
+                                                 "content": anthropic_text(b.get("content").unwrap_or(&Value::Null))}));
+                        }
+                        _ => {}
+                    }
+                }
+                if role == "assistant" {
+                    let mut msg = json!({"role": "assistant", "content": text});
+                    if !reasoning.is_empty() {
+                        msg["reasoning_content"] = Value::String(reasoning);
+                    }
+                    if !calls.is_empty() {
+                        msg["tool_calls"] = Value::Array(calls);
+                    }
+                    messages.push(msg);
+                } else if !text.is_empty() {
+                    messages.push(json!({"role": role, "content": text}));
+                }
+            }
+            Some(c) => messages.push(json!({"role": role, "content": anthropic_text(c)})),
+            None => {}
+        }
+    }
+    let tools: Vec<Value> = req.get("tools").and_then(Value::as_array).into_iter().flatten()
+        .map(|t| json!({"type": "function", "function": {"name": t["name"], "description": t.get("description").cloned().unwrap_or(Value::Null),
+                                                         "parameters": t.get("input_schema").cloned().unwrap_or(json!({"type": "object"}))}}))
+        .collect();
+    let thinking = req.get("thinking").and_then(|t| t.get("type")).and_then(Value::as_str) == Some("enabled");
+    let mut out = json!({"messages": messages, "max_tokens": req.get("max_tokens").cloned().unwrap_or(json!(4096)),
+                         "chat_template_kwargs": {"enable_thinking": thinking}, "stream": req.get("stream").cloned().unwrap_or(json!(false))});
+    if !tools.is_empty() {
+        out["tools"] = Value::Array(tools);
+    }
+    for (from, to) in [("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("stop_sequences", "stop"), ("steering", "steering")] {
+        if let Some(v) = req.get(from) {
+            out[to] = v.clone();
+        }
+    }
+    out
+}
+
+fn stop_reason(finish: Finish, stopped: bool, tool_calls: bool) -> &'static str {
+    match finish {
+        _ if tool_calls => "tool_use",
+        _ if stopped => "stop_sequence",
+        Finish::Length => "max_tokens",
+        _ => "end_turn",
+    }
+}
+
+fn tool_use_blocks(calls: &[Value]) -> Vec<Value> {
+    calls.iter().map(|c| {
+        let input: Value = c["function"]["arguments"].as_str().and_then(|a| serde_json::from_str(a).ok()).unwrap_or(json!({}));
+        json!({"type": "tool_use", "id": c["id"].as_str().unwrap_or("").replace("call_", "toolu_"), "name": c["function"]["name"], "input": input})
+    }).collect()
+}
+
+async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
+    let converted = from_anthropic(&req);
+    let p = match prepare(&app, &converted) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let (tx, mut rx) = tmpsc::unbounded_channel();
+    let prompt_tokens = p.ids.len();
+    if app.jobs.send(Job { ids: p.ids, params: p.params, tx }).is_err() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "generation worker stopped");
+    }
+    let id = format!("msg_{}", now());
+    let (thinking, tools, stops) = (p.thinking, p.tools, p.stops);
+    if !p.stream {
+        let (seg, n, finish, cached) = match drive(&app, &mut rx, &stops, thinking, |_| {}).await {
+            Ok(r) => r,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+        let (reasoning, content, calls) = parse_output(&seg.text, thinking, tools.as_ref());
+        let mut blocks = Vec::new();
+        if let Some(r) = reasoning.filter(|r| !r.is_empty()) {
+            blocks.push(json!({"type": "thinking", "thinking": r, "signature": ""}));
+        }
+        if !content.is_empty() {
+            blocks.push(json!({"type": "text", "text": content}));
+        }
+        blocks.extend(tool_use_blocks(&calls));
+        return Json(json!({"id": id, "type": "message", "role": "assistant", "model": app.name, "content": blocks,
+                           "stop_reason": stop_reason(finish, seg.stopped, !calls.is_empty()), "stop_sequence": Value::Null,
+                           "usage": {"input_tokens": prompt_tokens - cached, "cache_read_input_tokens": cached, "output_tokens": n}}))
+        .into_response();
+    }
+    let (out_tx, out_rx) = tmpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
+    tokio::spawn(async move {
+        let ev = |name: &str, data: Value| Ok(Event::default().event(name).data(data.to_string()));
+        let _ = out_tx.send(ev("message_start", json!({"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant",
+            "model": app.name, "content": [], "stop_reason": Value::Null, "stop_sequence": Value::Null,
+            "usage": {"input_tokens": prompt_tokens, "output_tokens": 0}}})));
+        // Blocks open as their kind changes: (index, kind) of the open block.
+        let mut open: Option<(usize, bool)> = None;
+        let mut next_index = 0usize;
+        let mut emit = |reasoning: bool, text: String| {
+            if open.map(|(_, r)| r) != Some(reasoning) {
+                if let Some((i, _)) = open {
+                    let _ = out_tx.send(ev("content_block_stop", json!({"type": "content_block_stop", "index": i})));
+                }
+                let block = if reasoning { json!({"type": "thinking", "thinking": ""}) } else { json!({"type": "text", "text": ""}) };
+                let _ = out_tx.send(ev("content_block_start", json!({"type": "content_block_start", "index": next_index, "content_block": block})));
+                open = Some((next_index, reasoning));
+                next_index += 1;
+            }
+            let i = open.unwrap().0;
+            let delta = if reasoning { json!({"type": "thinking_delta", "thinking": text}) } else { json!({"type": "text_delta", "text": text}) };
+            let _ = out_tx.send(ev("content_block_delta", json!({"type": "content_block_delta", "index": i, "delta": delta})));
+        };
+        let result = drive(&app, &mut rx, &stops, thinking, |s| match s {
+            Seg::Reasoning(t) => emit(true, t),
+            Seg::Content(t) => emit(false, t),
+        })
+        .await;
+        let (seg, n, finish, _) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = out_tx.send(ev("error", json!({"type": "error", "error": {"type": "api_error", "message": e}})));
+                return;
+            }
+        };
+        let (_, content, calls) = parse_output(&seg.text, thinking, tools.as_ref());
+        if let Some(t) = seg.tail(&content) {
+            emit(false, t);
+        }
+        if let Some((i, _)) = open {
+            let _ = out_tx.send(ev("content_block_stop", json!({"type": "content_block_stop", "index": i})));
+        }
+        for (k, block) in tool_use_blocks(&calls).into_iter().enumerate() {
+            let i = next_index + k;
+            let input = block["input"].to_string();
+            let mut start = block.clone();
+            start["input"] = json!({});
+            let _ = out_tx.send(ev("content_block_start", json!({"type": "content_block_start", "index": i, "content_block": start})));
+            let _ = out_tx.send(ev("content_block_delta", json!({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": input}})));
+            let _ = out_tx.send(ev("content_block_stop", json!({"type": "content_block_stop", "index": i})));
+        }
+        let _ = out_tx.send(ev("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": stop_reason(finish, seg.stopped, !calls.is_empty()), "stop_sequence": Value::Null},
+                                                        "usage": {"output_tokens": n}})));
+        let _ = out_tx.send(ev("message_stop", json!({"type": "message_stop"})));
     });
     Sse::new(UnboundedReceiverStream::new(out_rx)).keep_alive(KeepAlive::default()).into_response()
 }
