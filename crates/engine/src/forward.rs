@@ -545,6 +545,35 @@ pub fn forward_batch(model: &Model, states: &[&SequenceState], ws: &Workspace, s
     final_mixer(&model.final_hc, &ctx, &mut carry, None)
 }
 
+/// A captured batched decode step for fixed sequences (their buffers are baked in): the step block
+/// is prepared on the host with [`prepare_batch`], then one graph runs the forward pass and the
+/// greedy argmax of every row into `out` (i32 per sequence).
+pub struct BatchGraph {
+    graph: squash_cuda::Graph,
+    bytes: usize,
+    rows: usize,
+}
+
+impl BatchGraph {
+    pub fn capture(model: &Model, states: &[&SequenceState], ws: &Workspace, hw: &HeadWorkspace, s: &Stream, out: u64) -> Result<Self> {
+        let bytes = StepLayout::new(ws.max_tokens).used(states.len());
+        let graph = squash_cuda::Graph::capture(s, |s| {
+            forward_batch(model, states, ws, s, bytes)?;
+            head_argmax_into(model, hw, s, ws.out, states.len(), out)
+        })?;
+        Ok(Self { graph, bytes, rows: states.len() })
+    }
+
+    /// One step: `tokens[b]` for `states[b]` (the captured sequences, in order); the next greedy tokens
+    /// are in `out` after the stream synchronizes.
+    pub fn step(&self, model: &Model, states: &mut [&mut SequenceState], ws: &mut Workspace, s: &Stream, tokens: &[i32]) -> Result<()> {
+        ensure!(states.len() == self.rows, "graph captured for {} sequences", self.rows);
+        let bytes = prepare_batch(model, states, ws, tokens)?;
+        ensure!(bytes == self.bytes, "step layout changed");
+        self.graph.launch(s)
+    }
+}
+
 /// Runs the step prepared by [`prepare`] (`t` tokens, `bytes` of step block) entirely on the device:
 /// no host synchronization, so it can be captured into a CUDA graph. Afterwards `ws.out` holds the final
 /// mixer output, BF16 [T, D].

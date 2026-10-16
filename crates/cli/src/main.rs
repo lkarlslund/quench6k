@@ -572,7 +572,7 @@ fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> R
             Ok(seq.tokens[..seq.prompt_len].to_vec())
         })
         .collect::<Result<_>>()?;
-    let cap = prompts.iter().map(|p| p.len()).max().unwrap() + n + 16;
+    let cap = prompts.iter().map(|p| p.len()).max().unwrap() + 2 * n + 16;
     let mut ws = Workspace::new(2048, cap)?;
     let hw = HeadWorkspace::new(2, 1)?;
     let out = squash_cuda::DeviceBuffer::new(8)?;
@@ -619,6 +619,15 @@ fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> R
         batched[1].push(next[1]);
     }
     println!("batched: {:.1} tok/s eager (2 sequences)", 2.0 * (n - 1) as f64 / t1.elapsed().as_secs_f64());
+    // The same with a captured graph, continuing both sequences.
+    let g = forward::BatchGraph::capture(&model, &[&a, &b], &ws, &hw, &s, out.addr())?;
+    let t2 = std::time::Instant::now();
+    for _ in 0..n {
+        g.step(&model, &mut [&mut a, &mut b], &mut ws, &s, &toks)?;
+        let next: Vec<i32> = s.download(out.addr(), 2)?;
+        toks = [next[0], next[1]];
+    }
+    println!("batched graph: {:.1} tok/s (2 sequences)", 2.0 * n as f64 / t2.elapsed().as_secs_f64());
     for i in 0..2 {
         let same = batched[i].iter().zip(&single[i]).take_while(|(x, y)| x == y).count();
         println!("sequence {i}: {same}/{n} tokens identical to single-sequence decoding");
