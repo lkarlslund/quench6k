@@ -278,7 +278,11 @@ fn qsa_select_matches_cpu() {
     let s = Stream::new().unwrap();
     let mut rng = Rng(0xa11c_e5e1_ec7);
     for &(start, ld, coarse) in &[(8_000usize, 2048usize, true), (131_000, 32_768, true), (262_000, 65_536, true), (40_000, 65_536, true), (131_000, 32_768, false), (262_000, 65_536, false), (20_000, 65_536, false), (30_000, 65_536, true)] {
-        let t = 4;
+      // 4 rows take the cluster variant, 300 the one-block-per-row (prefill) kernel.
+      for t in [4usize, 300] {
+        if start + t > 4 * ld {
+            continue;  // rows longer than ld cannot occur (ld covers the context)
+        }
         // Coarse values give the threshold many ties; continuous ones usually end the search early.
         let scores: Vec<f32> = (0..t * ld).map(|_| if coarse { (rng.next() * 40.0).round() / 8.0 } else { rng.next() * 3.0 }).collect();
         let ds = upload(&s, &scores);
@@ -293,8 +297,9 @@ fn qsa_select_matches_cpu() {
             idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
             let mut want: Vec<i32> = idx[..512].iter().map(|&i| i as i32).collect();
             want.sort();
-            assert_eq!(&got[r * 512..(r + 1) * 512], &want[..], "start {start} ld {ld} row {r}");
+            assert_eq!(&got[r * 512..(r + 1) * 512], &want[..], "start {start} ld {ld} t {t} row {r}");
         }
+      }
     }
 }
 

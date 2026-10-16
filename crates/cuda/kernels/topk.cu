@@ -260,9 +260,10 @@ extern "C" cudaError_t squash_argmax(const float* x, int rows, int n, size_t ld,
 namespace {
 
 // QSA group selection: per query row, the 512 highest-scoring complete groups, written in ascending
-// group order. Exact radix selection in three passes (11, 11, 10 bits) over order-preserving keys;
-// ties at the threshold go to the lowest group indices. Each thread owns a contiguous range of the
-// row, so the compaction is a prefix sum over thread counts: deterministic and already sorted.
+// group order. Exact radix selection in up to three passes (11, 11, 10 bits) over order-preserving
+// keys, ending early once the threshold bin is taken whole; ties at the threshold go to the lowest
+// group indices. The compaction walks the row in coalesced tiles of 4 values per thread, with block
+// prefix sums for the threshold ties and the output positions: deterministic and already sorted.
 constexpr int SEL_THREADS = 1024, SEL_K = 512, SEL_BINS = 2048;
 
 // Inclusive prefix sum over the block's per-thread values (1024 threads). `scratch` holds 32 ints.
@@ -297,7 +298,8 @@ __global__ void __launch_bounds__(SEL_THREADS) qsa_select_kernel(const float* __
     __shared__ int hist[SEL_BINS];
     __shared__ int scratch[32];
     __shared__ unsigned s_prefix, s_mask;
-    __shared__ int s_remaining;
+    __shared__ int s_remaining, s_tile[2];
+    __shared__ bool s_done;
     const int n = (*start_ptr + (int)blockIdx.x + 1) / group;
     if (n <= SEL_K) return;  // dense row
     const float* row = scores + blockIdx.x * ld;
@@ -306,6 +308,7 @@ __global__ void __launch_bounds__(SEL_THREADS) qsa_select_kernel(const float* __
         s_prefix = 0;
         s_mask = 0;
         s_remaining = SEL_K;
+        s_done = false;
     }
     const int shifts[3] = {21, 10, 0}, widths[3] = {11, 11, 10};
     for (int pass = 0; pass < 3; ++pass) {
@@ -353,36 +356,49 @@ __global__ void __launch_bounds__(SEL_THREADS) qsa_select_kernel(const float* __
                 above += hist[b];
             }
             s_remaining -= above;
+            s_done = hist[b] == s_remaining;  // the whole bin is taken: no ties to break
             s_prefix |= (unsigned)b << shift;
             s_mask |= (unsigned)(bins - 1) << shift;
         }
         __syncthreads();
+        if (s_done) break;
     }
-    const unsigned threshold = s_prefix;
+    // Keys compare on the resolved bits only (all of them unless a pass ended the search early).
+    const unsigned threshold = s_prefix, rmask = s_mask;
     const int take_equal = s_remaining;
-    // Compaction over contiguous per-thread ranges (multiples of 4, read as float4).
-    const int per = ((n + SEL_THREADS - 1) / SEL_THREADS + 3) / 4 * 4, b0 = min(n, tid * per), b1 = min(n, b0 + per);
-    int gt = 0, eq = 0;
-    for (int i = b0; i < b1; i += 4) {
-        const float4 v = *reinterpret_cast<const float4*>(row + i);
-        const float e[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-        for (int c = 0; c < 4; ++c) {
-            if (i + c >= b1) break;
-            const unsigned u = order_key(e[c]);
-            gt += u > threshold;
-            eq += u == threshold;
-        }
-    }
-    const int eq_before = block_inclusive_scan(eq, scratch) - eq;
-    const int eq_take = max(0, min(eq, take_equal - eq_before));
-    const int mine = gt + eq_take;
-    int pos = block_inclusive_scan(mine, scratch) - mine;
-    int eq_seen = 0;
     int* dst = out + (size_t)blockIdx.x * SEL_K;
-    for (int i = b0; i < b1; ++i) {
-        const unsigned u = order_key(row[i]);
-        if (u > threshold || (u == threshold && eq_seen++ < eq_take)) dst[pos++] = i;
+    int base = 0, eq_used = 0;  // outputs written and threshold ties seen before this tile
+    for (int i0 = 0; i0 < n; i0 += SEL_THREADS * 4) {
+        const int i = i0 + tid * 4;
+        unsigned u[4] = {0, 0, 0, 0};
+        int gt = 0, eq = 0;
+        if (i < n) {
+            const float4 v = *reinterpret_cast<const float4*>(row + i);
+            const float e[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                u[c] = order_key(e[c]) & rmask;
+                if (i + c >= n) continue;
+                gt += u[c] > threshold;
+                eq += u[c] == threshold;
+            }
+        }
+        const int eq_incl = block_inclusive_scan(eq, scratch);
+        const int eq_take = max(0, min(eq, take_equal - (eq_used + eq_incl - eq)));
+        const int mine = gt + eq_take;
+        const int pos_incl = block_inclusive_scan(mine, scratch);
+        if (tid == SEL_THREADS - 1) {
+            s_tile[0] = pos_incl;
+            s_tile[1] = eq_incl;
+        }
+        int pos = base + pos_incl - mine, eq_seen = 0;
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+            if (i + c < n && (u[c] > threshold || (u[c] == threshold && eq_seen++ < eq_take))) dst[pos++] = i + c;
+        __syncthreads();
+        base += s_tile[0];
+        eq_used += s_tile[1];
+        if (base >= SEL_K) break;
     }
     (void)lane;
 }
