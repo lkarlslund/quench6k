@@ -798,8 +798,8 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
             }
         }
     }
-    // After layer 0 of a small batch the deferred update is the MoE output in ws.y with weights in ws.inj.
-    let mut carry = Carry::new(ws, part == Part::FromPle && t <= k::gemv_max_m());
+    // After layer 0 the deferred update is the MoE output in ws.y with weights in ws.inj.
+    let mut carry = Carry::new(ws, part == Part::FromPle);
     let layers = match part {
         Part::Whole => 0..model.layers.len(),
         Part::BeforePle => 0..1,
@@ -1188,15 +1188,14 @@ pub fn step_bytes(ws: &Workspace, t: usize) -> usize {
 }
 
 /// Eager step: [`prepare`] then [`forward_device`].
+/// The step is launched in two parts: token IDs, the embedding and layer 0 first, then (after the host
+/// gathers the PLE rows, overlapping layer 0 on the GPU) the PLE rows and the remaining layers.
 pub fn forward(model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, new_tokens: &[i32]) -> Result<()> {
-    let t0 = std::time::Instant::now();
-    let bytes = prepare(model, state, ws, new_tokens)?;
-    let t1 = std::time::Instant::now();
-    forward_device(model, state, ws, s, new_tokens.len(), bytes, None)?;
-    if new_tokens.len() > 1000 && std::env::var_os("SQUASH_TIME_PREP").is_some() {
-        s.synchronize()?;
-        eprintln!("forward {} tokens: prepare {:.1} ms, device {:.1} ms", new_tokens.len(), (t1 - t0).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3);
-    }
+    let t = new_tokens.len();
+    prepare_tokens(state, ws, new_tokens)?;
+    forward_part(model, state, ws, s, t, 0, Part::BeforePle, false, None)?;
+    let bytes = prepare_ple(model, state, ws, t)?;
+    forward_part(model, state, ws, s, t, bytes, Part::FromPle, false, None)?;
     // The pinned step block may be overwritten by the next prepare only after this step consumed it.
     s.synchronize()
 }
