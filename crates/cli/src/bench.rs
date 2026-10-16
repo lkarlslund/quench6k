@@ -16,9 +16,10 @@ fn prompt(len: usize) -> Result<Vec<i32>> {
     Ok(ids)
 }
 
-pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, profile: bool, ncu_steps: usize, mtp: usize) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, profile: bool, ncu_steps: usize, mtp: usize, adaptive: bool) -> Result<()> {
     if mtp > 0 {
-        return run_mtp(model_dir, precision, contexts, generate, chunk, mtp, ncu_steps);
+        return run_mtp(model_dir, precision, contexts, generate, chunk, mtp, adaptive, ncu_steps);
     }
     let (model, stream) = crate::load(model_dir, precision, false)?;
     let capacity = contexts.iter().max().copied().unwrap_or(0) + generate + 16 + ncu_steps;
@@ -115,7 +116,8 @@ fn sanity(model: &squash_engine::model::Model, stream: &squash_cuda::Stream, chu
 
 /// MTP speculative decoding benchmark: prefill, then greedy draft-and-verify rounds as CUDA graphs.
 /// The sanity check runs the same path on the code fixture against its reference tokens first.
-fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, drafts: usize, ncu_rounds: usize) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, drafts: usize, adaptive: bool, ncu_rounds: usize) -> Result<()> {
     use squash_engine::spec::{SpecDecoder, SpecGraphs};
     let (model, stream) = crate::load(model_dir, precision, true)?;
     let max_ctx = contexts.iter().max().copied().unwrap_or(0).max(512);
@@ -133,7 +135,7 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         let seq: Sequence = serde_json::from_slice(&std::fs::read("oracle/fixtures/code/sequence.json")?)?;
         let mut state = SequenceState::with_mtp(seq.tokens.len() + slack, true)?;
         let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &stream, &seq.tokens[..seq.prompt_len], drafts, chunk)?;
-        let g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream)?;
+        let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive)?;
         let mut got = Vec::new();
         while got.len() < CHECK {
             got.extend(g.round(&model, &mut state, &mut ws, &mut dec, &stream)?);
@@ -152,7 +154,7 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         let t0 = Instant::now();
         let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &stream, &tokens, drafts, chunk)?;
         let prefill = ctx as f64 / t0.elapsed().as_secs_f64();
-        let g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream)?;
+        let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive)?;
         let t1 = Instant::now();
         let mut produced = 0;
         while produced < generate {

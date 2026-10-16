@@ -124,6 +124,9 @@ enum Command {
         /// MTP speculative decoding with this many drafts per round (0: plain decoding).
         #[arg(long, default_value_t = 0)]
         mtp: usize,
+        /// With --mtp N: choose each round's draft length in 1..=N from the observed acceptance.
+        #[arg(long)]
+        adaptive: bool,
     },
     /// Measure MTP draft acceptance on a fixture (drafts are compared with the target's greedy tokens).
     MtpProbe {
@@ -155,6 +158,9 @@ enum Command {
         /// Run the speculative rounds as CUDA graphs.
         #[arg(long)]
         graphs: bool,
+        /// With --graphs: adaptive draft length in 1..=drafts.
+        #[arg(long)]
+        adaptive: bool,
         /// With --graphs, run this many more rounds inside a cudaProfilerStart/Stop region.
         #[arg(long, default_value_t = 0)]
         profile_rounds: usize,
@@ -217,8 +223,8 @@ fn main() -> Result<()> {
         Command::Score { model, precision, fixture, out, suffix, chunk, decode } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode)?,
         Command::Generate { model, precision, fixture, tie } => generate(&model, precision.into(), &fixture, tie)?,
         Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
-        Command::SpecCheck { model, precision, fixture, n, drafts, chunk, graphs, profile_rounds } => mtp::check(&model, precision.into(), &fixture, n, drafts, chunk, graphs, profile_rounds)?,
-        Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps, mtp } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps, mtp)?,
+        Command::SpecCheck { model, precision, fixture, n, drafts, chunk, graphs, adaptive, profile_rounds } => mtp::check(&model, precision.into(), &fixture, n, drafts, chunk, graphs, adaptive, profile_rounds)?,
+        Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps, mtp, adaptive } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps, mtp, adaptive)?,
         Command::Gate { fixtures, candidates, suffix } => {
             let mut all = true;
             let mut any = false;
