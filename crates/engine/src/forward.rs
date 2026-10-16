@@ -1063,6 +1063,15 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
         op!(prof, "experts down", s, k::moe_down_small(s, ws.act, tables(&moe.down), ws.offsets, ws.active, ws.num_active, max_active, t, ws.yd));
     } else {
         op!(prof, "moe_route", s, k::moe_route(s, col(0), ld, t, ws.top_i, ws.top_w));
+        if std::env::var_os("SQUASH_CHECK_ROUTE").is_some() {
+            let ti: Vec<i32> = s.download(ws.top_i, t * TOP_K)?;
+            if let Some(bad) = ti.iter().position(|&e| !(0..EXPERTS as i32).contains(&e)) {
+                let row = bad / TOP_K;
+                let lg: Vec<f32> = s.download(col(0) + (row * ld * 4) as u64, EXPERTS)?;
+                let nan = lg.iter().filter(|v| v.is_nan()).count();
+                eprintln!("bad route: t {t}, row {row}, index {}, logits nan {nan}, first {:?}", ti[bad], &lg[..4]);
+            }
+        }
         let tile_rows = if fp4_prefill() && fp4_mode() != 3 { k::fp4_tile_rows() } else { k::moe_tile_rows() };
         op!(prof, "moe_plan", s, k::moe_plan(s, ws.top_i, t, ws.counts, ws.cursor, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row, tile_rows));
         let tiles = ws.max_tiles().min((t * TOP_K).div_ceil(tile_rows) + EXPERTS);

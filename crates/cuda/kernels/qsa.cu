@@ -883,6 +883,9 @@ __global__ void __launch_bounds__(MQ_W * 32) attention_mq_kernel(const float* __
 #pragma unroll
                 for (int qi = 0; qi < QB; ++qi)
                     if (key > pq[qi]) m &= ~(1u << qi);
+                // A key no query may see is not loaded (zero rows): past the sequence the cache holds
+                // stale or uninitialized values, and 0 * NaN would poison P V.
+                if (m == 0) key = -1;
             }
             keys[tile & 1][tid] = key;
             kmask[tile & 1][tid] = (unsigned char)m;

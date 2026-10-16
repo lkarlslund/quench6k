@@ -29,11 +29,10 @@ SQ_DEVICE float ue4m3_value(int code) {
 // Squared error of one 16-value block quantized with block scale `bs`.
 SQ_DEVICE float fp4_block_error(const float* v, float bs) {
     if (bs <= 0.0f) return 3.4e38f;
-    const float inv = 1.0f / bs;
     float e = 0.0f;
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
-        const float d = v[i] - e2m1_value(e2m1_code(v[i] * inv)) * bs;
+        const float d = v[i] - e2m1_value(e2m1_code(v[i] / bs)) * bs;
         e = fmaf(d, d, e);
     }
     return e;
