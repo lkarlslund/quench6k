@@ -1,3 +1,4 @@
+#include <cstdlib>
 // Row-wise top-k by exact radix selection, k <= 512. One 1024-thread block per row.
 //
 // The k-th largest value is found with four 8-bit histogram passes over order-preserving integer
@@ -550,7 +551,8 @@ extern "C" cudaError_t squash_qsa_select(const float* scores, int T, size_t ld, 
     if (ld % 4 != 0) return cudaErrorInvalidValue;
     // Cluster variant while a row slice fits in shared memory.
     const size_t smem = std::max(((ld + CL - 1) / CL + 3) / 4 * 4, std::min(ld, (size_t)SOLO_N)) * sizeof(unsigned);
-    if (smem <= 96 * 1024) {
+    // Few rows (decode): a cluster per row. Many rows (prefill) keep the GPU busy with one block per row.
+    if (smem <= 96 * 1024 && T < 256) {
         static size_t configured = 0;
         if (smem > configured) {
             const cudaError_t e = cudaFuncSetAttribute(qsa_select_cluster_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
