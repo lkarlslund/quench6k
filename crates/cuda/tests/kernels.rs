@@ -379,3 +379,61 @@ fn draft_sketch_matches_full_head() {
     }
     assert!(same >= 19, "sketch agreed {same}/20");
 }
+
+/// W4A4 grouped expert GEMM: quantized activation rows times NVFP4 weights against the CPU product of
+/// the dequantized operands (one expert, three row tiles, a partial last tile).
+#[test]
+fn fp4_grouped_gemm_matches_cpu() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0xf4f4_0001);
+    for &(m, n, k) in &[(150usize, 256usize, 640usize), (70, 128, 2560)] {
+        let x: Vec<f32> = rng.vec(m * k).iter().enumerate().map(|(i, &v)| bf16::round(v * (1.0 + (i / k) as f32 * 0.37))).collect();
+        let dx = upload(&s, &to_bf16(&x));
+        let qa = DeviceBuffer::zeroed(kernels::fp4_rows_bytes(m, k)).unwrap();
+        kernels::fp4_quant_rows(&s, dx.addr(), m, k, qa.addr()).unwrap();
+        let (ca, sa, ra) = kernels::fp4_rows_layout(qa.addr(), m, k);
+        let codes_a: Vec<u8> = s.download(ca, m * k / 2).unwrap();
+        let scales_a: Vec<u8> = s.download(sa, m * k / 16).unwrap();
+        let rs: Vec<f32> = s.download(ra, m).unwrap();
+        let wc: Vec<u8> = (0..n * k / 2).map(|_| ((rng.next() + 1.0) * 127.9) as u8).collect();
+        let ws: Vec<u8> = (0..n * k / 16).map(|_| 0x20 + ((rng.next() + 1.0) * 10.0) as u8).collect();
+        let (dwc, dws) = (upload(&s, &wc), upload(&s, &ws));
+        let wptr = upload(&s, &[dwc.addr()]);
+        let sptr = upload(&s, &[dws.addr()]);
+        let ws2 = upload(&s, &[0.5f32]);
+        let mut offsets = vec![m as i32; 513];
+        offsets[0] = 0;
+        let doff = upload(&s, &offsets);
+        let tiles = m.div_ceil(kernels::fp4_tile_rows());
+        let te = upload(&s, &vec![0i32; tiles]);
+        let tr = upload(&s, &(0..tiles).map(|t| (t * kernels::fp4_tile_rows()) as i32).collect::<Vec<_>>());
+        let nt = upload(&s, &[tiles as i32]);
+        let dy = DeviceBuffer::zeroed(m * n * 4).unwrap();
+        kernels::moe_fp4_gemm(&s, qa.addr(), m, wptr.addr(), sptr.addr(), ws2.addr(), doff.addr(), te.addr(), tr.addr(), nt.addr(), tiles, dy.addr(), n, k).unwrap();
+        let y: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
+        let deq = |codes: &[u8], scales: &[u8], row: usize, t: usize| {
+            let idx = row * k + t;
+            let byte = codes[idx / 2];
+            nvfp4_value(if idx % 2 == 0 { byte & 15 } else { byte >> 4 }) * fp8_e4m3(scales[idx / 16])
+        };
+        let mut worst = 0f64;
+        for i in 0..m {
+            for j in 0..n {
+                let dot: f64 = (0..k).map(|t| deq(&codes_a, &scales_a, i, t) as f64 * deq(&wc, &ws, j, t) as f64).sum();
+                let want = dot * rs[i] as f64 * 0.5;
+                let mag: f64 = (0..k).map(|t| (deq(&codes_a, &scales_a, i, t) as f64 * deq(&wc, &ws, j, t) as f64).abs()).sum::<f64>() * rs[i] as f64 * 0.5;
+                worst = worst.max((y[i * n + j] as f64 - want).abs() / mag.max(1e-30));
+            }
+        }
+        assert!(worst < 1e-5, "fp4 gemm {m}x{n}x{k}: relative error {worst}");
+        // The quantized activations approximate x.
+        let mut err = 0f64;
+        for i in 0..m {
+            for t in 0..k {
+                err = err.max(((deq(&codes_a, &scales_a, i, t) * rs[i]) as f64 - x[i * k + t] as f64).abs() / (rs[i] as f64 * 6.0 * 448.0));
+            }
+        }
+        assert!(err < 0.2, "fp4 activation quantization error {err}");
+    }
+}

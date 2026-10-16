@@ -36,7 +36,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", source.display());
         let object = out.join(source.file_stem().unwrap()).with_extension("o");
         let mut cmd = Command::new(&nvcc);
-        cmd.args(["-c", "-std=c++20", "-arch=sm_120a", "-Xcompiler=-fPIC", "--expt-relaxed-constexpr"])
+        cmd.args(["-c", "-std=c++20", "-gencode=arch=compute_120a,code=sm_120a", "-Xcompiler=-fPIC", "--expt-relaxed-constexpr"])
             .arg("-I")
             .arg(kernels)
             .arg(if profile == "release" { "-O3" } else { "-O2" })

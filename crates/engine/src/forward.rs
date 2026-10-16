@@ -942,6 +942,19 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
     finish_layer(layer, ctx, carry, prof, rec)
 }
 
+/// Prefill experts on the FP4 tensor cores (W4A4, activations quantized per row with least-error block
+/// scales); set by SQUASH_PREFILL_FP4=1 while it is evaluated.
+pub fn fp4_prefill() -> bool {
+    fp4_mode() != 0
+}
+
+/// 0: off, 1: gate/up and down on FP4, 2: gate/up only (down BF16 on fake-quantized input), 3: down
+/// only, 4: gate/up only (down BF16).
+fn fp4_mode() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SQUASH_PREFILL_FP4").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
 /// The second half of a layer: the MLP HyperConnection, the MoE block and its output.
 fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>, rec: Option<(u64, usize)>) -> Result<()> {
     let (ws, s, t) = (ctx.ws, ctx.s, ctx.t);
@@ -974,6 +987,37 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
             k::moe_nvfp4_gemm(s, x, proj.weights, proj.scales, proj.scale2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, y, n, kk)
         };
         let fake_fp4 = std::env::var_os("SQUASH_FAKE_FP4").is_some();
+        if fp4_prefill() {
+            // W4A4: quantize each token once (into yd, free until the down projection), gather the
+            // quantized rows by expert (into xs), FP4 tensor-core GEMMs; the SwiGLU output is
+            // quantized into eg (free once SwiGLU has read it).
+            let pairs = t * TOP_K;
+            let grouped4 = |proj: &crate::model::ExpertProj, a: u64, y: u64, n: usize, kk: usize| {
+                k::moe_fp4_gemm(s, a, pairs, proj.weights, proj.scales, proj.scale2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, y, n, kk)
+            };
+            let mode = fp4_mode();
+            if mode != 3 {
+                op!(prof, "fp4 quant", s, k::fp4_quant_rows(s, ws.m, t, D, ws.yd));
+                op!(prof, "fp4 gather", s, k::fp4_gather(s, ws.yd, t, D, ws.pair_row, ws.xs));
+                op!(prof, "experts gate", s, grouped4(&moe.gate, ws.xs, ws.eg, EXPERT_WIDTH, D));
+                op!(prof, "experts up", s, grouped4(&moe.up, ws.xs, ws.eu, EXPERT_WIDTH, D));
+            } else {
+                k::moe_gather(s, ws.m, ws.pair_row, t, ws.xs)?;
+                k::fake_fp4_act(s, ws.xs, pairs, D)?;
+                grouped(&moe.gate, ws.xs, ws.eg, EXPERT_WIDTH, D)?;
+                grouped(&moe.up, ws.xs, ws.eu, EXPERT_WIDTH, D)?;
+            }
+            op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, pairs));
+            if mode == 1 || mode == 3 {
+                op!(prof, "fp4 quant", s, k::fp4_quant_rows(s, ws.act, pairs, EXPERT_WIDTH, ws.eg));
+                op!(prof, "experts down", s, grouped4(&moe.down, ws.eg, ws.yd, D, EXPERT_WIDTH));
+            } else {
+                if mode == 2 {
+                    k::fake_fp4_act(s, ws.act, pairs, EXPERT_WIDTH)?;
+                }
+                op!(prof, "experts down", s, grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH));
+            }
+        } else {
         if fake_fp4 {
             k::fake_fp4_act(s, ws.xs, t * TOP_K, D)?;
         }
@@ -984,6 +1028,7 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
             k::fake_fp4_act(s, ws.act, t * TOP_K, EXPERT_WIDTH)?;
         }
         op!(prof, "experts down", s, grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH));
+        }
     }
     // One token: the shared-expert tail (SwiGLU, down projection, combine) in one kernel. Larger
     // batches are faster as three kernels; the arithmetic is the same either way.

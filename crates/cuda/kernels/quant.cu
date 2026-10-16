@@ -5,24 +5,9 @@
 
 #include <cuda_fp8.h>
 
-#include "common.cuh"
+#include "fp4.cuh"
 
 namespace {
-
-// Round-to-nearest-even onto the E2M1 grid {0, 0.5, 1, 1.5, 2, 3, 4, 6}, saturating; returns the 4-bit code.
-SQ_DEVICE uint8_t e2m1_code(float x) {
-    const float a = fminf(fabsf(x), 6.0f);
-    uint8_t c;
-    if (a < 0.25f) c = 0;
-    else if (a <= 0.75f) c = a == 0.25f ? 0 : (a < 0.75f ? 1 : 2);
-    else if (a < 1.25f) c = 2;
-    else if (a <= 1.75f) c = a == 1.25f ? 2 : (a < 1.75f ? 3 : 4);
-    else if (a < 2.5f) c = 4;
-    else if (a <= 3.5f) c = a == 2.5f ? 4 : (a < 3.5f ? 5 : 6);
-    else if (a < 5.0f) c = 6;
-    else c = a == 5.0f ? 6 : 7;
-    return c | (x < 0 && c != 0 ? 8 : 0);
-}
 
 // Per-matrix absolute maximum: matrices [count, N * K] BF16; amax[count] must start at 0.
 __global__ void amax_kernel(const __nv_bfloat16* __restrict__ w, size_t per, unsigned* amax) {
@@ -90,30 +75,6 @@ extern "C" cudaError_t squash_quantize_nvfp4(const void* w, int count, int n, in
 
 namespace {
 
-SQ_DEVICE float e2m1_value(uint8_t c) {
-    constexpr float grid[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    return (c & 8 ? -1.0f : 1.0f) * grid[c & 7];
-}
-
-SQ_DEVICE float ue4m3_value(int code) {
-    __nv_fp8_e4m3 v;
-    v.__x = (__nv_fp8_storage_t)code;
-    return float(v);
-}
-
-// Squared error of one 16-value block quantized with block scale `bs` (values already divided by the
-// row scale).
-SQ_DEVICE float block_error(const float* v, float bs) {
-    if (bs <= 0.0f) return 3.4e38f;
-    float e = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        const float d = v[i] - e2m1_value(e2m1_code(v[i] / bs)) * bs;
-        e = fmaf(d, d, e);
-    }
-    return e;
-}
-
 // NVFP4 activation quantization with a per-row scale (amax / (6 * 448)) and, per block of 16, the
 // E4M3 block scale among the nearest code to amax_b / 6 and its +-1, +-2 neighbours with the least
 // squared error. `fake`: writes the dequantized values back into x (BF16 [rows, cols], in place).
@@ -131,24 +92,10 @@ __global__ void fp4_act_kernel(__nv_bfloat16* x, int rows, int cols) {
     const float rs = amax / (6.0f * 448.0f);
     if (rs == 0.0f) return;
     for (int b = lane; b < cols / 16; b += 32) {
-        float v[16], am = 0.0f;
+        float v[16];
 #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            v[i] = bf2f(xr[16 * b + i]) / rs;
-            am = fmaxf(am, fabsf(v[i]));
-        }
-        const int first = (int)__nv_fp8_e4m3(am / 6.0f).__x;
-        int best = first;
-        float best_e = block_error(v, ue4m3_value(first));
-        constexpr int offs[4] = {-1, 1, -2, 2};
-#pragma unroll
-        for (int t = 0; t < 4; ++t) {
-            const int c = first + offs[t];
-            if (c < 0 || c > 0x7e) continue;
-            const float e = block_error(v, ue4m3_value(c));
-            if (e < best_e) best_e = e, best = c;
-        }
-        const float bs = ue4m3_value(best);
+        for (int i = 0; i < 16; ++i) v[i] = bf2f(xr[16 * b + i]) / rs;
+        const float bs = ue4m3_value(fp4_block_scale(v));
 #pragma unroll
         for (int i = 0; i < 16; ++i) xr[16 * b + i] = f2bf(bs > 0.0f ? e2m1_value(e2m1_code(v[i] / bs)) * bs * rs : 0.0f);
     }

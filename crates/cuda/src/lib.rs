@@ -126,6 +126,10 @@ pub mod ffi {
         pub fn squash_moe_route(logits: *const f32, ld: c_int, t: c_int, top_i: *mut i32, top_w: *mut f32, stream: Stream) -> Error;
         pub fn squash_moe_plan(top_i: *const i32, t: c_int, counts: *mut i32, cursor: *mut i32, offsets: *mut i32, tile_expert: *mut i32, tile_row: *mut i32, num_tiles: *mut i32, pair_row: *mut i32, stream: Stream) -> Error;
         pub fn squash_moe_gather(m: *const c_void, pair_row: *const i32, t: c_int, xs: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_fp4_tile_rows() -> c_int;
+        pub fn squash_fp4_quant_rows(x: *const c_void, rows: c_int, k: c_int, codes: *mut u8, scales: *mut u8, rscale: *mut f32, stream: Stream) -> Error;
+        pub fn squash_fp4_gather(codes: *const u8, scales: *const u8, rscale: *const f32, pair_row: *const i32, t: c_int, k: c_int, gcodes: *mut u8, gscales: *mut u8, grscale: *mut f32, stream: Stream) -> Error;
+        pub fn squash_moe_fp4_gemm(a: *const u8, a_scales: *const u8, a_rscale: *const f32, w_ptr: *const u64, s_ptr: *const u64, ws2: *const f32, offsets: *const i32, tile_expert: *const i32, tile_row: *const i32, num_tiles: *const i32, max_tiles: c_int, y: *mut f32, n: c_int, k: c_int, stream: Stream) -> Error;
         pub fn squash_moe_nvfp4_gemm(xs: *const c_void, w_ptr: *const u64, s_ptr: *const u64, ws2: *const f32, offsets: *const i32, tile_expert: *const i32, tile_row: *const i32, num_tiles: *const i32, max_tiles: c_int, y: *mut f32, n: c_int, k: c_int, stream: Stream) -> Error;
         pub fn squash_swiglu(gate: *const f32, up: *const f32, ld: c_int, width: c_int, act: *mut c_void, count: usize, stream: Stream) -> Error;
         pub fn squash_moe_combine(yd: *const f32, pair_row: *const i32, top_w: *const f32, sg: *const f32, ld_sg: c_int, sh: *const f32, y: *mut f32, t: c_int, stream: Stream) -> Error;

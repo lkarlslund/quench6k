@@ -215,6 +215,47 @@ pub fn moe_gather(s: &Stream, m: u64, pair_row: u64, t: usize, xs: u64) -> Resul
 }
 
 #[allow(clippy::too_many_arguments)]
+/// NVFP4-quantized activation rows in one buffer: codes U8 [rows, K/2], block scales U8 [rows, K/16],
+/// row scales F32 [rows] (see `fp4_quant_rows`). Returns (codes, scales, row scales) addresses.
+pub fn fp4_rows_layout(base: u64, rows: usize, k: usize) -> (u64, u64, u64) {
+    let codes = base;
+    let scales = codes + (rows * k / 2) as u64;
+    let rscale = (scales + (rows * k / 16) as u64).div_ceil(256) * 256;
+    (codes, scales, rscale)
+}
+
+/// Bytes of an `fp4_rows_layout` buffer.
+pub fn fp4_rows_bytes(rows: usize, k: usize) -> usize {
+    (rows * k / 2 + rows * k / 16).div_ceil(256) * 256 + rows * 4
+}
+
+pub fn fp4_tile_rows() -> usize {
+    unsafe { ffi::squash_fp4_tile_rows() as usize }
+}
+
+/// Quantizes BF16 rows [rows, k] to NVFP4 into an `fp4_rows_layout` buffer at `out`.
+pub fn fp4_quant_rows(s: &Stream, x: u64, rows: usize, k: usize, out: u64) -> Result<()> {
+    let (c, sc, r) = fp4_rows_layout(out, rows, k);
+    launch!("fp4_quant_rows", ffi::squash_fp4_quant_rows(p(x), n32(rows), n32(k), c as *mut u8, sc as *mut u8, fm(r), s.raw()))
+}
+
+/// Gathers quantized token rows (`t` tokens at `src`) into routed-pair order (t * 10 rows at `dst`).
+pub fn fp4_gather(s: &Stream, src: u64, t: usize, k: usize, pair_row: u64, dst: u64) -> Result<()> {
+    let (c, sc, r) = fp4_rows_layout(src, t, k);
+    let (gc, gsc, gr) = fp4_rows_layout(dst, t * 10, k);
+    launch!("fp4_gather", ffi::squash_fp4_gather(c as *const u8, sc as *const u8, f(r), i(pair_row), n32(t), n32(k), gc as *mut u8, gsc as *mut u8, fm(gr), s.raw()))
+}
+
+/// W4A4 grouped expert GEMM over quantized rows (`rows` of them in an `fp4_rows_layout` buffer at `a`).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_fp4_gemm(s: &Stream, a: u64, rows: usize, w_ptr: u64, s_ptr: u64, ws2: u64, offsets: u64, tile_expert: u64, tile_row: u64, num_tiles: u64, max_tiles: usize, y: u64, n: usize, k: usize) -> Result<()> {
+    let (c, sc, r) = fp4_rows_layout(a, rows, k);
+    launch!(
+        "moe_fp4_gemm",
+        ffi::squash_moe_fp4_gemm(c as *const u8, sc as *const u8, f(r), w_ptr as *const u64, s_ptr as *const u64, f(ws2), i(offsets), i(tile_expert), i(tile_row), i(num_tiles), n32(max_tiles), fm(y), n32(n), n32(k), s.raw())
+    )
+}
+
 pub fn moe_nvfp4_gemm(s: &Stream, xs: u64, w_ptr: u64, s_ptr: u64, ws2: u64, offsets: u64, tile_expert: u64, tile_row: u64, num_tiles: u64, max_tiles: usize, y: u64, n: usize, k: usize) -> Result<()> {
     launch!(
         "moe_nvfp4_gemm",
