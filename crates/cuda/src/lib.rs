@@ -56,6 +56,13 @@ pub mod ffi {
         pub fn squash_checksum(data: *const c_void, bytes: usize, out: *mut u64, stream: Stream) -> Error;
         pub fn squash_gemm_bf16_f32(fmt: c_int, x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, scale: *const f32, y: *mut f32, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
         pub fn squash_gemm_bf16_bf16(fmt: c_int, x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, scale: *const f32, y: *mut c_void, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
+        pub fn squash_vit_layernorm(x: *const f32, t: c_int, d: c_int, w: *const c_void, b: *const c_void, out: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_vit_bias_act(y: *const f32, t: c_int, n: c_int, bias: *const c_void, act: c_int, out: *mut c_void, ldo: c_int, stream: Stream) -> Error;
+        pub fn squash_vit_residual(h: *mut f32, y: *const f32, bias: *const c_void, extra: *const f32, t: c_int, n: c_int, assign: c_int, stream: Stream) -> Error;
+        pub fn squash_vit_qkv_rope(qkv: *const f32, bias: *const c_void, cos: *const f32, sin: *const f32, t: c_int, q: *mut f32, k: *mut f32, v: *mut f32, stream: Stream) -> Error;
+        pub fn squash_vit_attention(q: *const f32, k: *const f32, v: *const f32, t: c_int, seg: c_int, out: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_to_bf16(x: *const f32, n: usize, out: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_pad_cols(src: *const c_void, n: c_int, k: c_int, dst: *mut c_void, ldd: c_int, stream: Stream) -> Error;
         pub fn squash_gemv_max_m() -> c_int;
         pub fn squash_gemv(fmt: c_int, m: c_int, x: *const c_void, ldx: c_int, w: *const c_void, scale: *const f32, y: *mut f32, ldy: c_int, partial: *mut f32, n: c_int, k: c_int, splits: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;
         pub fn squash_fold_norm(w: *mut c_void, g: *const c_void, n: c_int, k: c_int, stream: Stream) -> Error;

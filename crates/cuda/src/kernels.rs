@@ -430,3 +430,48 @@ pub fn steer_max_rank() -> usize {
 pub fn steer(s: &Stream, h: u64, t: usize, directions: u64, ranks: u64, masks: u64, norm_preserve: bool, strength: u64, layer: usize) -> Result<()> {
     launch!("steer", ffi::squash_steer(fm(h), n32(t), f(directions), i(ranks), i(masks), norm_preserve as i32, f(strength), n32(layer), s.raw()))
 }
+
+/// Vision activation epilogues (SPEC §14).
+#[derive(Clone, Copy, Debug)]
+pub enum VitAct {
+    None = 0,
+    GeluTanh = 1,
+    GeluErf = 2,
+}
+
+/// out[t] = LayerNorm(x[t]) * w + b over `d` columns, BF16.
+pub fn vit_layernorm(s: &Stream, x: u64, t: usize, d: usize, w: u64, b: u64, out: u64) -> Result<()> {
+    check(unsafe { ffi::squash_vit_layernorm(x as *const f32, t as i32, d as i32, p(w), p(b), pm(out), s.raw()) }, "vit_layernorm")
+}
+
+/// out[t, j] = act(y[t, j] + bias[j]) for y [t, n] FP32, BF16 out with row stride `ldo`.
+#[allow(clippy::too_many_arguments)]
+pub fn vit_bias_act(s: &Stream, y: u64, t: usize, n: usize, bias: u64, act: VitAct, out: u64, ldo: usize) -> Result<()> {
+    check(unsafe { ffi::squash_vit_bias_act(y as *const f32, t as i32, n as i32, p(bias), act as i32, pm(out), ldo as i32, s.raw()) }, "vit_bias_act")
+}
+
+/// h (+)= y + bias (+ extra), all [t, n] FP32 (`assign` overwrites h).
+#[allow(clippy::too_many_arguments)]
+pub fn vit_residual(s: &Stream, h: u64, y: u64, bias: u64, extra: u64, t: usize, n: usize, assign: bool) -> Result<()> {
+    check(unsafe { ffi::squash_vit_residual(h as *mut f32, y as *const f32, p(bias), opt_f(extra), t as i32, n as i32, assign as i32, s.raw()) }, "vit_residual")
+}
+
+/// Splits qkv [t, 3456] (+ bias) into q, k (2D RoPE applied) and v, FP32 [t, 16, 72] each.
+#[allow(clippy::too_many_arguments)]
+pub fn vit_qkv_rope(s: &Stream, qkv: u64, bias: u64, cos: u64, sin: u64, t: usize, q: u64, k: u64, v: u64) -> Result<()> {
+    check(unsafe { ffi::squash_vit_qkv_rope(qkv as *const f32, p(bias), cos as *const f32, sin as *const f32, t as i32, q as *mut f32, k as *mut f32, v as *mut f32, s.raw()) }, "vit_qkv_rope")
+}
+
+/// Bidirectional attention within segments of `seg` patches; BF16 out [t, 1152].
+pub fn vit_attention(s: &Stream, q: u64, k: u64, v: u64, t: usize, seg: usize, out: u64) -> Result<()> {
+    check(unsafe { ffi::squash_vit_attention(q as *const f32, k as *const f32, v as *const f32, t as i32, seg as i32, pm(out), s.raw()) }, "vit_attention")
+}
+
+pub fn to_bf16(s: &Stream, x: u64, n: usize, out: u64) -> Result<()> {
+    check(unsafe { ffi::squash_to_bf16(x as *const f32, n, pm(out), s.raw()) }, "to_bf16")
+}
+
+/// dst [n, ldd] <- src [n, k] BF16, zero columns past k.
+pub fn pad_cols(s: &Stream, src: u64, n: usize, k: usize, dst: u64, ldd: usize) -> Result<()> {
+    check(unsafe { ffi::squash_pad_cols(p(src), n as i32, k as i32, pm(dst), ldd as i32, s.raw()) }, "pad_cols")
+}

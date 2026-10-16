@@ -217,6 +217,15 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         n: usize,
     },
+    /// Vision tower check: encodes reference pixels (tools/ref/vision_ref.py output) and compares the
+    /// merged embeddings with the HF reference.
+    VisionCheck {
+        #[arg(long)]
+        model: PathBuf,
+        /// Directory with pixels.f32, embeds.f32 and meta.json.
+        #[arg(long)]
+        reference: PathBuf,
+    },
     /// Measure prefill and greedy decode throughput at the given prompt lengths.
     Bench {
         #[arg(long)]
@@ -341,6 +350,7 @@ fn main() -> Result<()> {
                 println!("verified {checked} tensors byte-exact");
             }
         }
+        Command::VisionCheck { model, reference } => vision_check(&model, &reference)?,
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, batch2, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, batch2, &steer)?,
         Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir } => {
             serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir })?
@@ -669,5 +679,46 @@ fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> R
         let same = batched[i].iter().zip(&single[i]).take_while(|(x, y)| x == y).count();
         println!("sequence {i}: {same}/{n} tokens identical to single-sequence decoding");
     }
+    Ok(())
+}
+
+fn vision_check(model_dir: &std::path::Path, reference: &std::path::Path) -> Result<()> {
+    use squash_engine::vision::{VisionInput, VisionModel};
+    squash_cuda::set_device(0)?;
+    let ckpt = Checkpoint::open(model_dir)?;
+    let s = squash_cuda::Stream::new()?;
+    let t0 = std::time::Instant::now();
+    let vm = VisionModel::load(&ckpt, LoadOptions::default(), &s)?;
+    println!("vision tower loaded in {:.1}s", t0.elapsed().as_secs_f64());
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(reference.join("meta.json"))?)?;
+    let grid: Vec<usize> = meta["grid_thw"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+    let read_f32 = |name: &str| -> Result<Vec<f32>> { Ok(std::fs::read(reference.join(name))?.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()) };
+    let input = VisionInput { pixels: read_f32("pixels.f32")?, grid: [grid[0], grid[1], grid[2]] };
+    let want = read_f32("embeds.f32")?;
+    vm.encode(&s, &input)?; // warm-up
+    let t1 = std::time::Instant::now();
+    let out = vm.encode(&s, &input)?;
+    let ms = t1.elapsed().as_secs_f64() * 1e3;
+    let got: Vec<f32> = s.download(out.addr(), want.len())?;
+    let (mut max_err, mut sum_err, mut min_cos, mut sum_cos) = (0f64, 0f64, 1f64, 0f64);
+    let tokens = input.tokens();
+    for t in 0..tokens {
+        let (a, b) = (&got[t * 2560..(t + 1) * 2560], &want[t * 2560..(t + 1) * 2560]);
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            let (x, y) = (*x as f64, *y as f64);
+            max_err = max_err.max((x - y).abs());
+            sum_err += (x - y).abs();
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        let c = dot / (na.sqrt() * nb.sqrt());
+        min_cos = min_cos.min(c);
+        sum_cos += c;
+    }
+    let scale = want.iter().map(|v| v.abs() as f64).sum::<f64>() / want.len() as f64;
+    println!("{} patches -> {tokens} tokens in {ms:.1} ms", input.patches());
+    println!("|err| max {max_err:.5} mean {:.6} (mean |ref| {scale:.5}); cosine min {min_cos:.6} mean {:.6}", sum_err / want.len() as f64, sum_cos / tokens as f64);
     Ok(())
 }

@@ -8,6 +8,7 @@ pub mod profile;
 pub mod session;
 pub mod spec;
 pub mod steering;
+pub mod vision;
 
 /// Which checkpoint tensors belong on the GPU.
 pub mod selection {
