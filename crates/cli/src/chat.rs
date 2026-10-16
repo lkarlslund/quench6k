@@ -43,8 +43,19 @@ impl Chat {
     /// Renders `messages` (OpenAI-style JSON) with an open assistant turn.
     pub fn render(&self, messages: &Value, tools: Option<&Value>, enable_thinking: Option<bool>, reasoning_effort: Option<&str>) -> Result<String> {
         let tmpl = self.env.get_template("chat")?;
+        // OpenAI sends tool-call arguments as a JSON string; the template iterates them as a mapping.
+        let mut messages = messages.clone();
+        for m in messages.as_array_mut().into_iter().flatten() {
+            for call in m.get_mut("tool_calls").and_then(Value::as_array_mut).into_iter().flatten() {
+                if let Some(args) = call.pointer_mut("/function/arguments") {
+                    if let Some(parsed) = args.as_str().and_then(|text| serde_json::from_str::<Value>(text).ok()) {
+                        *args = parsed;
+                    }
+                }
+            }
+        }
         let mut ctx = serde_json::Map::new();
-        ctx.insert("messages".into(), messages.clone());
+        ctx.insert("messages".into(), messages);
         ctx.insert("add_generation_prompt".into(), Value::Bool(true));
         if let Some(t) = tools.filter(|t| !t.is_null()) {
             ctx.insert("tools".into(), t.clone());
