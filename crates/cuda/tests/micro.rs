@@ -270,3 +270,26 @@ fn select_latency() {
         }
     }
 }
+
+/// Dense INT8G and BF16 GEMM throughput on prefill-sized shapes (M = 4096 tokens).
+#[test]
+#[ignore]
+fn gemm_throughput() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let m = 4096;
+    for &(n, k) in &[(16480usize, 2560usize), (2560, 6144), (13952, 2560), (324, 10240), (10240, 320)] {
+        let x = filled(&s, m * k * 2, 0);
+        let y = filled(&s, m * n * 4, 0);
+        let w8 = filled(&s, n * k, 3);
+        let sc = scales(&s, n * k / kernels::int8_group());
+        let wb = filled(&s, n * k * 2, 0);
+        let mut line = format!("M={m} N={n} K={k}:");
+        for (fmt, w, scale, name) in [(WeightFormat::Int8Group, &w8, sc.addr(), "int8g"), (WeightFormat::Bf16, &wb, 0, "bf16")] {
+            let g = Graph::capture(&s, |s| (0..8).try_for_each(|_| kernels::gemm_f32(s, x.addr(), k, fmt, w.addr(), k, scale, y.addr(), n, m, n, k, 1.0, false))).unwrap();
+            let us = time_graph(&s, &g, 8);
+            line += &format!("  {name} {us:.0} us {:.0} TFLOPS", 2.0 * (m * n * k) as f64 / us / 1e6);
+        }
+        println!("{line}");
+    }
+}

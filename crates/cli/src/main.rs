@@ -111,7 +111,8 @@ enum Command {
         ctx: Vec<usize>,
         #[arg(long, default_value_t = 256)]
         generate: usize,
-        #[arg(long, default_value_t = 1024)]
+        /// Prefill chunk (tokens per forward pass).
+        #[arg(long, default_value_t = 8192)]
         chunk: usize,
         /// Also print per-op GPU time for a few eager decode steps.
         #[arg(long)]
