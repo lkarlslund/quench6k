@@ -786,11 +786,12 @@ pub fn head_argmax_into(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u
     k::argmax(s, hw.logits.addr(), rows, VOCAB, VOCAB, hw.argmax.addr(), out)
 }
 
-/// Greedy draft token for one hidden state through the drafter's NVFP4 LM head, written to `out`.
+/// Greedy draft token for one hidden state, written to `out`: a 1-bit sketch of the LM head shortlists
+/// 8 candidates per 8192 rows and the drafter's NVFP4 head rescores them (the NVFP4 argmax whenever
+/// it is shortlisted, which is nearly always).
 pub fn draft_head_argmax_into(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64, out: u64) -> Result<()> {
-    let (codes, scales, scale2) = model.mtp.as_ref().expect("model loaded without MTP").draft_head;
-    k::nvfp4_dense_gemv(s, hidden, codes, scales, scale2, hw.logits.addr(), VOCAB)?;
-    k::argmax(s, hw.logits.addr(), 1, VOCAB, VOCAB, hw.argmax.addr(), out)
+    let mtp = model.mtp.as_ref().expect("model loaded without MTP");
+    k::draft_head_argmax(s, hidden, mtp.draft_sketch, mtp.draft_head, hw.logits.addr(), hw.pick.addr(), VOCAB, out)
 }
 
 /// Greedy next token for one hidden state: LM head, argmax, and a copy of the token to `hw.token_host`.
@@ -820,6 +821,7 @@ pub struct HeadWorkspace {
     target: DeviceBuffer,
     top_ids: DeviceBuffer,
     top_logits: DeviceBuffer,
+    pick: DeviceBuffer,
 }
 
 impl HeadWorkspace {
@@ -835,6 +837,7 @@ impl HeadWorkspace {
             target: DeviceBuffer::new(rows * 4)?,
             top_ids: DeviceBuffer::new(rows * top_k * 4)?,
             top_logits: DeviceBuffer::new(rows * top_k * 4)?,
+            pick: DeviceBuffer::new(k::draft_pick_words(VOCAB) * 4)?,
         })
     }
 }

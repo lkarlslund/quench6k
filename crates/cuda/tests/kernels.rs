@@ -341,3 +341,41 @@ fn gdn_chunked_matches_sequential() {
         assert!(eo < 1e-4 && es < 1e-4, "T={t}: output {eo}, state {es}");
     }
 }
+
+/// The sketch-shortlisted draft head returns the NVFP4 head's argmax for typical rows.
+#[test]
+fn draft_sketch_matches_full_head() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x5ce7_c4ed);
+    const D: usize = 2560;
+    let n = 100_000usize;
+    let w: Vec<f32> = rng.vec(n * D).iter().map(|v| v * 0.05).collect();
+    let dw = upload(&s, &to_bf16(&w));
+    let codes = DeviceBuffer::new(n * D / 2).unwrap();
+    let scales = DeviceBuffer::new(n * D / 16).unwrap();
+    let s2 = DeviceBuffer::new(4).unwrap();
+    let amax = DeviceBuffer::new(4).unwrap();
+    kernels::quantize_nvfp4(&s, dw.addr(), 1, n, D, codes.addr(), scales.addr(), s2.addr(), amax.addr()).unwrap();
+    let sketch = DeviceBuffer::new(kernels::draft_sketch_bytes(n)).unwrap();
+    kernels::build_draft_sketch(&s, dw.addr(), sketch.addr(), n).unwrap();
+    let ys = DeviceBuffer::new(n * 4).unwrap();
+    let pick = DeviceBuffer::new(kernels::draft_pick_words(n) * 4).unwrap();
+    let full = DeviceBuffer::new(n * 4).unwrap();
+    let out = DeviceBuffer::new(8).unwrap();
+    let scratch = DeviceBuffer::new(kernels::argmax_scratch(1, n)).unwrap();
+    let mut same = 0;
+    for trial in 0..20 {
+        // A hidden state close to a few rows (a confident prediction) plus noise.
+        let target = (trial * 7919) % n;
+        let x: Vec<f32> = (0..D).map(|i| w[target * D + i] * 20.0 + rng.next() * 0.5).collect();
+        let dx = upload(&s, &to_bf16(&x));
+        kernels::draft_head_argmax(&s, dx.addr(), sketch.addr(), (codes.addr(), scales.addr(), s2.addr()), ys.addr(), pick.addr(), n, out.addr()).unwrap();
+        kernels::nvfp4_dense_gemv(&s, dx.addr(), codes.addr(), scales.addr(), s2.addr(), full.addr(), n).unwrap();
+        kernels::argmax(&s, full.addr(), 1, n, n, scratch.addr(), out.addr() + 4).unwrap();
+        let r: Vec<i32> = s.download(out.addr(), 2).unwrap();
+        println!("trial {trial}: target {target}, sketch {}, full {}", r[0], r[1]);
+        same += (r[0] == r[1]) as usize;
+    }
+    assert!(same >= 19, "sketch agreed {same}/20");
+}

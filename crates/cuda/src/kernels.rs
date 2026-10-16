@@ -400,3 +400,23 @@ pub fn spec_accept(s: &Stream, rc: u64, ctl: u64, n: usize) -> Result<()> {
 pub fn nvfp4_dense_gemv(s: &Stream, x: u64, codes: u64, scales: u64, scale2: u64, y: u64, n: usize) -> Result<()> {
     launch!("nvfp4_dense_gemv", ffi::squash_nvfp4_dense_gemv(p(x), p(codes), p(scales), f(scale2), fm(y), n32(n), s.raw()))
 }
+
+pub fn draft_sketch_bytes(n: usize) -> usize {
+    unsafe { ffi::squash_draft_sketch_bytes(n as i32) }
+}
+
+/// Words of the per-slice pick buffer for [`draft_head_argmax`].
+pub fn draft_pick_words(n: usize) -> usize {
+    2 * unsafe { ffi::squash_draft_slices(n as i32) } as usize
+}
+
+pub fn build_draft_sketch(s: &Stream, w: u64, sketch: u64, n: usize) -> Result<()> {
+    launch!("build_draft_sketch", ffi::squash_build_draft_sketch(p(w), pm(sketch), n32(n), s.raw()))
+}
+
+/// Draft token of one BF16 hidden row: the sketch shortlists 8 candidates per 8192-row slice, the NVFP4
+/// head rescores them, and the best goes to `out` (i32). `ys`: n floats; `pick`: [`draft_pick_words`].
+#[allow(clippy::too_many_arguments)]
+pub fn draft_head_argmax(s: &Stream, x: u64, sketch: u64, head: (u64, u64, u64), ys: u64, pick: u64, n: usize, out: u64) -> Result<()> {
+    launch!("draft_head_argmax", ffi::squash_draft_head_argmax(p(x), p(sketch), p(head.0), p(head.1), f(head.2), fm(ys), pm(pick), n32(n), im(out), s.raw()))
+}

@@ -104,6 +104,10 @@ pub mod ffi {
         pub fn squash_spec_layout(field: c_int) -> c_int;
         pub fn squash_spec_mtp_header(rc: *const i32, hdr: *mut i32, tokens_off: c_int, pos_off: c_int, j: c_int, c: c_int, stream: Stream) -> Error;
         pub fn squash_spec_accept(rc: *mut i32, ctl: *mut i32, n: c_int, stream: Stream) -> Error;
+        pub fn squash_draft_sketch_bytes(n: c_int) -> usize;
+        pub fn squash_draft_slices(n: c_int) -> c_int;
+        pub fn squash_build_draft_sketch(w: *const c_void, sketch: *mut c_void, n: c_int, stream: Stream) -> Error;
+        pub fn squash_draft_head_argmax(x: *const c_void, sketch: *const c_void, codes: *const c_void, scales: *const c_void, scale2: *const f32, ys: *mut f32, pick: *mut c_void, n: c_int, out: *mut i32, stream: Stream) -> Error;
         pub fn squash_nvfp4_dense_gemv(x: *const c_void, codes: *const c_void, scales: *const c_void, scale2: *const f32, y: *mut f32, n: c_int, stream: Stream) -> Error;
         pub fn squash_qsa_split_floats(t: c_int) -> usize;
         pub fn squash_qsa_attention_split(q: *const f32, qg: *const f32, ld: c_int, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: *const i32, t: c_int, part: *mut f32, out: *mut c_void, stream: Stream) -> Error;

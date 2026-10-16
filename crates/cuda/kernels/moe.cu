@@ -158,48 +158,62 @@ __global__ void __launch_bounds__(THREADS) nvfp4_gemm_kernel(const __nv_bfloat16
     const int n0 = blockIdx.x * BN;
     const int k_tiles = K / BK;
 
-    auto load = [&](int stage, int kt) {
+    // A tiles via cp.async; B (FP4 codes + FP8 scales) is fetched into registers one k-tile ahead and
+    // decoded into shared memory after the current tile's MMAs.
+    auto load_a = [&](int stage, int kt) {
         const int k = kt * BK;
-        {
-            const int r = tid >> 2, c = (tid & 3) * 8;
-            const bool ok = r0 + r < r_end;
-            cp_async16(&sA[stage][r * LDS + c], X + (size_t)(ok ? r0 + r : r0) * K + k + c, ok);
+        const int r = tid >> 2, c = (tid & 3) * 8;
+        const bool ok = r0 + r < r_end;
+        cp_async16(&sA[stage][r * LDS + c], X + (size_t)(ok ? r0 + r : r0) * K + k + c, ok);
+    };
+    uint4 bcodes = make_uint4(0, 0, 0, 0);
+    uint16_t bsc = 0;
+    const bool b_row = tid < BN && n0 + tid < N;
+    auto fetch_b = [&](int kt) {
+        if (b_row) {
+            const int n = n0 + tid, k = kt * BK;
+            bcodes = *reinterpret_cast<const uint4*>(W + (size_t)n * (K / 2) + k / 2);
+            bsc = *reinterpret_cast<const uint16_t*>(Sc + (size_t)n * (K / 16) + k / 16);
         }
-        if (tid < BN) {
-            const int n = n0 + tid;
-            __nv_bfloat16* dst = &sB[stage][tid * LDS];
-            if (n < N) {
-                const uint4 codes = *reinterpret_cast<const uint4*>(W + (size_t)n * (K / 2) + k / 2);
-                const uint16_t sc = *reinterpret_cast<const uint16_t*>(Sc + (size_t)n * (K / 16) + k / 16);
-                // FP4 x FP8 products are exact in FP16 and then in BF16 (hardware conversions).
-                const __half h0 = __float2half(fp8_to_float(sc & 0xff)), h1 = __float2half(fp8_to_float(sc >> 8));
-                const __half2 s0 = __halves2half2(h0, h0), s1 = __halves2half2(h1, h1);
-                const uint8_t* b = reinterpret_cast<const uint8_t*>(&codes);
-                uint32_t packed[16];
+    };
+    auto store_b = [&](int stage) {
+        if (tid >= BN) return;
+        __nv_bfloat16* dst = &sB[stage][tid * LDS];
+        uint32_t packed[16];
+        if (b_row) {
+            // FP4 x FP8 products are exact in FP16 and then in BF16 (hardware conversions).
+            const __half h0 = __float2half(fp8_to_float(bsc & 0xff)), h1 = __float2half(fp8_to_float(bsc >> 8));
+            const __half2 s0 = __halves2half2(h0, h0), s1 = __halves2half2(h1, h1);
+            const uint8_t* bb = reinterpret_cast<const uint8_t*>(&bcodes);
 #pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    const __half2_raw r = __nv_cvt_fp4x2_to_halfraw2(b[i], __NV_E2M1);
-                    const float2 f = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&r), i < 8 ? s0 : s1));
-                    const __nv_bfloat162 v = __floats2bfloat162_rn(f.x, f.y);
-                    packed[i] = *reinterpret_cast<const uint32_t*>(&v);
-                }
-#pragma unroll
-                for (int i = 0; i < 4; ++i)
-                    *reinterpret_cast<uint4*>(dst + 8 * i) = make_uint4(packed[4 * i], packed[4 * i + 1], packed[4 * i + 2], packed[4 * i + 3]);
-            } else {
-#pragma unroll
-                for (int i = 0; i < BK; ++i) dst[i] = f2bf(0.0f);
+            for (int i = 0; i < 16; ++i) {
+                const __half2_raw r = __nv_cvt_fp4x2_to_halfraw2(bb[i], __NV_E2M1);
+                const float2 f = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&r), i < 8 ? s0 : s1));
+                const __nv_bfloat162 v = __floats2bfloat162_rn(f.x, f.y);
+                packed[i] = *reinterpret_cast<const uint32_t*>(&v);
             }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) packed[i] = 0;
         }
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            *reinterpret_cast<uint4*>(dst + 8 * i) = make_uint4(packed[4 * i], packed[4 * i + 1], packed[4 * i + 2], packed[4 * i + 3]);
     };
 
     float acc[2][4][4] = {};
-    load(0, 0);
+    load_a(0, 0);
     cp_async_commit();
+    fetch_b(0);
+    store_b(0);
     for (int kt = 0; kt < k_tiles; ++kt) {
         cp_async_wait<0>();
         __syncthreads();
-        if (kt + 1 < k_tiles) load((kt + 1) % STAGES, kt + 1);
+        const bool more = kt + 1 < k_tiles;
+        if (more) {
+            load_a((kt + 1) % STAGES, kt + 1);
+            fetch_b(kt + 1);
+        }
         cp_async_commit();
         const __nv_bfloat16* a_tile = sA[kt % STAGES];
         const __nv_bfloat16* b_tile = sB[kt % STAGES];
@@ -218,7 +232,9 @@ __global__ void __launch_bounds__(THREADS) nvfp4_gemm_kernel(const __nv_bfloat16
 #pragma unroll
                 for (int j = 0; j < 4; ++j) mma_bf16(acc[i][j], a[i], &b[j >> 1][(j & 1) * 2]);
         }
-        __syncthreads();
+        // The other stage was last read by the previous tile's MMAs, which every thread finished
+        // before this tile's barrier.
+        if (more) store_b((kt + 1) % STAGES);
     }
     const float alpha = ws2[e];
     const int g = lane >> 2, t4 = lane & 3;
@@ -1029,6 +1045,209 @@ extern "C" cudaError_t squash_moe_experts_t1(const void* m, const float* logits,
                               u2, top_i, top_w, pair_row, ab));
     SQ_CHECK_LAUNCH(sq_launch(down_t1_kernel, dim3(D / (EW * 8), TOPK), EW * 32, 0, st, static_cast<const __nv_bfloat16*>(ab),
                               dw, ds, d2, static_cast<const int*>(top_i), yd));
+    SQ_RETURN_LAUNCH();
+}
+
+namespace {
+
+// ---- draft head shortlist: a 1-bit sketch of the head ranks the vocabulary, the exact NVFP4 rows
+// rescore each slice's best candidates ------------------------------------------------------------
+
+constexpr int SK_GROUPS = D / 64, SK_SLICE = 8192, SK_PICK = 8;
+
+// masks [group][row]: bit i = (w[row, 64 group + i] >= 0); scales [group][row] = mean |w| of the group.
+__global__ void build_sketch_kernel(const __nv_bfloat16* __restrict__ w, unsigned long long* masks, __half* scales, int N) {
+    const size_t item = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (item >= (size_t)N * SK_GROUPS) return;
+    const int row = (int)(item % N), g = (int)(item / N);
+    const __nv_bfloat16* p = w + (size_t)row * D + g * 64;
+    unsigned long long m = 0;
+    float sum = 0.0f;
+    for (int i = 0; i < 64; ++i) {
+        const float v = bf2f(p[i]);
+        sum += fabsf(v);
+        if (v >= 0.0f) m |= 1ull << i;
+    }
+    masks[item] = m;
+    scales[item] = __float2half(sum / 64.0f);
+}
+
+// y[row] = sum_g scale_g (2 sum_{bits} x - sum_g x): lane = row, 32 rows per warp.
+__global__ void __launch_bounds__(256) sketch_gemv_kernel(const __nv_bfloat16* __restrict__ x,
+                                                          const unsigned long long* __restrict__ masks,
+                                                          const __half* __restrict__ scales, float* y, int N) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ float xs[D], gsum[SK_GROUPS];
+    for (int i = threadIdx.x; i < D; i += blockDim.x) xs[i] = bf2f(x[i]);
+    __syncthreads();
+    if (threadIdx.x < SK_GROUPS) {
+        float t = 0.0f;
+        for (int i = 0; i < 64; ++i) t += xs[threadIdx.x * 64 + i];
+        gsum[threadIdx.x] = t;
+    }
+    __syncthreads();
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= N) return;
+    float acc = 0.0f;
+    for (int g = 0; g < SK_GROUPS; ++g) {
+        const unsigned long long m = __ldg(masks + (size_t)g * N + row);
+        const float sc = __half2float(__ldg(scales + (size_t)g * N + row));
+        float sel = 0.0f;
+        const float* xg = xs + g * 64;
+#pragma unroll
+        for (int i = 0; i < 64; ++i) sel += (m >> i & 1ull) ? xg[i] : 0.0f;
+        acc = fmaf(sc, 2.0f * sel - gsum[g], acc);
+    }
+    y[row] = acc;
+}
+
+// One block per slice of SK_SLICE rows: the SK_PICK best sketch logits, each rescored exactly with its
+// NVFP4 row (one warp per candidate); writes the slice's best (exact logit, row).
+__global__ void __launch_bounds__(256) draft_pick_kernel(const float* __restrict__ ys, int N,
+                                                         const __nv_bfloat16* __restrict__ x,
+                                                         const uint8_t* __restrict__ codes,
+                                                         const uint8_t* __restrict__ scales, const float* scale2,
+                                                         float* best_v, int* best_i) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ float wv[8];
+    __shared__ int wi[8], picks[SK_PICK];
+    __shared__ float exact[SK_PICK];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int base = blockIdx.x * SK_SLICE;
+    constexpr int PER = SK_SLICE / 256;
+    float v[PER];
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int r = base + tid + 256 * j;
+        v[j] = r < N ? __ldcg(ys + r) : -INFINITY;
+    }
+    for (int p = 0; p < SK_PICK; ++p) {
+        float bv = -INFINITY;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int j = 0; j < PER; ++j)
+            if (v[j] > bv) {
+                bv = v[j];
+                bi = base + tid + 256 * j;
+            }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffff, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (lane == 0) {
+            wv[warp] = bv;
+            wi[warp] = bi;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float b = wv[0];
+            int ib = wi[0];
+            for (int w = 1; w < 8; ++w)
+                if (wv[w] > b || (wv[w] == b && wi[w] < ib)) {
+                    b = wv[w];
+                    ib = wi[w];
+                }
+            picks[p] = b == -INFINITY ? -1 : ib;
+        }
+        __syncthreads();
+        const int pick = picks[p];
+#pragma unroll
+        for (int j = 0; j < PER; ++j)
+            if (base + tid + 256 * j == pick) v[j] = -INFINITY;
+    }
+    // Exact NVFP4 logit of candidate `warp`: 80 chunks of 32 weights over the lanes.
+    {
+        const int r = picks[warp];
+        float acc = 0.0f;
+        if (r >= 0) {
+            const uint8_t* W = codes + (size_t)r * (D / 2);
+            const uint8_t* Sc = scales + (size_t)r * (D / 16);
+            for (int c = lane; c < D / 32; c += 32) {
+                const uint4 cd = __ldg(reinterpret_cast<const uint4*>(W + c * 16));
+                const uint16_t sc = __ldg(reinterpret_cast<const uint16_t*>(Sc + c * 2));
+                float w[32];
+                decode32(cd, sc, w);
+                chunk_dot(w, x + c * 32, acc);
+            }
+            acc = warp_sum(acc) * *scale2;
+        }
+        if (lane == 0) exact[warp] = r >= 0 ? acc : -INFINITY;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float b = -INFINITY;
+        int ib = 0x7fffffff;
+        for (int p = 0; p < SK_PICK; ++p)
+            if (picks[p] >= 0 && (exact[p] > b || (exact[p] == b && picks[p] < ib))) {
+                b = exact[p];
+                ib = picks[p];
+            }
+        best_v[blockIdx.x] = b;
+        best_i[blockIdx.x] = ib;
+    }
+}
+
+__global__ void draft_final_kernel(const float* __restrict__ best_v, const int* __restrict__ best_i, int slices, int* out) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int lane = threadIdx.x;
+    float bv = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int s = lane; s < slices; s += 32)
+        if (best_v[s] > bv || (best_v[s] == bv && best_i[s] < bi)) {
+            bv = best_v[s];
+            bi = best_i[s];
+        }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffff, bv, o);
+        const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    if (lane == 0) *out = bi;
+}
+
+}  // namespace
+
+extern "C" size_t squash_draft_sketch_bytes(int N) { return (size_t)N * SK_GROUPS * (8 + 2); }
+extern "C" int squash_draft_slices(int N) { return (N + SK_SLICE - 1) / SK_SLICE; }
+
+// sketch: squash_draft_sketch_bytes(N) bytes (masks, then scales), from the BF16 head w [N, 2560].
+extern "C" cudaError_t squash_build_draft_sketch(const void* w, void* sketch, int N, cudaStream_t st) {
+    auto* masks = static_cast<unsigned long long*>(sketch);
+    auto* sc = reinterpret_cast<__half*>(masks + (size_t)N * SK_GROUPS);
+    const size_t items = (size_t)N * SK_GROUPS;
+    build_sketch_kernel<<<(unsigned)((items + 255) / 256), 256, 0, st>>>(static_cast<const __nv_bfloat16*>(w), masks, sc, N);
+    return cudaGetLastError();
+}
+
+// Draft token for one hidden row x: sketch ranking (logits into ys [N]), per-slice NVFP4 rescoring of
+// the best candidates (pick: 2 * slices words), argmax into *out.
+extern "C" cudaError_t squash_draft_head_argmax(const void* x, const void* sketch, const void* codes, const void* scales,
+                                                const float* scale2, float* ys, void* pick, int N, int* out,
+                                                cudaStream_t st) {
+    const auto* xb = static_cast<const __nv_bfloat16*>(x);
+    const auto* masks = static_cast<const unsigned long long*>(sketch);
+    const auto* sc = reinterpret_cast<const __half*>(masks + (size_t)N * SK_GROUPS);
+    const int slices = (N + SK_SLICE - 1) / SK_SLICE;
+    float* bv = static_cast<float*>(pick);
+    int* bi = reinterpret_cast<int*>(bv + slices);
+    SQ_CHECK_LAUNCH(sq_launch(sketch_gemv_kernel, (N + 255) / 256, 256, 0, st, xb, masks, sc, ys, N));
+    // Launched without PDL: reading the sketch logits right behind their producer under PDL gave stale
+    // values (the buffer is rewritten for every draft).
+    draft_pick_kernel<<<slices, 256, 0, st>>>(static_cast<const float*>(ys), N, xb, static_cast<const uint8_t*>(codes),
+                                               static_cast<const uint8_t*>(scales), scale2, bv, bi);
+    SQ_CHECK_LAUNCH(sq_launch(draft_final_kernel, 1, 32, 0, st, static_cast<const float*>(bv), static_cast<const int*>(bi), slices, out));
     SQ_RETURN_LAUNCH();
 }
 

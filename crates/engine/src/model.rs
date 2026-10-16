@@ -174,6 +174,8 @@ impl PleTable {
 pub struct Mtp {
     /// NVFP4 copy of the LM head for drafting: (codes, block scales, scale2) and their storage.
     pub draft_head: (u64, u64, u64),
+    /// 1-bit sketch of the LM head that shortlists draft candidates (see `squash_draft_head_argmax`).
+    pub draft_sketch: u64,
     pub _draft_head: Vec<DeviceBuffer>,
     pub fc_embedding: Linear,
     pub fc_hidden: Linear,
@@ -229,7 +231,7 @@ fn read_i64s<const N: usize>(ckpt: &Checkpoint, name: &str) -> Result<[i64; N]> 
 }
 
 impl Model {
-    pub fn bind(ckpt: &Checkpoint, weights: DeviceWeights, mtp_experts: Option<(ExpertTables, (u64, u64, u64), Vec<DeviceBuffer>)>, stream: &Stream) -> Result<Self> {
+    pub fn bind(ckpt: &Checkpoint, weights: DeviceWeights, mtp_experts: Option<(ExpertTables, (u64, u64, u64), u64, Vec<DeviceBuffer>)>, stream: &Stream) -> Result<Self> {
         let w = |name: &str| -> Result<u64> { Ok(weights.get(name)?.addr) };
         let lin = |name: &str| -> Result<Linear> {
             let t = weights.get(name)?;
@@ -347,8 +349,9 @@ impl Model {
 
         let mtp = match mtp_experts {
             None => None,
-            Some((tables, head, head_bufs)) => Some(Mtp {
+            Some((tables, head, sketch, head_bufs)) => Some(Mtp {
                 draft_head: head,
+                draft_sketch: sketch,
                 _draft_head: head_bufs,
                 fc_embedding: lin("mtp.fc_embedding.weight")?,
                 fc_hidden: lin("mtp.fc_hidden.weight")?,
@@ -421,7 +424,7 @@ pub fn projection_groups(mtp: bool) -> Vec<(String, Vec<String>)> {
 }
 
 /// NVFP4 copy of the LM head for the drafter, quantized from the checkpoint's BF16 head.
-fn load_draft_head(ckpt: &Checkpoint, opts: crate::loader::LoadOptions, stream: &Stream) -> Result<((u64, u64, u64), Vec<DeviceBuffer>)> {
+fn load_draft_head(ckpt: &Checkpoint, opts: crate::loader::LoadOptions, stream: &Stream) -> Result<((u64, u64, u64), u64, Vec<DeviceBuffer>)> {
     let (staged, _) = crate::loader::upload(ckpt, |t| t == "lm_head.weight", opts)?;
     let src = staged.get("lm_head.weight")?;
     let codes = DeviceBuffer::new(VOCAB * D / 2)?;
@@ -429,8 +432,10 @@ fn load_draft_head(ckpt: &Checkpoint, opts: crate::loader::LoadOptions, stream: 
     let s2 = DeviceBuffer::new(4)?;
     let amax = DeviceBuffer::new(4)?;
     squash_cuda::kernels::quantize_nvfp4(stream, src.addr, 1, VOCAB, D, codes.addr(), scales.addr(), s2.addr(), amax.addr())?;
+    let sketch = DeviceBuffer::new(squash_cuda::kernels::draft_sketch_bytes(VOCAB))?;
+    squash_cuda::kernels::build_draft_sketch(stream, src.addr, sketch.addr(), VOCAB)?;
     stream.synchronize()?;
-    Ok(((codes.addr(), scales.addr(), s2.addr()), vec![codes, scales, s2]))
+    Ok(((codes.addr(), scales.addr(), s2.addr()), sketch.addr(), vec![codes, scales, s2, sketch]))
 }
 
 /// Uploads the MTP layer's BF16 experts one tensor at a time and NVFP4-quantizes them into the layout
@@ -509,8 +514,8 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
         weights.merge(converted);
     }
     let mtp_experts = if mtp {
-        let (head, bufs) = load_draft_head(ckpt, opts, stream)?;
-        Some((load_mtp_experts(ckpt, opts, stream)?, head, bufs))
+        let (head, sketch, bufs) = load_draft_head(ckpt, opts, stream)?;
+        Some((load_mtp_experts(ckpt, opts, stream)?, head, sketch, bufs))
     } else {
         None
     };
