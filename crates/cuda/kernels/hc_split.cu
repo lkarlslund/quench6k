@@ -8,6 +8,7 @@
 //   hc_up_mix  u = up . z for the 4 rows of each feature d; m[d] = mean_s sigmoid(u_s) x_s r_s (1 + g_s);
 //              the updated residual x is written back to h
 
+#include "variants.cuh"
 #include "wfmt.cuh"
 
 namespace {
@@ -171,7 +172,7 @@ __global__ void __launch_bounds__(WARPS * 32) hc_up_mix_kernel(float* h, int T, 
                                                                const uint8_t* __restrict__ wu, const float* __restrict__ su,
                                                                const __nv_bfloat16* __restrict__ g,
                                                                const __nv_bfloat16* z, const float* r,
-                                                               __nv_bfloat16* m) {
+                                                               __nv_bfloat16* m, int preload) {
     pdl_launch_dependents();
     const int lane = threadIdx.x & 31, d = blockIdx.x * WARPS + (threadIdx.x >> 5);
     const bool active = lane < RANK / 16;
@@ -202,6 +203,15 @@ __global__ void __launch_bounds__(WARPS * 32) hc_up_mix_kernel(float* h, int T, 
         for (int i = 0; i < 16; ++i) w[s][i] *= gs[s];
     }
     pdl_wait();
+    // The first token group's residual, pending update and RMS factor do not depend on the dot
+    // products: loaded together with z (one round trip instead of two). hc.preload (kbench) = 0 off.
+    const bool early = preload != 0;
+    float x0 = 0.0f, y0 = 0.0f, i0 = 0.0f, r0 = 0.0f;
+    if (early && lt < T) {
+        x0 = h[(size_t)lt * H + ls * D + d];
+        if (y) y0 = y[(size_t)lt * D + d], i0 = inj_prev[lt * S + ls];
+        r0 = r[lt * S + ls];
+    }
 
 #pragma unroll
     for (int t0 = 0; t0 < MAXT; t0 += TG) {
@@ -230,12 +240,13 @@ __global__ void __launch_bounds__(WARPS * 32) hc_up_mix_kernel(float* h, int T, 
         float term = 0;
         if (t < T) {
             const size_t idx = (size_t)t * H + ls * D + d;
-            float x = h[idx];
+            const bool pre = early && t0 == 0;
+            float x = pre ? x0 : h[idx];
             if (y) {
-                x = fmaf(y[(size_t)t * D + d], inj_prev[t * S + ls], x);
+                x = fmaf(pre ? y0 : y[(size_t)t * D + d], pre ? i0 : inj_prev[t * S + ls], x);
                 if (lane % LPS == 0) h[idx] = x;
             }
-            term = sigmoidf(us) * x * r[t * S + ls] * gw;
+            term = sigmoidf(us) * x * (pre ? r0 : r[t * S + ls]) * gw;
         }
         term += __shfl_xor_sync(0xffffffff, term, LPS);
         term += __shfl_xor_sync(0xffffffff, term, 2 * LPS);
@@ -253,7 +264,8 @@ cudaError_t launch(float* h, int T, const float* y, const float* inj_prev, const
     SQ_CHECK_LAUNCH(sq_launch(hc_down_kernel<F, MAXT>, dim3((N + 15) / 16, SPLITS), WARPS * 32, 0, st, h, T, y, inj_prev,
                               wd, sd, wi, si, N, partial, xsq));
     SQ_CHECK_LAUNCH(sq_launch(hc_finish_kernel, (T * N + 255) / 256, 256, 0, st, partial, xsq, T, N, z, inj, r));
-    SQ_CHECK_LAUNCH(sq_launch(hc_up_mix_kernel<F, MAXT>, D / WARPS, WARPS * 32, 0, st, h, T, y, inj_prev, wu, su, g, z, r, m));
+    SQ_CHECK_LAUNCH(sq_launch(hc_up_mix_kernel<F, MAXT>, D / WARPS, WARPS * 32, 0, st, h, T, y, inj_prev, wu, su, g, z, r, m,
+                              sq_variant("hc.preload", 1)));
     return cudaGetLastError();
 }
 
