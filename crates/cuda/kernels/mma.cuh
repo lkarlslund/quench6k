@@ -19,6 +19,11 @@ SQ_DEVICE void ldmatrix_x4(uint32_t* r, const void* smem) {
                  : "r"(s));
 }
 
+SQ_DEVICE void ldmatrix_x2(uint32_t* r, const void* smem) {
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(s));
+}
+
 // Transposing variant: for B fragments from a [k][n] (n-contiguous) tile.
 SQ_DEVICE void ldmatrix_x4_trans(uint32_t* r, const void* smem) {
     const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));

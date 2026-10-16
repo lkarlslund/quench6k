@@ -430,13 +430,13 @@ namespace {
 // query heads form the MMA rows (padded to 16); keys are streamed in tiles of 64 (the same key list
 // as attention_kernel). FP32 values that meet BF16 tensor cores (q, the probabilities) are split
 // into hi + lo BF16 parts, so products keep about 16 mantissa bits; accumulation is FP32.
-constexpr int MT = 64, MW = 4, MPAD = HD + 8, PPAD = MT + 8;
-constexpr size_t MMA_ATT_SMEM = (size_t)(2 * 16 * MPAD + 2 * MT * MPAD + 2 * 16 * PPAD) * 2 + 16 * (MT + 4) * 4;
-// FP8 caches: each thread prefetches its share of a tile's raw rows into registers (8 chunks of 16 values).
-constexpr int KV8_CHUNKS = MT * HD / 16 / (MW * 32);
-
 // Split q and the probabilities into hi + lo BF16 parts (about 16 mantissa bits); false: single BF16.
 constexpr bool ATT_SPLIT = false;
+constexpr int MT = 32, MW = 4, MPAD = HD + 8, PPAD = MT + 8, NSPLIT = ATT_SPLIT ? 2 : 1;
+// 32-key tiles and no lo buffers keep this at about 46 KB: two blocks per SM overlap their gathers.
+constexpr size_t MMA_ATT_SMEM = (size_t)(NSPLIT * 16 * MPAD + 2 * MT * MPAD + NSPLIT * 16 * PPAD) * 2 + 16 * (MT + 4) * 4;
+// FP8 caches: each thread prefetches its share of a tile's raw rows into registers (8 chunks of 16 values).
+constexpr int KV8_CHUNKS = MT * HD / 16 / (MW * 32);
 
 SQ_DEVICE void split_bf16(float x, __nv_bfloat16& hi, __nv_bfloat16& lo) {
     hi = f2bf(x);
@@ -453,11 +453,11 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
     pdl_wait();
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __nv_bfloat16* Qh = reinterpret_cast<__nv_bfloat16*>(smem_raw);  // [16][MPAD]
-    __nv_bfloat16* Ql = Qh + 16 * MPAD;
+    __nv_bfloat16* Ql = Qh + (NSPLIT - 1) * 16 * MPAD;
     __nv_bfloat16* Ks = Ql + 16 * MPAD;  // [MT][MPAD]
     __nv_bfloat16* Vs = Ks + MT * MPAD;  // [MT][MPAD]
     __nv_bfloat16* Ph = Vs + MT * MPAD;  // [16][PPAD]
-    __nv_bfloat16* Pl = Ph + 16 * PPAD;
+    __nv_bfloat16* Pl = Ph + (NSPLIT - 1) * 16 * PPAD;
     float* Ss = reinterpret_cast<float*>(Pl + 16 * PPAD);  // [16][MT + 4]
     __shared__ int keys[2][MT];
     __shared__ float rmax[16], rsum[16], rscale[16];
@@ -475,7 +475,7 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
         __nv_bfloat16 hi = f2bf(0.0f), lo = f2bf(0.0f);
         if (r < QPG) split_bf16(q[(size_t)t * QH * HD + (kvh * QPG + r) * HD + d], hi, lo);
         Qh[r * MPAD + d] = hi;
-        Ql[r * MPAD + d] = lo;
+        if constexpr (ATT_SPLIT) Ql[r * MPAD + d] = lo;
     }
     if (tid < 16) {
         rmax[tid] = -INFINITY;
@@ -548,36 +548,32 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
     load_rows(0, Vs, vcache);
     cp_async_commit();
 
-    float o[8][4] = {};
+    constexpr int ONT = HD / MW / 8;  // output n-tiles per warp
+    float o[ONT][4] = {};
     const int g = lane >> 2, t4 = lane & 3;
     for (int tile = 0; tile < tiles; ++tile) {
         cp_async_wait<1>();  // K of this tile
         __syncthreads();
         dequant(Ks);
-        // S = Q K^T / 16 for this warp's 16 keys (two n-tiles), hi and lo parts of Q.
-        float sacc[2][4] = {};
+        // S = Q K^T / 16 for this warp's 8 keys (one n-tile), hi and lo parts of Q.
+        float sacc[4] = {};
 #pragma unroll
         for (int kk = 0; kk < HD; kk += 16) {
-            uint32_t ah[4], al[4], b[4];
+            uint32_t ah[4], al[4], b[2];
             ldmatrix_x4(ah, Qh + (lane & 15) * MPAD + kk + (lane >> 4) * 8);
-            ldmatrix_x4(al, Ql + (lane & 15) * MPAD + kk + (lane >> 4) * 8);
-            ldmatrix_x4(b, Ks + (warp * 16 + (lane & 7) + ((lane >> 4) << 3)) * MPAD + kk + ((lane >> 3) & 1) * 8);
-#pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                mma_bf16(sacc[j], ah, &b[j * 2]);
-                if constexpr (ATT_SPLIT) mma_bf16(sacc[j], al, &b[j * 2]);
-            }
+            if constexpr (ATT_SPLIT) ldmatrix_x4(al, Ql + (lane & 15) * MPAD + kk + (lane >> 4) * 8);
+            ldmatrix_x2(b, Ks + (warp * 8 + (lane & 7)) * MPAD + kk + ((lane >> 3) & 1) * 8);
+            mma_bf16(sacc, ah, b);
+            if constexpr (ATT_SPLIT) mma_bf16(sacc, al, b);
         }
         const int nk = min(MT, nkeys - tile * MT);
 #pragma unroll
-        for (int j = 0; j < 2; ++j)
+        for (int h = 0; h < 2; ++h)
 #pragma unroll
-            for (int h = 0; h < 2; ++h)
-#pragma unroll
-                for (int x = 0; x < 2; ++x) {
-                    const int col = warp * 16 + j * 8 + t4 * 2 + x;
-                    Ss[(g + h * 8) * (MT + 4) + col] = col < nk ? sacc[j][h * 2 + x] * (1.0f / 16.0f) : -INFINITY;
-                }
+            for (int x = 0; x < 2; ++x) {
+                const int col = warp * 8 + t4 * 2 + x;
+                Ss[(g + h * 8) * (MT + 4) + col] = col < nk ? sacc[h * 2 + x] * (1.0f / 16.0f) : -INFINITY;
+            }
         __syncthreads();
         // The next tile's keys and K rows load while this tile's softmax and P V run.
         if (tile + 1 < tiles) {
@@ -586,32 +582,33 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
             load_rows(tile + 1, Ks, kcache);
         }
         cp_async_commit();
-        // Online softmax: thread (row tid / 8, 8 keys).
+        // Online softmax: thread (row tid / 16, 4 keys).
         {
-            const int r = tid / 8, c0 = (tid % 8) * 8;
-            float v[8], m = -INFINITY;
+            constexpr int TPR = MW * 32 / 16, KPT = MT / TPR;  // threads per row, keys per thread
+            const int r = tid / TPR, c0 = (tid % TPR) * KPT;
+            float v[KPT], m = -INFINITY;
 #pragma unroll
-            for (int x = 0; x < 8; ++x) {
+            for (int x = 0; x < KPT; ++x) {
                 v[x] = Ss[r * (MT + 4) + c0 + x];
                 m = fmaxf(m, v[x]);
             }
 #pragma unroll
-            for (int off = 1; off < 8; off <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off));
+            for (int off = 1; off < TPR; off <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off));
             const float m_old = rmax[r], m_new = fmaxf(m_old, m);
             float sum = 0.0f;
 #pragma unroll
-            for (int x = 0; x < 8; ++x) {
+            for (int x = 0; x < KPT; ++x) {
                 const float e = m_new == -INFINITY ? 0.0f : __expf(v[x] - m_new);
                 sum += e;
                 __nv_bfloat16 hi, lo;
                 split_bf16(e, hi, lo);
                 Ph[r * PPAD + c0 + x] = hi;
-                Pl[r * PPAD + c0 + x] = lo;
+                if constexpr (ATT_SPLIT) Pl[r * PPAD + c0 + x] = lo;
             }
 #pragma unroll
-            for (int off = 1; off < 8; off <<= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
+            for (int off = 1; off < TPR; off <<= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
             __syncwarp();
-            if ((tid % 8) == 0) {
+            if ((tid % TPR) == 0) {
                 const float scale = m_old == -INFINITY ? 0.0f : __expf(m_old - m_new);
                 rscale[r] = scale;
                 rsum[r] = rsum[r] * scale + sum;
@@ -621,11 +618,11 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
         cp_async_wait<1>();  // V of this tile
         __syncthreads();
         dequant(Vs);
-        // O = O * scale + P V for this warp's 64 output columns (8 n-tiles).
+        // O = O * scale + P V for this warp's HD / MW output columns.
         {
             const float s0 = rscale[g], s1 = rscale[g + 8];
 #pragma unroll
-            for (int nt = 0; nt < 8; ++nt) {
+            for (int nt = 0; nt < ONT; ++nt) {
                 o[nt][0] *= s0;
                 o[nt][1] *= s0;
                 o[nt][2] *= s1;
@@ -635,12 +632,12 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
             for (int kk = 0; kk < MT; kk += 16) {
                 uint32_t ah[4], al[4];
                 ldmatrix_x4(ah, Ph + (lane & 15) * PPAD + kk + (lane >> 4) * 8);
-                ldmatrix_x4(al, Pl + (lane & 15) * PPAD + kk + (lane >> 4) * 8);
+                if constexpr (ATT_SPLIT) ldmatrix_x4(al, Pl + (lane & 15) * PPAD + kk + (lane >> 4) * 8);
 #pragma unroll
-                for (int nt = 0; nt < 8; nt += 2) {
+                for (int nt = 0; nt < ONT; nt += 2) {
                     uint32_t b[4];
                     const int m = lane >> 3, rr = lane & 7;
-                    ldmatrix_x4_trans(b, Vs + (kk + (m & 1) * 8 + rr) * MPAD + warp * 64 + nt * 8 + (m >> 1) * 8);
+                    ldmatrix_x4_trans(b, Vs + (kk + (m & 1) * 8 + rr) * MPAD + warp * (HD / MW) + nt * 8 + (m >> 1) * 8);
                     mma_bf16(o[nt], ah, &b[0]);
                     if constexpr (ATT_SPLIT) mma_bf16(o[nt], al, &b[0]);
                     mma_bf16(o[nt + 1], ah, &b[2]);
@@ -660,10 +657,10 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
         const int head = kvh * QPG + r;
         const float inv = 1.0f / rsum[r];
 #pragma unroll
-        for (int nt = 0; nt < 8; ++nt)
+        for (int nt = 0; nt < ONT; ++nt)
 #pragma unroll
             for (int x = 0; x < 2; ++x) {
-                const int d = warp * 64 + nt * 8 + t4 * 2 + x;
+                const int d = warp * (HD / MW) + nt * 8 + t4 * 2 + x;
                 const float gate = qg[(size_t)t * ld + head * 2 * HD + HD + d];
                 out[(size_t)t * QH * HD + head * HD + d] = f2bf(o[nt][h * 2 + x] * inv * sigmoidf(gate));
             }
