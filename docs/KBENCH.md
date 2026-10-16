@@ -181,3 +181,8 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
   arithmetic); a split multi-query attention for decode; per-expert dependencies between the expert
   gate/up and down kernels (the 1-row version was 1.8% slower); the prefill multi-query attention
   with 8 queries per block needs about 122 KB of shared memory, over the 99 KB limit.
+- Fusing hc_down and hc_finish for one token with whole rows per block (4 rows x 4 streams, the same
+  split partials and sums, so bitwise identical) is 6% slower per decode step: 81 blocks instead of
+  420 and a serial 4-thread finish. The three-kernel HC stays.
+- Draft length policy: forced fixed lengths (2, 4, 6 drafts) are 7-10% slower than the adaptive
+  policy on sampled requests; its decay (0.75-0.95) makes no measurable difference.
