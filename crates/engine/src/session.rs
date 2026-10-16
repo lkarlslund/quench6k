@@ -161,9 +161,15 @@ impl Run {
 struct Snapshot {
     pos: usize,
     buf: DeviceBuffer,
+    /// Taken at a chunk boundary inside a long prompt rather than at a turn boundary; these are
+    /// recycled first.
+    periodic: bool,
 }
 
-const MAX_SNAPSHOTS: usize = 4;
+const MAX_SNAPSHOTS: usize = 12;
+/// Periodic snapshots per prompt (at most): a long prompt edited in the middle re-prefills at most
+/// about 1/8 of itself.
+const PERIODIC_SNAPSHOTS: usize = 8;
 
 /// The largest top-k the session samples from.
 pub const MAX_TOP_K: usize = 64;
@@ -470,7 +476,7 @@ impl Session {
             }
         }
         s.synchronize()?;
-        self.snapshots.push(Snapshot { pos: tokens.len(), buf: snap_buf });
+        self.snapshots.push(Snapshot { pos: tokens.len(), buf: snap_buf, periodic: false });
         self.kv_tokens = tokens;
         Ok(())
     }
@@ -500,7 +506,7 @@ impl Session {
             s.copy_d2d(buf.addr() + off, addr, bytes)?;
             off += bytes as u64;
         }
-        Ok(Snapshot { pos, buf })
+        Ok(Snapshot { pos, buf, periodic: false })
     }
 
     fn restore_snapshot(&self, s: &Stream, snap: &Snapshot) -> Result<()> {
@@ -558,12 +564,25 @@ impl Session {
         };
         self.reused = start;
         let mut pauses: Vec<usize> = boundaries.iter().copied().filter(|&b| b > start && b < prompt.len() && b <= mm_limit && !self.snapshots.iter().any(|sn| sn.pos == b)).collect();
+        // Periodic snapshots on chunk boundaries (no extra prefill steps), at most PERIODIC_SNAPSHOTS
+        // per prompt, so a prefix shared up to any point is reusable to within one interval of it.
+        let interval = self.chunk * prompt.len().div_ceil(self.chunk * PERIODIC_SNAPSHOTS).max(1);
+        let periodic: Vec<usize> = (1..).map(|k| k * interval).take_while(|&p| p < prompt.len()).filter(|&p| p > start && p <= mm_limit && !pauses.contains(&p) && !self.snapshots.iter().any(|sn| sn.pos == p)).collect();
+        pauses.extend(&periodic);
         pauses.sort_unstable();
         pauses.dedup();
         let snapshots = &mut self.snapshots;
         self.dec.prefill_from(model, &mut self.state, &mut self.ws, s, prompt, start, self.chunk, &pauses, |state, pos, pending| {
-            let recycled = if snapshots.len() >= MAX_SNAPSHOTS { Some(snapshots.remove(0).buf) } else { None };
-            snapshots.push(Self::save_snapshot(state, pending, s, pos, recycled)?);
+            // Recycle the oldest periodic snapshot first, then the oldest.
+            let recycled = if snapshots.len() >= MAX_SNAPSHOTS {
+                let i = snapshots.iter().position(|sn| sn.periodic).unwrap_or(0);
+                Some(snapshots.remove(i).buf)
+            } else {
+                None
+            };
+            let mut snap = Self::save_snapshot(state, pending, s, pos, recycled)?;
+            snap.periodic = periodic.contains(&pos);
+            snapshots.push(snap);
             Ok(())
         })?;
         self.kv_tokens = prompt.to_vec();
