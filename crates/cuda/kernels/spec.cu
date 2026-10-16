@@ -46,7 +46,94 @@ __global__ void accept_kernel(int* rc, int* ctl, int n) {
     ctl[1] ^= 1;
 }
 
+// Sampling parameters and generator state of sampled speculative rounds.
+struct SampleParams {
+    float temperature, top_p;
+    int k;  // candidates (a prefix of the sorted top list)
+    int pad;
+    unsigned long long seed, counter;
+};
+
+SQ_DEVICE double uniform(SampleParams* sp) {
+    unsigned long long z = sp->seed + 0x9e3779b97f4a7c15ull * (++sp->counter);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    z ^= z >> 31;
+    return (double)(z >> 11) / 9007199254740992.0;
+}
+
+// Sampled verification of [x, d1 .. dn] with deterministic drafts (rows 0 .. n of sorted top-K ids and
+// logits). Each row's distribution is the plain sampler's: softmax at the temperature over the top k,
+// cut to the smallest prefix reaching top_p, renormalized. Row r < n keeps draft d_{r+1} with its
+// probability p(d) and otherwise draws from p without d; row n draws from p. The results go where the
+// greedy tokens go, so the accept kernel keeps exactly the accepted drafts and the corrected token, and
+// the output has the plain sampler's distribution.
+__global__ void sample_rows_kernel(const int* __restrict__ ids, const float* __restrict__ vals, int K, int n, int* rc,
+                                   SampleParams* sp) {
+    pdl_launch_dependents();
+    pdl_wait();
+    if (threadIdx.x != 0) return;
+    const int k = min(sp->k, K);
+    const double t = fmax((double)sp->temperature, 1e-4);
+    double probs[64];
+    for (int r = 0; r <= n; ++r) {
+        const int* id = ids + (size_t)r * K;
+        const float* v = vals + (size_t)r * K;
+        double total = 0.0;
+        for (int i = 0; i < k; ++i) {
+            probs[i] = exp(((double)v[i] - (double)v[0]) / t);
+            total += probs[i];
+        }
+        int keep = k;
+        double acc = 0.0;
+        for (int i = 0; i < k; ++i) {
+            probs[i] /= total;
+        }
+        if (sp->top_p < 1.0f) {
+            for (int i = 0; i < k; ++i) {
+                acc += probs[i];
+                if (acc >= (double)sp->top_p) {
+                    keep = i + 1;
+                    break;
+                }
+            }
+        }
+        double mass = 0.0;
+        for (int i = 0; i < keep; ++i) mass += probs[i];
+        int skip = -1;
+        double pd = 0.0;
+        if (r < n) {
+            const int d = rc[DRAFT + r];
+            for (int i = 0; i < keep; ++i)
+                if (id[i] == d) skip = i, pd = probs[i] / mass;
+            if (skip >= 0 && uniform(sp) < pd) {
+                rc[GREEDY + r] = d;
+                continue;
+            }
+        }
+        // Draw from the kept candidates without the rejected draft.
+        double rem = (mass - (skip >= 0 ? probs[skip] : 0.0)) * uniform(sp);
+        int tok = -1;
+        for (int i = 0; i < keep; ++i) {
+            if (i == skip) continue;
+            tok = id[i];
+            rem -= probs[i];
+            if (rem <= 0.0) break;
+        }
+        if (tok < 0) tok = id[0];  // only the draft was kept and it was rejected: cannot happen (pd = 1)
+        rc[GREEDY + r] = tok;
+        return;  // later rows are past the first rejection
+    }
+}
+
 }  // namespace
+
+extern "C" cudaError_t squash_spec_sample_rows(const int* ids, const float* vals, int k_list, int n, int* rc, void* params,
+                                               cudaStream_t st) {
+    if (n > NMAX || k_list > 64) return cudaErrorInvalidValue;
+    SQ_CHECK_LAUNCH(sq_launch(sample_rows_kernel, 1, 32, 0, st, ids, vals, k_list, n, rc, (SampleParams*)params));
+    SQ_RETURN_LAUNCH();
+}
 
 extern "C" int squash_spec_layout(int field) {
     switch (field) {

@@ -64,6 +64,8 @@ enum Work {
 struct Job {
     ids: Vec<i32>,
     params: GenParams,
+    /// Speculative decoding allowed (request field "mtp", default true).
+    mtp: bool,
     tx: tmpsc::UnboundedSender<Msg>,
     /// Activation capture: the output file and metadata to embed.
     capture: Option<(PathBuf, Value)>,
@@ -257,7 +259,7 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
                     }
                 }
             }
-            let speculate = slots[other].is_none() && queue.is_empty();
+            let speculate = job.mtp && slots[other].is_none() && queue.is_empty();
             let t0 = std::time::Instant::now();
             match session.begin(model, s, free, &job.ids, &job.params, speculate) {
                 Ok((run, toks)) => {
@@ -332,6 +334,7 @@ struct Prepared {
     stream: bool,
     /// Stream prefill progress chunks ("return_progress", as llama.cpp's server).
     progress: bool,
+    mtp: bool,
 }
 
 fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
@@ -383,7 +386,8 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
     let params = GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids), capture: capture.is_some(), images, progress: None };
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let progress = stream && req.get("return_progress").and_then(Value::as_bool).unwrap_or(false);
-    Ok(Prepared { capture, ids, params, stops, thinking, tools, stream, progress })
+    let mtp = req.get("mtp").and_then(Value::as_bool).unwrap_or(true);
+    Ok(Prepared { capture, ids, params, stops, thinking, tools, stream, progress, mtp })
 }
 
 /// Splits generated text into (reasoning, content, tool calls).
@@ -700,7 +704,7 @@ async fn generate(app: &App, p: &Prepared, mut on_seg: impl FnMut(Seg)) -> Resul
                 let _ = ptx.send(Msg::Progress(done, cached));
             })));
         }
-        app.jobs.send(Work::Generate(Job { ids: ids.clone(), params: params.clone(), tx, capture: p.capture.clone() })).map_err(|_| "generation worker stopped".to_string())?;
+        app.jobs.send(Work::Generate(Job { ids: ids.clone(), params: params.clone(), mtp: p.mtp, tx, capture: p.capture.clone() })).map_err(|_| "generation worker stopped".to_string())?;
         let (n, finish, cached) = drive(app, &mut rx, ids.len(), &p.stops, &mut seg, &mut stream, &mut on_seg).await?;
         total += n;
         cached_first.get_or_insert(cached);

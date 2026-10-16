@@ -396,6 +396,16 @@ pub fn spec_accept(s: &Stream, rc: u64, ctl: u64, n: usize) -> Result<()> {
     launch!("spec_accept", ffi::squash_spec_accept(im(rc), im(ctl), n32(n), s.raw()))
 }
 
+/// Sampled verification of `n` drafts from rows 0 ..= n of sorted top-`k_list` (ids, logits): writes
+/// the per-row tokens that `spec_accept` then accepts (see the kernel). `params`: the sampling
+/// parameters and generator state, [`SAMPLE_PARAMS_BYTES`] bytes.
+pub fn spec_sample_rows(s: &Stream, ids: u64, vals: u64, k_list: usize, n: usize, rc: u64, params: u64) -> Result<()> {
+    launch!("spec_sample_rows", ffi::squash_spec_sample_rows(i(ids), f(vals), n32(k_list), n32(n), im(rc), params as *mut std::ffi::c_void, s.raw()))
+}
+
+/// Layout of the sampled-round parameters: temperature f32, top_p f32, k i32, pad, seed u64, counter u64.
+pub const SAMPLE_PARAMS_BYTES: usize = 32;
+
 /// y[n] = scale2 · W[n] · x for one BF16 token x of 2560, W NVFP4 [n, 2560] (codes, block scales, scale2).
 pub fn nvfp4_dense_gemv(s: &Stream, x: u64, codes: u64, scales: u64, scale2: u64, y: u64, n: usize) -> Result<()> {
     launch!("nvfp4_dense_gemv", ffi::squash_nvfp4_dense_gemv(p(x), p(codes), p(scales), f(scale2), fm(y), n32(n), s.raw()))

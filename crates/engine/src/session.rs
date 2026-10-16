@@ -331,7 +331,7 @@ impl Session {
         ensure!(!prompt.is_empty(), "empty prompt");
         ensure!(prompt.len() < self.capacity, "prompt of {} tokens exceeds the context of {}", prompt.len(), self.capacity);
         let budget = p.max_tokens.min(self.capacity - prompt.len());
-        let mut run = Run { slot, params: p.clone(), produced: 0, spec: false, pending: 0, rng: Rng(p.seed ^ 0x9e37_79b9_7f4a_7c15), budget };
+        let mut run = Run { slot, params: p.clone(), produced: 0, spec: false, pending: 0, rng: Rng::new(p.seed), budget };
         let speculate = speculate && !p.capture;
         self.prompt_site = None;
         let capture = if p.capture { Some(forward::CaptureTarget { pos: prompt.len() - 1, buf: self.capture_buf()? }) } else { None };
@@ -347,7 +347,12 @@ impl Session {
             if let Some(c) = capture {
                 self.prompt_site = Some(self.read_site(s, "prompt_last", c.buf, c.pos, prompt[c.pos], self.dec.last_logits_addr())?);
             }
-            if p.temperature <= 0.0 && speculate {
+            if speculate {
+                // Sampled runs draw the first token here; the first round commits it.
+                if p.temperature > 0.0 {
+                    self.dec.next = self.sample(s, self.dec.last_logits_addr(), p, &mut run.rng)?;
+                }
+                self.spec.set_sampling(s, sampling(p))?;
                 self.spec.restart(&self.state, &self.dec, s)?;
                 run.spec = true;
                 return Ok((run, Vec::new()));
@@ -669,7 +674,12 @@ impl Session {
         }
         self.mm_pending = self.encode_images(s, p)?;
         self.prefill(model, s, prompt, &p.images, &p.boundaries, p.steering_strength, p.progress.as_ref())?;
-        if p.temperature <= 0.0 {
+        if p.temperature <= 0.0 || !p.capture {
+            if p.temperature > 0.0 {
+                let mut rng = Rng::new(p.seed);
+                self.dec.next = self.sample(s, self.dec.last_logits_addr(), p, &mut rng)?;
+            }
+            self.spec.set_sampling(s, sampling(p))?;
             self.spec.restart(&self.state, &self.dec, s)?;
             // The target's first token, then speculative rounds (each commits the previous `next`
             // and the accepted drafts; the round's own `next` is emitted by the following round).
@@ -688,7 +698,7 @@ impl Session {
             }
         }
         // Sampled: the first token from the last prompt row's logits, then one token per step.
-        let mut rng = Rng(p.seed ^ 0x9e37_79b9_7f4a_7c15);
+        let mut rng = Rng::new(p.seed);
         let mut tok = self.sample(s, self.dec.last_logits_addr(), p, &mut rng)?;
         loop {
             if let Some(f) = emit(tok, &mut produced) {
@@ -734,8 +744,22 @@ impl Session {
     }
 }
 
+/// The speculative rounds' sampling parameters for a request (None: greedy).
+fn sampling(p: &GenParams) -> Option<(f32, f32, usize, u64)> {
+    (p.temperature > 0.0).then(|| (p.temperature, p.top_p, p.top_k, p.seed ^ 0x5bd1_e995_7f4a_7c15))
+}
+
 struct Rng(u64);
 impl Rng {
+    /// A generator whose stream depends on every bit of `seed` (xorshift alone, seeded with nearby
+    /// values, starts with nearly identical outputs).
+    fn new(seed: u64) -> Self {
+        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Self((z ^ (z >> 31)) | 1)
+    }
+
     fn next(&mut self) -> f64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;

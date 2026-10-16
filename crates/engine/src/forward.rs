@@ -1105,6 +1105,12 @@ pub fn draft_head_argmax_into(model: &Model, hw: &HeadWorkspace, s: &Stream, hid
     k::draft_head_argmax(s, hidden, mtp.draft_sketch, mtp.draft_head, hw.logits.addr(), hw.pick.addr(), VOCAB, out)
 }
 
+/// LM-head logits of `rows` consecutive hidden rows into the head workspace.
+pub fn head_logits_rows(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64, rows: usize) -> Result<()> {
+    ensure!(rows <= hw.rows, "head workspace holds {} rows", hw.rows);
+    linear_ld(s, hw.partial.addr(), hidden, D, &model.lm_head, hw.logits.addr(), VOCAB, rows)
+}
+
 /// LM-head logits of one hidden row into the head workspace (row 0).
 pub fn head_logits(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64) -> Result<()> {
     linear_ld(s, hw.partial.addr(), hidden, D, &model.lm_head, hw.logits.addr(), VOCAB, 1)

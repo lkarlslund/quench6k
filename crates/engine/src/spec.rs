@@ -190,7 +190,15 @@ pub struct SpecGraphs {
     _rc: DeviceBuffer,
     rc_host: squash_cuda::PinnedBuffer,
     pub policy: DraftPolicy,
+    /// Sampled rounds: the parameters and generator state, and the verified rows' top candidates.
+    sample_params: DeviceBuffer,
+    _top_ids: DeviceBuffer,
+    _top_vals: DeviceBuffer,
+    sampled: bool,
 }
+
+/// Candidates per verified row in sampled rounds (the request's top_k is a prefix of them).
+pub const SAMPLE_TOP: usize = 64;
 
 struct GraphSet {
     n: usize,
@@ -198,6 +206,7 @@ struct GraphSet {
     mtp: Vec<squash_cuda::Graph>,
     verify_before_ple: squash_cuda::Graph,
     verify_from_ple: squash_cuda::Graph,
+    verify_from_ple_sampled: squash_cuda::Graph,
     bytes: usize,
 }
 
@@ -281,6 +290,9 @@ impl SpecGraphs {
         let (layout_max, draft_at, greedy_at, ints) = k::spec_layout();
         ensure!(nmax <= layout_max, "at most {layout_max} drafts");
         let rc = DeviceBuffer::zeroed(ints * 4)?;
+        let sample_params = DeviceBuffer::zeroed(k::SAMPLE_PARAMS_BYTES)?;
+        let top_ids = DeviceBuffer::new((nmax + 1) * SAMPLE_TOP * 4)?;
+        let top_vals = DeviceBuffer::new((nmax + 1) * SAMPLE_TOP * 4)?;
         let rc_host = squash_cuda::PinnedBuffer::new(ints * 4)?;
         let ctl = state.spec.as_ref().context("sequence without speculative state")?.ctl.addr();
         let (tok_off, pos_off) = forward::step_offsets(ws);
@@ -315,11 +327,38 @@ impl SpecGraphs {
                 s.copy_d2d(dec.verified.addr(), ws.h, (n + 1) * H * 4)?;
                 unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
             })?;
-            sets.push(GraphSet { n, mtp, verify_before_ple, verify_from_ple, bytes });
+            let verify_from_ple_sampled = squash_cuda::Graph::capture(s, |s| {
+                forward::forward_part(model, state, ws, s, n + 1, bytes, Part::FromPle, true, None)?;
+                forward::head_logits_rows(model, &dec.head, s, ws.out, n + 1)?;
+                k::topk(s, dec.head.logits_addr(), n + 1, crate::model::VOCAB, crate::model::VOCAB, SAMPLE_TOP, false, top_ids.addr(), top_vals.addr())?;
+                k::spec_sample_rows(s, top_ids.addr(), top_vals.addr(), SAMPLE_TOP, n, rc.addr(), sample_params.addr())?;
+                k::spec_accept(s, rc.addr(), ctl, n)?;
+                s.copy_d2d(dec.verified.addr(), ws.h, (n + 1) * H * 4)?;
+                unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
+            })?;
+            sets.push(GraphSet { n, mtp, verify_before_ple, verify_from_ple, verify_from_ple_sampled, bytes });
         }
         // Round state: next token at position len(state), nothing to catch up yet.
         s.upload_to(rc.addr(), &[state.len() as i32, dec.next, 0, 0])?;
-        Ok(Self { sets, _rc: rc, rc_host, policy: DraftPolicy::new(lengths) })
+        Ok(Self { sets, _rc: rc, rc_host, policy: DraftPolicy::new(lengths), sample_params, _top_ids: top_ids, _top_vals: top_vals, sampled: false })
+    }
+
+    /// Greedy rounds (`None`), or sampled rounds with (temperature, top_p, top_k, seed); top_k is capped
+    /// at [`SAMPLE_TOP`] (0: all of them).
+    pub fn set_sampling(&mut self, s: &Stream, sampling: Option<(f32, f32, usize, u64)>) -> Result<()> {
+        self.sampled = sampling.is_some();
+        if let Some((t, top_p, k, seed)) = sampling {
+            let k = if k == 0 { SAMPLE_TOP } else { k.min(SAMPLE_TOP) } as u32;
+            let mut b = Vec::with_capacity(32);
+            b.extend_from_slice(&t.to_le_bytes());
+            b.extend_from_slice(&top_p.to_le_bytes());
+            b.extend_from_slice(&k.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&seed.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            s.upload_to(self.sample_params.addr(), &b)?;
+        }
+        Ok(())
     }
 
     /// Points the round control at a decoder restarted on a new prompt.
@@ -349,7 +388,7 @@ impl SpecGraphs {
         set.verify_before_ple.launch(s)?;
         let bytes = forward::prepare_ple(model, state, ws, n + 1)?;
         debug_assert_eq!(bytes, set.bytes);
-        set.verify_from_ple.launch(s)?;
+        if self.sampled { set.verify_from_ple_sampled.launch(s)? } else { set.verify_from_ple.launch(s)? }
         s.synchronize()?;
         dec.verify_secs += t1.elapsed().as_secs_f64();
         let a = self.rc_word(3) as usize;
