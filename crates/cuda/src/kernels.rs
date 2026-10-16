@@ -231,8 +231,11 @@ pub fn moe_route(s: &Stream, logits: u64, ld: usize, t: usize, top_i: u64, top_w
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn moe_plan(s: &Stream, top_i: u64, t: usize, counts: u64, cursor: u64, offsets: u64, tile_expert: u64, tile_row: u64, num_tiles: u64, pair_row: u64) -> Result<()> {
-    launch!("moe_plan", ffi::squash_moe_plan(i(top_i), n32(t), im(counts), im(cursor), im(offsets), im(tile_expert), im(tile_row), im(num_tiles), im(pair_row), s.raw()))
+/// Groups the routed pairs by expert into tiles of `tile_rows` rows ([`moe_tile_rows`] for the BF16
+/// expert GEMM, [`fp4_tile_rows`] for the FP4 one).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_plan(s: &Stream, top_i: u64, t: usize, counts: u64, cursor: u64, offsets: u64, tile_expert: u64, tile_row: u64, num_tiles: u64, pair_row: u64, tile_rows: usize) -> Result<()> {
+    launch!("moe_plan", ffi::squash_moe_plan(i(top_i), n32(t), im(counts), im(cursor), im(offsets), im(tile_expert), im(tile_row), im(num_tiles), im(pair_row), n32(tile_rows), s.raw()))
 }
 
 pub fn moe_gather(s: &Stream, m: u64, pair_row: u64, t: usize, xs: u64) -> Result<()> {

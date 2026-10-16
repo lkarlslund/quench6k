@@ -103,7 +103,8 @@ SQ_DEVICE void mma_fp4(float* c, const uint32_t* a, const uint32_t* b, uint32_t 
 // Tile: BM rows of one expert x BN outputs; k-tiles of BK values (BK / 2 bytes per row). Rows in
 // shared memory are 64 bytes (four 16-byte chunks), chunk c of row r stored at c ^ ((r >> 1) & 3) so
 // that ldmatrix reads of 8 rows hit distinct banks.
-constexpr int BM = 64, BN = 128, BK = 128, RB = BK / 2, STAGES = 4, THREADS = 256;
+constexpr int BM = 128, BN = 128, BK = 128, RB = BK / 2, STAGES = 2, THREADS = 256;
+constexpr int MI = BM / 32, WTM = BM / 2;  // m16 tiles per warp; warp tile rows (warps 2 x 4)
 
 SQ_DEVICE int swz(int r, int c) { return r * RB + ((c ^ ((r >> 1) & 3)) << 4); }
 
@@ -125,7 +126,7 @@ struct UpArgs {
 };
 
 template <bool GU = false, typename OT = float>
-__global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ As,
+__global__ void __launch_bounds__(THREADS, 2) fp4_gemm_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ As,
                                                            const float* __restrict__ Ar, const uint64_t* __restrict__ w_ptr,
                                                            const uint64_t* __restrict__ s_ptr, const float* __restrict__ ws2,
                                                            const int* __restrict__ offsets, const int* __restrict__ tile_expert,
@@ -153,8 +154,9 @@ __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __rest
 
     auto load = [&](int s, int kt) {
         Stage& g = st[s];
-        {  // A: 64 rows x 4 chunks, one per thread
-            const int r = tid >> 2, c = tid & 3;
+#pragma unroll
+        for (int i = 0; i < BM * 4 / THREADS; ++i) {  // A: BM rows x 4 chunks
+            const int idx = tid + i * THREADS, r = idx >> 2, c = idx & 3;
             const bool ok = r0 + r < r_end;
             cp_async16(&g.a[swz(r, c)], A + (size_t)(ok ? r0 + r : r0) * KB + kt * RB + c * 16, ok);
         }
@@ -175,7 +177,7 @@ __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __rest
         }
     };
 
-    float acc[2][4][4] = {};
+    float acc[MI][4][4] = {};
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < k_tiles) load(s, s);
@@ -191,12 +193,12 @@ __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __rest
         const Stage& g = st[kt % STAGES];
 #pragma unroll
         for (int s = 0; s < 2; ++s) {  // two k64 steps per k-tile
-            uint32_t a[2][4], b[4][2], sa[2], sb[4];
+            uint32_t a[MI][4], b[4][2], sa[MI], sb[4];
 #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                const int r = warp_m * 32 + i * 16 + (lane & 15);
+            for (int i = 0; i < MI; ++i) {
+                const int r = warp_m * WTM + i * 16 + (lane & 15);
                 ldmatrix_x4(a[i], &g.a[swz(r, s * 2 + (lane >> 4))]);
-                sa[i] = *reinterpret_cast<const uint32_t*>(&g.as[(warp_m * 32 + i * 16 + ta) * 8 + s * 4]);
+                sa[i] = *reinterpret_cast<const uint32_t*>(&g.as[(warp_m * WTM + i * 16 + ta) * 8 + s * 4]);
             }
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
@@ -208,7 +210,7 @@ __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __rest
 #pragma unroll
             for (int j = 0; j < 4; ++j) sb[j] = *reinterpret_cast<const uint32_t*>(&g.bs[(warp_n * 32 + j * 8 + tb) * 8 + s * 4]);
 #pragma unroll
-            for (int i = 0; i < 2; ++i)
+            for (int i = 0; i < MI; ++i)
 #pragma unroll
                 for (int j = 0; j < 4; ++j) mma_fp4(acc[i][j], a[i], b[j], sa[i], sb[j]);
         }
@@ -223,10 +225,10 @@ __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __rest
         const float s2u = up.ws2[e];
         if (warp_n >= 2) {
 #pragma unroll
-            for (int i = 0; i < 2; ++i)
+            for (int i = 0; i < MI; ++i)
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    const int rl = warp_m * 32 + i * 16 + g8 + h * 8, r = r0 + rl;
+                    const int rl = warp_m * WTM + i * 16 + g8 + h * 8, r = r0 + rl;
                     if (r >= r_end) continue;
                     const float sc = Ar[r] * s2u;
 #pragma unroll
@@ -238,10 +240,10 @@ __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __rest
         __syncthreads();
         if (warp_n < 2) {
 #pragma unroll
-            for (int i = 0; i < 2; ++i)
+            for (int i = 0; i < MI; ++i)
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    const int rl = warp_m * 32 + i * 16 + g8 + h * 8, r = r0 + rl;
+                    const int rl = warp_m * WTM + i * 16 + g8 + h * 8, r = r0 + rl;
                     if (r >= r_end) continue;
                     const float sc = Ar[r] * s2;
 #pragma unroll
@@ -256,10 +258,10 @@ __global__ void __launch_bounds__(THREADS) fp4_gemm_kernel(const uint8_t* __rest
         return;
     }
 #pragma unroll
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < MI; ++i)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int r = r0 + warp_m * 32 + i * 16 + g8 + h * 8;
+            const int r = r0 + warp_m * WTM + i * 16 + g8 + h * 8;
             if (r >= r_end) continue;
             const float sc = Ar[r] * s2;
 #pragma unroll

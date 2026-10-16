@@ -914,12 +914,12 @@ extern "C" cudaError_t squash_moe_route(const float* logits, int ld, int T, int*
 // Groups the T*10 routed pairs by expert. Scratch: counts/cursor [512], offsets [513],
 // tile_expert/tile_row [max tiles], num_tiles [1], pair_row [T*10].
 extern "C" cudaError_t squash_moe_plan(const int* top_i, int T, int* counts, int* cursor, int* offsets, int* tile_expert,
-                                       int* tile_row, int* num_tiles, int* pair_row, cudaStream_t st) {
+                                       int* tile_row, int* num_tiles, int* pair_row, int tile_rows, cudaStream_t st) {
     const int pairs = T * TOPK;
     cudaError_t err = cudaMemsetAsync(counts, 0, E * sizeof(int), st);
     if (err != cudaSuccess) return err;
     if (pairs > 0) SQ_CHECK_LAUNCH(sq_launch(count_kernel, (pairs + 255) / 256, 256, 0, st, top_i, pairs, counts));
-    SQ_CHECK_LAUNCH(sq_launch(plan_kernel, 1, E, 0, st, counts, offsets, cursor, tile_expert, tile_row, num_tiles, BM));
+    SQ_CHECK_LAUNCH(sq_launch(plan_kernel, 1, E, 0, st, counts, offsets, cursor, tile_expert, tile_row, num_tiles, tile_rows));
     if (pairs > 0) SQ_CHECK_LAUNCH(sq_launch(scatter_kernel, (pairs + 255) / 256, 256, 0, st, top_i, pairs, cursor, pair_row));
     SQ_RETURN_LAUNCH();
 }

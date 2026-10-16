@@ -125,7 +125,7 @@ pub mod ffi {
         pub fn squash_qsa_split_floats(t: c_int) -> usize;
         pub fn squash_qsa_attention_split(q: *const f32, qg: *const f32, ld: c_int, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: *const i32, t: c_int, fp8: c_int, part: *mut f32, out: *mut c_void, stream: Stream) -> Error;
         pub fn squash_moe_route(logits: *const f32, ld: c_int, t: c_int, top_i: *mut i32, top_w: *mut f32, stream: Stream) -> Error;
-        pub fn squash_moe_plan(top_i: *const i32, t: c_int, counts: *mut i32, cursor: *mut i32, offsets: *mut i32, tile_expert: *mut i32, tile_row: *mut i32, num_tiles: *mut i32, pair_row: *mut i32, stream: Stream) -> Error;
+        pub fn squash_moe_plan(top_i: *const i32, t: c_int, counts: *mut i32, cursor: *mut i32, offsets: *mut i32, tile_expert: *mut i32, tile_row: *mut i32, num_tiles: *mut i32, pair_row: *mut i32, tile_rows: c_int, stream: Stream) -> Error;
         pub fn squash_moe_gather(m: *const c_void, pair_row: *const i32, t: c_int, xs: *mut c_void, stream: Stream) -> Error;
         pub fn squash_fp4_tile_rows() -> c_int;
         pub fn squash_mxfp8_rows(x: *const c_void, rows: c_int, cols: c_int, ld: c_int, codes: *mut u8, scales: *mut u8, stream: Stream) -> Error;
