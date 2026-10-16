@@ -520,8 +520,19 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
             fold(&name, t.addr, t.shape[0], t.shape[1])?;
         }
         // Experiment: the projections that would be 8-bit rounded to MXFP8 in place.
-        if std::env::var_os("SQUASH_FAKE_MXFP8").is_some() {
-            let names: Vec<String> = weights.tensors.keys().filter(|n| selection::eight_bit(n)).cloned().collect();
+        // SQUASH_FAKE_MXFP8_SET: comma-separated classes (gdn, gdnout, attn) instead of everything.
+        let set = std::env::var("SQUASH_FAKE_MXFP8_SET").ok();
+        let in_set = |n: &str| match &set {
+            None => true,
+            Some(set) => set.split(',').any(|c| match c {
+                "gdn" => n.contains(".linear_attn.in_proj"),
+                "gdnout" => n.contains(".linear_attn.out_proj"),
+                "attn" => n.contains(".self_attn."),
+                _ => false,
+            }),
+        };
+        if std::env::var_os("SQUASH_FAKE_MXFP8").is_some() || set.is_some() {
+            let names: Vec<String> = weights.tensors.keys().filter(|n| selection::eight_bit(n) && in_set(n)).cloned().collect();
             for name in names {
                 let t = weights.get(&name)?;
                 if t.shape.len() == 2 && t.shape[1] % 32 == 0 {

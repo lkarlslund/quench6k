@@ -882,6 +882,9 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
             let st = || gdn.expect("GDN layer state");
             let (ld, x) = (g.proj.n, ws.proj);
             let col = |j: usize| x + (g.proj.col(j) * 4) as u64;
+            if t > k::gemv_max_m() && fake_set("gdn") {
+                k::fake_mxfp8(s, ws.m, t, D, D)?;
+            }
             op!(prof, "gdn proj", s, project(s, ws, ws.m, &g.proj, x, t));
             let spec = match (ctx.spec, gdn_rec) {
                 (Some((ctl, _, defer)), Some(rec)) => Some(k::Deferral { rec, ctl, defer }),
@@ -964,6 +967,11 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
 fn gdn_tc() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("SQUASH_GDN_TC").map_or(true, |v| v != "0"))
+}
+
+/// Experiment: whether projection class `c` is fake-quantized to MXFP8 (SQUASH_FAKE_MXFP8_SET).
+fn fake_set(c: &str) -> bool {
+    std::env::var("SQUASH_FAKE_MXFP8_SET").is_ok_and(|v| v.split(',').any(|x| x == c))
 }
 
 pub fn fp4_prefill() -> bool {
