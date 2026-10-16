@@ -494,3 +494,59 @@ fn hc_combine_norm_matches_separate() {
     let (a, b): (Vec<u16>, Vec<u16>) = (s.download(na.addr(), t * 10240).unwrap(), s.download(nb.addr(), t * 10240).unwrap());
     assert_eq!(a, b, "norms differ");
 }
+
+/// Prefill GEMM throughput (run with --ignored --nocapture).
+#[test]
+#[ignore]
+fn gemm_throughput() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    for &(m, n, k) in &[(8192usize, 16512usize, 2560usize), (8192, 2560, 6144), (8192, 324, 10240), (8192, 10240, 320)] {
+        let x = DeviceBuffer::zeroed(m * k * 2).unwrap();
+        let w = DeviceBuffer::zeroed(n * k * 2).unwrap();
+        let wq = DeviceBuffer::zeroed(n * k).unwrap();
+        let sc = DeviceBuffer::zeroed(n * k / 64 * 4).unwrap();
+        let y = DeviceBuffer::zeroed(m * n * 4).unwrap();
+        for (name, fmt, wa, sa) in [("bf16", WeightFormat::Bf16, w.addr(), 0), ("int8g", WeightFormat::Int8Group, wq.addr(), sc.addr())] {
+            let run = || kernels::gemm_f32(&s, x.addr(), k, fmt, wa, k, sa, y.addr(), n, m, n, k, 1.0, false).unwrap();
+            run();
+            s.synchronize().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..10 { run(); }
+            s.synchronize().unwrap();
+            let secs = t.elapsed().as_secs_f64() / 10.0;
+            println!("{m}x{n}x{k} {name}: {:.3} ms, {:.0} TFLOPS", secs * 1e3, 2.0 * (m * n * k) as f64 / secs / 1e12);
+        }
+    }
+}
+
+/// Large GEMMs take the 256-row tile path: sampled outputs against the CPU, BF16 and INT8-group weights.
+#[test]
+fn gemm_tall_tiles_match_cpu() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x7a11_0001);
+    let (m, n, k) = (8200usize, 4100usize, 128usize);
+    let x = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
+    let w = rng.vec(n * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
+    let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
+    let wq = DeviceBuffer::new(n * k).unwrap();
+    let wsc = DeviceBuffer::new(n * k / 64 * 4).unwrap();
+    kernels::quantize_int8_groups(&s, dw.addr(), n, k, wq.addr(), wsc.addr()).unwrap();
+    let q: Vec<i8> = s.download(wq.addr(), n * k).unwrap();
+    let sc: Vec<f32> = s.download(wsc.addr(), n * k / 64).unwrap();
+    for (fmt, wa, sa) in [(WeightFormat::Bf16, dw.addr(), 0), (WeightFormat::Int8Group, wq.addr(), wsc.addr())] {
+        let dy = DeviceBuffer::zeroed(m * n * 4).unwrap();
+        kernels::gemm_f32(&s, dx.addr(), k, fmt, wa, k, sa, dy.addr(), n, m, n, k, 1.0, false).unwrap();
+        let y: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
+        let wv = |j: usize, t: usize| if sa == 0 { w[j * k + t] } else { bf16::round(q[j * k + t] as f32 * sc[(j * k + t) / 64]) };
+        let mut worst = 0f64;
+        for _ in 0..4000 {
+            let i = (((rng.next() + 1.0) * 0.5) * m as f32) as usize % m;
+            let j = (((rng.next() + 1.0) * 0.5) * n as f32) as usize % n;
+            let dot: f64 = (0..k).map(|t| x[i * k + t] as f64 * wv(j, t) as f64).sum();
+            worst = worst.max((y[i * n + j] as f64 - dot).abs() / (k as f64).sqrt());
+        }
+        assert!(worst < 1e-4, "{fmt:?}: error {worst}");
+    }
+}
