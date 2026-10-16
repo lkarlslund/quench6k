@@ -49,6 +49,34 @@ pub struct ImageInput {
     pub input: crate::vision::VisionInput,
 }
 
+/// A content key per image span start: (prompt index, a negative pseudo-token ID from a hash of the
+/// pixels and grid). Real token IDs are non-negative, so a key never matches a token.
+fn image_marks(images: &[std::sync::Arc<ImageInput>]) -> Vec<(usize, i32)> {
+    let mut marks = Vec::new();
+    for im in images {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for v in im.input.grid.iter().map(|&g| g as u32).chain(im.input.pixels.iter().map(|p| p.to_bits())) {
+            h = (h ^ v as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        for (k, &start) in im.starts.iter().enumerate() {
+            let hk = (h ^ (k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+            marks.push((start, -1 - ((hk >> 33) as i32 & 0x3fff_ffff)));
+        }
+    }
+    marks
+}
+
+/// `tokens` with the marked positions replaced by their keys.
+fn keyed(tokens: &[i32], marks: &[(usize, i32)]) -> Vec<i32> {
+    let mut v = tokens.to_vec();
+    for &(i, key) in marks {
+        if i < v.len() {
+            v[i] = key;
+        }
+    }
+    v
+}
+
 impl std::fmt::Debug for ImageInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ImageInput {{ starts: {:?}, grid: {:?} }}", self.starts, self.input.grid)
@@ -122,9 +150,9 @@ pub struct Session {
     vision: Option<crate::vision::VisionModel>,
     /// Image spans of the request being prefilled on slot 0.
     mm_pending: Vec<std::sync::Arc<forward::MmSpan>>,
-    /// Cached tokens past this index follow an image (placeholder IDs do not identify the image), so
-    /// they are never reused.
-    kv_limit: usize,
+    /// Prompt positions whose `kv_tokens` entry is an image's content key instead of its placeholder
+    /// ID (the first placeholder of each image), so the cache matches images by content.
+    kv_marks: Vec<(usize, i32)>,
 }
 
 struct Aux {
@@ -219,7 +247,7 @@ impl Session {
             prompt_site: None,
             vision: None,
             mm_pending: Vec::new(),
-            kv_limit: usize::MAX,
+            kv_marks: Vec::new(),
         })
     }
 
@@ -253,7 +281,7 @@ impl Session {
         r?;
         forward::head_logits(model, &self.hw, s, self.ws.out)?;
         if run.slot == 0 {
-            self.kv_tokens = self.state.tokens.clone();
+            self.sync_kv_tokens();
         }
         let site = self.read_site(s, "completion_last", buf, pos, run.pending, self.hw.logits_addr())?;
         Ok(Some(CaptureResult { sites: vec![prompt_site, site] }))
@@ -313,7 +341,7 @@ impl Session {
             self.state.reset(s)?;
             self.state.set_steering_strength(s, p.steering_strength)?;
             self.ws.capture = capture;
-            let r = self.prefill(model, s, prompt, &p.boundaries, p.steering_strength, p.progress.as_ref());
+            let r = self.prefill(model, s, prompt, &p.images, &p.boundaries, p.steering_strength, p.progress.as_ref());
             self.ws.capture = None;
             r?;
             if let Some(c) = capture {
@@ -381,13 +409,13 @@ impl Session {
         match runs {
             [run] if run.spec => {
                 let committed = self.spec.round(model, &mut self.state, &mut self.ws, &mut self.dec, s)?;
-                self.kv_tokens = self.state.tokens.clone();
+                self.sync_kv_tokens();
                 Ok(vec![committed])
             }
             [run] => {
                 if run.slot == 0 {
                     self.graph.step(model, &mut self.state, &mut self.ws, &self.hw, s, run.pending)?;
-                    self.kv_tokens = self.state.tokens.clone();
+                    self.sync_kv_tokens();
                 } else {
                     let aux = self.aux.as_mut().expect("second slot");
                     aux.graph.step(model, &mut aux.state, &mut self.ws, &self.hw, s, run.pending)?;
@@ -401,7 +429,7 @@ impl Session {
                 let aux = self.aux.as_mut().expect("second slot");
                 aux.batch.step(model, &mut [&mut self.state, &mut aux.state], &mut self.ws, s, &[a.pending, b.pending])?;
                 s.synchronize()?;
-                self.kv_tokens = self.state.tokens.clone();
+                self.sync_kv_tokens();
                 let logits = self.aux.as_ref().unwrap().hw2.logits_addr();
                 let ta = self.sample(s, logits, &a.params.clone(), &mut a.rng)?;
                 let tb = self.sample(s, logits + (VOCAB * 4) as u64, &b.params.clone(), &mut b.rng)?;
@@ -497,6 +525,11 @@ impl Session {
         Ok(())
     }
 
+    /// `kv_tokens` for the slot-0 sequence: its tokens with image placeholders keyed by content.
+    fn sync_kv_tokens(&mut self) {
+        self.kv_tokens = keyed(&self.state.tokens, &self.kv_marks);
+    }
+
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -536,21 +569,22 @@ impl Session {
 
     /// Positions the state, target and MTP caches on the longest snapshot whose prefix the caches still
     /// hold, prefills the rest of `prompt`, and takes new snapshots at `boundaries`.
-    fn prefill(&mut self, model: &Model, s: &Stream, prompt: &[i32], boundaries: &[usize], strength: f32, progress: Option<&Progress>) -> Result<()> {
+    fn prefill(&mut self, model: &Model, s: &Stream, prompt: &[i32], images: &[std::sync::Arc<ImageInput>], boundaries: &[usize], strength: f32, progress: Option<&Progress>) -> Result<()> {
         // Steered state is never reused across strengths, and the store holds unsteered state only.
         if self.kv_strength != strength {
             self.kv_tokens.clear();
             self.snapshots.clear();
         }
-        let mm_limit = self.mm_pending.first().map(|sp| sp.start).unwrap_or(usize::MAX);
-        let mut lcp = self.kv_tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count().min(self.kv_limit).min(mm_limit);
+        let marks = image_marks(images);
+        let key = keyed(prompt, &marks);
+        let mut lcp = self.kv_tokens.iter().zip(&key).take_while(|(a, b)| a == b).count();
         if strength == 0.0 && self.store.enabled() {
             // The new prompt overwrites the cached conversation past `lcp`: keep its boundary state.
             if self.snapshots.iter().any(|sn| sn.pos > lcp) {
                 self.stash(usize::MAX)?;
             }
             let gpu_best = self.snapshots.iter().filter(|sn| sn.pos <= lcp && sn.pos < prompt.len()).map(|sn| sn.pos).max().unwrap_or(0);
-            if let Some((i, len)) = self.store.best(prompt) {
+            if let Some((i, len)) = self.store.best(&key) {
                 if len > gpu_best {
                     self.load_entry(s, i)?;
                     lcp = len;
@@ -562,7 +596,7 @@ impl Session {
         self.snapshots.retain(|sn| sn.pos <= lcp);
         self.state.reset(s)?;
         self.state.mm = std::mem::take(&mut self.mm_pending);
-        self.kv_limit = mm_limit;
+        self.kv_marks = marks;
         let best = self.snapshots.iter().enumerate().filter(|(_, sn)| sn.pos < prompt.len()).max_by_key(|(_, sn)| sn.pos).map(|(i, _)| i);
         let start = match best {
             Some(i) => {
@@ -583,11 +617,11 @@ impl Session {
             (f.0)(start, start);
         }
         let report = progress.map(|f| move |pos: usize| (f.0)(pos, start));
-        let mut pauses: Vec<usize> = boundaries.iter().copied().filter(|&b| b > start && b < prompt.len() && b <= mm_limit && !self.snapshots.iter().any(|sn| sn.pos == b)).collect();
+        let mut pauses: Vec<usize> = boundaries.iter().copied().filter(|&b| b > start && b < prompt.len() && !self.snapshots.iter().any(|sn| sn.pos == b)).collect();
         // Periodic snapshots on chunk boundaries (no extra prefill steps), at most PERIODIC_SNAPSHOTS
         // per prompt, so a prefix shared up to any point is reusable to within one interval of it.
         let interval = self.chunk * prompt.len().div_ceil(self.chunk * PERIODIC_SNAPSHOTS).max(1);
-        let periodic: Vec<usize> = (1..).map(|k| k * interval).take_while(|&p| p < prompt.len()).filter(|&p| p > start && p <= mm_limit && !pauses.contains(&p) && !self.snapshots.iter().any(|sn| sn.pos == p)).collect();
+        let periodic: Vec<usize> = (1..).map(|k| k * interval).take_while(|&p| p < prompt.len()).filter(|&p| p > start && !pauses.contains(&p) && !self.snapshots.iter().any(|sn| sn.pos == p)).collect();
         pauses.extend(&periodic);
         pauses.sort_unstable();
         pauses.dedup();
@@ -605,7 +639,7 @@ impl Session {
             snapshots.push(snap);
             Ok(())
         }, report.as_ref().map(|f| f as &(dyn Fn(usize) + Send + Sync)))?;
-        self.kv_tokens = prompt.to_vec();
+        self.kv_tokens = key;
         Ok(())
     }
 
@@ -634,7 +668,7 @@ impl Session {
             return Ok((Finish::Length, 0));
         }
         self.mm_pending = self.encode_images(s, p)?;
-        self.prefill(model, s, prompt, &p.boundaries, p.steering_strength, p.progress.as_ref())?;
+        self.prefill(model, s, prompt, &p.images, &p.boundaries, p.steering_strength, p.progress.as_ref())?;
         if p.temperature <= 0.0 {
             self.spec.restart(&self.state, &self.dec, s)?;
             // The target's first token, then speculative rounds (each commits the previous `next`
@@ -643,12 +677,12 @@ impl Session {
                 let committed = self.spec.round(model, &mut self.state, &mut self.ws, &mut self.dec, s)?;
                 for &tok in &committed {
                     if let Some(f) = emit(tok, &mut produced) {
-                        self.kv_tokens = self.state.tokens.clone();
+                        self.sync_kv_tokens();
                         return Ok((f, produced));
                     }
                 }
                 if self.state.len() + 2 * (self.dec.drafts + 2) >= self.state.capacity {
-                    self.kv_tokens = self.state.tokens.clone();
+                    self.sync_kv_tokens();
                     return Ok((Finish::Length, produced));
                 }
             }
@@ -658,7 +692,7 @@ impl Session {
         let mut tok = self.sample(s, self.dec.last_logits_addr(), p, &mut rng)?;
         loop {
             if let Some(f) = emit(tok, &mut produced) {
-                self.kv_tokens = self.state.tokens.clone();
+                self.sync_kv_tokens();
                 return Ok((f, produced));
             }
             self.graph.step(model, &mut self.state, &mut self.ws, &self.hw, s, tok)?;
