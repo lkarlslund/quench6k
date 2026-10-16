@@ -195,6 +195,9 @@ enum Command {
         /// Concurrent requests decoded together (1 or 2).
         #[arg(long, default_value_t = 2)]
         slots: usize,
+        /// Directory for activation captures requested per request ("capture": {"name": ...}).
+        #[arg(long)]
+        capture_dir: Option<PathBuf>,
     },
     /// Batched decode check: two fixture prompts decoded together must give each one's single-sequence
     /// greedy tokens, bit for bit; also times both.
@@ -329,8 +332,8 @@ fn main() -> Result<()> {
             }
         }
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, &steer)?,
-        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots } => {
-            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots })?
+        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir } => {
+            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir })?
         }
         Command::BatchCheck { model, fixture, n } => batch_check(&model, &fixture, n)?,
         Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, steer } => {
@@ -532,7 +535,7 @@ fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, tempe
     let messages = serde_json::json!([{"role": "user", "content": prompt}]);
     let text = chat.render(&messages, None, Some(think), None)?;
     let ids = chat.encode(&text)?;
-    let params = squash_engine::session::GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: chat.stop_tokens.clone(), steering_strength: strength, boundaries: chat.boundaries(&ids) };
+    let params = squash_engine::session::GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: chat.stop_tokens.clone(), steering_strength: strength, boundaries: chat.boundaries(&ids), capture: false };
     let mut out = chat::TextStream::default();
     let t1 = std::time::Instant::now();
     let mut first = None;

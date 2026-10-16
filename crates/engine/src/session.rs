@@ -24,6 +24,35 @@ pub struct GenParams {
     /// Prompt positions worth a recurrent-state snapshot for prefix reuse (e.g. the start of the final
     /// assistant turn, which a follow-up turn shares).
     pub boundaries: Vec<usize>,
+    /// Record activations at the final prompt token and the final generated token (plain decoding).
+    pub capture: bool,
+}
+
+/// Activation capture of one request: per site (prompt_last, completion_last) the per-layer records
+/// (`forward::CaptureLayout`, 48 layers), the absolute position and token, and the top-20 next-token
+/// ids with log-probabilities.
+pub struct CaptureResult {
+    pub sites: Vec<CaptureSite>,
+}
+
+pub struct CaptureSite {
+    pub name: &'static str,
+    pub position: usize,
+    pub token: i32,
+    pub records: Vec<u8>,
+    pub top_ids: Vec<i32>,
+    pub top_logprobs: Vec<f32>,
+}
+
+/// Top-20 ids and log-probabilities of a logits row.
+fn top20(logits: &[f32]) -> (Vec<i32>, Vec<f32>) {
+    let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lse = m + logits.iter().map(|v| ((v - m) as f64).exp()).sum::<f64>().ln() as f32;
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.select_nth_unstable_by(20, |&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+    idx.truncate(20);
+    idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap().then(a.cmp(&b)));
+    (idx.iter().map(|&i| i as i32).collect(), idx.iter().map(|&i| logits[i] - lse).collect())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +88,9 @@ pub struct Session {
     store: ContextStore,
     /// The second, plain-decoding slot for a concurrent request.
     aux: Option<Aux>,
+    /// Activation capture records (two sites x 48 layers), and the prompt_last site of the current run.
+    capture_buf: Option<DeviceBuffer>,
+    prompt_site: Option<CaptureSite>,
 }
 
 struct Aux {
@@ -68,6 +100,8 @@ struct Aux {
     hw2: HeadWorkspace,
     _out2: DeviceBuffer,
 }
+
+const CAPTURE_LAYER_BYTES: usize = forward::CaptureLayout::BYTES;
 
 /// A request in progress on a slot (0: the main slot with MTP and the prefix cache; 1: the plain slot).
 pub struct Run {
@@ -141,7 +175,45 @@ impl Session {
             kv_strength: 0.0,
             store: ContextStore::open(store)?,
             aux: None,
+            capture_buf: None,
+            prompt_site: None,
         })
+    }
+
+    fn capture_buf(&mut self) -> Result<u64> {
+        if self.capture_buf.is_none() {
+            self.capture_buf = Some(DeviceBuffer::zeroed(2 * crate::model::LAYERS * CAPTURE_LAYER_BYTES)?);
+        }
+        Ok(self.capture_buf.as_ref().unwrap().addr())
+    }
+
+    fn read_site(&self, s: &Stream, name: &'static str, buf: u64, position: usize, token: i32, logits: u64) -> Result<CaptureSite> {
+        let records: Vec<u8> = s.download(buf, crate::model::LAYERS * CAPTURE_LAYER_BYTES)?;
+        let row: Vec<f32> = s.download(logits, VOCAB)?;
+        let (top_ids, top_logprobs) = top20(&row);
+        Ok(CaptureSite { name, position, token, records, top_ids, top_logprobs })
+    }
+
+    /// Ends a capture run: feeds its final generated token through the model once, recording the
+    /// completion_last site, and returns both sites.
+    pub fn finish_capture(&mut self, model: &Model, s: &Stream, run: &Run) -> Result<Option<CaptureResult>> {
+        let Some(prompt_site) = self.prompt_site.take() else { return Ok(None) };
+        if !run.params.capture || run.spec {
+            return Ok(None);
+        }
+        let buf = self.capture_buf()? + (crate::model::LAYERS * CAPTURE_LAYER_BYTES) as u64;
+        let state = if run.slot == 0 { &mut self.state } else { &mut self.aux.as_mut().expect("second slot").state };
+        let pos = state.len();
+        self.ws.capture = Some(forward::CaptureTarget { pos, buf });
+        let r = forward::forward(model, state, &mut self.ws, s, &[run.pending]);
+        self.ws.capture = None;
+        r?;
+        forward::head_logits(model, &self.hw, s, self.ws.out)?;
+        if run.slot == 0 {
+            self.kv_tokens = self.state.tokens.clone();
+        }
+        let site = self.read_site(s, "completion_last", buf, pos, run.pending, self.hw.logits_addr())?;
+        Ok(Some(CaptureResult { sites: vec![prompt_site, site] }))
     }
 
     /// Adds the second slot (plain decoding, batched with the main slot when both are busy).
@@ -167,10 +239,19 @@ impl Session {
         ensure!(prompt.len() < self.capacity, "prompt of {} tokens exceeds the context of {}", prompt.len(), self.capacity);
         let budget = p.max_tokens.min(self.capacity - prompt.len());
         let mut run = Run { slot, params: p.clone(), produced: 0, spec: false, pending: 0, rng: Rng(p.seed ^ 0x9e37_79b9_7f4a_7c15), budget };
+        let speculate = speculate && !p.capture;
+        self.prompt_site = None;
+        let capture = if p.capture { Some(forward::CaptureTarget { pos: prompt.len() - 1, buf: self.capture_buf()? }) } else { None };
         if slot == 0 {
             self.state.reset(s)?;
             self.state.set_steering_strength(s, p.steering_strength)?;
-            self.prefill(model, s, prompt, &p.boundaries, p.steering_strength)?;
+            self.ws.capture = capture;
+            let r = self.prefill(model, s, prompt, &p.boundaries, p.steering_strength);
+            self.ws.capture = None;
+            r?;
+            if let Some(c) = capture {
+                self.prompt_site = Some(self.read_site(s, "prompt_last", c.buf, c.pos, prompt[c.pos], self.dec.last_logits_addr())?);
+            }
             if p.temperature <= 0.0 && speculate {
                 self.spec.restart(&self.state, &self.dec, s)?;
                 run.spec = true;
@@ -183,11 +264,19 @@ impl Session {
         let aux = self.aux.as_mut().expect("second slot");
         aux.state.reset(s)?;
         aux.state.set_steering_strength(s, p.steering_strength)?;
+        self.ws.capture = capture;
         for c in prompt.chunks(self.chunk) {
-            forward::forward(model, &mut aux.state, &mut self.ws, s, c)?;
+            if let Err(e) = forward::forward(model, &mut aux.state, &mut self.ws, s, c) {
+                self.ws.capture = None;
+                return Err(e);
+            }
         }
+        self.ws.capture = None;
         let last = self.ws.out + (((prompt.len() - 1) % self.chunk) * crate::model::D * 2) as u64;
         forward::head_logits(model, &self.hw, s, last)?;
+        if let Some(c) = capture {
+            self.prompt_site = Some(self.read_site(s, "prompt_last", c.buf, c.pos, prompt[c.pos], self.hw.logits_addr())?);
+        }
         let tok = self.sample(s, self.hw.logits_addr(), p, &mut run.rng)?;
         run.pending = tok;
         Ok((run, vec![tok]))

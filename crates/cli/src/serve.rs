@@ -35,6 +35,7 @@ pub struct ServeOptions {
     pub tool_retries: usize,
     /// Concurrent requests decoded together (1 or 2).
     pub slots: usize,
+    pub capture_dir: Option<PathBuf>,
 }
 
 /// Identity of the served model and numerics for stored contexts: config.json plus the profile.
@@ -59,6 +60,8 @@ struct Job {
     ids: Vec<i32>,
     params: GenParams,
     tx: tmpsc::UnboundedSender<Msg>,
+    /// Activation capture: the output file and metadata to embed.
+    capture: Option<(PathBuf, Value)>,
 }
 
 enum Msg {
@@ -77,6 +80,8 @@ struct App {
     steering: bool,
     tool_retries: usize,
     tool_call_token: Option<i32>,
+    capture_dir: Option<PathBuf>,
+    model_id: String,
 }
 
 pub fn run(opts: ServeOptions) -> Result<()> {
@@ -117,7 +122,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         schedule(&model, &stream, &mut session, &jobs_rx);
     });
     let default_strength = ready_rx.recv().context("worker thread")??;
-    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, tool_retries: opts.tool_retries, tool_call_token });
+    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, tool_retries: opts.tool_retries, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model) });
     let router = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -146,20 +151,36 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
         run: Run,
         tx: tmpsc::UnboundedSender<Msg>,
         reused: usize,
+        capture: Option<(PathBuf, Value)>,
+        generated: Vec<i32>,
     }
-    // Sends tokens; true when the run is over (stop, length, or the client went away).
-    fn emit(a: &mut Active, toks: &[i32]) -> bool {
+    // Sends tokens; Some when the run is over (Cancelled when the client went away).
+    fn emit(a: &mut Active, toks: &[i32]) -> Option<Finish> {
         for &t in toks {
             if a.tx.send(Msg::Token(t)).is_err() {
-                return true;
+                return Some(Finish::Cancelled);
             }
+            a.generated.push(t);
             if let Some(f) = a.run.accept(t) {
-                let _ = a.tx.send(Msg::Done(f, a.reused));
-                return true;
+                return Some(f);
             }
         }
-        false
+        None
     }
+    // Completes a finished run: writes its capture, then reports.
+    let complete = |a: Active, f: Finish, session: &mut Session| {
+        if let Some((path, meta)) = &a.capture {
+            let result = session.finish_capture(model, s, &a.run).and_then(|c| match c {
+                Some(c) => write_capture(path, meta, &a.generated, &c),
+                None => Ok(()),
+            });
+            if let Err(e) = result {
+                let _ = a.tx.send(Msg::Error(format!("capture: {e:#}")));
+                return;
+            }
+        }
+        let _ = a.tx.send(Msg::Done(f, a.reused));
+    };
     let nslots = if session.has_second_slot() { 2 } else { 1 };
     let mut slots: [Option<Active>; 2] = [None, None];
     let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
@@ -190,8 +211,8 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
                 if a.run.is_spec() {
                     match session.to_plain(model, s, &mut a.run) {
                         Ok(toks) => {
-                            if emit(a, &toks) {
-                                slots[other] = None;
+                            if let Some(f) = emit(a, &toks) {
+                                complete(slots[other].take().unwrap(), f, session);
                             }
                         }
                         Err(e) => {
@@ -204,9 +225,10 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
             let speculate = slots[other].is_none() && queue.is_empty();
             match session.begin(model, s, free, &job.ids, &job.params, speculate) {
                 Ok((run, toks)) => {
-                    let mut a = Active { run, tx: job.tx, reused: if free == 0 { session.reused } else { 0 } };
-                    if !emit(&mut a, &toks) {
-                        slots[free] = Some(a);
+                    let mut a = Active { run, tx: job.tx, reused: if free == 0 { session.reused } else { 0 }, capture: job.capture, generated: Vec::new() };
+                    match emit(&mut a, &toks) {
+                        Some(f) => complete(a, f, session),
+                        None => slots[free] = Some(a),
                     }
                 }
                 Err(e) => {
@@ -225,10 +247,11 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
                 let mut k = 0;
                 for slot in slots.iter_mut() {
                     if let Some(a) = slot {
-                        if emit(a, &toks[k]) {
-                            *slot = None;
-                        }
+                        let done = emit(a, &toks[k]);
                         k += 1;
+                        if let Some(f) = done {
+                            complete(slot.take().unwrap(), f, session);
+                        }
                     }
                 }
             }
@@ -257,6 +280,7 @@ fn now() -> u64 {
 
 /// What the request asks for, after rendering and tokenizing.
 struct Prepared {
+    capture: Option<(PathBuf, Value)>,
     ids: Vec<i32>,
     params: GenParams,
     stops: Vec<String>,
@@ -289,8 +313,21 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
         Some(a) => a as f32,
         None => app.default_strength,
     };
-    let params = GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids) };
-    Ok(Prepared { ids, params, stops, thinking, tools, stream: req.get("stream").and_then(Value::as_bool).unwrap_or(false) })
+    let capture = match req.get("capture") {
+        None | Some(Value::Null) => None,
+        Some(c) => {
+            let name = c.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") || name.starts_with('.') {
+                return Err(error(StatusCode::BAD_REQUEST, "capture.name must be a plain file name"));
+            }
+            let Some(dir) = &app.capture_dir else { return Err(error(StatusCode::BAD_REQUEST, "capture requested but the server has no --capture-dir")) };
+            let meta = json!({"engine": "squash", "model_id": app.model_id, "prompt_ids": ids, "temperature": temperature, "top_p": top_p,
+                              "top_k": top_k, "seed": seed, "steering_strength": steering_strength, "request": c});
+            Some((dir.join(format!("{name}.safetensors")), meta))
+        }
+    };
+    let params = GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids), capture: capture.is_some() };
+    Ok(Prepared { capture, ids, params, stops, thinking, tools, stream: req.get("stream").and_then(Value::as_bool).unwrap_or(false) })
 }
 
 /// Splits generated text into (reasoning, content, tool calls).
@@ -532,7 +569,7 @@ async fn generate(app: &App, p: &Prepared, mut on_seg: impl FnMut(Seg)) -> Resul
     let mut ids = p.ids.clone();
     for attempt in 0..=app.tool_retries {
         let (tx, mut rx) = tmpsc::unbounded_channel();
-        app.jobs.send(Work::Generate(Job { ids: ids.clone(), params: params.clone(), tx })).map_err(|_| "generation worker stopped".to_string())?;
+        app.jobs.send(Work::Generate(Job { ids: ids.clone(), params: params.clone(), tx, capture: p.capture.clone() })).map_err(|_| "generation worker stopped".to_string())?;
         let (n, finish, cached) = drive(app, &mut rx, &p.stops, &mut seg, &mut stream, &mut on_seg).await?;
         total += n;
         cached_first.get_or_insert(cached);
@@ -859,4 +896,60 @@ mod tests {
         let json_style = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n</tool_call>";
         assert!(validate_calls(json_style, &tools()).is_ok(), "{:?}", validate_calls(json_style, &tools()));
     }
+}
+
+/// Writes an activation capture as safetensors: per site and layer `layers.{L}.{name}.{site}` tensors
+/// (premix F32 [4, 2560], mix BF16 [2560], block F32 [2560], moe F32 [2560], router_logits F32 [512],
+/// router_top_ids I32 [10], router_top_weights F32 [10]), `top_ids.{site}` / `top_logprobs.{site}` [20],
+/// and JSON metadata (request, prompt and completion ids, positions, fire count).
+fn write_capture(path: &std::path::Path, meta: &Value, generated: &[i32], c: &squash_engine::session::CaptureResult) -> Result<()> {
+    use squash_engine::forward::CaptureLayout as L;
+    let fields: [(&str, &str, usize, Vec<usize>, usize); 7] = [
+        ("premix", "F32", L::PREMIX, vec![4, 2560], L::MIX - L::PREMIX),
+        ("mix", "BF16", L::MIX, vec![2560], L::BLOCK - L::MIX),
+        ("block", "F32", L::BLOCK, vec![2560], L::MOE - L::BLOCK),
+        ("moe", "F32", L::MOE, vec![2560], L::ROUTER - L::MOE),
+        ("router_logits", "F32", L::ROUTER, vec![512], L::TOP_I - L::ROUTER),
+        ("router_top_ids", "I32", L::TOP_I, vec![10], L::TOP_W - L::TOP_I),
+        ("router_top_weights", "F32", L::TOP_W, vec![10], L::BYTES - L::TOP_W),
+    ];
+    let mut header = serde_json::Map::new();
+    let mut data: Vec<u8> = Vec::new();
+    let add = |name: String, dtype: &str, shape: Vec<usize>, bytes: &[u8], header: &mut serde_json::Map<String, Value>, data: &mut Vec<u8>| {
+        header.insert(name, json!({"dtype": dtype, "shape": shape, "data_offsets": [data.len(), data.len() + bytes.len()]}));
+        data.extend_from_slice(bytes);
+    };
+    let layers = squash_engine::model::LAYERS;
+    for site in &c.sites {
+        for l in 0..layers {
+            let rec = &site.records[l * L::BYTES..(l + 1) * L::BYTES];
+            for (name, dtype, off, shape, len) in &fields {
+                add(format!("layers.{l}.{name}.{}", site.name), dtype, shape.clone(), &rec[*off..off + len], &mut header, &mut data);
+            }
+        }
+        let ids: Vec<u8> = site.top_ids.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let lps: Vec<u8> = site.top_logprobs.iter().flat_map(|v| v.to_le_bytes()).collect();
+        add(format!("top_ids.{}", site.name), "I32", vec![site.top_ids.len()], &ids, &mut header, &mut data);
+        add(format!("top_logprobs.{}", site.name), "F32", vec![site.top_logprobs.len()], &lps, &mut header, &mut data);
+    }
+    let mut m = meta.clone();
+    m["completion_ids"] = json!(generated);
+    m["sites"] = Value::Array(c.sites.iter().map(|s| json!({"site": s.name, "position": s.position, "token": s.token})).collect());
+    m["fire_count"] = json!(layers * c.sites.len());
+    header.insert("__metadata__".into(), json!({"squash.capture": m.to_string()}));
+    let mut h = Value::Object(header).to_string().into_bytes();
+    while h.len() % 8 != 0 {
+        h.push(b' ');
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        f.write_all(&(h.len() as u64).to_le_bytes())?;
+        f.write_all(&h)?;
+        f.write_all(&data)?;
+        f.flush()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }

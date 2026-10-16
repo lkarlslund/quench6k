@@ -164,6 +164,9 @@ impl SequenceState {
 /// Scratch buffers for steps of up to `max_tokens` tokens.
 pub struct Workspace {
     pub max_tokens: usize,
+    /// Activation capture for the next eager steps: the row at absolute position `pos` is recorded into
+    /// `buf` (see `CaptureLayout`). Not for captured graphs.
+    pub capture: Option<CaptureTarget>,
     score_cols: usize,
     bufs: Vec<DeviceBuffer>,
     pub h: u64,
@@ -249,6 +252,7 @@ impl Workspace {
         };
         Self {
             max_tokens,
+            capture: None,
             score_cols,
             h: alloc(t * H * 4)?,
             proj: alloc(t * PROJ_WIDTH * 4)?,
@@ -406,6 +410,31 @@ pub fn ple_rows(tokens: &[i32], p: usize, mult: &[i64; 3], sizes: &[i64; 16], of
     })
 }
 
+/// Where to record activations: the token at absolute position `pos`, into `buf`
+/// ([`CaptureLayout::BYTES`] per layer, 48 layers).
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureTarget {
+    pub pos: usize,
+    pub buf: u64,
+}
+
+/// Per-layer record of an activation capture (byte offsets): the pre-mix lane state (F32 [4, 2560],
+/// before the attention-input HyperConnection), the mixed block input (BF16 [2560]), the attention or
+/// GDN block output (F32 [2560]), the MoE output (F32 [2560]), the router logits (F32 [512]) and the
+/// routed experts (I32 [10]) with their weights (F32 [10]).
+pub struct CaptureLayout;
+
+impl CaptureLayout {
+    pub const PREMIX: usize = 0;
+    pub const MIX: usize = Self::PREMIX + H * 4;
+    pub const BLOCK: usize = Self::MIX + D * 2;
+    pub const MOE: usize = Self::BLOCK + D * 4;
+    pub const ROUTER: usize = Self::MOE + D * 4;
+    pub const TOP_I: usize = Self::ROUTER + EXPERTS * 4;
+    pub const TOP_W: usize = Self::TOP_I + TOP_K * 4;
+    pub const BYTES: usize = Self::TOP_W + TOP_K * 4;
+}
+
 /// Byte offsets inside the step block: [start: i32 | pad][tokens: i32 x max][pos3: i32 x 3 x max][PLE rows: BF16 x D x max].
 struct StepLayout {
     tokens: usize,
@@ -537,6 +566,7 @@ pub fn forward_batch(model: &Model, states: &[&SequenceState], ws: &Workspace, s
         spec: None,
         steer: None,
         batch: Some(states),
+        capture: None,
     };
     let mut carry = Carry::new(ws, false);
     for i in 0..model.layers.len() {
@@ -625,7 +655,9 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
     }
     let spec = state.spec.as_ref().map(|sp| (sp.ctl.addr(), sp.ple_rec.addr(), defer));
     let steer = model.steering.as_ref().map(|p| (p.directions.addr(), p.ranks.addr(), p.masks.addr(), p.norm_preserve, state.steer_strength.addr()));
-    let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr(), spec, steer, batch: None };
+    let first = state.len() - t;
+    let capture = ws.capture.filter(|c| c.pos >= first && c.pos < first + t).map(|c| (c.buf, c.pos - first));
+    let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr(), spec, steer, batch: None, capture };
     if part != Part::FromPle {
         op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, ctx.pos3, ctx.start, t));
         op!(prof, "embed", s, k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h));
@@ -666,6 +698,8 @@ struct LayerCtx<'a> {
     /// Batched decode: row b is the next token of sequence b (with its start position at
     /// `start + 4 b`); stateful operations run per sequence.
     batch: Option<&'a [&'a SequenceState]>,
+    /// Activation capture: (record buffer, row of this step).
+    capture: Option<(u64, usize)>,
 }
 
 /// Residual bookkeeping carried from layer to layer. Small batches defer each block's residual update to
@@ -726,11 +760,21 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
         }
         op!(prof, "steer", s, k::steer(s, ws.h, t, dirs, ranks, masks, norm_preserve, strength, index));
     }
+    let rec = ctx.capture.filter(|_| index < LAYERS).map(|(buf, row)| (buf + (index * CaptureLayout::BYTES) as u64, row));
+    if let Some((buf, row)) = rec {
+        if let Some(y) = carry.pending.take() {
+            op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, carry.inj, t));
+        }
+        s.copy_d2d(buf + CaptureLayout::PREMIX as u64, ws.h + (row * H * 4) as u64, H * 4)?;
+    }
     if small {
         op!(prof, "hc_small", s, hyper_connection_small(s, ws, &layer.attn_hc, t, carry.pending.map(|y| (y, carry.inj)), carry.inj_next, ws.m));
         std::mem::swap(&mut carry.inj, &mut carry.inj_next);
     } else {
         hyper_connection(s, ws, &layer.attn_hc, t, ws.m, prof.as_deref_mut())?;
+    }
+    if let Some((buf, row)) = rec {
+        s.copy_d2d(buf + CaptureLayout::MIX as u64, ws.m + (row * D * 2) as u64, D * 2)?;
     }
     match &layer.block {
         Block::Gdn(g) => {
@@ -784,7 +828,7 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
                     op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, qr, colr(0), ld, c.k.addr(), c.v.addr(), sel, start_b, 1, ws.att_part, att));
                 }
                 op!(prof, "qsa o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
-                return finish_layer(layer, ctx, carry, prof);
+                return finish_layer(layer, ctx, carry, prof, None);
             }
             let c = qsa.expect("QSA layer cache");
             op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, col(0), col(1), ld, q.q_norm, q.k_norm, ws.q, c.k.addr(), c.v.addr(), pos3, start, t));
@@ -803,11 +847,14 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
             op!(prof, "qsa o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
         }
     }
-    finish_layer(layer, ctx, carry, prof)
+    if let Some((buf, row)) = rec {
+        s.copy_d2d(buf + CaptureLayout::BLOCK as u64, ws.y + (row * D * 4) as u64, D * 4)?;
+    }
+    finish_layer(layer, ctx, carry, prof, rec)
 }
 
 /// The second half of a layer: the MLP HyperConnection, the MoE block and its output.
-fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>) -> Result<()> {
+fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>, rec: Option<(u64, usize)>) -> Result<()> {
     let (ws, s, t) = (ctx.ws, ctx.s, ctx.t);
     let small = t <= k::gemv_max_m();
     if small {
@@ -851,6 +898,12 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
         op!(prof, "shared swiglu", s, k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
         op!(prof, "shared down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
         op!(prof, "moe_combine", s, k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
+    }
+    if let Some((buf, row)) = rec {
+        s.copy_d2d(buf + CaptureLayout::MOE as u64, ws.y + (row * D * 4) as u64, D * 4)?;
+        s.copy_d2d(buf + CaptureLayout::ROUTER as u64, col(0) + (row * ld * 4) as u64, EXPERTS * 4)?;
+        s.copy_d2d(buf + CaptureLayout::TOP_I as u64, ws.top_i + (row * TOP_K * 4) as u64, TOP_K * 4)?;
+        s.copy_d2d(buf + CaptureLayout::TOP_W as u64, ws.top_w + (row * TOP_K * 4) as u64, TOP_K * 4)?;
     }
     if small {
         carry.pending = Some(ws.y);
@@ -906,7 +959,7 @@ pub fn forward_mtp_staged(model: &Model, state: &SequenceState, ws: &Workspace, 
     // fc_hidden maps each of the 4 streams: rows of the [t, 4, 2560] input are the 4t stream slices.
     op!(prof, "mtp fc_h", s, linear_ld(s, ws.partial, ws.n, D, &mtp.fc_hidden, ws.h, D, S * t));
     op!(prof, "mtp combine", s, k::hc_combine(s, ws.h, ws.y, ws.ones, t));
-    let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0, spec: None, steer: None, batch: None };
+    let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0, spec: None, steer: None, batch: None, capture: None };
     let mut carry = Carry::new(ws, false);
     layer_forward(LAYERS, &mtp.layer, None, None, Some(cache), &ctx, &mut carry, prof.as_deref_mut())?;
     final_mixer(&mtp.final_hc, &ctx, &mut carry, prof)
