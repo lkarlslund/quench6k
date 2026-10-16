@@ -17,6 +17,8 @@ pub struct GenParams {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: usize,
+    /// Drops candidates below min_p times the most likely one's probability (0: off).
+    pub min_p: f32,
     pub seed: u64,
     /// Generation ends after any of these tokens (which is emitted).
     pub stop_tokens: Vec<i32>,
@@ -789,6 +791,8 @@ impl Session {
                 }
             }
         }
+        // min_p: a prefix of the sorted list too (ratios to the first are unchanged by renormalizing).
+        keep = keep.min(probs.iter().take_while(|&&x| x >= p.min_p as f64 * probs[0]).count().max(1));
         let mass: f64 = probs[..keep].iter().sum();
         let mut r = rng.next() * mass;
         for i in 0..keep {
@@ -818,8 +822,8 @@ fn with_ple_warm<R>(model: &Model, prompt: &[i32], start: usize, f: impl FnOnce(
 }
 
 /// The speculative rounds' sampling parameters for a request (None: greedy).
-fn sampling(p: &GenParams) -> Option<(f32, f32, usize, u64)> {
-    (p.temperature > 0.0).then(|| (p.temperature, p.top_p, p.top_k, p.seed ^ 0x5bd1_e995_7f4a_7c15))
+fn sampling(p: &GenParams) -> Option<crate::spec::Sampling> {
+    (p.temperature > 0.0).then(|| crate::spec::Sampling { temperature: p.temperature, top_p: p.top_p, top_k: p.top_k, min_p: p.min_p, seed: p.seed ^ 0x5bd1_e995_7f4a_7c15 })
 }
 
 struct Rng(u64);

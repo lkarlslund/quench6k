@@ -98,7 +98,7 @@ cudaError_t sq_launch(void (*kernel)(Exp...), dim3 grid, dim3 block, size_t smem
     return cudaLaunchKernelEx(&cfg, kernel, static_cast<Exp>(args)...);
 }
 
-// Sampling parameters and generator state of sampled speculative rounds (32 bytes). `draft_sampled`
+// Sampling parameters and generator state of sampled speculative rounds (40 bytes). `draft_sampled`
 // > 0: drafts are sampled from the drafter's distribution (and verified against it) instead of greedy,
 // at draft_sampled percent of the temperature.
 struct SampleParams {
@@ -106,6 +106,8 @@ struct SampleParams {
     int k;  // candidates (a prefix of the sorted top list)
     int draft_sampled;
     unsigned long long seed, counter;
+    float min_p;  // drop candidates below min_p times the most likely one's probability
+    int pad;
 };
 
 SQ_DEVICE double sample_uniform(SampleParams* sp) {

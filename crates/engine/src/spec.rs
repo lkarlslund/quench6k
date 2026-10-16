@@ -202,6 +202,16 @@ pub struct SpecGraphs {
 /// Candidates per verified row in sampled rounds (the request's top_k is a prefix of them).
 pub const SAMPLE_TOP: usize = 64;
 
+/// Sampling parameters of a request (temperature > 0).
+#[derive(Clone, Copy, Debug)]
+pub struct Sampling {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub min_p: f32,
+    pub seed: u64,
+}
+
 /// Sampled rounds draw their drafts at this percentage of the request's temperature (a sharper proposal
 /// than the target's distribution is accepted more often; any proposal keeps the output exact).
 const DRAFT_TEMPERATURE_PERCENT: u32 = 100;
@@ -351,13 +361,13 @@ impl SpecGraphs {
         Ok(Self { sets, _rc: rc, rc_host, policy: DraftPolicy::new(lengths), sample_params, _top_ids: top_ids, _top_vals: top_vals, _draft_q: draft_q, sampled: false })
     }
 
-    /// Greedy rounds (`None`), or sampled rounds with (temperature, top_p, top_k, seed); top_k is capped
-    /// at [`SAMPLE_TOP`] (0: all of them). Sampled rounds draw their drafts from the drafter's
-    /// distribution (`SQUASH_SAMPLED_DRAFTS=0`: its most likely token, as greedy rounds do).
-    pub fn set_sampling(&mut self, s: &Stream, sampling: Option<(f32, f32, usize, u64)>) -> Result<()> {
+    /// Greedy rounds (`None`), or sampled rounds; top_k is capped at [`SAMPLE_TOP`] (0: all of them).
+    /// Sampled rounds draw their drafts from the drafter's distribution (`SQUASH_SAMPLED_DRAFTS=0`: its
+    /// most likely token, as greedy rounds do).
+    pub fn set_sampling(&mut self, s: &Stream, sampling: Option<Sampling>) -> Result<()> {
         self.sampled = sampling.is_some();
         let mut b = vec![0u8; squash_cuda::kernels::SAMPLE_PARAMS_BYTES];
-        if let Some((t, top_p, k, seed)) = sampling {
+        if let Some(Sampling { temperature: t, top_p, top_k: k, min_p, seed }) = sampling {
             let k = if k == 0 { SAMPLE_TOP } else { k.min(SAMPLE_TOP) } as u32;
             // Drafts are drawn at this percentage of the temperature (0: greedy drafts).
             let draft_sampled: u32 = std::env::var("SQUASH_SAMPLED_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(DRAFT_TEMPERATURE_PERCENT);
@@ -368,6 +378,8 @@ impl SpecGraphs {
             b.extend_from_slice(&draft_sampled.to_le_bytes());
             b.extend_from_slice(&seed.to_le_bytes());
             b.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_from_slice(&min_p.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
         }
         // Greedy rounds read the parameters too (the draft flag), so they are always rewritten.
         s.upload_to(self.sample_params.addr(), &b)

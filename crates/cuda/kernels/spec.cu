@@ -86,6 +86,12 @@ __global__ void sample_rows_kernel(const int* __restrict__ ids, const float* __r
                 }
             }
         }
+        // min_p: also a prefix of the sorted list (ratios to the first survive renormalizing).
+        for (int i = 1; i < keep; ++i)
+            if (probs[i] < (double)sp->min_p * probs[0]) {
+                keep = i;
+                break;
+            }
         double mass = 0.0;
         for (int i = 0; i < keep; ++i) mass += probs[i];
         if (r < n && sp->draft_sampled && qs != nullptr) {

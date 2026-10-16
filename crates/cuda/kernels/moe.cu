@@ -1291,6 +1291,11 @@ __global__ void draft_final_kernel(const float* __restrict__ best_v, const int* 
                         break;
                     }
             }
+            for (int i = 1; i < keep; ++i)
+                if (p[i] < (double)sp->min_p * p[0]) {
+                    keep = i;
+                    break;
+                }
             double mass = 0.0;
             for (int i = 0; i < keep; ++i) mass += p[i];
             double rem = mass * sample_uniform(sp);

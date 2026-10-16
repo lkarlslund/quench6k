@@ -83,3 +83,4 @@ previous one stopped.
 - 2026-10-16: vision encoder in 2048-patch blocks (largest default image: 1.66 GB -> ~0.43 GB peak, output identical); on OOM it frees GPU snapshots (stashing non-periodic ones) and retries. Fixes koder 'stream ended' errors from a mid-stream cudaMalloc failure (another process also holds 4.2 GB of this GPU).
 - 2026-10-16: images inside a restored prefix are no longer re-encoded (spans keep their geometry for positions; only images reaching the restore point are encoded). Follow-up turn with a 4.2 MP image: ~4.5 s -> 0.4 s.
 - 2026-10-16: sampled MTP drafts from the drafter's distribution (exact speculative sampling): +2% tok/s on sampled requests, within noise; kept on (distribution test passes). done: log lines report MTP tokens/round.
+- 2026-10-16: min_p sampling (plain, MTP verification, sampled drafts); distribution test at min_p 0.2, 1500 samples: z within +-0.61.
