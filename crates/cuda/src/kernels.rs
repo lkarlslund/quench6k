@@ -527,6 +527,11 @@ pub fn fake_mxfp8(s: &Stream, x: u64, rows: usize, cols: usize, ld: usize) -> Re
 
 /// NVFP4 quantize-dequantize of BF16 activations in place (experiments): per-row scale, per-16 E4M3
 /// block scale chosen by least squared error.
+/// Symmetric `bits`-bit integer quantize-dequantize of BF16 rows in place, one scale per `group` (experiments).
+pub fn fake_int(s: &Stream, x: u64, rows: usize, cols: usize, group: usize, bits: usize) -> Result<()> {
+    launch!("fake_int", ffi::squash_fake_int(x as *mut std::ffi::c_void, n32(rows), n32(cols), n32(group), n32(bits), s.raw()))
+}
+
 pub fn fake_fp4_act(s: &Stream, x: u64, rows: usize, cols: usize) -> Result<()> {
     launch!("fake_fp4_act", ffi::squash_fake_fp4_act(x as *mut std::ffi::c_void, n32(rows), n32(cols), s.raw()))
 }

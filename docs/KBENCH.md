@@ -127,3 +127,31 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
   verify step at this host's PCIe link (Gen 3 x4, 3.6 GB/s measured; exact). Tried and dropped: a
   register cap for the 4-row GEMV (`__launch_bounds__` min blocks 2-4: 1.4-15% slower) and the fused
   shared-expert tail for multi-row steps (2.5% slower at 4 rows: every block recomputes the SwiGLU input).
+
+## Findings (2026-10-16, night): precision, host overhead, prefill shapes
+
+- Lower-precision dense weights do not fit the gate. Fake-quantized at load
+  (`SQUASH_FAKE_FP4_W=classes`, `SQUASH_FAKE_BITS=b` for integers with a scale per 64; classes qkv, z,
+  gdnout, attnin, attno, shared, hc, router, plus mtp), each scored and gated against out/g7:
+  NVFP4 for every large dense class fails 11 of 12 checks; alone, each of z, qkv, gdnout, attno, hc,
+  shared and attnin fails at least one completion bound (z and qkv only narrowly); INT6 and INT5 for
+  all dense classes fail 3 and 5 completion checks. The current configuration's margins are small
+  (multiturn completion p99 0.300 against a bound of 0.340). Dense weights stay 8-bit.
+- Host waits: `cudaDeviceScheduleSpin` makes no difference (the default already spins). Launching the
+  second half of a decode or verify step before the host gathers its PLE rows (a device wait on a
+  pinned flag) is correct but not faster: unprofiled, the launch already overlaps layer 0 (the gaps
+  seen under nsys come from its API tracing).
+- Prefill PLE rows (5 KB per token over the 3.6 GB/s link) are now gathered and uploaded in
+  1,024-token pieces on the side stream (+0.5-1% prefill).
+- Context-store switching between conversations costs about 0.4 s per switch at 22K tokens (stash:
+  0.08 s pinned allocation + 0.146 s copy of 498 MiB; load: 0.146 s), all PCIe; rare in the service
+  trace (5 of 107 requests over 8K switch back to an earlier conversation).
+- Prefill shapes at 8K: BF16 GEMMs 26% (HC down N=324 at about 168 TFLOPS; 64-column tiles for small
+  grids are 1% slower overall), FP4 expert GEMMs 15% (bounded below by reading every expert's weights
+  once per chunk: 1.4 GB per layer), GDN chunked 11%, MXFP8 in-proj 9%, attention 8%, HC combine+norm
+  13% (at the memory floor of the FP32 residual). A 16K chunk is 3.7% faster at 32K but needs 6.4 GB
+  more device memory than the service has.
+- Long-context decode costs little: 5.23 ms per token at 8K, 5.58 ms at 250K.
+- Drafting only from a frequent-token subset of the vocabulary would cut the draft head's 1-bit
+  sketch pass (238 us of an 839 us draft graph) but covers only 94% of generated tokens; not worth the
+  lost acceptance.

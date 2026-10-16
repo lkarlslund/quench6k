@@ -522,12 +522,37 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
     let (mut weights, mut stats) = loader::upload(ckpt, |n| wanted(n) && !quantized(n), opts)?;
     // Fold each HyperConnection's (1 + w) norm weight into its down and injection projections (SPEC §4),
     // so small batches can project the raw residual and apply the per-stream RMS factor afterwards.
+    // Experiment: SQUASH_FAKE_FP4_W (comma-separated classes) rounds those BF16 weights to NVFP4 values
+    // (per-row scale, least-error E4M3 block scales per 16) before they are quantized as usual.
+    let fake_fp4 = std::env::var("SQUASH_FAKE_FP4_W").ok();
+    let fp4_class = |n: &str| {
+        fake_fp4.as_deref().is_some_and(|set| {
+            set.split(',').any(|c| match c {
+                "qkv" => n.ends_with(".linear_attn.in_proj_qkv.weight"),
+                "z" => n.ends_with(".linear_attn.in_proj_z.weight"),
+                "gdnout" => n.ends_with(".linear_attn.out_proj.weight"),
+                "attnin" => n.contains(".self_attn.") && !n.ends_with(".o_proj.weight"),
+                "attno" => n.ends_with(".self_attn.o_proj.weight"),
+                "shared" => n.contains(".shared_expert.") && !n.ends_with("shared_expert_gate.weight"),
+                "hc" => n.contains("hyper_connection."),
+                "router" => n.ends_with(".mlp.gate.weight"),
+                _ => false,
+            }) && (set.split(',').any(|c| c == "mtp") || !n.starts_with("mtp."))
+        })
+    };
     let fold = |name: &str, addr: u64, n: usize, k: usize| -> Result<()> {
         let prefix = name.strip_suffix(".input_mix_weight_down.weight").or_else(|| name.strip_suffix(".block_inject_weight.weight"));
-        match prefix {
-            Some(prefix) => squash_cuda::kernels::fold_norm(stream, addr, weights.get(&format!("{prefix}.hc_norm.weight"))?.addr, n, k),
-            None => Ok(()),
+        if let Some(prefix) = prefix {
+            squash_cuda::kernels::fold_norm(stream, addr, weights.get(&format!("{prefix}.hc_norm.weight"))?.addr, n, k)?;
         }
+        if fp4_class(name) {
+            // SQUASH_FAKE_BITS=b (2..8): b-bit integers with a scale per 64 instead of NVFP4.
+            match std::env::var("SQUASH_FAKE_BITS").ok().and_then(|v| v.parse::<usize>().ok()) {
+                Some(bits) => squash_cuda::kernels::fake_int(stream, addr, n, k, 64, bits)?,
+                None => squash_cuda::kernels::fake_fp4_act(stream, addr, n, k)?,
+            }
+        }
+        Ok(())
     };
     if format == WeightFormat::Bf16 {
         let names: Vec<String> = weights.tensors.keys().filter(|n| n.ends_with(".input_mix_weight_down.weight") || n.ends_with(".block_inject_weight.weight")).cloned().collect();
@@ -545,6 +570,7 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
                 "gdnout" => n.contains(".linear_attn.out_proj"),
                 "attn" => n.contains(".self_attn."),
                 "hc" => n.contains("hyper_connection."),
+                "router" => n.ends_with(".mlp.gate.weight"),
                 _ => false,
             }),
         };

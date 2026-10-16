@@ -139,3 +139,30 @@ extern "C" cudaError_t squash_fake_mxfp8(void* x, int rows, int cols, int ld, cu
     SQ_CHECK_LAUNCH(sq_launch(fake_mxfp8_kernel, (unsigned)((n + 255) / 256), 256, 0, st, (__nv_bfloat16*)x, rows, cols, ld));
     SQ_RETURN_LAUNCH();
 }
+
+namespace {
+
+// Symmetric integer quantize-dequantize in place (experiments): per `group` consecutive values of a
+// row, scale amax / qmax (qmax = 2^(bits-1) - 1), round to nearest. One thread per group.
+__global__ void fake_int_kernel(__nv_bfloat16* x, size_t groups, int group, float qmax) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= groups) return;
+    __nv_bfloat16* p = x + i * group;
+    float amax = 0.0f;
+    for (int j = 0; j < group; ++j) amax = fmaxf(amax, fabsf(bf2f(p[j])));
+    if (amax == 0.0f) return;
+    const float s = amax / qmax;
+    for (int j = 0; j < group; ++j) p[j] = f2bf(rintf(bf2f(p[j]) / s) * s);
+}
+
+}  // namespace
+
+extern "C" cudaError_t squash_fake_int(void* x, int rows, int cols, int group, int bits, cudaStream_t st) {
+    if (cols % group != 0 || bits < 2 || bits > 8) return cudaErrorInvalidValue;
+    const size_t n = (size_t)rows * (cols / group);
+    if (n == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(fake_int_kernel, (unsigned)((n + 255) / 256), 256, 0, st, (__nv_bfloat16*)x, n, group, (float)((1 << (bits - 1)) - 1)));
+    SQ_RETURN_LAUNCH();
+}
