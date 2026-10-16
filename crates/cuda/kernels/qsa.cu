@@ -768,6 +768,294 @@ __global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __r
 
 }  // namespace
 
+namespace {
+
+// Multi-query selected attention for prefill: one block (12 warps) per 4 consecutive queries and KV
+// head. The rows are the 4 queries x 12 query heads (48 = three m16 tiles); the keys are the union of
+// the 4 queries' selected groups (each query masks the groups it did not select and keys past its
+// position), so neighbouring queries share their K/V gathers. The union is built with one bitmap per
+// query over the complete groups (in the K/V tile buffers, before the attention loop).
+constexpr int QB = 4, MQ_ROWS = QB * 12, MQ_W = 12, MQ_T = 32, MQ_MAXU = QB * (TOPG + 1);
+constexpr size_t MQ_SMEM = (size_t)(MQ_ROWS * MPAD + 2 * MQ_T * MPAD + MQ_ROWS * (MQ_T + 8)) * 2 + MQ_ROWS * (MQ_T + 4) * 4 +
+                           MQ_MAXU * 4;
+constexpr int MQ_KV8 = MQ_T * HD / 16;  // 16-value chunks per FP8 tile
+
+template <bool FP8>
+__global__ void __launch_bounds__(MQ_W * 32) attention_mq_kernel(const float* __restrict__ q, const float* __restrict__ qg, int ld,
+                                                                 const void* __restrict__ kcache, const void* __restrict__ vcache,
+                                                                 const int* __restrict__ sel, const int* __restrict__ start_ptr,
+                                                                 int T, __nv_bfloat16* out) {
+    pdl_launch_dependents();
+    pdl_wait();
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(smem_raw);  // [48][MPAD]
+    __nv_bfloat16* Ks = Qs + MQ_ROWS * MPAD;                          // [MQ_T][MPAD]
+    __nv_bfloat16* Vs = Ks + MQ_T * MPAD;                             // [MQ_T][MPAD]
+    __nv_bfloat16* Ps = Vs + MQ_T * MPAD;                             // [48][MQ_T + 8]
+    float* Ss = reinterpret_cast<float*>(Ps + MQ_ROWS * (MQ_T + 8));  // [48][MQ_T + 4]
+    int* ulist = reinterpret_cast<int*>(Ss + MQ_ROWS * (MQ_T + 4));    // union groups: g | mask << 24
+    __shared__ int keys[2][MQ_T];
+    __shared__ unsigned char kmask[2][MQ_T];
+    __shared__ float rmax[MQ_ROWS], rsum[MQ_ROWS], rscale[MQ_ROWS];
+    __shared__ int s_count, scan[MQ_W * 32];
+
+    const int t0 = blockIdx.x * QB, kvh = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int start = *start_ptr;
+    int pq[QB], cq[QB];
+    bool live[QB];
+#pragma unroll
+    for (int i = 0; i < QB; ++i) {
+        live[i] = t0 + i < T;
+        pq[i] = start + min(t0 + i, T - 1);
+        cq[i] = (pq[i] + 1) / GROUP;
+    }
+    // Union over groups 0 .. G - 1 (the last query's complete groups plus its tail group).
+    const int G = cq[QB - 1] + 1, words = (G + 31) / 32;
+    unsigned* bm = reinterpret_cast<unsigned*>(Ks);  // [QB][words], within Ks .. Vs
+    for (int i = tid; i < QB * words; i += MQ_W * 32) bm[i] = 0;
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < QB; ++i) {
+        if (!live[i]) continue;
+        unsigned* b = bm + i * words;
+        const int last = pq[i] / GROUP;  // groups holding keys 0 .. p (the tail group may be partial)
+        if (cq[i] <= TOPG) {
+            for (int w = tid; w * 32 <= last; w += MQ_W * 32) {
+                const int hi = min(31, last - w * 32);
+                b[w] = hi == 31 ? 0xffffffffu : ((2u << hi) - 1u);
+            }
+        } else {
+            for (int j = tid; j < TOPG; j += MQ_W * 32) {
+                const int g = sel[(size_t)(t0 + i) * TOPG + j];
+                atomicOr(&b[g >> 5], 1u << (g & 31));
+            }
+            if (tid == 0 && last == cq[i]) atomicOr(&b[last >> 5], 1u << (last & 31));
+        }
+    }
+    __syncthreads();
+    // Compact the union: each thread a contiguous range of words, exclusive scan of their counts.
+    {
+        const int per = (words + MQ_W * 32 - 1) / (MQ_W * 32), w0 = tid * per, w1 = min(words, w0 + per);
+        int cnt = 0;
+        for (int w = w0; w < w1; ++w) cnt += __popc(bm[w] | bm[words + w] | bm[2 * words + w] | bm[3 * words + w]);
+        scan[tid] = cnt;
+        __syncthreads();
+        for (int off = 1; off < MQ_W * 32; off <<= 1) {
+            const int v = tid >= off ? scan[tid - off] : 0;
+            __syncthreads();
+            scan[tid] += v;
+            __syncthreads();
+        }
+        int pos = scan[tid] - cnt;
+        if (tid == MQ_W * 32 - 1) s_count = scan[tid];
+        for (int w = w0; w < w1; ++w) {
+            const unsigned b0 = bm[w], b1 = bm[words + w], b2 = bm[2 * words + w], b3 = bm[3 * words + w];
+            unsigned u = b0 | b1 | b2 | b3;
+            while (u) {
+                const int bit = __ffs(u) - 1;
+                u &= u - 1;
+                const unsigned m = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1) | (((b2 >> bit) & 1) << 2) | (((b3 >> bit) & 1) << 3);
+                ulist[pos++] = (w * 32 + bit) | (int)(m << 24);
+            }
+        }
+    }
+    __syncthreads();
+    const int nkeys = s_count * GROUP, tiles = (nkeys + MQ_T - 1) / MQ_T;
+
+    for (int i = tid; i < MQ_ROWS * HD; i += MQ_W * 32) {
+        const int r = i / HD, d = i % HD, qi = r / 12, h = r % 12;
+        Qs[r * MPAD + d] = live[qi] ? f2bf(q[(size_t)(t0 + qi) * QH * HD + (kvh * 12 + h) * HD + d]) : f2bf(0.0f);
+    }
+    if (tid < MQ_ROWS) {
+        rmax[tid] = -INFINITY;
+        rsum[tid] = 0.0f;
+    }
+    // Key `i` of the union: position and the queries that may see it.
+    auto load_keys = [&](int tile) {
+        if (tid < MQ_T) {
+            const int i = tile * MQ_T + tid;
+            int key = -1;
+            unsigned m = 0;
+            if (i < nkeys) {
+                const int e = ulist[i / GROUP];
+                key = (e & 0xffffff) * GROUP + i % GROUP;
+                m = (unsigned)e >> 24;
+#pragma unroll
+                for (int qi = 0; qi < QB; ++qi)
+                    if (key > pq[qi]) m &= ~(1u << qi);
+            }
+            keys[tile & 1][tid] = key;
+            kmask[tile & 1][tid] = (unsigned char)m;
+        }
+    };
+    uint4 kraw[2], vraw[2];
+    float kscl[2], vscl[2];
+    auto load_rows = [&](int tile, __nv_bfloat16* dst, const void* cache) {
+        if constexpr (FP8) {
+            uint4* raw = dst == Ks ? kraw : vraw;
+            float* scl = dst == Ks ? kscl : vscl;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int c = tid + j * MQ_W * 32;
+                raw[j] = make_uint4(0, 0, 0, 0);
+                scl[j] = 0.0f;
+                if (c < MQ_KV8) {
+                    const int key = keys[tile & 1][c / 16];
+                    if (key >= 0) {
+                        const unsigned char* row = kv_row<true>(cache, key, kvh);
+                        raw[j] = *reinterpret_cast<const uint4*>(row + (c % 16) * 16);
+                        scl[j] = *reinterpret_cast<const float*>(row + HD);
+                    }
+                }
+            }
+        } else {
+            for (int c = tid; c < MQ_T * HD / 8; c += MQ_W * 32) {
+                const int r = c / (HD / 8), col = (c % (HD / 8)) * 8;
+                const int key = keys[tile & 1][r];
+                cp_async16(dst + r * MPAD + col, kv_row<false>(cache, max(key, 0), kvh) + col * 2, key >= 0);
+            }
+        }
+    };
+    auto dequant = [&](__nv_bfloat16* dst) {
+        if constexpr (FP8) {
+            const uint4* raw = dst == Ks ? kraw : vraw;
+            const float* scl = dst == Ks ? kscl : vscl;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int c = tid + j * MQ_W * 32;
+                if (c >= MQ_KV8) continue;
+                const unsigned char* b = reinterpret_cast<const unsigned char*>(&raw[j]);
+                __align__(16) __nv_bfloat16 v[16];
+#pragma unroll
+                for (int e = 0; e < 16; ++e) {
+                    __nv_fp8_e4m3 f;
+                    f.__x = b[e];
+                    v[e] = f2bf(float(f) * scl[j]);
+                }
+                __nv_bfloat16* d = dst + (c / 16) * MPAD + (c % 16) * 16;
+                reinterpret_cast<uint4*>(d)[0] = reinterpret_cast<const uint4*>(v)[0];
+                reinterpret_cast<uint4*>(d)[1] = reinterpret_cast<const uint4*>(v)[1];
+            }
+            __syncthreads();
+        }
+    };
+    load_keys(0);
+    __syncthreads();
+    load_rows(0, Ks, kcache);
+    cp_async_commit();
+    load_rows(0, Vs, vcache);
+    cp_async_commit();
+
+    const int mt = warp % 3, g = lane >> 2, t4 = lane & 3;
+    const int snt = warp / 3;            // S: key n-tile of this warp (4 x 8 keys)
+    const int oc0 = (warp / 3) * 64;     // O: 64 output columns of this warp
+    float o[8][4] = {};
+    for (int tile = 0; tile < tiles; ++tile) {
+        cp_async_wait<1>();  // K of this tile
+        __syncthreads();
+        dequant(Ks);
+        float sacc[4] = {};
+#pragma unroll
+        for (int kk = 0; kk < HD; kk += 16) {
+            uint32_t a[4], b[2];
+            ldmatrix_x4(a, Qs + (mt * 16 + (lane & 15)) * MPAD + kk + (lane >> 4) * 8);
+            ldmatrix_x2(b, Ks + (snt * 8 + (lane & 7)) * MPAD + kk + ((lane >> 3) & 1) * 8);
+            mma_bf16(sacc, a, b);
+        }
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int x = 0; x < 2; ++x) {
+                const int row = mt * 16 + g + h * 8, col = snt * 8 + t4 * 2 + x;
+                const bool ok = (kmask[tile & 1][col] >> (row / 12)) & 1;
+                Ss[row * (MQ_T + 4) + col] = ok ? sacc[h * 2 + x] * (1.0f / 16.0f) : -INFINITY;
+            }
+        __syncthreads();
+        if (tile + 1 < tiles) {
+            load_keys(tile + 1);
+            __syncthreads();
+            load_rows(tile + 1, Ks, kcache);
+        }
+        cp_async_commit();
+        // Online softmax: 8 threads per row, 4 keys each.
+        {
+            const int r = tid / 8, c0 = (tid % 8) * 4;
+            float v[4], m = -INFINITY;
+#pragma unroll
+            for (int x = 0; x < 4; ++x) {
+                v[x] = Ss[r * (MQ_T + 4) + c0 + x];
+                m = fmaxf(m, v[x]);
+            }
+#pragma unroll
+            for (int off = 1; off < 8; off <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off));
+            const float m_old = rmax[r], m_new = fmaxf(m_old, m);
+            float sum = 0.0f;
+#pragma unroll
+            for (int x = 0; x < 4; ++x) {
+                const float e = m_new == -INFINITY ? 0.0f : __expf(v[x] - m_new);
+                sum += e;
+                Ps[r * (MQ_T + 8) + c0 + x] = f2bf(e);
+            }
+#pragma unroll
+            for (int off = 1; off < 8; off <<= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
+            __syncwarp();
+            if ((tid % 8) == 0) {
+                const float scale = m_old == -INFINITY ? 0.0f : __expf(m_old - m_new);
+                rscale[r] = scale;
+                rsum[r] = rsum[r] * scale + sum;
+                rmax[r] = m_new;
+            }
+        }
+        cp_async_wait<1>();  // V of this tile
+        __syncthreads();
+        dequant(Vs);
+        {
+            const float s0 = rscale[mt * 16 + g], s1 = rscale[mt * 16 + g + 8];
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                o[nt][0] *= s0;
+                o[nt][1] *= s0;
+                o[nt][2] *= s1;
+                o[nt][3] *= s1;
+            }
+#pragma unroll
+            for (int kk = 0; kk < MQ_T; kk += 16) {
+                uint32_t a[4];
+                ldmatrix_x4(a, Ps + (mt * 16 + (lane & 15)) * (MQ_T + 8) + kk + (lane >> 4) * 8);
+#pragma unroll
+                for (int nt = 0; nt < 8; nt += 2) {
+                    uint32_t b[4];
+                    const int m = lane >> 3, rr = lane & 7;
+                    ldmatrix_x4_trans(b, Vs + (kk + (m & 1) * 8 + rr) * MPAD + oc0 + nt * 8 + (m >> 1) * 8);
+                    mma_bf16(o[nt], a, &b[0]);
+                    mma_bf16(o[nt + 1], a, &b[2]);
+                }
+            }
+        }
+        __syncthreads();
+        if (tile + 1 < tiles) load_rows(tile + 1, Vs, vcache);
+        cp_async_commit();
+    }
+    cp_async_wait<0>();
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int r = mt * 16 + g + h * 8, qi = r / 12, head = kvh * 12 + r % 12;
+        if (!live[qi]) continue;
+        const int t = t0 + qi;
+        const float inv = 1.0f / rsum[r];
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt)
+#pragma unroll
+            for (int x = 0; x < 2; ++x) {
+                const int d = oc0 + nt * 8 + t4 * 2 + x;
+                const float gate = qg[(size_t)t * ld + head * 2 * HD + HD + d];
+                out[(size_t)t * QH * HD + head * HD + d] = f2bf(o[nt][h * 2 + x] * inv * sigmoidf(gate));
+            }
+    }
+}
+
+}  // namespace
+
 extern "C" cudaError_t squash_qsa_attention(const float* q, const float* qg, int ld, const void* kcache, const void* vcache,
                                             const int* sel, const int* start, int T, int fp8, void* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
@@ -778,6 +1066,19 @@ extern "C" cudaError_t squash_qsa_attention(const float* q, const float* qg, int
             if (e != cudaSuccess) return e;
         }
         configured = true;
+    }
+    if (std::getenv("SQUASH_ATT_SINGLE") == nullptr) {
+        static bool mq_configured = false;
+        if (!mq_configured) {
+            for (auto kern : {attention_mq_kernel<false>, attention_mq_kernel<true>}) {
+                const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)MQ_SMEM);
+                if (e != cudaSuccess) return e;
+            }
+            mq_configured = true;
+        }
+        SQ_CHECK_LAUNCH(sq_launch(fp8 ? attention_mq_kernel<true> : attention_mq_kernel<false>, dim3((T + QB - 1) / QB, KVH), MQ_W * 32,
+                                  MQ_SMEM, st, q, qg, ld, kcache, vcache, sel, start, T, static_cast<__nv_bfloat16*>(out)));
+        SQ_RETURN_LAUNCH();
     }
     SQ_CHECK_LAUNCH(sq_launch(fp8 ? attention_mma_kernel<true> : attention_mma_kernel<false>, dim3(T, KVH), MW * 32, MMA_ATT_SMEM, st,
                               q, qg, ld, kcache, vcache, sel, start, static_cast<__nv_bfloat16*>(out)));
