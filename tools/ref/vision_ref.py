@@ -20,13 +20,14 @@ from safetensors import safe_open
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, type=pathlib.Path)
-    ap.add_argument("--image", required=True, type=pathlib.Path)
+    ap.add_argument("--image", type=pathlib.Path)
+    ap.add_argument("--video", type=pathlib.Path, help="a video instead of an image (HF video processor)")
     ap.add_argument("--out", required=True, type=pathlib.Path)
     ap.add_argument("--max-pixels", type=int, default=None, help="cap the resized image area")
     ap.add_argument("--bf16", action="store_true", help="also run the tower in BF16 (writes embeds_bf16.f32)")
     args = ap.parse_args()
 
-    from transformers import AutoConfig, AutoImageProcessor
+    from transformers import AutoConfig, AutoImageProcessor, AutoVideoProcessor
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpVisionModel
 
     config = AutoConfig.from_pretrained(args.model)
@@ -34,9 +35,18 @@ def main():
     kw = {}
     if args.max_pixels:
         kw["size"] = {"shortest_edge": proc.size["shortest_edge"], "longest_edge": args.max_pixels}
-    img = Image.open(args.image).convert("RGB")
-    batch = proc(images=[img], return_tensors="pt", **kw)
-    pixels, grid = batch["pixel_values"].float(), batch["image_grid_thw"]
+    extra = {}
+    if args.video:
+        vproc = AutoVideoProcessor.from_pretrained(args.model)
+        batch = vproc(videos=[str(args.video)], return_tensors="pt", return_metadata=True)
+        pixels, grid = batch["pixel_values_videos"].float(), batch["video_grid_thw"]
+        md = batch["video_metadata"][0]
+        extra = {"video": str(args.video), "fps": float(md.fps), "frames_indices": [int(i) for i in md.frames_indices],
+                 "total_num_frames": int(md.total_num_frames)}
+    else:
+        img = Image.open(args.image).convert("RGB")
+        batch = proc(images=[img], return_tensors="pt", **kw)
+        pixels, grid = batch["pixel_values"].float(), batch["image_grid_thw"]
 
     vc = config.vision_config
     vc._attn_implementation = "eager"
@@ -65,7 +75,9 @@ def main():
               % (np.abs(eb - embeds).max(), np.abs(eb - embeds).mean(), cos.min(), cos.mean()))
     pixels.numpy().astype(np.float32).tofile(args.out / "pixels.f32")
     embeds.astype(np.float32).tofile(args.out / "embeds.f32")
-    meta = {"grid_thw": grid[0].tolist(), "patches": int(pixels.shape[0]), "tokens": int(embeds.shape[0]), "image": str(args.image)}
+    meta = {"grid_thw": grid[0].tolist(), "patches": int(pixels.shape[0]), "tokens": int(embeds.shape[0]), **extra}
+    if args.image:
+        meta["image"] = str(args.image)
     (args.out / "meta.json").write_text(json.dumps(meta) + "\n")
     print(meta, "embeds", embeds.shape, "absmax", float(np.abs(embeds).max()))
 

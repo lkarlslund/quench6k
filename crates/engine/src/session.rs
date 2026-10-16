@@ -30,15 +30,16 @@ pub struct GenParams {
     pub images: Vec<std::sync::Arc<ImageInput>>,
 }
 
-/// A preprocessed image whose merged tokens occupy prompt positions [start, start + tokens).
+/// A preprocessed image or video. Each temporal group (one for an image) fills its own run of
+/// placeholder tokens, starting at the matching prompt index of `starts`.
 pub struct ImageInput {
-    pub start: usize,
+    pub starts: Vec<usize>,
     pub input: crate::vision::VisionInput,
 }
 
 impl std::fmt::Debug for ImageInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ImageInput {{ start: {}, grid: {:?} }}", self.start, self.input.grid)
+        write!(f, "ImageInput {{ starts: {:?}, grid: {:?} }}", self.starts, self.input.grid)
     }
 }
 
@@ -266,7 +267,12 @@ impl Session {
             return Ok(Vec::new());
         }
         let vm = self.vision.as_ref().ok_or_else(|| anyhow::anyhow!("image input needs the vision tower (--vision)"))?;
-        p.images.iter().map(|im| Ok(std::sync::Arc::new(vm.span(s, &im.input, im.start)?))).collect()
+        let mut spans = Vec::new();
+        for im in &p.images {
+            spans.extend(vm.spans(s, &im.input, &im.starts)?.into_iter().map(std::sync::Arc::new));
+        }
+        spans.sort_by_key(|sp| sp.start);
+        Ok(spans)
     }
 
     pub fn has_second_slot(&self) -> bool {

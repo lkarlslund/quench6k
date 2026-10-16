@@ -38,6 +38,7 @@ pub struct ServeOptions {
     pub capture_dir: Option<PathBuf>,
     pub vision: bool,
     pub image_max_pixels: usize,
+    pub video_max_frames: usize,
 }
 
 /// Identity of the served model and numerics for stored contexts: config.json plus the profile.
@@ -87,6 +88,7 @@ struct App {
     model_id: String,
     vision: bool,
     image_max_pixels: usize,
+    video_max_frames: usize,
 }
 
 pub fn run(opts: ServeOptions) -> Result<()> {
@@ -132,7 +134,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         schedule(&model, &stream, &mut session, &jobs_rx);
     });
     let default_strength = ready_rx.recv().context("worker thread")??;
-    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, tool_retries: opts.tool_retries, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model), vision, image_max_pixels: opts.image_max_pixels });
+    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, tool_retries: opts.tool_retries, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model), vision, image_max_pixels: opts.image_max_pixels, video_max_frames: opts.video_max_frames });
     let router = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -305,11 +307,11 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
     let enable_thinking = kwargs.get("enable_thinking").and_then(Value::as_bool);
     let effort = kwargs.get("reasoning_effort").or_else(|| req.get("reasoning_effort")).and_then(Value::as_str);
     let tools = req.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty())).cloned();
-    let (messages, images) = extract_images(app, messages)?;
+    let (messages, images, videos) = extract_images(app, messages)?;
     let text = app.chat.render(&messages, tools.as_ref(), enable_thinking, effort).map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
     let thinking = text.ends_with("<think>\n");
     let ids = app.chat.encode(&text).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let (ids, images) = app.chat.expand_images(&ids, images).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let (ids, images) = app.chat.expand_media(&ids, images, videos).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let max_tokens = req.get("max_completion_tokens").or_else(|| req.get("max_tokens")).and_then(Value::as_u64).unwrap_or(4096) as usize;
     let temperature = req.get("temperature").and_then(Value::as_f64).unwrap_or(1.0) as f32;
     let top_p = req.get("top_p").and_then(Value::as_f64).unwrap_or(0.95) as f32;
@@ -343,18 +345,20 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
 }
 
 /// Splits generated text into (reasoning, content, tool calls).
-/// Replaces image parts of message contents (OpenAI `image_url` with a data URL, or `image` with
-/// base64 `data`) by template placeholders and preprocesses the images, in order.
-fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<squash_engine::vision::VisionInput>), Response> {
+/// Replaces image and video parts of message contents (OpenAI-style `image_url` / `video_url` with
+/// a data URL) by template placeholders and preprocesses them, in order.
+#[allow(clippy::type_complexity)]
+fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<squash_engine::vision::VisionInput>, Vec<squash_engine::vision::VideoClip>), Response> {
     use base64::Engine;
     let mut out = messages.clone();
-    let mut images = Vec::new();
+    let (mut images, mut videos) = (Vec::new(), Vec::new());
     for m in out.as_array_mut().into_iter().flatten() {
         let Some(parts) = m.get_mut("content").and_then(Value::as_array_mut) else { continue };
         for part in parts.iter_mut() {
-            let url = match part.get("type").and_then(Value::as_str) {
-                Some("image_url") => part.get("image_url").and_then(|u| u.get("url").or(Some(u))).and_then(Value::as_str).map(str::to_owned),
-                Some("image") => part.get("image").and_then(Value::as_str).map(str::to_owned),
+            let kind = part.get("type").and_then(Value::as_str).unwrap_or("").to_owned();
+            let url = match kind.as_str() {
+                "image_url" | "video_url" => part.get(kind.as_str()).and_then(|u| u.get("url").or(Some(u))).and_then(Value::as_str).map(str::to_owned),
+                "image" | "video" => part.get(kind.as_str()).and_then(Value::as_str).map(str::to_owned),
                 _ => continue,
             };
             if !app.vision {
@@ -363,13 +367,23 @@ fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<squash_engi
             let url = url.ok_or_else(|| error(StatusCode::BAD_REQUEST, "image part without a URL"))?;
             let data = url.strip_prefix("data:").and_then(|r| r.split_once(";base64,")).map(|(_, d)| d)
                 .ok_or_else(|| error(StatusCode::BAD_REQUEST, "images must be data URLs (data:<type>;base64,...)"))?;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|e| error(StatusCode::BAD_REQUEST, format!("image base64: {e}")))?;
-            let input = squash_engine::vision::preprocess_image(&bytes, 65536, app.image_max_pixels).map_err(|e| error(StatusCode::BAD_REQUEST, format!("image: {e:#}")))?;
-            images.push(input);
-            *part = json!({"type": "image"});
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|e| error(StatusCode::BAD_REQUEST, format!("media base64: {e}")))?;
+            if kind.starts_with("video") {
+                // ffmpeg reads the clip from a private temporary file.
+                let path = std::env::temp_dir().join(format!("squash-video-{}-{}", std::process::id(), now() ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9)));
+                std::fs::write(&path, &bytes).map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("video: {e}")))?;
+                let clip = squash_engine::vision::preprocess_video(&path, 4096, 25165824, app.video_max_frames);
+                let _ = std::fs::remove_file(&path);
+                videos.push(clip.map_err(|e| error(StatusCode::BAD_REQUEST, format!("video: {e:#}")))?);
+                *part = json!({"type": "video"});
+            } else {
+                let input = squash_engine::vision::preprocess_image(&bytes, 65536, app.image_max_pixels).map_err(|e| error(StatusCode::BAD_REQUEST, format!("image: {e:#}")))?;
+                images.push(input);
+                *part = json!({"type": "image"});
+            }
         }
     }
-    Ok((out, images))
+    Ok((out, images, videos))
 }
 
 fn parse_output(text: &str, thinking: bool, tools: Option<&Value>) -> (Option<String>, String, Vec<Value>) {

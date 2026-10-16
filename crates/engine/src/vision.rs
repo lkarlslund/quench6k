@@ -237,19 +237,127 @@ pub fn preprocess_image(bytes: &[u8], min_pixels: usize, max_pixels: usize) -> R
 }
 
 impl VisionModel {
-    /// Encodes `input` into a span of placeholder tokens starting at sequence index `start`.
-    pub fn span(&self, s: &Stream, input: &VisionInput, start: usize) -> Result<crate::forward::MmSpan> {
-        let emb = self.encode(s, input)?;
+    /// Encodes `input` into one span of placeholder tokens per temporal group (an image has one),
+    /// starting at the given sequence indices (each group is its own MRoPE grid with t = 1).
+    pub fn spans(&self, s: &Stream, input: &VisionInput, starts: &[usize]) -> Result<Vec<crate::forward::MmSpan>> {
         let [t, h, w] = input.grid;
+        ensure!(starts.len() == t, "{} span starts for {t} temporal groups", starts.len());
+        let emb = std::sync::Arc::new(self.encode(s, input)?);
         let (gh, gw) = (h / MERGE, w / MERGE);
-        let mut offsets = Vec::with_capacity(t * gh * gw);
-        for ti in 0..t {
-            for r in 0..gh {
-                for c in 0..gw {
-                    offsets.push([ti as i32, r as i32, c as i32]);
+        let offsets: Vec<[i32; 3]> = (0..gh).flat_map(|r| (0..gw).map(move |c| [0, r as i32, c as i32])).collect();
+        Ok(starts
+            .iter()
+            .enumerate()
+            .map(|(g, &start)| crate::forward::MmSpan { start, emb: emb.clone(), row: g * gh * gw, offsets: offsets.clone(), advance: gh.max(gw) as i32 })
+            .collect())
+    }
+}
+
+/// A sampled, preprocessed video: temporal groups of 2 frames and each group's timestamp (seconds).
+pub struct VideoClip {
+    pub input: VisionInput,
+    pub timestamps: Vec<f64>,
+}
+
+/// The Qwen3-VL video `smart_resize`: like images, but the area budget covers all frames.
+fn video_resize(frames: usize, height: usize, width: usize, min_pixels: usize, max_pixels: usize) -> Result<(usize, usize)> {
+    let factor = (PATCH * MERGE) as f64;
+    let (mut h, mut w) = (height as f64, width as f64);
+    if h < factor || w < factor {
+        let scale = (factor / h).max(factor / w);
+        h = (h * scale).floor();
+        w = (w * scale).floor();
+    }
+    ensure!(h.max(w) / h.min(w) <= 200.0, "video aspect ratio over 200");
+    let t = ((frames as f64) / TEMPORAL as f64).round_ties_even() * TEMPORAL as f64;
+    let (mut hb, mut wb) = ((h / factor).round_ties_even() * factor, (w / factor).round_ties_even() * factor);
+    let n = frames as f64;
+    if t * hb * wb > max_pixels as f64 {
+        let beta = (n * h * w / max_pixels as f64).sqrt();
+        hb = factor.max((h / beta / factor).floor() * factor);
+        wb = factor.max((w / beta / factor).floor() * factor);
+    } else if t * hb * wb < min_pixels as f64 {
+        let beta = (min_pixels as f64 / (n * h * w)).sqrt();
+        hb = (h * beta / factor).ceil() * factor;
+        wb = (w * beta / factor).ceil() * factor;
+    }
+    Ok((hb as usize, wb as usize))
+}
+
+/// The checkpoint's video processor, with ffmpeg decoding: samples 2 frames per second (4 to
+/// `max_frames`, at most every frame) at evenly spaced indices, resizes them all to one size, pairs
+/// frames into temporal patches (repeating the last frame to an even count) and cuts patches like
+/// images. Timestamps average each pair's frame times, as the HF processor's prompt does.
+pub fn preprocess_video(path: &std::path::Path, min_pixels: usize, max_pixels: usize, max_frames: usize) -> Result<VideoClip> {
+    use anyhow::Context;
+    let probe = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,duration", "-of", "json"])
+        .arg(path)
+        .output()
+        .context("running ffprobe")?;
+    ensure!(probe.status.success(), "ffprobe: {}", String::from_utf8_lossy(&probe.stderr));
+    let info: serde_json::Value = serde_json::from_slice(&probe.stdout)?;
+    let st = &info["streams"][0];
+    let (width, height) = (st["width"].as_u64().context("video width")? as usize, st["height"].as_u64().context("video height")? as usize);
+    let rate = |v: &serde_json::Value| -> Option<f64> {
+        let (a, b) = v.as_str()?.split_once('/')?;
+        let (a, b) = (a.parse::<f64>().ok()?, b.parse::<f64>().ok()?);
+        (b > 0.0 && a > 0.0).then_some(a / b)
+    };
+    let fps = rate(&st["avg_frame_rate"]).or_else(|| rate(&st["r_frame_rate"])).unwrap_or(24.0);
+    let total = match st["nb_frames"].as_str().and_then(|n| n.parse::<usize>().ok()) {
+        Some(n) => n,
+        None => (st["duration"].as_str().and_then(|d| d.parse::<f64>().ok()).context("video length")? * fps).floor() as usize,
+    };
+    ensure!(total > 0, "video has no frames");
+    let wanted = ((total as f64 / fps * 2.0) as usize).max(4).min(max_frames).min(total);
+    let indices: Vec<usize> = (0..wanted)
+        .map(|i| if wanted == 1 { 0.0 } else { i as f64 * (total - 1) as f64 / (wanted - 1) as f64 })
+        .map(|x| x.round_ties_even() as usize)
+        .collect();
+    let select = indices.iter().map(|i| format!("eq(n\\,{i})")).collect::<Vec<_>>().join("+");
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-vf", &format!("select='{select}'"), "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+        .output()
+        .context("running ffmpeg")?;
+    ensure!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+    let frame_bytes = width * height * 3;
+    let got = out.stdout.len() / frame_bytes;
+    ensure!(got > 0, "ffmpeg returned no frames");
+    let (h, w) = video_resize(got, height, width, min_pixels, max_pixels)?;
+    let mut frames: Vec<image::RgbImage> = out
+        .stdout
+        .chunks_exact(frame_bytes)
+        .map(|raw| {
+            let img = image::RgbImage::from_raw(width as u32, height as u32, raw.to_vec()).expect("frame size");
+            image::imageops::resize(&img, w as u32, h as u32, image::imageops::FilterType::CatmullRom)
+        })
+        .collect();
+    let mut idx = indices[..got.min(indices.len())].to_vec();
+    while frames.len() % TEMPORAL != 0 {
+        frames.push(frames.last().unwrap().clone());
+        idx.push(*idx.last().unwrap());
+    }
+    let (gh, gw) = (h / PATCH, w / PATCH);
+    let coords = patch_coords(gh, gw);
+    let groups = frames.len() / TEMPORAL;
+    let mut pixels = Vec::with_capacity(groups * gh * gw * PATCH_DIM);
+    for g in 0..groups {
+        for &(r, c) in &coords {
+            for ch in 0..3 {
+                for f in &frames[g * TEMPORAL..(g + 1) * TEMPORAL] {
+                    for y in 0..PATCH {
+                        for x in 0..PATCH {
+                            let v = f.get_pixel((c * PATCH + x) as u32, (r * PATCH + y) as u32)[ch];
+                            pixels.push((v as f32 / 255.0 - 0.5) / 0.5);
+                        }
+                    }
                 }
             }
         }
-        Ok(crate::forward::MmSpan { start, emb, offsets, advance: gh.max(gw) as i32 })
     }
+    let timestamps = idx.chunks(TEMPORAL).map(|p| (p[0] as f64 / fps + p[TEMPORAL - 1] as f64 / fps) / 2.0).collect();
+    Ok(VideoClip { input: VisionInput { pixels, grid: [groups, gh, gw] }, timestamps })
 }

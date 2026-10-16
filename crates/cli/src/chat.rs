@@ -76,20 +76,38 @@ impl Chat {
     /// Snapshot positions for prefix reuse: the start of the prompt's final turn (its last
     /// `<|im_start|>`), which the next request of the same conversation shares.
     /// Expands each `<|image_pad|>` placeholder of `ids` (in order) into one token per merged image
-    /// token, returning the new IDs and each image's span.
-    pub fn expand_images(&self, ids: &[i32], images: Vec<squash_engine::vision::VisionInput>) -> Result<(Vec<i32>, Vec<std::sync::Arc<squash_engine::session::ImageInput>>)> {
-        let pad = self.token_id("<|image_pad|>").ok_or_else(|| anyhow::anyhow!("tokenizer has no <|image_pad|>"))?;
+    /// token, and each `<|video_pad|>` into, per temporal group,
+    /// `<{t:.1} seconds><|vision_start|>` + one pad per merged token + `<|vision_end|>` (the HF
+    /// Qwen3-VL processor's expansion).
+    pub fn expand_media(&self, ids: &[i32], images: Vec<squash_engine::vision::VisionInput>, videos: Vec<squash_engine::vision::VideoClip>) -> Result<(Vec<i32>, Vec<std::sync::Arc<squash_engine::session::ImageInput>>)> {
+        use squash_engine::session::ImageInput;
+        let token = |t: &str| self.token_id(t).ok_or_else(|| anyhow::anyhow!("tokenizer has no {t}"));
+        let (pad, vpad, vstart, vend) = (token("<|image_pad|>")?, token("<|video_pad|>")?, token("<|vision_start|>")?, token("<|vision_end|>")?);
         let found = ids.iter().filter(|&&t| t == pad).count();
         anyhow::ensure!(found == images.len(), "{} images for {found} image placeholders", images.len());
-        let mut out = Vec::with_capacity(ids.len() + images.iter().map(|i| i.tokens()).sum::<usize>());
-        let mut spans = Vec::with_capacity(images.len());
-        let mut it = images.into_iter();
+        let vfound = ids.iter().filter(|&&t| t == vpad).count();
+        anyhow::ensure!(vfound == videos.len(), "{} videos for {vfound} video placeholders", videos.len());
+        let mut out = Vec::with_capacity(ids.len());
+        let mut spans = Vec::with_capacity(images.len() + videos.len());
+        let (mut it, mut vt) = (images.into_iter(), videos.into_iter());
         for &t in ids {
             if t == pad {
                 let input = it.next().unwrap();
                 let start = out.len();
                 out.extend(std::iter::repeat_n(pad, input.tokens()));
-                spans.push(std::sync::Arc::new(squash_engine::session::ImageInput { start, input }));
+                spans.push(std::sync::Arc::new(ImageInput { starts: vec![start], input }));
+            } else if t == vpad {
+                let clip = vt.next().unwrap();
+                let per = clip.input.tokens() / clip.input.grid[0];
+                let mut starts = Vec::with_capacity(clip.timestamps.len());
+                for ts in &clip.timestamps {
+                    out.extend(self.encode(&format!("<{ts:.1} seconds>"))?);
+                    out.push(vstart);
+                    starts.push(out.len());
+                    out.extend(std::iter::repeat_n(vpad, per));
+                    out.push(vend);
+                }
+                spans.push(std::sync::Arc::new(ImageInput { starts, input: clip.input }));
             } else {
                 out.push(t);
             }

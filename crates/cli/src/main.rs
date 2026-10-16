@@ -170,6 +170,9 @@ enum Command {
         /// Images to show the model (placed before the prompt text).
         #[arg(long)]
         image: Vec<PathBuf>,
+        /// Videos to show the model (after the images; decoded with ffmpeg).
+        #[arg(long)]
+        video: Vec<PathBuf>,
         #[command(flatten)]
         steer: SteerArgs,
     },
@@ -216,6 +219,9 @@ enum Command {
         /// each 32x32 block becomes one token).
         #[arg(long, default_value_t = 4194304)]
         image_max_pixels: usize,
+        /// Most frames sampled from a video (2 per second; the processor allows 768).
+        #[arg(long, default_value_t = 128)]
+        video_max_frames: usize,
     },
     /// Batched decode check: two fixture prompts decoded together must give each one's single-sequence
     /// greedy tokens, bit for bit; also times both.
@@ -365,12 +371,12 @@ fn main() -> Result<()> {
         }
         Command::VisionCheck { model, reference, max_pixels } => vision_check(&model, &reference, max_pixels)?,
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, batch2, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, batch2, &steer)?,
-        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir, no_vision, image_max_pixels } => {
-            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir, vision: !no_vision, image_max_pixels })?
+        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir, no_vision, image_max_pixels, video_max_frames } => {
+            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir, vision: !no_vision, image_max_pixels, video_max_frames })?
         }
         Command::BatchCheck { model, fixture, n } => batch_check(&model, &fixture, n)?,
-        Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, image, steer } => {
-            chat_once(&model, &prompt, max_tokens, temperature, top_p, top_k, seed, think, context, &image, &steer)?
+        Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, image, video, steer } => {
+            chat_once(&model, &prompt, max_tokens, temperature, top_p, top_k, seed, think, context, &image, &video, &steer)?
         }
         Command::Generate { model, precision, fixture, tie, steer } => generate(&model, precision.into(), &fixture, tie, &steer)?,
         Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
@@ -578,7 +584,7 @@ fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathB
 }
 
 #[allow(clippy::too_many_arguments)]
-fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32, top_k: usize, seed: u64, think: bool, context: usize, images: &[PathBuf], steer: &SteerArgs) -> Result<()> {
+fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32, top_k: usize, seed: u64, think: bool, context: usize, images: &[PathBuf], videos: &[PathBuf], steer: &SteerArgs) -> Result<()> {
     use std::io::Write;
     let chat = chat::Chat::load(model_dir, None)?;
     let (mut model, stream) = load(model_dir, Precision::Int8Group, true)?;
@@ -587,18 +593,23 @@ fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, tempe
     let mut session = squash_engine::session::Session::new(&model, &stream, context, 8192, 6, Default::default())?;
     let mut content = vec![];
     let mut inputs = vec![];
-    if !images.is_empty() {
+    let mut clips = vec![];
+    if !images.is_empty() || !videos.is_empty() {
         session.set_vision(squash_engine::vision::VisionModel::load(&Checkpoint::open(model_dir)?, LoadOptions::default(), &stream)?);
         for path in images {
             inputs.push(squash_engine::vision::preprocess_image(&std::fs::read(path)?, 65536, 16777216)?);
             content.push(serde_json::json!({"type": "image"}));
+        }
+        for path in videos {
+            clips.push(squash_engine::vision::preprocess_video(path, 4096, 25165824, 768)?);
+            content.push(serde_json::json!({"type": "video"}));
         }
     }
     content.push(serde_json::json!({"type": "text", "text": prompt}));
     println!("session ready in {:.1}s", t0.elapsed().as_secs_f64());
     let messages = serde_json::json!([{"role": "user", "content": content}]);
     let text = chat.render(&messages, None, Some(think), None)?;
-    let (ids, images) = chat.expand_images(&chat.encode(&text)?, inputs)?;
+    let (ids, images) = chat.expand_media(&chat.encode(&text)?, inputs, clips)?;
     let params = squash_engine::session::GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: chat.stop_tokens.clone(), steering_strength: strength, boundaries: chat.boundaries(&ids), capture: false, images };
     let mut out = chat::TextStream::default();
     let t1 = std::time::Instant::now();
@@ -718,6 +729,24 @@ fn vision_check(model_dir: &std::path::Path, reference: &std::path::Path, max_pi
     let read_f32 = |name: &str| -> Result<Vec<f32>> { Ok(std::fs::read(reference.join(name))?.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()) };
     let input = VisionInput { pixels: read_f32("pixels.f32")?, grid: [grid[0], grid[1], grid[2]] };
     let want = read_f32("embeds.f32")?;
+    if let Some(path) = meta["video"].as_str() {
+        let clip = squash_engine::vision::preprocess_video(std::path::Path::new(path), 4096, 25165824, 768)?;
+        println!("video timestamps {:?}", clip.timestamps);
+        if clip.input.grid == input.grid {
+            let d: Vec<f32> = clip.input.pixels.iter().zip(&input.pixels).map(|(a, b)| (a - b).abs()).collect();
+            println!("video preprocessing: grid {:?}; pixel |diff| max {:.4} mean {:.5}", clip.input.grid, d.iter().cloned().fold(0f32, f32::max), d.iter().sum::<f32>() / d.len() as f32);
+            let own = vm.encode(&s, &clip.input)?;
+            let got: Vec<f32> = s.download(own.addr(), want.len())?;
+            let cos: f64 = (0..input.tokens()).map(|t| {
+                let (a, b) = (&got[t * 2560..(t + 1) * 2560], &want[t * 2560..(t + 1) * 2560]);
+                let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+                dot / (a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt() * b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt())
+            }).sum::<f64>() / input.tokens() as f64;
+            println!("embeddings from squash's own preprocessing vs the reference: mean cosine {cos:.6}");
+        } else {
+            println!("video preprocessing: grid {:?} differs from the reference {:?}", clip.input.grid, input.grid);
+        }
+    }
     if let Some(path) = meta["image"].as_str() {
         let own = squash_engine::vision::preprocess_image(&std::fs::read(path)?, 65536, max_pixels)?;
         if own.grid == input.grid {
