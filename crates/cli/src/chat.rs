@@ -180,30 +180,65 @@ impl Chat {
 #[derive(Default)]
 pub struct TextStream {
     ids: Vec<i32>,
-    sent: usize,
+    /// Token window decoded per push: ids[prefix..read] were emitted already (their text ends on a
+    /// complete character), ids[read..] not yet. Decoding only the window keeps a push O(1) in the
+    /// length of the generation.
+    prefix: usize,
+    read: usize,
 }
 
 impl TextStream {
     /// A stream continuing after `ids` (already shown).
-    pub fn after(chat: &Chat, ids: &[i32]) -> Result<Self> {
-        let sent = chat.decode(ids, true)?.len();
-        Ok(Self { ids: ids.to_vec(), sent })
+    pub fn after(_chat: &Chat, ids: &[i32]) -> Result<Self> {
+        Ok(Self { ids: ids.to_vec(), prefix: ids.len().saturating_sub(6), read: ids.len() })
     }
 
     pub fn ids(&self) -> &[i32] {
         &self.ids
     }
 
+    /// Appends `id`; returns the text it completes (empty while a character is still incomplete).
     pub fn push(&mut self, chat: &Chat, id: i32) -> Result<String> {
         self.ids.push(id);
-        let text = chat.decode(&self.ids, true)?;
-        let stable = if text.ends_with('\u{FFFD}') { text.trim_end_matches('\u{FFFD}').len() } else { text.len() };
-        if stable <= self.sent || !text.is_char_boundary(self.sent) {
+        let shown = chat.decode(&self.ids[self.prefix..self.read], true)?;
+        let text = chat.decode(&self.ids[self.prefix..], true)?;
+        if text.len() <= shown.len() || text.ends_with('\u{FFFD}') || !text.is_char_boundary(shown.len()) || !text.starts_with(&shown) {
             return Ok(String::new());
         }
-        let out = text[self.sent..stable].to_string();
-        self.sent = stable;
-        Ok(out)
+        self.prefix = self.read;
+        self.read = self.ids.len();
+        Ok(text[shown.len()..].to_string())
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Streaming a generation token by token yields exactly its full decode (multi-byte characters
+    /// split across tokens included).
+    #[test]
+    fn text_stream_matches_full_decode() {
+        let dir = std::path::Path::new("/storage/ai/huggingface/main/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4");
+        if !dir.join("tokenizer.json").exists() {
+            return;
+        }
+        let chat = Chat::load(dir, None).unwrap();
+        let text = "Hello, wörld! 你好，世界。 🦀🚀 emoji ZWJ 👩‍💻 and code:\n```rust\nfn main() { println!(\"ok\"); }\n```\n".repeat(20);
+        let ids = chat.encode_plain(&text).unwrap();
+        let mut stream = TextStream::default();
+        let mut out = String::new();
+        for &id in &ids {
+            out += &stream.push(&chat, id).unwrap();
+        }
+        assert_eq!(out, chat.decode(&ids, true).unwrap());
+        // Continuing after a prefix.
+        let half = ids.len() / 2;
+        let mut stream = TextStream::after(&chat, &ids[..half]).unwrap();
+        let mut rest = String::new();
+        for &id in &ids[half..] {
+            rest += &stream.push(&chat, id).unwrap();
+        }
+        assert_eq!(chat.decode(&ids[..half], true).unwrap() + &rest, chat.decode(&ids, true).unwrap());
+    }
 }
