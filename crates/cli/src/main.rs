@@ -1,6 +1,7 @@
 mod bench;
 mod chat;
 mod mtp;
+mod serve;
 
 use std::path::PathBuf;
 
@@ -161,6 +162,24 @@ enum Command {
         #[command(flatten)]
         steer: SteerArgs,
     },
+    /// OpenAI-compatible HTTP server (/v1/models, /v1/chat/completions with streaming and tool calls).
+    Serve {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: std::net::SocketAddr,
+        /// Longest prompt + completion in tokens.
+        #[arg(long, default_value_t = 65536)]
+        context: usize,
+        /// Longest speculative draft (adaptive 1..=N) for greedy requests.
+        #[arg(long, default_value_t = 6)]
+        drafts: usize,
+        /// Model name reported by /v1/models.
+        #[arg(long, default_value = "squash")]
+        name: String,
+        #[command(flatten)]
+        steer: SteerArgs,
+    },
     /// Measure prefill and greedy decode throughput at the given prompt lengths.
     Bench {
         #[arg(long)]
@@ -284,6 +303,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, &steer)?,
+        Command::Serve { model, listen, context, drafts, name, steer } => serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer })?,
         Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, steer } => {
             chat_once(&model, &prompt, max_tokens, temperature, top_p, top_k, seed, think, context, &steer)?
         }
