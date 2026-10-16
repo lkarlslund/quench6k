@@ -166,3 +166,11 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
   (0.4 ms for a re-sent conversation, exact). Streaming detokenization is O(1) per token.
 - Single-TF32 GDN prefill is 4% faster but fails the tool-call completion bound (also with TF32
   only in the per-chunk products); 3xTF32 stays.
+- HC up-mix loads its first token group's residual, pending update and RMS factor together with z
+  (-0.15% / -0.29% per step at 1 / 4 rows, exact). Deeper GEMV preloads for long K, 64-column GEMM
+  tiles and the INT8 wide kernel for the HC down-projection in prefill were all slower.
+- Context store: a stash allocates a fresh pinned buffer (0.07-0.08 s for 500 MiB) and evictions write
+  to disk synchronously inside the insert; both only cost on conversation switches, which are rare.
+- Full model after this session (FP8 KV): 8K prefill 14.7K tok/s, plain decode 190 tok/s, greedy MTP
+  416 tok/s; 32K: 14.4K / 189 / 408 tok/s. Sampled MTP (temperature 1.0, top_p 0.95, top_k 20) on
+  the service: 236-350 tok/s at 2.3-3.7 tokens per round, depending on the text.
