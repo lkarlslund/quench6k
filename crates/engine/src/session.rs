@@ -207,6 +207,8 @@ struct Snapshot {
 }
 
 const MAX_SNAPSHOTS: usize = 12;
+/// Device memory a new snapshot leaves free; below it, an older snapshot is recycled instead.
+const SNAPSHOT_HEADROOM: usize = 1 << 30;
 /// Periodic snapshots per prompt (at most): a long prompt edited in the middle re-prefills at most
 /// about 1/8 of itself.
 const PERIODIC_SNAPSHOTS: usize = 8;
@@ -550,6 +552,10 @@ impl Session {
         v
     }
 
+    fn snapshot_bytes(state: &SequenceState, pending: u64) -> usize {
+        Self::pieces(state, pending).iter().map(|p| p.1).sum()
+    }
+
     fn save_snapshot(state: &SequenceState, pending: u64, s: &Stream, pos: usize, recycled: Option<DeviceBuffer>) -> Result<Snapshot> {
         let pieces = Self::pieces(state, pending);
         let total: usize = pieces.iter().map(|p| p.1).sum();
@@ -635,16 +641,32 @@ impl Session {
         let snapshots = &mut self.snapshots;
         let (dec, state, ws, chunk) = (&mut self.dec, &mut self.state, &mut self.ws, self.chunk);
         with_ple_warm(model, prompt, start, || dec.prefill_from(model, state, ws, s, prompt, start, chunk, &pauses, |state, pos, pending| {
-            // Recycle the oldest periodic snapshot first, then the oldest.
-            let recycled = if snapshots.len() >= MAX_SNAPSHOTS {
+            // Recycle the oldest periodic snapshot first, then the oldest. Snapshots only speed up later
+            // prompts: when device memory is short, an older one is recycled, or none is taken.
+            let oldest = |snapshots: &mut Vec<Snapshot>| {
                 let i = snapshots.iter().position(|sn| sn.periodic).unwrap_or(0);
-                Some(snapshots.remove(i).buf)
-            } else {
-                None
+                snapshots.remove(i).buf
             };
-            let mut snap = Self::save_snapshot(state, pending, s, pos, recycled)?;
-            snap.periodic = periodic.contains(&pos);
-            snapshots.push(snap);
+            let buf = if snapshots.len() >= MAX_SNAPSHOTS {
+                Some(oldest(snapshots))
+            } else {
+                // Leave headroom for per-request buffers (vision encoder, sampling).
+                let bytes = Self::snapshot_bytes(state, pending);
+                let room = squash_cuda::mem_info().map_or(false, |(free, _)| free >= bytes + SNAPSHOT_HEADROOM);
+                match if room { DeviceBuffer::new(bytes) } else { Err(anyhow::anyhow!("under {} MiB free", SNAPSHOT_HEADROOM >> 20)) } {
+                    Ok(b) => Some(b),
+                    Err(_) if !snapshots.is_empty() => Some(oldest(snapshots)),
+                    Err(e) => {
+                        eprintln!("snapshot at {pos} skipped: {e:#}");
+                        None
+                    }
+                }
+            };
+            if let Some(buf) = buf {
+                let mut snap = Self::save_snapshot(state, pending, s, pos, Some(buf))?;
+                snap.periodic = periodic.contains(&pos);
+                snapshots.push(snap);
+            }
             Ok(())
         }, report.as_ref().map(|f| f as &(dyn Fn(usize) + Send + Sync))))?;
         self.kv_tokens = key;

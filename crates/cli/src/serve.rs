@@ -509,11 +509,26 @@ fn parse_tool_call(body: &str, tools: Option<&Value>) -> Option<Value> {
         let raw = body[pe + 1..ve].strip_prefix('\n').unwrap_or(&body[pe + 1..ve]);
         let raw = raw.strip_suffix('\n').unwrap_or(raw);
         let ty = schema.and_then(|s| s.pointer(&format!("/function/parameters/properties/{arg}/type"))).and_then(Value::as_str);
-        let value = if ty == Some("string") { Value::String(raw.to_string()) } else { serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string())) };
+        let value = param_value(raw, ty);
         args.insert(arg, value);
         cursor = ve + "</parameter>".len();
     }
     Some(json!({"name": name, "arguments": Value::Object(args).to_string()}))
+}
+
+/// Converts a `<parameter>` body to the schema's type. Booleans and null are accepted in any case
+/// (`False`, `None`: the model sometimes writes Python literals), as vLLM's Qwen3-Coder parser does.
+fn param_value(raw: &str, ty: Option<&str>) -> Value {
+    if ty == Some("string") {
+        return Value::String(raw.to_string());
+    }
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" if ty == Some("boolean") || ty.is_none() => return Value::Bool(true),
+        "false" if ty == Some("boolean") || ty.is_none() => return Value::Bool(false),
+        "null" | "none" => return Value::Null,
+        _ => {}
+    }
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 fn finish_reason(finish: Finish, tool_calls: bool) -> &'static str {
@@ -1103,6 +1118,19 @@ mod tests {
         assert!(validate_calls(mistyped, &tools()).unwrap_err().contains("not a integer"));
         let json_style = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n</tool_call>";
         assert!(validate_calls(json_style, &tools()).is_ok(), "{:?}", validate_calls(json_style, &tools()));
+    }
+
+    #[test]
+    fn python_style_literals() {
+        let tools = json!([{"type": "function", "function": {"name": "exec_command", "parameters": {"type": "object",
+            "properties": {"cmd": {"type": "string"}, "login": {"type": "boolean"}}, "required": ["cmd"]}}}]);
+        let call = "<tool_call>\n<function=exec_command>\n<parameter=cmd>\nwc -l False\n</parameter>\n<parameter=login>\nFalse\n</parameter>\n</function>\n</tool_call>";
+        assert!(validate_calls(call, &tools).is_ok());
+        let args: Value = serde_json::from_str(parse_tool_call(&call[11..call.len() - 12], Some(&tools)).unwrap()["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({"cmd": "wc -l False", "login": false}));
+        assert_eq!(param_value("TRUE", Some("boolean")), json!(true));
+        assert_eq!(param_value("None", Some("integer")), Value::Null);
+        assert_eq!(param_value("None", Some("string")), json!("None"));
     }
 }
 
