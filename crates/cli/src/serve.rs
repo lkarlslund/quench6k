@@ -16,7 +16,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use squash_engine::model::Precision;
-use squash_engine::session::{Finish, GenParams, Session};
+use squash_engine::session::{Finish, GenParams, Progress, Session};
 use tokio::sync::mpsc as tmpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -71,6 +71,8 @@ struct Job {
 
 enum Msg {
     Token(i32),
+    /// Prefill progress: (prompt tokens computed, of which served from cache).
+    Progress(usize, usize),
     /// Finished, with the prompt tokens served from the prefix cache.
     Done(Finish, usize),
     Error(String),
@@ -301,6 +303,8 @@ struct Prepared {
     thinking: bool,
     tools: Option<Value>,
     stream: bool,
+    /// Stream prefill progress chunks ("return_progress", as llama.cpp's server).
+    progress: bool,
 }
 
 fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
@@ -342,8 +346,10 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
             Some((dir.join(format!("{name}.safetensors")), meta))
         }
     };
-    let params = GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids), capture: capture.is_some(), images };
-    Ok(Prepared { capture, ids, params, stops, thinking, tools, stream: req.get("stream").and_then(Value::as_bool).unwrap_or(false) })
+    let params = GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids), capture: capture.is_some(), images, progress: None };
+    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let progress = stream && req.get("return_progress").and_then(Value::as_bool).unwrap_or(false);
+    Ok(Prepared { capture, ids, params, stops, thinking, tools, stream, progress })
 }
 
 /// Splits generated text into (reasoning, content, tool calls).
@@ -509,6 +515,10 @@ async fn full_response(app: Arc<App>, p: Prepared, id: String) -> Response {
 enum Seg {
     Reasoning(String),
     Content(String),
+    /// Prefill progress: (prompt tokens computed, total, served from cache, milliseconds since start).
+    Prompt(usize, usize, usize, u64),
+    /// Bytes of tool-call text generated so far (held back until the call is validated).
+    ToolBytes(usize),
 }
 
 /// Splits the growing output text into streamable pieces: reasoning until `</think>` (thinking turns),
@@ -521,11 +531,12 @@ struct Segmenter {
     in_reasoning: bool,
     content_started: bool,
     stopped: bool,
+    tool_bytes: usize,
 }
 
 impl Segmenter {
     fn new(thinking: bool) -> Self {
-        Self { text: String::new(), sent: 0, thinking, in_reasoning: thinking, content_started: false, stopped: false }
+        Self { text: String::new(), sent: 0, thinking, in_reasoning: thinking, content_started: false, stopped: false, tool_bytes: 0 }
     }
 
     fn feed(&mut self, piece: &str, stops: &[String]) -> Vec<Seg> {
@@ -567,6 +578,12 @@ impl Segmenter {
                     sent = end;
                     self.content_started = true;
                 }
+            } else {
+                let held = text.len() - (sent + text[sent..].find("<tool_call>").unwrap_or(0));
+                if held != self.tool_bytes {
+                    self.tool_bytes = held;
+                    out.push(Seg::ToolBytes(held));
+                }
             }
             break;
         }
@@ -590,8 +607,9 @@ impl Segmenter {
 
 /// Receives one generation job's tokens, feeding decoded text through the segmenter to `on_seg`;
 /// returns (tokens, finish, cached prompt tokens) or an error message.
-async fn drive(app: &App, rx: &mut tmpsc::UnboundedReceiver<Msg>, stops: &[String], seg: &mut Segmenter, stream: &mut TextStream, on_seg: &mut impl FnMut(Seg)) -> Result<(usize, Finish, usize), String> {
+async fn drive(app: &App, rx: &mut tmpsc::UnboundedReceiver<Msg>, total_prompt: usize, stops: &[String], seg: &mut Segmenter, stream: &mut TextStream, on_seg: &mut impl FnMut(Seg)) -> Result<(usize, Finish, usize), String> {
     let mut n = 0usize;
+    let start = std::time::Instant::now();
     while let Some(msg) = rx.recv().await {
         match msg {
             Msg::Token(t) => {
@@ -607,6 +625,7 @@ async fn drive(app: &App, rx: &mut tmpsc::UnboundedReceiver<Msg>, stops: &[Strin
                     rx.close();
                 }
             }
+            Msg::Progress(done, cached) => on_seg(Seg::Prompt(done, total_prompt, cached, start.elapsed().as_millis() as u64)),
             Msg::Done(f, c) => return Ok((n, f, c)),
             Msg::Error(e) => return Err(e),
         }
@@ -626,8 +645,14 @@ async fn generate(app: &App, p: &Prepared, mut on_seg: impl FnMut(Seg)) -> Resul
     let mut ids = p.ids.clone();
     for attempt in 0..=app.tool_retries {
         let (tx, mut rx) = tmpsc::unbounded_channel();
+        if p.progress {
+            let ptx = tx.clone();
+            params.progress = Some(Progress(Arc::new(move |done, cached| {
+                let _ = ptx.send(Msg::Progress(done, cached));
+            })));
+        }
         app.jobs.send(Work::Generate(Job { ids: ids.clone(), params: params.clone(), tx, capture: p.capture.clone() })).map_err(|_| "generation worker stopped".to_string())?;
-        let (n, finish, cached) = drive(app, &mut rx, &p.stops, &mut seg, &mut stream, &mut on_seg).await?;
+        let (n, finish, cached) = drive(app, &mut rx, ids.len(), &p.stops, &mut seg, &mut stream, &mut on_seg).await?;
         total += n;
         cached_first.get_or_insert(cached);
         let (Some(tools), Some(tc)) = (p.tools.as_ref(), app.tool_call_token) else { return Ok((seg, total, finish, cached_first.unwrap_or(0))) };
@@ -722,6 +747,19 @@ async fn stream_response(app: Arc<App>, p: Prepared, id: String) -> Response {
             let delta = match s {
                 Seg::Reasoning(t) => json!({"reasoning_content": t}),
                 Seg::Content(t) => json!({"content": t}),
+                // llama.cpp-style extensions (requested with "return_progress"; harmless otherwise).
+                Seg::Prompt(processed, total, cache, ms) => {
+                    let c = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": app.name, "choices": [],
+                                   "prompt_progress": {"total": total, "cache": cache, "processed": processed, "time_ms": ms}});
+                    let _ = out_tx.send(Ok(Event::default().data(c.to_string())));
+                    return;
+                }
+                Seg::ToolBytes(b) => {
+                    let c = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": app.name,
+                                   "choices": [{"index": 0, "delta": {}, "finish_reason": Value::Null}], "tool_call_progress": {"bytes": b}});
+                    let _ = out_tx.send(Ok(Event::default().data(c.to_string())));
+                    return;
+                }
             };
             let _ = out_tx.send(chunk(delta, None));
         })
@@ -914,6 +952,7 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
         let result = generate(&app, &p, |s| match s {
             Seg::Reasoning(t) => emit(true, t),
             Seg::Content(t) => emit(false, t),
+            Seg::Prompt(..) | Seg::ToolBytes(_) => {}
         })
         .await;
         let (seg, n, finish, _) = match result {

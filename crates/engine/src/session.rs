@@ -28,6 +28,18 @@ pub struct GenParams {
     pub capture: bool,
     /// Images of the prompt, in order; each fills a run of placeholder tokens.
     pub images: Vec<std::sync::Arc<ImageInput>>,
+    /// Called during prefill with (prompt tokens computed so far, of which served from cache).
+    pub progress: Option<Progress>,
+}
+
+/// A prefill progress callback: (prompt tokens computed so far, of which served from cache).
+#[derive(Clone)]
+pub struct Progress(pub std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>);
+
+impl std::fmt::Debug for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Progress")
+    }
 }
 
 /// A preprocessed image or video. Each temporal group (one for an image) fills its own run of
@@ -301,7 +313,7 @@ impl Session {
             self.state.reset(s)?;
             self.state.set_steering_strength(s, p.steering_strength)?;
             self.ws.capture = capture;
-            let r = self.prefill(model, s, prompt, &p.boundaries, p.steering_strength);
+            let r = self.prefill(model, s, prompt, &p.boundaries, p.steering_strength, p.progress.as_ref());
             self.ws.capture = None;
             r?;
             if let Some(c) = capture {
@@ -336,6 +348,10 @@ impl Session {
             }
             last_rows = end - c0;
             c0 = end;
+            if let Some(f) = &p.progress {
+                s.synchronize()?;
+                (f.0)(end, 0);
+            }
         }
         self.ws.capture = None;
         let last = self.ws.out + ((last_rows - 1) * crate::model::D * 2) as u64;
@@ -520,7 +536,7 @@ impl Session {
 
     /// Positions the state, target and MTP caches on the longest snapshot whose prefix the caches still
     /// hold, prefills the rest of `prompt`, and takes new snapshots at `boundaries`.
-    fn prefill(&mut self, model: &Model, s: &Stream, prompt: &[i32], boundaries: &[usize], strength: f32) -> Result<()> {
+    fn prefill(&mut self, model: &Model, s: &Stream, prompt: &[i32], boundaries: &[usize], strength: f32, progress: Option<&Progress>) -> Result<()> {
         // Steered state is never reused across strengths, and the store holds unsteered state only.
         if self.kv_strength != strength {
             self.kv_tokens.clear();
@@ -563,6 +579,10 @@ impl Session {
             }
         };
         self.reused = start;
+        if let Some(f) = progress {
+            (f.0)(start, start);
+        }
+        let report = progress.map(|f| move |pos: usize| (f.0)(pos, start));
         let mut pauses: Vec<usize> = boundaries.iter().copied().filter(|&b| b > start && b < prompt.len() && b <= mm_limit && !self.snapshots.iter().any(|sn| sn.pos == b)).collect();
         // Periodic snapshots on chunk boundaries (no extra prefill steps), at most PERIODIC_SNAPSHOTS
         // per prompt, so a prefix shared up to any point is reusable to within one interval of it.
@@ -584,7 +604,7 @@ impl Session {
             snap.periodic = periodic.contains(&pos);
             snapshots.push(snap);
             Ok(())
-        })?;
+        }, report.as_ref().map(|f| f as &(dyn Fn(usize) + Send + Sync)))?;
         self.kv_tokens = prompt.to_vec();
         Ok(())
     }
@@ -614,7 +634,7 @@ impl Session {
             return Ok((Finish::Length, 0));
         }
         self.mm_pending = self.encode_images(s, p)?;
-        self.prefill(model, s, prompt, &p.boundaries, p.steering_strength)?;
+        self.prefill(model, s, prompt, &p.boundaries, p.steering_strength, p.progress.as_ref())?;
         if p.temperature <= 0.0 {
             self.spec.restart(&self.state, &self.dec, s)?;
             // The target's first token, then speculative rounds (each commits the previous `next`

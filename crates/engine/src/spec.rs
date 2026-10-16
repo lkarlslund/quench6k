@@ -57,14 +57,15 @@ impl SpecDecoder {
     /// for it stay valid.
     pub fn restart(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], chunk: usize) -> Result<()> {
         s.memset(self.pending.addr(), 0, H * 4)?;
-        self.prefill_from(model, state, ws, s, prompt, 0, chunk, &[], |_, _, _| Ok(()))
+        self.prefill_from(model, state, ws, s, prompt, 0, chunk, &[], |_, _, _| Ok(()), None)
     }
 
     /// Prefills `prompt[start..]` into `state`, which already holds `prompt[..start]` (target and MTP
     /// caches, recurrent state, and the pending row: see `pending_addr`). At each position in
     /// `pauses` (ascending, in start..len) the chunking breaks and `at_pause(state, pos, pending)` runs.
+    /// `progress(pos)` is called when the prompt up to `pos` has been computed (after each chunk).
     #[allow(clippy::too_many_arguments)]
-    pub fn prefill_from(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], start: usize, chunk: usize, pauses: &[usize], mut at_pause: impl FnMut(&SequenceState, usize, u64) -> Result<()>) -> Result<()> {
+    pub fn prefill_from(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], start: usize, chunk: usize, pauses: &[usize], mut at_pause: impl FnMut(&SequenceState, usize, u64) -> Result<()>, progress: Option<&(dyn Fn(usize) + Send + Sync)>) -> Result<()> {
         ensure!(start < prompt.len(), "nothing to prefill");
         ensure!(state.len() == start, "state holds {} tokens, expected {start}", state.len());
         let mut next = 0;
@@ -89,6 +90,10 @@ impl SpecDecoder {
             if pause.peek() == Some(&end) {
                 pause.next();
                 at_pause(state, end, self.pending.addr())?;
+            }
+            if let Some(f) = progress {
+                s.synchronize()?;
+                f(end);
             }
             c0 = end;
         }
