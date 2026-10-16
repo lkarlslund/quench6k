@@ -6,3 +6,4 @@
 *.ncu-rep
 /out/
 __pycache__/
+/.claude/
