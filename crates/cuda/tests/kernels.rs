@@ -538,10 +538,15 @@ fn gemm_throughput() {
 /// Large GEMMs take the 256-row tile path: sampled outputs against the CPU, BF16 and INT8-group weights.
 #[test]
 fn gemm_tall_tiles_match_cpu() {
+    for (m, n, k) in [(8200usize, 4100usize, 128usize), (2100, 324, 4096)] {
+        gemm_tiles_match_cpu(m, n, k);
+    }
+}
+
+fn gemm_tiles_match_cpu(m: usize, n: usize, k: usize) {
     squash_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x7a11_0001);
-    let (m, n, k) = (8200usize, 4100usize, 128usize);
     let x = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
     let w = rng.vec(n * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
     let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
