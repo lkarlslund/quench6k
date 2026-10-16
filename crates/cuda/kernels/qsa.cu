@@ -7,7 +7,7 @@
 // and per sequence: pos3 I32 [ctx, 3] MRoPE positions (t, h, w).
 // A step processes T new tokens at positions start .. start + T - 1.
 
-#include "common.cuh"
+#include "mma.cuh"
 
 namespace {
 
@@ -193,107 +193,6 @@ __global__ void __launch_bounds__(256) index_score_small_kernel(const float* __r
 
 constexpr int ATT_THREADS = 256, KT = 32, QPG = QH / KVH;  // 12 query heads per KV head
 
-// Selected attention for one (query t, KV head). Keys: every position 0..p when the query has at most
-// 512 complete groups, else the 4 positions of each selected group plus the incomplete tail group.
-// out[t, head, :] = softmax(q k / 16) v * sigmoid(gate), written as BF16 for o_proj.
-__global__ void __launch_bounds__(ATT_THREADS) attention_kernel(const float* __restrict__ q, const float* __restrict__ qg, int ld,
-                                                                 const __nv_bfloat16* __restrict__ kcache,
-                                                                 const __nv_bfloat16* __restrict__ vcache,
-                                                                 const int* __restrict__ sel,
-                                                                 const int* __restrict__ start_ptr, __nv_bfloat16* out) {
-    pdl_launch_dependents();
-    pdl_wait();
-    __shared__ float sq[QPG][HD];
-    __shared__ __nv_bfloat16 sk[KT][HD], sv[KT][HD];
-    __shared__ float sp[QPG][KT];
-    __shared__ float smax[QPG], ssum[QPG], sscale[QPG];
-    __shared__ int keys[KT];
-
-    const int t = blockIdx.x, kvh = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int p = *start_ptr + t;
-    const int complete = (p + 1) / GROUP;
-    const bool dense = complete <= TOPG;
-    const int tail_begin = complete * GROUP;
-    const int nkeys = dense ? p + 1 : TOPG * GROUP + (p + 1 - tail_begin);
-
-    for (int i = tid; i < QPG * HD; i += ATT_THREADS)
-        sq[i / HD][i % HD] = q[(size_t)t * QH * HD + (kvh * QPG + i / HD) * HD + i % HD];
-    if (tid < QPG) {
-        smax[tid] = -INFINITY;
-        ssum[tid] = 0;
-    }
-    float acc[QPG] = {};
-    __syncthreads();
-
-    for (int k0 = 0; k0 < nkeys; k0 += KT) {
-        const int nk = min(KT, nkeys - k0);
-        if (tid < nk) {
-            const int i = k0 + tid;
-            keys[tid] = dense ? i : (i < TOPG * GROUP ? sel[(size_t)t * TOPG + i / GROUP] * GROUP + i % GROUP
-                                                      : tail_begin + i - TOPG * GROUP);
-        }
-        __syncthreads();
-        for (int i = tid; i < nk * HD / 8; i += ATT_THREADS) {
-            const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
-            const size_t src = ((size_t)keys[r] * KVH + kvh) * HD + c;
-            *reinterpret_cast<uint4*>(&sk[r][c]) = *reinterpret_cast<const uint4*>(kcache + src);
-            *reinterpret_cast<uint4*>(&sv[r][c]) = *reinterpret_cast<const uint4*>(vcache + src);
-        }
-        __syncthreads();
-        // scores: warp w handles keys w, w+8, w+16, w+24 for all 12 heads
-        for (int r = warp; r < nk; r += ATT_THREADS / 32) {
-            float part[QPG] = {};
-            for (int d = lane; d < HD; d += 32) {
-                const float kf = bf2f(sk[r][d]);
-#pragma unroll
-                for (int h = 0; h < QPG; ++h) part[h] += sq[h][d] * kf;
-            }
-#pragma unroll
-            for (int h = 0; h < QPG; ++h) {
-                const float s = warp_sum(part[h]);
-                if (lane == 0) sp[h][r] = s * (1.0f / 16.0f);
-            }
-        }
-        __syncthreads();
-        // online softmax update: warp h < 12 handles head h
-        if (warp < QPG / 1 && warp < 8) {
-            for (int h = warp; h < QPG; h += 8) {
-                float m = lane < nk ? sp[h][lane] : -INFINITY;
-                m = warp_max(m);
-                const float new_max = fmaxf(smax[h], m);
-                const float e = lane < nk ? __expf(sp[h][lane] - new_max) : 0.0f;
-                if (lane < nk) sp[h][lane] = e;
-                const float sum = warp_sum(e);
-                if (lane == 0) {
-                    const float scale = __expf(smax[h] - new_max);
-                    sscale[h] = scale;
-                    ssum[h] = ssum[h] * scale + sum;
-                    smax[h] = new_max;
-                }
-            }
-        }
-        __syncthreads();
-        // PV: thread owns dim tid for all 12 heads
-#pragma unroll
-        for (int h = 0; h < QPG; ++h) acc[h] *= sscale[h];
-        for (int r = 0; r < nk; ++r) {
-            const float vf = bf2f(sv[r][tid]);
-#pragma unroll
-            for (int h = 0; h < QPG; ++h) acc[h] += sp[h][r] * vf;
-        }
-        __syncthreads();
-    }
-#pragma unroll
-    for (int h = 0; h < QPG; ++h) {
-        const int head = kvh * QPG + h;
-        const float gate = qg[(size_t)t * ld + head * 2 * HD + HD + tid];
-        out[(size_t)t * QH * HD + head * HD + tid] = f2bf(acc[h] / ssum[h] * sigmoidf(gate));
-    }
-}
-
-
-// ---- split-key attention for small batches -------------------------------------------------
-// A query attends to at most 512 * 4 + 3 = 2051 keys, so SPLITS chunks of CHUNK keys always cover it.
 constexpr int CHUNK = 32, SPLITS = (TOPG * GROUP + GROUP - 1 + CHUNK - 1) / CHUNK;
 
 SQ_DEVICE int key_at(int i, bool dense, const int* sel_row, int tail_begin) {
@@ -479,12 +378,215 @@ extern "C" cudaError_t squash_qsa_index_scores(const float* iq, const void* pool
     SQ_RETURN_LAUNCH();
 }
 
+namespace {
+
+// Tensor-core selected attention for prefill: one block (4 warps) per (query t, KV head). The 12
+// query heads form the MMA rows (padded to 16); keys are streamed in tiles of 64 (the same key list
+// as attention_kernel). FP32 values that meet BF16 tensor cores (q, the probabilities) are split
+// into hi + lo BF16 parts, so products keep about 16 mantissa bits; accumulation is FP32.
+constexpr int MT = 64, MW = 4, MPAD = HD + 8, PPAD = MT + 8;
+constexpr size_t MMA_ATT_SMEM = (size_t)(2 * 16 * MPAD + 2 * MT * MPAD + 2 * 16 * PPAD) * 2 + 16 * (MT + 4) * 4;
+
+SQ_DEVICE void split_bf16(float x, __nv_bfloat16& hi, __nv_bfloat16& lo) {
+    hi = f2bf(x);
+    lo = f2bf(x - bf2f(hi));
+}
+
+__global__ void __launch_bounds__(MW * 32) attention_mma_kernel(const float* __restrict__ q, const float* __restrict__ qg, int ld,
+                                                                const __nv_bfloat16* __restrict__ kcache,
+                                                                const __nv_bfloat16* __restrict__ vcache,
+                                                                const int* __restrict__ sel,
+                                                                const int* __restrict__ start_ptr, __nv_bfloat16* out) {
+    pdl_launch_dependents();
+    pdl_wait();
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __nv_bfloat16* Qh = reinterpret_cast<__nv_bfloat16*>(smem_raw);  // [16][MPAD]
+    __nv_bfloat16* Ql = Qh + 16 * MPAD;
+    __nv_bfloat16* Ks = Ql + 16 * MPAD;  // [MT][MPAD]
+    __nv_bfloat16* Vs = Ks + MT * MPAD;  // [MT][MPAD]
+    __nv_bfloat16* Ph = Vs + MT * MPAD;  // [16][PPAD]
+    __nv_bfloat16* Pl = Ph + 16 * PPAD;
+    float* Ss = reinterpret_cast<float*>(Pl + 16 * PPAD);  // [16][MT + 4]
+    __shared__ int keys[2][MT];
+    __shared__ float rmax[16], rsum[16], rscale[16];
+
+    const int t = blockIdx.x, kvh = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int p = *start_ptr + t;
+    const int complete = (p + 1) / GROUP;
+    const bool dense = complete <= TOPG;
+    const int tail_begin = complete * GROUP;
+    const int nkeys = dense ? p + 1 : TOPG * GROUP + (p + 1 - tail_begin);
+    const int tiles = (nkeys + MT - 1) / MT;
+
+    for (int i = tid; i < 16 * HD; i += MW * 32) {
+        const int r = i / HD, d = i % HD;
+        __nv_bfloat16 hi = f2bf(0.0f), lo = f2bf(0.0f);
+        if (r < QPG) split_bf16(q[(size_t)t * QH * HD + (kvh * QPG + r) * HD + d], hi, lo);
+        Qh[r * MPAD + d] = hi;
+        Ql[r * MPAD + d] = lo;
+    }
+    if (tid < 16) {
+        rmax[tid] = -INFINITY;
+        rsum[tid] = 0.0f;
+    }
+    auto key_of = [&](int i) {
+        return dense ? i : (i < TOPG * GROUP ? sel[(size_t)t * TOPG + i / GROUP] * GROUP + i % GROUP : tail_begin + i - TOPG * GROUP);
+    };
+    // Tile `tile`'s key list into keys[tile & 1] (tid < MT), then its K or V rows (cp.async, zero past nkeys).
+    auto load_keys = [&](int tile) {
+        if (tid < MT) {
+            const int i = tile * MT + tid;
+            keys[tile & 1][tid] = i < nkeys ? key_of(i) : -1;
+        }
+    };
+    auto load_rows = [&](int tile, __nv_bfloat16* dst, const __nv_bfloat16* cache) {
+        for (int c = tid; c < MT * HD / 8; c += MW * 32) {
+            const int r = c / (HD / 8), col = (c % (HD / 8)) * 8;
+            const int key = keys[tile & 1][r];
+            cp_async16(dst + r * MPAD + col, cache + ((size_t)max(key, 0) * KVH + kvh) * HD + col, key >= 0);
+        }
+    };
+    load_keys(0);
+    __syncthreads();
+    load_rows(0, Ks, kcache);
+    cp_async_commit();
+    load_rows(0, Vs, vcache);
+    cp_async_commit();
+
+    float o[8][4] = {};
+    const int g = lane >> 2, t4 = lane & 3;
+    for (int tile = 0; tile < tiles; ++tile) {
+        cp_async_wait<1>();  // K of this tile
+        __syncthreads();
+        // S = Q K^T / 16 for this warp's 16 keys (two n-tiles), hi and lo parts of Q.
+        float sacc[2][4] = {};
+#pragma unroll
+        for (int kk = 0; kk < HD; kk += 16) {
+            uint32_t ah[4], al[4], b[4];
+            ldmatrix_x4(ah, Qh + (lane & 15) * MPAD + kk + (lane >> 4) * 8);
+            ldmatrix_x4(al, Ql + (lane & 15) * MPAD + kk + (lane >> 4) * 8);
+            ldmatrix_x4(b, Ks + (warp * 16 + (lane & 7) + ((lane >> 4) << 3)) * MPAD + kk + ((lane >> 3) & 1) * 8);
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                mma_bf16(sacc[j], ah, &b[j * 2]);
+                mma_bf16(sacc[j], al, &b[j * 2]);
+            }
+        }
+        const int nk = min(MT, nkeys - tile * MT);
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int x = 0; x < 2; ++x) {
+                    const int col = warp * 16 + j * 8 + t4 * 2 + x;
+                    Ss[(g + h * 8) * (MT + 4) + col] = col < nk ? sacc[j][h * 2 + x] * (1.0f / 16.0f) : -INFINITY;
+                }
+        __syncthreads();
+        // The next tile's keys and K rows load while this tile's softmax and P V run.
+        if (tile + 1 < tiles) {
+            load_keys(tile + 1);
+            __syncthreads();
+            load_rows(tile + 1, Ks, kcache);
+        }
+        cp_async_commit();
+        // Online softmax: thread (row tid / 8, 8 keys).
+        {
+            const int r = tid / 8, c0 = (tid % 8) * 8;
+            float v[8], m = -INFINITY;
+#pragma unroll
+            for (int x = 0; x < 8; ++x) {
+                v[x] = Ss[r * (MT + 4) + c0 + x];
+                m = fmaxf(m, v[x]);
+            }
+#pragma unroll
+            for (int off = 1; off < 8; off <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off));
+            const float m_old = rmax[r], m_new = fmaxf(m_old, m);
+            float sum = 0.0f;
+#pragma unroll
+            for (int x = 0; x < 8; ++x) {
+                const float e = m_new == -INFINITY ? 0.0f : __expf(v[x] - m_new);
+                sum += e;
+                __nv_bfloat16 hi, lo;
+                split_bf16(e, hi, lo);
+                Ph[r * PPAD + c0 + x] = hi;
+                Pl[r * PPAD + c0 + x] = lo;
+            }
+#pragma unroll
+            for (int off = 1; off < 8; off <<= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
+            __syncwarp();
+            if ((tid % 8) == 0) {
+                const float scale = m_old == -INFINITY ? 0.0f : __expf(m_old - m_new);
+                rscale[r] = scale;
+                rsum[r] = rsum[r] * scale + sum;
+                rmax[r] = m_new;
+            }
+        }
+        cp_async_wait<1>();  // V of this tile
+        __syncthreads();
+        // O = O * scale + P V for this warp's 64 output columns (8 n-tiles).
+        {
+            const float s0 = rscale[g], s1 = rscale[g + 8];
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                o[nt][0] *= s0;
+                o[nt][1] *= s0;
+                o[nt][2] *= s1;
+                o[nt][3] *= s1;
+            }
+#pragma unroll
+            for (int kk = 0; kk < MT; kk += 16) {
+                uint32_t ah[4], al[4];
+                ldmatrix_x4(ah, Ph + (lane & 15) * PPAD + kk + (lane >> 4) * 8);
+                ldmatrix_x4(al, Pl + (lane & 15) * PPAD + kk + (lane >> 4) * 8);
+#pragma unroll
+                for (int nt = 0; nt < 8; nt += 2) {
+                    uint32_t b[4];
+                    const int m = lane >> 3, rr = lane & 7;
+                    ldmatrix_x4_trans(b, Vs + (kk + (m & 1) * 8 + rr) * MPAD + warp * 64 + nt * 8 + (m >> 1) * 8);
+                    mma_bf16(o[nt], ah, &b[0]);
+                    mma_bf16(o[nt], al, &b[0]);
+                    mma_bf16(o[nt + 1], ah, &b[2]);
+                    mma_bf16(o[nt + 1], al, &b[2]);
+                }
+            }
+        }
+        __syncthreads();
+        if (tile + 1 < tiles) load_rows(tile + 1, Vs, vcache);
+        cp_async_commit();
+    }
+    cp_async_wait<0>();
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int r = g + h * 8;
+        if (r >= QPG) continue;
+        const int head = kvh * QPG + r;
+        const float inv = 1.0f / rsum[r];
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt)
+#pragma unroll
+            for (int x = 0; x < 2; ++x) {
+                const int d = warp * 64 + nt * 8 + t4 * 2 + x;
+                const float gate = qg[(size_t)t * ld + head * 2 * HD + HD + d];
+                out[(size_t)t * QH * HD + head * HD + d] = f2bf(o[nt][h * 2 + x] * inv * sigmoidf(gate));
+            }
+    }
+}
+
+}  // namespace
+
 extern "C" cudaError_t squash_qsa_attention(const float* q, const float* qg, int ld, const void* kcache, const void* vcache,
                                             const int* sel, const int* start, int T, void* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(attention_kernel, dim3(T, KVH), ATT_THREADS, 0, st, q, qg, ld, static_cast<const __nv_bfloat16*>(kcache),
-                                                           static_cast<const __nv_bfloat16*>(vcache), sel, start,
-                                                           static_cast<__nv_bfloat16*>(out)));
+    static bool configured = false;
+    if (!configured) {
+        const cudaError_t e = cudaFuncSetAttribute(attention_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)MMA_ATT_SMEM);
+        if (e != cudaSuccess) return e;
+        configured = true;
+    }
+    SQ_CHECK_LAUNCH(sq_launch(attention_mma_kernel, dim3(T, KVH), MW * 32, MMA_ATT_SMEM, st, q, qg, ld,
+                              static_cast<const __nv_bfloat16*>(kcache), static_cast<const __nv_bfloat16*>(vcache), sel,
+                              start, static_cast<__nv_bfloat16*>(out)));
     SQ_RETURN_LAUNCH();
 }
 
