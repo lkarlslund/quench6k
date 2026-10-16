@@ -655,3 +655,28 @@ fn mxfp8_gemm_matches_cpu() {
     }
     assert!(gw < 1e-4, "mxfp8 gemv error {gw}");
 }
+
+/// Split-K GEMM equals the CPU product (BF16 and INT8-group weights, with accumulate).
+#[test]
+fn gemm_split_matches_cpu() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x5911_0001);
+    let (m, n, k) = (300usize, 330usize, 4096usize);
+    let x = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
+    let w = rng.vec(n * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
+    let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
+    let partial = DeviceBuffer::zeroed(8 * m * n * 4).unwrap();
+    let y0 = rng.vec(m * n);
+    let dy = upload(&s, &y0);
+    kernels::gemm_f32_split(&s, dx.addr(), k, WeightFormat::Bf16, dw.addr(), k, 0, dy.addr(), n, m, n, k, 0.5, true, partial.addr(), 8).unwrap();
+    let y: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
+    let mut worst = 0f64;
+    for i in 0..m {
+        for j in 0..n {
+            let dot: f64 = (0..k).map(|t| x[i * k + t] as f64 * w[j * k + t] as f64).sum();
+            worst = worst.max((y[i * n + j] as f64 - (y0[i * n + j] as f64 + 0.5 * dot)).abs() / (k as f64).sqrt());
+        }
+    }
+    assert!(worst < 1e-4, "split gemm error {worst}");
+}

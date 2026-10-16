@@ -49,7 +49,7 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(cons
                                                        const void* __restrict__ Wv, int ldw,
                                                        const float* __restrict__ row_scale, OutT* Y, int ldy,
                                                        int M, int N, int K, float alpha, bool accumulate,
-                                                       MixArgs mix = {}) {
+                                                       MixArgs mix = {}, float* partial = nullptr) {
     pdl_launch_dependents();
     pdl_wait();
     const __nv_bfloat16* W = static_cast<const __nv_bfloat16*>(Wv);
@@ -63,12 +63,14 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(cons
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int warp_m = warp / WN, warp_n = warp % WN;
     const int m0 = blockIdx.y * BMT, n0 = blockIdx.x * BNT;
-    const int k_tiles = K / BK;
+    // Split K (gridDim.z > 1): this CTA's K range; raw sums go to partial[z][M][N].
+    const int kz = blockIdx.z * (K / gridDim.z);
+    const int k_tiles = K / gridDim.z / BK;
     // Global weight row of the tile's local column r.
     auto wrow = [&](int r) { return MIX ? (r >> 5) * HC_D + blockIdx.x * 32 + (r & 31) : n0 + r; };
 
     auto load_a = [&](int stage, int kt) {  // A: 128 rows x 4 chunks of 8 elements
-        const int k = kt * BK;
+        const int k = kz + kt * BK;
 #pragma unroll
         for (int i = 0; i < BMT * 4 / THREADS; ++i) {
             const int idx = tid + i * THREADS;
@@ -79,7 +81,7 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(cons
         }
     };
     auto load = [&](int stage, int kt) {
-        const int k = kt * BK;
+        const int k = kz + kt * BK;
         load_a(stage, kt);
         if constexpr (WF == 0) {
 #pragma unroll
@@ -133,7 +135,7 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(cons
     const int br = tid / (BK / BPT), bc = (tid % (BK / BPT)) * BPT, bgn = wrow(br);
     auto fetch_b = [&](int kt) {
         if (bgn < N) {
-            const int k = kt * BK;
+            const int k = kz + kt * BK;
 #pragma unroll
             for (int u = 0; u < NU; ++u) braw[u] = __ldg(reinterpret_cast<const uint4*>(W8 + (size_t)bgn * ldw + k + bc + 16 * u));
             if constexpr (WF == 3) bgs = row_scale[(size_t)bgn * (K / 64) + (k + bc) / 64];
@@ -265,6 +267,12 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(cons
                 const int m = m0 + warp_m * 64 + i * 16 + g + h * 8;
                 const int n = n0 + warp_n * WTN + j * 8 + t4 * 2;
                 if (m >= M) continue;
+                if (partial) {
+                    float* pp = partial + ((size_t)blockIdx.z * M + m) * N;
+                    if (n < N) pp[n] = acc[i][j][h * 2];
+                    if (n + 1 < N) pp[n + 1] = acc[i][j][h * 2 + 1];
+                    continue;
+                }
                 const float s0 = (WF == 1 || WF == 2) && n < N ? row_scale[n] : 1.0f;
                 const float s1 = (WF == 1 || WF == 2) && n + 1 < N ? row_scale[n + 1] : 1.0f;
                 if (n < N) store_out(&Y[(size_t)m * ldy + n], alpha * s0 * acc[i][j][h * 2], accumulate);
@@ -307,7 +315,7 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
     const bool wide = !two && (int)(grid_w.x * grid_w.y) >= 4 * sms;
     const float* sc = fmt == 3 ? scale : nullptr;
     auto go = [&](auto kern, size_t smem, dim3 g) {
-        return sq_launch(kern, g, THREADS, smem, stream, x, ldx, W, ldw, sc, y, ldy, M, N, K, alpha, accumulate != 0, MixArgs{});
+        return sq_launch(kern, g, THREADS, smem, stream, x, ldx, W, ldw, sc, y, ldy, M, N, K, alpha, accumulate != 0, MixArgs{}, (float*)nullptr);
     };
     const size_t wide_smem = gemm_smem_bytes(3, 256, 128);
     if (fmt == 3)
@@ -321,7 +329,50 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
     SQ_RETURN_LAUNCH();
 }
 
+// Y[m, n] (= or +=) alpha * sum over z of partial[z][m][n], in z order.
+template <typename OutT>
+__global__ void split_reduce_kernel(const float* __restrict__ partial, int splits, OutT* Y, int ldy, int M, int N, float alpha,
+                                    bool accumulate) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)M * N) return;
+    const int m = i / N, n = i % N;
+    float v = 0.0f;
+    for (int z = 0; z < splits; ++z) v += partial[(size_t)z * M * N + i];
+    store_out(&Y[(size_t)m * ldy + n], alpha * v, accumulate);
+}
+
 }  // namespace
+
+// Split-K GEMM for small grids: `splits` CTAs along K per output tile (K a multiple of 32 * splits),
+// partial sums [splits, M, N] in `partial`, reduced in split order.
+extern "C" cudaError_t squash_gemm_bf16_f32_split(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
+                                                  float* Y, int ldy, int M, int N, int K, float alpha, int accumulate,
+                                                  float* partial, int splits, cudaStream_t stream) {
+    if (K % (BK * splits) != 0 || ldx % 8 != 0 || ldw % 16 != 0 || (fmt != 0 && fmt != 3)) return cudaErrorInvalidValue;
+    if (M == 0 || N == 0) return cudaSuccess;
+    static bool configured = false;
+    if (!configured) {
+        for (auto kern : {gemm_kernel<float, 0>, gemm_kernel<float, 3>}) {
+            const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GEMM_SMEM);
+            if (e != cudaSuccess) return e;
+        }
+        configured = true;
+    }
+    const dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, splits);
+    const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
+    if (fmt == 3)
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 3>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, scale, Y, ldy, M, N, K, 1.0f, false,
+                                  MixArgs{}, partial));
+    else
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 0>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, (const float*)nullptr, Y, ldy, M,
+                                  N, K, 1.0f, false, MixArgs{}, partial));
+    const size_t count = (size_t)M * N;
+    SQ_CHECK_LAUNCH(sq_launch(split_reduce_kernel<float>, (unsigned)((count + 255) / 256), 256, 0, stream, (const float*)partial, splits, Y,
+                              ldy, M, N, alpha, accumulate != 0));
+    SQ_RETURN_LAUNCH();
+}
 
 // HyperConnection up-projection (W [10240, K]) fused with the mix: m [M, 2560] BF16 from
 // z [M, K] BF16, n [M, 10240] BF16 and the optional norm weight g [10240] (see MIX above).
@@ -342,10 +393,10 @@ extern "C" cudaError_t squash_gemm_hc_up_mix(int fmt, const void* X, int ldx, co
     const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
     if (fmt == 3)
         SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 3, true>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, scale, (float*)nullptr, 0, M,
-                                  HC_S * HC_D, K, 1.0f, false, mix));
+                                  HC_S * HC_D, K, 1.0f, false, mix, (float*)nullptr));
     else if (fmt == 0)
         SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 0, true>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, (const float*)nullptr,
-                                  (float*)nullptr, 0, M, HC_S * HC_D, K, 1.0f, false, mix));
+                                  (float*)nullptr, 0, M, HC_S * HC_D, K, 1.0f, false, mix, (float*)nullptr));
     else
         return cudaErrorInvalidValue;
     SQ_RETURN_LAUNCH();

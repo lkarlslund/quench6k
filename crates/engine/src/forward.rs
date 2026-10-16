@@ -411,9 +411,20 @@ fn linear_ld(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, l
         let splits = if ctas >= TARGET_CTAS / 2 { 1 } else { (TARGET_CTAS / 2).div_ceil(ctas).clamp(1, w.k.div_ceil(512)).min(PARTIAL_FLOATS / (t * w.n)).max(1) };
         k::gemv(s, t, x, ldx, w.fmt, w.addr, w.scale, y, ldy, partial, w.n, w.k, splits, 1.0, false)
     } else {
+        // Grids smaller than the GPU (short prefills) split K: the largest split up to two CTAs per SM
+        // that divides K into 32-multiples and fits the partial buffer.
+        let ctas = w.n.div_ceil(128) * t.div_ceil(128);
+        if ctas < SMS && w.k >= 1024 && matches!(w.fmt, k::WeightFormat::Bf16 | k::WeightFormat::Int8Group) {
+            let splits = (2..=(2 * SMS / ctas).min(16)).rev().find(|&sp| w.k % (32 * sp) == 0 && t * w.n * sp <= PARTIAL_FLOATS).unwrap_or(1);
+            if splits > 1 {
+                return k::gemm_f32_split(s, x, ldx, w.fmt, w.addr, w.k, w.scale, y, ldy, t, w.n, w.k, 1.0, false, partial, splits);
+            }
+        }
         k::gemm_f32(s, x, ldx, w.fmt, w.addr, w.k, w.scale, y, ldy, t, w.n, w.k, 1.0, false)
     }
 }
+
+const SMS: usize = 188;
 
 fn linear(s: &Stream, ws: &Workspace, x: u64, w: &Linear, y: u64, t: usize) -> Result<()> {
     linear_ws(s, ws, x, w.k, w, y, w.n, t)

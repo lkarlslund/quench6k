@@ -128,6 +128,7 @@ pub mod ffi {
         pub fn squash_moe_plan(top_i: *const i32, t: c_int, counts: *mut i32, cursor: *mut i32, offsets: *mut i32, tile_expert: *mut i32, tile_row: *mut i32, num_tiles: *mut i32, pair_row: *mut i32, tile_rows: c_int, stream: Stream) -> Error;
         pub fn squash_moe_gather(m: *const c_void, pair_row: *const i32, t: c_int, xs: *mut c_void, stream: Stream) -> Error;
         pub fn squash_fp4_tile_rows() -> c_int;
+        pub fn squash_gemm_bf16_f32_split(fmt: c_int, x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, scale: *const f32, y: *mut f32, ldy: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, accumulate: c_int, partial: *mut f32, splits: c_int, stream: Stream) -> Error;
         pub fn squash_mxfp8_rows(x: *const c_void, rows: c_int, cols: c_int, ld: c_int, codes: *mut u8, scales: *mut u8, stream: Stream) -> Error;
         pub fn squash_gemm_mx8(a: *const u8, a_scales: *const u8, w: *const u8, w_scales: *const u8, y: *mut f32, ldy: c_int, m: c_int, n: c_int, k: c_int, stream: Stream) -> Error;
         pub fn squash_moe_fp4_gate_up(a: *const u8, a_scales: *const u8, a_rscale: *const f32, w_ptr: *const u64, s_ptr: *const u64, ws2: *const f32, u_ptr: *const u64, us_ptr: *const u64, us2: *const f32, offsets: *const i32, tile_expert: *const i32, tile_row: *const i32, num_tiles: *const i32, max_tiles: c_int, act: *mut c_void, n: c_int, k: c_int, stream: Stream) -> Error;
