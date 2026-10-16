@@ -155,7 +155,11 @@ pub fn run(opts: ServeOptions) -> Result<()> {
             let _ = ack_rx.recv();
         }
         println!("stopped");
-        Ok(())
+        // Exit without tearing down the GPU worker: destroying its CUDA graphs while the runtime
+        // shuts down crashes, and the driver frees everything at exit anyway.
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(0)
     })
 }
 
@@ -204,6 +208,12 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
         eprintln!("done: slot {}, prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s), {:?}",
                   a.run.slot, a.prompt, a.reused, a.prefill, (a.prompt - a.reused) as f64 / a.prefill.max(1e-9), n, secs,
                   n.saturating_sub(1) as f64 / secs.max(1e-9), f);
+        if let Some(path) = std::env::var_os("SQUASH_TRACE") {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "{}", json!({"slot": a.run.slot, "finish": format!("{f:?}"), "generated": a.generated}));
+            }
+        }
         let _ = a.tx.send(Msg::Done(f, a.reused));
     };
     let nslots = if session.has_second_slot() { 2 } else { 1 };
@@ -334,7 +344,14 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
     let text = app.chat.render(&messages, tools.as_ref(), enable_thinking, effort).map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
     let thinking = text.ends_with("<think>\n");
     let ids = app.chat.encode(&text).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let (ids, images) = app.chat.expand_media(&ids, images, videos).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let (mut ids, images) = app.chat.expand_media(&ids, images, videos).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let mut thinking = thinking;
+    // Debugging: "prompt_ids" replays a traced prompt (text-only) in place of the rendered messages.
+    if let Some(raw) = req.get("prompt_ids").and_then(Value::as_array) {
+        ids = raw.iter().filter_map(Value::as_i64).map(|v| v as i32).collect();
+        let tail = app.chat.decode(&ids[ids.len().saturating_sub(4)..], false).unwrap_or_default();
+        thinking = tail.ends_with("<think>\n");
+    }
     let max_tokens = req.get("max_completion_tokens").or_else(|| req.get("max_tokens")).and_then(Value::as_u64).map_or(app.default_max_tokens, |n| n as usize);
     let temperature = req.get("temperature").and_then(Value::as_f64).unwrap_or(1.0) as f32;
     let top_p = req.get("top_p").and_then(Value::as_f64).unwrap_or(0.95) as f32;
@@ -413,8 +430,8 @@ fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<squash_engi
 
 fn parse_output(text: &str, thinking: bool, tools: Option<&Value>) -> (Option<String>, String, Vec<Value>) {
     let (reasoning, rest) = if thinking {
-        match text.find("</think>") {
-            Some(i) => (Some(text[..i].trim().to_string()), text[i + "</think>".len()..].trim_start()),
+        match think_end(text) {
+            Some((i, j)) => (Some(text[..i].trim().to_string()), text[j..].trim_start()),
             None => (Some(text.trim().to_string()), ""),
         }
     } else {
@@ -528,6 +545,20 @@ async fn full_response(app: Arc<App>, p: Prepared, id: String) -> Response {
     .into_response()
 }
 
+/// The end of the reasoning in a thinking turn's output: (start, end) of the `</think>` tag. The model
+/// sometimes opens its reasoning with a literal `<thinking>` and closes it with `</thinking>` text,
+/// never emitting `</think>`; then that closing tag ends the reasoning.
+fn think_end(text: &str) -> Option<(usize, usize)> {
+    let at = |i: usize, tag: &str| (i, i + tag.len());
+    if let Some(i) = text.find("</think>") {
+        return Some(at(i, "</think>"));
+    }
+    if text.trim_start().starts_with("<thinking>") {
+        return text.find("</thinking>").map(|i| at(i, "</thinking>"));
+    }
+    None
+}
+
 /// A piece of streamed output.
 enum Seg {
     Reasoning(String),
@@ -568,9 +599,10 @@ impl Segmenter {
         let (text, mut sent) = (&self.text, self.sent);
         loop {
             if self.in_reasoning {
-                let (end, done) = match text[sent..].find("</think>") {
-                    Some(i) => (sent + i, true),
-                    None => (text.len().saturating_sub("</think>".len()).max(sent), false),
+                let tag = think_end(text).filter(|&(i, _)| i >= sent);
+                let (end, done) = match tag {
+                    Some((i, _)) => (i, true),
+                    None => (text.len().saturating_sub("</thinking>".len()).max(sent), false),
                 };
                 let end = (sent..=end).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(sent);
                 let end = sent + text[sent..end].trim_end().len();
@@ -579,7 +611,7 @@ impl Segmenter {
                     sent = end;
                 }
                 if done {
-                    sent = text[sent..].find("</think>").map(|i| sent + i).unwrap_or(sent) + "</think>".len();
+                    sent = tag.map_or(sent, |(_, j)| j);
                     self.in_reasoning = false;
                     continue;
                 }
@@ -614,7 +646,7 @@ impl Segmenter {
             return None;
         }
         let text = &self.text;
-        let body = if self.thinking { text.find("</think>").map(|i| &text[i + "</think>".len()..]).unwrap_or("") } else { text.as_str() };
+        let body = if self.thinking { think_end(text).map(|(_, j)| &text[j..]).unwrap_or("") } else { text.as_str() };
         let lead = body.len() - body.trim_start().len();
         let body_start = text.len() - body.len() + lead;
         let shown = self.sent.saturating_sub(body_start).min(content.len());
@@ -673,7 +705,7 @@ async fn generate(app: &App, p: &Prepared, mut on_seg: impl FnMut(Seg)) -> Resul
         total += n;
         cached_first.get_or_insert(cached);
         let (Some(tools), Some(tc)) = (p.tools.as_ref(), app.tool_call_token) else { return Ok((seg, total, finish, cached_first.unwrap_or(0))) };
-        let body = if p.thinking { seg.text.find("</think>").map(|i| &seg.text[i + "</think>".len()..]).unwrap_or("") } else { seg.text.as_str() };
+        let body = if p.thinking { think_end(&seg.text).map(|(_, j)| &seg.text[j..]).unwrap_or("") } else { seg.text.as_str() };
         let problem = match validate_calls(body, tools) {
             // SQUASH_TEST_TOOL_RETRY: treat the first attempt's tool calls as invalid (exercises retries).
             Ok(()) if attempt == 0 && body.contains("<tool_call>") && std::env::var_os("SQUASH_TEST_TOOL_RETRY").is_some() => Some("forced by SQUASH_TEST_TOOL_RETRY".to_string()),
@@ -1009,6 +1041,28 @@ mod tests {
     fn tools() -> Value {
         json!([{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object",
             "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}}])
+    }
+
+    #[test]
+    fn literal_thinking_tags_end_reasoning() {
+        let text = "<thinking>\nplan it\n</thinking>\n## Goal\nsummary";
+        let (r, c, _) = parse_output(text, true, None);
+        assert_eq!(r.as_deref(), Some("<thinking>\nplan it"));
+        assert_eq!(c, "## Goal\nsummary");
+        let mut seg = Segmenter::new(true);
+        let mut streamed = String::new();
+        for piece in text.split_inclusive(' ').flat_map(|w| w.split_inclusive('\n')) {
+            for sg in seg.feed(piece, &[]) {
+                if let Seg::Content(t) = sg {
+                    streamed.push_str(&t);
+                }
+            }
+        }
+        streamed.push_str(&seg.tail(&c).unwrap_or_default());
+        assert_eq!(streamed, c);
+        // The real tag wins, and a literal tag without a literal opening stays reasoning.
+        assert_eq!(parse_output("a</thinking>b</think>c", true, None).1, "c");
+        assert_eq!(parse_output("a</thinking>b", true, None).1, "");
     }
 
     #[test]
