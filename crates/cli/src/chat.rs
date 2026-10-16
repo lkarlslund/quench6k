@@ -11,7 +11,13 @@ pub struct Chat {
     /// Generation stops at these tokens (`generation_config.json` eos ids and `<|im_end|>`).
     pub stop_tokens: Vec<i32>,
     im_start: Option<i32>,
+    /// Encodings of `<|im_start|>`-delimited prompt segments (see [`Chat::encode`]) and their total
+    /// text bytes.
+    segments: std::sync::Mutex<(std::collections::HashMap<String, Vec<i32>>, usize)>,
 }
+
+/// Cached segment text beyond which the segment cache starts over.
+const SEGMENT_CACHE_BYTES: usize = 64 << 20;
 
 impl Chat {
     /// `template`: a chat template file overriding the model's `chat_template.jinja`.
@@ -41,7 +47,7 @@ impl Chat {
             }
         }
         let im_start = tokenizer.token_to_id("<|im_start|>").map(|i| i as i32);
-        Ok(Self { tokenizer, env, stop_tokens, im_start })
+        Ok(Self { tokenizer, env, stop_tokens, im_start, segments: Default::default() })
     }
 
     /// Renders `messages` (OpenAI-style JSON) with an open assistant turn.
@@ -123,7 +129,42 @@ impl Chat {
         self.tokenizer.token_to_id(text).map(|i| i as i32)
     }
 
+    /// Token ids of `text`. The tokenizer splits at the special token `<|im_start|>`, so the text
+    /// between two of them encodes independently of the rest; those segments' encodings are cached,
+    /// and a conversation re-sent with a new turn (as agents do) only tokenizes its new messages.
     pub fn encode(&self, text: &str) -> Result<Vec<i32>> {
+        const MARK: &str = "<|im_start|>";
+        if self.im_start.is_none() || text.len() < 4096 {
+            return self.encode_plain(text);
+        }
+        let mut cuts: Vec<usize> = text.match_indices(MARK).map(|(i, _)| i).collect();
+        if cuts.first() != Some(&0) {
+            cuts.insert(0, 0);
+        }
+        cuts.push(text.len());
+        let mut ids = Vec::new();
+        for w in cuts.windows(2) {
+            let seg = &text[w[0]..w[1]];
+            if let Some(v) = self.segments.lock().unwrap().0.get(seg) {
+                ids.extend_from_slice(v);
+                continue;
+            }
+            let v = self.encode_plain(seg)?;
+            ids.extend_from_slice(&v);
+            let mut cache = self.segments.lock().unwrap();
+            if cache.1 + seg.len() > SEGMENT_CACHE_BYTES {
+                *cache = Default::default();
+            }
+            cache.1 += seg.len();
+            cache.0.insert(seg.to_string(), v);
+        }
+        if std::env::var_os("SQUASH_CHECK_ENCODE").is_some() {
+            anyhow::ensure!(ids == self.encode_plain(text)?, "segmented encoding differs from the whole text's");
+        }
+        Ok(ids)
+    }
+
+    fn encode_plain(&self, text: &str) -> Result<Vec<i32>> {
         let enc = self.tokenizer.encode(text, false).map_err(|e| anyhow!("tokenize: {e}"))?;
         Ok(enc.get_ids().iter().map(|&i| i as i32).collect())
     }

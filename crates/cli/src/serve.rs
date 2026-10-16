@@ -361,10 +361,15 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
     let enable_thinking = kwargs.get("enable_thinking").and_then(Value::as_bool);
     let effort = kwargs.get("reasoning_effort").or_else(|| req.get("reasoning_effort")).and_then(Value::as_str);
     let tools = req.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty())).cloned();
+    let t0 = std::time::Instant::now();
     let (messages, images, videos) = extract_images(app, messages)?;
     let text = app.chat.render(&messages, tools.as_ref(), enable_thinking, effort).map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
     let thinking = text.ends_with("<think>\n");
+    let t1 = std::time::Instant::now();
     let ids = app.chat.encode(&text).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if std::env::var_os("SQUASH_TIMING").is_some() {
+        eprintln!("prepare: render {:.1} ms, encode {:.1} ms ({} tokens)", (t1 - t0).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3, ids.len());
+    }
     let (mut ids, images) = app.chat.expand_media(&ids, images, videos).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let mut thinking = thinking;
     // Debugging: "prompt_ids" replays a traced prompt (text-only) in place of the rendered messages.
