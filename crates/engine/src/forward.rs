@@ -317,7 +317,7 @@ impl Workspace {
             conv: alloc(t * GDN_CONV * 4)?,
             beta: alloc(t * GDN_HEADS * 4)?,
             g: alloc(t * GDN_HEADS * 4)?,
-            gdn_chunks: alloc(if t >= 64 { k::gdn_chunk_scratch_floats(t) * 4 } else { 4 })?,
+            gdn_chunks: alloc(if t >= 64 { k::gdn_chunk_scratch_floats(t).max(k::gdn_tc_scratch_floats(t)) * 4 } else { 4 })?,
             o: alloc(t * GDN_Z * 4)?,
             o_bf: alloc(t * GDN_Z * 2)?,
             q: alloc(t * QSA_HEADS * QSA_DIM * 4)?,
@@ -899,7 +899,11 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
                 }
                 op!(prof, "gdn_conv", s, k::gdn_conv(s, col(0), ld, ws.conv, st().conv.addr(), g.conv, t));
                 op!(prof, "gdn_prep", s, k::gdn_prep(s, ws.conv, col(2), col(3), ld, g.a_log, g.dt_bias, ws.beta, ws.g, t));
-                op!(prof, "gdn_recurrent", s, k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st().recurrent.addr(), ws.o, t, ws.gdn_chunks));
+                if t >= 64 && gdn_tc() {
+                    op!(prof, "gdn_chunked_tc", s, k::gdn_chunked_tc(s, ws.conv, ws.beta, ws.g, st().recurrent.addr(), ws.o, t, ws.gdn_chunks));
+                } else {
+                    op!(prof, "gdn_recurrent", s, k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st().recurrent.addr(), ws.o, t, ws.gdn_chunks));
+                }
                 op!(prof, "gdn_gated_norm", s, k::gdn_gated_norm(s, ws.o, col(1), ld, g.norm, ws.o_bf, t));
             }
             op!(prof, "gdn out", s, linear(s, ws, ws.o_bf, &g.out, ws.y, t));
@@ -953,6 +957,12 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
 
 /// Prefill experts on the FP4 tensor cores (W4A4, activations quantized per row with least-error block
 /// scales); set by SQUASH_PREFILL_FP4=1 while it is evaluated.
+/// Prefill GDN on the tensor cores (SQUASH_GDN_TC=1 while it is evaluated).
+fn gdn_tc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SQUASH_GDN_TC").is_ok_and(|v| v == "1"))
+}
+
 pub fn fp4_prefill() -> bool {
     fp4_mode() != 0
 }

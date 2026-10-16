@@ -170,6 +170,15 @@ pub fn gdn_recurrent(s: &Stream, qkv: u64, beta: u64, g: u64, state: u64, out: u
     launch!("gdn_recurrent", ffi::squash_gdn_recurrent(f(qkv), f(beta), f(g), fm(state), fm(out), n32(t), fm(scratch), s.raw()))
 }
 
+/// Tensor-core chunked GDN (64-token chunks, TF32 MMAs); `scratch`: [`gdn_tc_scratch_floats`] floats.
+pub fn gdn_chunked_tc(s: &Stream, qkv: u64, beta: u64, g: u64, state: u64, out: u64, t: usize, scratch: u64) -> Result<()> {
+    launch!("gdn_chunked_tc", ffi::squash_gdn_chunked_tc(f(qkv), f(beta), f(g), fm(state), fm(out), n32(t), fm(scratch), s.raw()))
+}
+
+pub fn gdn_tc_scratch_floats(t: usize) -> usize {
+    unsafe { ffi::squash_gdn_tc_scratch_floats(t as i32) }
+}
+
 pub fn gdn_chunk_scratch_floats(t: usize) -> usize {
     unsafe { ffi::squash_gdn_chunk_scratch_floats(t as i32) }
 }

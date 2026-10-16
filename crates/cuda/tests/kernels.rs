@@ -323,22 +323,29 @@ fn gdn_chunked_matches_sequential() {
         let g: Vec<f32> = (0..t * VH).map(|_| -0.3 * (1.0 + rng.next())).collect();
         let state0: Vec<f32> = rng.vec(VH * DK * DK).iter().map(|v| v * 0.3).collect();
         let (dq, db, dg) = (upload(&s, &qkv), upload(&s, &beta), upload(&s, &g));
-        let run = |sequential: bool| -> (Vec<f32>, Vec<f32>) {
+        let run = |mode: u8| -> (Vec<f32>, Vec<f32>) {
             let st = upload(&s, &state0);
             let out = DeviceBuffer::new(t * VH * DK * 4).unwrap();
-            let scratch = DeviceBuffer::new(kernels::gdn_chunk_scratch_floats(t) * 4).unwrap();
-            kernels::gdn_recurrent(&s, dq.addr(), db.addr(), dg.addr(), st.addr(), out.addr(), t, if sequential { 0 } else { scratch.addr() }).unwrap();
+            let scratch = DeviceBuffer::new(kernels::gdn_chunk_scratch_floats(t).max(kernels::gdn_tc_scratch_floats(t)) * 4).unwrap();
+            if mode == 2 {
+                kernels::gdn_chunked_tc(&s, dq.addr(), db.addr(), dg.addr(), st.addr(), out.addr(), t, scratch.addr()).unwrap();
+            } else {
+                kernels::gdn_recurrent(&s, dq.addr(), db.addr(), dg.addr(), st.addr(), out.addr(), t, if mode == 0 { 0 } else { scratch.addr() }).unwrap();
+            }
             (s.download(out.addr(), t * VH * DK).unwrap(), s.download(st.addr(), VH * DK * DK).unwrap())
         };
-        let (o0, s0) = run(true);
-        let (o1, s1) = run(false);
+        let (o0, s0) = run(0);
+        let (o1, s1) = run(1);
+        let (o2, s2) = run(2);
         let err = |a: &[f32], b: &[f32]| {
             let scale = a.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-6);
             a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale
         };
         let (eo, es) = (err(&o0, &o1), err(&s0, &s1));
-        println!("T={t}: output error {eo:.2e}, state error {es:.2e}");
+        let (to, ts) = (err(&o0, &o2), err(&s0, &s2));
+        println!("T={t}: output error {eo:.2e}, state error {es:.2e}; tensor cores: output {to:.2e}, state {ts:.2e}");
         assert!(eo < 1e-4 && es < 1e-4, "T={t}: output {eo}, state {es}");
+        assert!(to < 1e-4 && ts < 1e-4, "T={t}: tensor-core output {to}, state {ts}");
     }
 }
 

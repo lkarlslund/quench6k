@@ -11,9 +11,12 @@
 
 namespace {
 
-constexpr int BM = 128, BN = 128, BK = 32, STAGES = 3, THREADS = 256;
+constexpr int BM = 128, BN = 128, BK = 32, THREADS = 256;
 constexpr int LDS = BK + 8;  // padded smem row (elements): conflict-free ldmatrix
-constexpr size_t GEMM_SMEM = (size_t)STAGES * (BM + BN) * LDS * 2;
+// Three stages by default; two (41 KB, two CTAs per SM) when a launch has between one and two CTAs per
+// SM, so that it runs as one wave instead of a full wave plus a small remainder.
+constexpr size_t gemm_smem_bytes(int stages) { return (size_t)stages * (BM + BN) * LDS * 2; }
+constexpr size_t GEMM_SMEM = gemm_smem_bytes(3);
 
 template <typename OutT>
 SQ_DEVICE void store_out(OutT* p, float v, bool accumulate);
@@ -39,8 +42,8 @@ struct MixArgs {
     __nv_bfloat16* m;
 };
 
-template <typename OutT, int WF, bool MIX = false>
-__global__ void __launch_bounds__(THREADS) gemm_kernel(const __nv_bfloat16* __restrict__ X, int ldx,
+template <typename OutT, int WF, bool MIX = false, int STAGES = 3>
+__global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(const __nv_bfloat16* __restrict__ X, int ldx,
                                                        const void* __restrict__ Wv, int ldw,
                                                        const float* __restrict__ row_scale, OutT* Y, int ldy,
                                                        int M, int N, int K, float alpha, bool accumulate,
@@ -265,17 +268,31 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
     const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
     OutT* y = static_cast<OutT*>(Y);
     static bool configured = false;
+    static int sms = 0;
     if (!configured) {
         for (auto kern : {gemm_kernel<OutT, 0>, gemm_kernel<OutT, 3>}) {
             const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GEMM_SMEM);
             if (e != cudaSuccess) return e;
         }
+        for (auto kern : {gemm_kernel<OutT, 0, false, 2>, gemm_kernel<OutT, 3, false, 2>}) {
+            const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gemm_smem_bytes(2));
+            if (e != cudaSuccess) return e;
+        }
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         configured = true;
     }
+    const int ctas = grid.x * grid.y;
+    const bool two = ctas > sms && ctas <= 2 * sms;
+    const float* sc = fmt == 3 ? scale : nullptr;
+    auto go = [&](auto kern, size_t smem) {
+        return sq_launch(kern, grid, THREADS, smem, stream, x, ldx, W, ldw, sc, y, ldy, M, N, K, alpha, accumulate != 0, MixArgs{});
+    };
     if (fmt == 3)
-        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 3>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, scale, y, ldy, M, N, K, alpha, accumulate != 0, MixArgs{}));
+        SQ_CHECK_LAUNCH(two ? go(gemm_kernel<OutT, 3, false, 2>, gemm_smem_bytes(2)) : go(gemm_kernel<OutT, 3>, GEMM_SMEM));
     else if (fmt == 0)
-        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<OutT, 0>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, nullptr, y, ldy, M, N, K, alpha, accumulate != 0, MixArgs{}));
+        SQ_CHECK_LAUNCH(two ? go(gemm_kernel<OutT, 0, false, 2>, gemm_smem_bytes(2)) : go(gemm_kernel<OutT, 0>, GEMM_SMEM));
     else
         return cudaErrorInvalidValue;
     SQ_RETURN_LAUNCH();
