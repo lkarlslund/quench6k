@@ -22,8 +22,9 @@ Every run first checks 64 greedy tokens of the code fixture against the referenc
 - FP8 KV (`--kv fp8`, 47% less K/V memory) passes the gate and measures the same decode speed
   (185.2 / 173.3 plain, 404.1 / 376.6 MTP3 at 8K / 260K) with prefill within 1%.
 
-Batch of two (`squash batch-check`, code + multiturn prompts, 256 tokens each): 269.9 tok/s eager,
-245.6 tok/s graph-captured, both sequences token-identical to single-sequence decoding; the gate
+Batch of two (`squash batch-check`, code + multiturn prompts): 271.1 tok/s eager, 277.8 tok/s
+graph-captured over 512 tokens each (245.6 over 256, where the first graph launches weigh in), both
+sequences token-identical to single-sequence decoding; the gate
 passes at batch 2 with distributions byte-identical to batch 1. Through `squash serve --slots 2`:
 236 tok/s aggregate with both responses identical to their solo runs.
 
