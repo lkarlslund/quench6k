@@ -104,6 +104,8 @@ pub mod ffi {
         pub fn squash_spec_layout(field: c_int) -> c_int;
         pub fn squash_spec_mtp_header(rc: *const i32, hdr: *mut i32, tokens_off: c_int, pos_off: c_int, j: c_int, c: c_int, stream: Stream) -> Error;
         pub fn squash_spec_accept(rc: *mut i32, ctl: *mut i32, n: c_int, stream: Stream) -> Error;
+        pub fn squash_steer_max_rank() -> c_int;
+        pub fn squash_steer(h: *mut f32, t: c_int, directions: *const f32, ranks: *const i32, masks: *const i32, norm_preserve: c_int, strength: *const f32, layer: c_int, stream: Stream) -> Error;
         pub fn squash_draft_sketch_bytes(n: c_int) -> usize;
         pub fn squash_draft_slices(n: c_int) -> c_int;
         pub fn squash_build_draft_sketch(w: *const c_void, sketch: *mut c_void, n: c_int, stream: Stream) -> Error;

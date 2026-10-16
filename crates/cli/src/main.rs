@@ -27,6 +27,35 @@ impl From<PrecisionArg> for Precision {
 }
 
 /// Opens the checkpoint and loads the text model onto GPU 0.
+/// Direction-removal steering (a `ninfer.steering/1` pack) for scoring and generation.
+#[derive(clap::Args, Clone, Debug, Default)]
+struct SteerArgs {
+    /// Steering pack to load.
+    #[arg(long)]
+    steering: Option<PathBuf>,
+    /// Steering strength (default: the pack's default_steering_strength).
+    #[arg(long)]
+    strength: Option<f32>,
+}
+
+impl SteerArgs {
+    /// Loads the pack into the model; returns the strength for new sequences.
+    fn attach(&self, model: &mut Model, stream: &squash_cuda::Stream) -> Result<f32> {
+        let Some(path) = &self.steering else { return Ok(0.0) };
+        let pack = squash_engine::steering::Steering::load(path, stream)?;
+        let strength = self.strength.unwrap_or(pack.default_strength);
+        println!(
+            "steering pack {}: layers {:?}, norm_preserve {}, strength {strength} (pack model_sha {})",
+            path.display(),
+            pack.layers.iter().map(|l| l.0).collect::<Vec<_>>(),
+            pack.norm_preserve,
+            pack.model_sha.as_deref().unwrap_or("-")
+        );
+        model.steering = Some(pack);
+        Ok(strength)
+    }
+}
+
 pub fn load(model_dir: &std::path::Path, precision: Precision, mtp: bool) -> Result<(Model, squash_cuda::Stream)> {
     squash_cuda::set_device(0)?;
     let ckpt = Checkpoint::open(model_dir)?;
@@ -86,6 +115,8 @@ enum Command {
         /// Run the completion one token per step (decode) after prefilling the prompt.
         #[arg(long)]
         decode: bool,
+        #[command(flatten)]
+        steer: SteerArgs,
     },
     /// Greedy generation from each fixture prompt, checked against the fixture sequence (GOAL.md §1).
     Generate {
@@ -99,6 +130,8 @@ enum Command {
         /// Reference logit margin at or below which a divergence counts as a near-tie.
         #[arg(long, default_value_t = 0.5)]
         tie: f32,
+        #[command(flatten)]
+        steer: SteerArgs,
     },
     /// Measure prefill and greedy decode throughput at the given prompt lengths.
     Bench {
@@ -220,8 +253,8 @@ fn main() -> Result<()> {
                 println!("verified {checked} tensors byte-exact");
             }
         }
-        Command::Score { model, precision, fixture, out, suffix, chunk, decode } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode)?,
-        Command::Generate { model, precision, fixture, tie } => generate(&model, precision.into(), &fixture, tie)?,
+        Command::Score { model, precision, fixture, out, suffix, chunk, decode, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, &steer)?,
+        Command::Generate { model, precision, fixture, tie, steer } => generate(&model, precision.into(), &fixture, tie, &steer)?,
         Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
         Command::SpecCheck { model, precision, fixture, n, drafts, chunk, graphs, adaptive, profile_rounds } => mtp::check(&model, precision.into(), &fixture, n, drafts, chunk, graphs, adaptive, profile_rounds)?,
         Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps, mtp, adaptive } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps, mtp, adaptive)?,
@@ -266,7 +299,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf], out: &std::path::Path, suffix: &str, chunk: usize, decode: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf], out: &std::path::Path, suffix: &str, chunk: usize, decode: bool, steer: &SteerArgs) -> Result<()> {
     use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
 
     #[derive(serde::Deserialize)]
@@ -276,7 +310,8 @@ fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf]
     }
     const TOP_K: usize = 32;
 
-    let (model, stream) = load(model_dir, precision, false)?;
+    let (mut model, stream) = load(model_dir, precision, false)?;
+    let strength = steer.attach(&mut model, &stream)?;
     std::fs::create_dir_all(out)?;
 
     let seqs: Vec<(PathBuf, Sequence)> = fixtures
@@ -291,6 +326,7 @@ fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf]
     for (dir, seq) in &seqs {
         let t0 = std::time::Instant::now();
         let mut state = SequenceState::new(seq.tokens.len())?;
+        state.set_steering_strength(&stream, strength)?;
         let positions = seq.tokens.len() - 1;
         let mut d = oracle::Distributions {
             meta: oracle::DistributionMeta {
@@ -332,7 +368,7 @@ fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf]
     Ok(())
 }
 
-fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf], tie: f32) -> Result<()> {
+fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf], tie: f32, steer: &SteerArgs) -> Result<()> {
     use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
 
     #[derive(serde::Deserialize)]
@@ -341,7 +377,8 @@ fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathB
         prompt_len: usize,
     }
 
-    let (model, stream) = load(model_dir, precision, false)?;
+    let (mut model, stream) = load(model_dir, precision, false)?;
+    let strength = steer.attach(&mut model, &stream)?;
     let seqs: Vec<(PathBuf, Sequence)> = fixtures
         .iter()
         .map(|f| Ok((f.clone(), serde_json::from_slice(&std::fs::read(f.join("sequence.json"))?)?)))
@@ -354,6 +391,7 @@ fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathB
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         let refs = [oracle::Distributions::load(&dir.join("llama-w4a4"))?, oracle::Distributions::load(&dir.join("llama-q8"))?];
         let mut state = SequenceState::new(seq.tokens.len())?;
+        state.set_steering_strength(&stream, strength)?;
         let prompt = &seq.tokens[..seq.prompt_len];
         for c in prompt.chunks(1024) {
             forward::forward(&model, &mut state, &mut ws, &stream, c)?;

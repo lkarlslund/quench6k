@@ -54,6 +54,8 @@ pub struct SequenceState {
     pub mtp_qsa: Option<QsaCache>,
     /// Speculative decoding: recurrent state is committed one step behind (see `Spec`).
     pub spec: Option<Spec>,
+    /// Device f32: strength of the model's steering pack for this sequence (0: unsteered).
+    pub steer_strength: DeviceBuffer,
 }
 
 /// Recurrent-state bookkeeping for speculative decoding. A verification step processes drafts that may
@@ -122,7 +124,14 @@ impl SequenceState {
             } else {
                 None
             },
+            steer_strength: DeviceBuffer::zeroed(4)?,
         })
+    }
+
+    /// Sets this sequence's steering strength (read on the device by every later step).
+    pub fn set_steering_strength(&self, s: &Stream, strength: f32) -> Result<()> {
+        s.upload(&self.steer_strength, &[strength])?;
+        s.synchronize()
     }
 
     pub fn len(&self) -> usize {
@@ -482,7 +491,8 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
         Part::FromPle => unsafe { s.copy_h2d(ws.step + layout.ple as u64, ws.step_host.as_ptr().add(layout.ple), bytes - layout.ple)? },
     }
     let spec = state.spec.as_ref().map(|sp| (sp.ctl.addr(), sp.ple_rec.addr(), defer));
-    let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr(), spec };
+    let steer = model.steering.as_ref().map(|p| (p.directions.addr(), p.ranks.addr(), p.masks.addr(), p.norm_preserve, state.steer_strength.addr()));
+    let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr(), spec, steer };
     if part != Part::FromPle {
         op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, ctx.pos3, ctx.start, t));
         op!(prof, "embed", s, k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h));
@@ -496,7 +506,7 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
     };
     for i in layers {
         let rec = state.spec.as_ref().and_then(|sp| sp.gdn_rec[i].as_ref().map(|b| b.addr()));
-        layer_forward(&model.layers[i], state.gdn[i].as_ref(), rec, state.qsa[i].as_ref(), &ctx, &mut carry, prof.as_deref_mut())?;
+        layer_forward(i, &model.layers[i], state.gdn[i].as_ref(), rec, state.qsa[i].as_ref(), &ctx, &mut carry, prof.as_deref_mut())?;
     }
     if part == Part::BeforePle {
         return Ok(());
@@ -518,6 +528,8 @@ struct LayerCtx<'a> {
     ple_state: u64,
     /// Speculative bookkeeping: control word, PLE records, and whether this step defers its commit.
     spec: Option<(u64, u64, bool)>,
+    /// Steering: (directions, ranks, masks, norm_preserve, strength) when the model has a pack.
+    steer: Option<(u64, u64, u64, bool, u64)>,
 }
 
 /// Residual bookkeeping carried from layer to layer. Small batches defer each block's residual update to
@@ -547,7 +559,8 @@ fn final_mixer(hc: &Hc, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut
 
 /// One decoder layer (SPEC §3) over the step's tokens, with the layer's own GDN or QSA state.
 #[allow(clippy::too_many_arguments)]
-fn layer_forward(layer: &crate::model::Layer, gdn: Option<&GdnState>, gdn_rec: Option<u64>, qsa: Option<&QsaCache>, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnState>, gdn_rec: Option<u64>, qsa: Option<&QsaCache>, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>) -> Result<()> {
     let (ws, s, t, start, pos3) = (ctx.ws, ctx.s, ctx.t, ctx.start, ctx.pos3);
     let small = t <= k::gemv_max_m();
     if let Some(ple) = &layer.ple {
@@ -561,6 +574,14 @@ fn layer_forward(layer: &crate::model::Layer, gdn: Option<&GdnState>, gdn_rec: O
         op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv, ws.xn, ple.conv, ctx.ple_state, ws.h, t, spec));
     }
 
+    // Steering at the attention-input pre-mix point: the pending block output is committed first
+    // (the same FMA the HC kernels would apply), so a zero strength leaves every value unchanged.
+    if let Some((dirs, ranks, masks, norm_preserve, strength)) = ctx.steer.filter(|_| index < LAYERS) {
+        if let Some(y) = carry.pending.take() {
+            op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, carry.inj, t));
+        }
+        op!(prof, "steer", s, k::steer(s, ws.h, t, dirs, ranks, masks, norm_preserve, strength, index));
+    }
     if small {
         op!(prof, "hc_small", s, hyper_connection_small(s, ws, &layer.attn_hc, t, carry.pending.map(|y| (y, carry.inj)), carry.inj_next, ws.m));
         std::mem::swap(&mut carry.inj, &mut carry.inj_next);
@@ -708,9 +729,9 @@ pub fn forward_mtp_staged(model: &Model, state: &SequenceState, ws: &Workspace, 
     // fc_hidden maps each of the 4 streams: rows of the [t, 4, 2560] input are the 4t stream slices.
     op!(prof, "mtp fc_h", s, linear_ld(s, ws.partial, ws.n, D, &mtp.fc_hidden, ws.h, D, S * t));
     op!(prof, "mtp combine", s, k::hc_combine(s, ws.h, ws.y, ws.ones, t));
-    let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0, spec: None };
+    let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0, spec: None, steer: None };
     let mut carry = Carry::new(ws, false);
-    layer_forward(&mtp.layer, None, None, Some(cache), &ctx, &mut carry, prof.as_deref_mut())?;
+    layer_forward(LAYERS, &mtp.layer, None, None, Some(cache), &ctx, &mut carry, prof.as_deref_mut())?;
     final_mixer(&mtp.final_hc, &ctx, &mut carry, prof)
 }
 

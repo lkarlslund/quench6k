@@ -222,6 +222,8 @@ pub struct Model {
     pub final_hc: Hc,
     pub layers: Vec<Layer>,
     pub ple_table: PleTable,
+    /// Direction-removal steering pack, applied with each sequence's strength (see `steering`).
+    pub steering: Option<crate::steering::Steering>,
 }
 
 fn read_i64s<const N: usize>(ckpt: &Checkpoint, name: &str) -> Result<[i64; N]> {
@@ -376,6 +378,7 @@ impl Model {
             mtp,
             ple_table: PleTable::open(ckpt)?,
             weights,
+            steering: None,
         })
     }
 }

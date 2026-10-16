@@ -5,6 +5,7 @@ pub mod model;
 pub mod oracle;
 pub mod profile;
 pub mod spec;
+pub mod steering;
 
 /// Which checkpoint tensors belong on the GPU.
 pub mod selection {
