@@ -127,6 +127,8 @@ pub mod ffi {
         pub fn squash_moe_plan(top_i: *const i32, t: c_int, counts: *mut i32, cursor: *mut i32, offsets: *mut i32, tile_expert: *mut i32, tile_row: *mut i32, num_tiles: *mut i32, pair_row: *mut i32, stream: Stream) -> Error;
         pub fn squash_moe_gather(m: *const c_void, pair_row: *const i32, t: c_int, xs: *mut c_void, stream: Stream) -> Error;
         pub fn squash_fp4_tile_rows() -> c_int;
+        pub fn squash_hc_combine_norm(h: *mut f32, y: *const f32, inj: *const f32, n: *mut c_void, t: c_int, stream: Stream) -> Error;
+        pub fn squash_gemm_hc_up_mix(fmt: c_int, x: *const c_void, ldx: c_int, w: *const c_void, ldw: c_int, scale: *const f32, n: *const c_void, g: *const c_void, m: *mut c_void, rows: c_int, k: c_int, stream: Stream) -> Error;
         pub fn squash_fp4_quant_rows(x: *const c_void, rows: c_int, k: c_int, codes: *mut u8, scales: *mut u8, rscale: *mut f32, stream: Stream) -> Error;
         pub fn squash_fp4_gather(codes: *const u8, scales: *const u8, rscale: *const f32, pair_row: *const i32, t: c_int, k: c_int, gcodes: *mut u8, gscales: *mut u8, grscale: *mut f32, stream: Stream) -> Error;
         pub fn squash_moe_fp4_gemm(a: *const u8, a_scales: *const u8, a_rscale: *const f32, w_ptr: *const u64, s_ptr: *const u64, ws2: *const f32, offsets: *const i32, tile_expert: *const i32, tile_row: *const i32, num_tiles: *const i32, max_tiles: c_int, y: *mut f32, n: c_int, k: c_int, stream: Stream) -> Error;

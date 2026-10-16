@@ -31,10 +31,35 @@ __global__ void grouped_rmsnorm_kernel(const float* __restrict__ h, const __nv_b
     const int t = blockIdx.x / S, s = blockIdx.x % S;
     const float* x = h + (size_t)t * H + s * D;
     float ss = 0;
-    for (int d = threadIdx.x; d < D; d += blockDim.x) ss += x[d] * x[d];
+    for (int d = threadIdx.x; d < D; d += blockDim.x) ss = __fmaf_rn(x[d], x[d], ss);
     const float r = rsqrtf(block_sum(ss, scratch) / D + EPS);
     for (int d = threadIdx.x; d < D; d += blockDim.x)
-        n[(size_t)t * H + s * D + d] = f2bf(x[d] * r * (w ? 1.0f + bf2f(w[s * D + d]) : 1.0f));
+        n[(size_t)t * H + s * D + d] = f2bf(__fmul_rn(__fmul_rn(x[d], r), w ? 1.0f + bf2f(w[s * D + d]) : 1.0f));
+}
+
+// hc_combine then grouped_rmsnorm (no weight) in one pass: h[t, s, :] += y[t, :] * inj[t, s], then
+// n = rmsnorm(h[t, s, :]); the same roundings as the two kernels. One block of 256 per (t, s).
+__global__ void __launch_bounds__(256) hc_combine_norm_kernel(float* h, const float* __restrict__ y,
+                                                              const float* __restrict__ inj, __nv_bfloat16* n) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ float scratch[32];
+    const int t = blockIdx.x / S, s = blockIdx.x % S;
+    float* x = h + (size_t)t * H + s * D;
+    const float a = inj[t * S + s];
+    constexpr int PER = D / 256;
+    float v[PER];
+    float ss = 0;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int d = threadIdx.x + i * 256;
+        v[i] = __fmaf_rn(y[(size_t)t * D + d], a, x[d]);
+        x[d] = v[i];
+        ss = __fmaf_rn(v[i], v[i], ss);
+    }
+    const float r = rsqrtf(block_sum(ss, scratch) / D + EPS);
+#pragma unroll
+    for (int i = 0; i < PER; ++i) n[(size_t)t * H + s * D + threadIdx.x + i * 256] = f2bf(__fmul_rn(__fmul_rn(v[i], r), 1.0f));
 }
 
 // inj[t, j] = 2 * sigmoid(dot(n[t], W[j]) / 4) for j < 4; one block per token.
@@ -82,7 +107,8 @@ __global__ void hc_mix_kernel(const float* __restrict__ u, const __nv_bfloat16* 
 #pragma unroll
     for (int s = 0; s < S; ++s) {
         const size_t j = (size_t)t * H + s * D + d;
-        acc += sigmoidf(u[j]) * bf2f(n[j]) * (g ? 1.0f + bf2f(g[s * D + d]) : 1.0f);
+        // Explicit roundings (no FMA contraction), as the fused up+mix GEMM epilogue.
+        acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(sigmoidf(u[j]), bf2f(n[j])), g ? 1.0f + bf2f(g[s * D + d]) : 1.0f));
     }
     m[i] = f2bf(acc / S);
 }
@@ -94,7 +120,7 @@ __global__ void hc_combine_kernel(float* h, const float* __restrict__ y, const f
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * H) return;
     const int t = i / H, s = (i % H) / D, d = i % D;
-    h[i] += y[(size_t)t * D + d] * inj[t * S + s];
+    h[i] = __fmaf_rn(y[(size_t)t * D + d], inj[t * S + s], h[i]);
 }
 
 __global__ void f32_to_bf16_kernel(const float* __restrict__ x, __nv_bfloat16* y, size_t count) {
@@ -158,6 +184,13 @@ extern "C" cudaError_t squash_hc_mix(const float* u, const void* n, const void* 
     SQ_CHECK_LAUNCH(sq_launch(hc_mix_kernel, blocks((size_t)T * D, 256), 256, 0, st, u, static_cast<const __nv_bfloat16*>(n),
                                                                static_cast<const __nv_bfloat16*>(g),
                                                                static_cast<__nv_bfloat16*>(m), T));
+    SQ_RETURN_LAUNCH();
+}
+
+extern "C" cudaError_t squash_hc_combine_norm(float* h, const float* y, const float* inj, void* n, int T, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    static_assert(D % 256 == 0, "D must be a multiple of 256");
+    SQ_CHECK_LAUNCH(sq_launch(hc_combine_norm_kernel, T * S, 256, 0, st, h, y, inj, static_cast<__nv_bfloat16*>(n)));
     SQ_RETURN_LAUNCH();
 }
 

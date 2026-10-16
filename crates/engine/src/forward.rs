@@ -426,14 +426,23 @@ fn project(s: &Stream, ws: &Workspace, x: u64, proj: &Proj, out: u64, t: usize) 
 
 /// Mixes the residual through a HyperConnection: writes the BF16 block input to `out` and, when the HC
 /// injects, the injection weights to `ws.inj`.
-fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, out: u64, mut prof: Option<&mut Profiler>) -> Result<()> {
+/// `pending`: the previous block's output, still to be added to the residual with the injection
+/// weights in `ws.inj` (fused with the norm).
+fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, pending: Option<u64>, out: u64, mut prof: Option<&mut Profiler>) -> Result<()> {
     let inj = if hc.injects { ws.inj } else { 0 };
     {
-        op!(prof, "hc norm", s, k::grouped_rmsnorm(s, ws.h, 0, ws.n, t));
+        match pending {
+            Some(y) => op!(prof, "hc combine+norm", s, k::hc_combine_norm(s, ws.h, y, ws.inj, ws.n, t)),
+            None => op!(prof, "hc norm", s, k::grouped_rmsnorm(s, ws.h, 0, ws.n, t)),
+        }
         op!(prof, "hc down", s, project(s, ws, ws.n, &hc.down, ws.proj, t));
         op!(prof, "hc act", s, k::hc_act(s, ws.proj, hc.down.n, ws.low_bf, inj, t));
-        op!(prof, "hc up", s, linear(s, ws, ws.low_bf, &hc.up, ws.up, t));
-        op!(prof, "hc mix", s, k::hc_mix(s, ws.up, ws.n, hc.norm, out, t));
+        if t > 4 * k::gemv_max_m() && std::env::var_os("SQUASH_HC_UNFUSED").is_none() {
+            op!(prof, "hc up+mix", s, k::gemm_hc_up_mix(s, ws.low_bf, hc.up.fmt, hc.up.addr, hc.up.scale, ws.n, hc.norm, out, t, hc.up.k));
+        } else {
+            op!(prof, "hc up", s, linear(s, ws, ws.low_bf, &hc.up, ws.up, t));
+            op!(prof, "hc mix", s, k::hc_mix(s, ws.up, ws.n, hc.norm, out, t));
+        }
     }
     Ok(())
 }
@@ -812,7 +821,7 @@ fn final_mixer(hc: &Hc, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut
         op!(prof, "hc_small", s, hyper_connection_small(s, ws, hc, t, carry.pending.take().map(|y| (y, carry.inj)), carry.inj_next, ws.out));
         Ok(())
     } else {
-        hyper_connection(s, ws, hc, t, ws.out, prof)
+        hyper_connection(s, ws, hc, t, carry.pending.take(), ws.out, prof)
     }
 }
 
@@ -860,7 +869,7 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
         op!(prof, "hc_small", s, hyper_connection_small(s, ws, &layer.attn_hc, t, carry.pending.map(|y| (y, carry.inj)), carry.inj_next, ws.m));
         std::mem::swap(&mut carry.inj, &mut carry.inj_next);
     } else {
-        hyper_connection(s, ws, &layer.attn_hc, t, ws.m, prof.as_deref_mut())?;
+        hyper_connection(s, ws, &layer.attn_hc, t, carry.pending.take(), ws.m, prof.as_deref_mut())?;
     }
     if let Some((buf, row)) = rec {
         s.copy_d2d(buf + CaptureLayout::MIX as u64, ws.m + (row * D * 2) as u64, D * 2)?;
@@ -963,8 +972,7 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
         op!(prof, "hc_small", s, hyper_connection_small(s, ws, &layer.mlp_hc, t, Some((ws.y, carry.inj)), carry.inj_next, ws.m));
         std::mem::swap(&mut carry.inj, &mut carry.inj_next);
     } else {
-        op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, ws.y, ws.inj, t));
-        hyper_connection(s, ws, &layer.mlp_hc, t, ws.m, prof.as_deref_mut())?;
+        hyper_connection(s, ws, &layer.mlp_hc, t, Some(ws.y), ws.m, prof.as_deref_mut())?;
     }
     let moe = &layer.moe;
     let (ld, x) = (moe.proj.n, ws.proj);
@@ -1046,11 +1054,9 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
         s.copy_d2d(buf + CaptureLayout::TOP_I as u64, ws.top_i + (row * TOP_K * 4) as u64, TOP_K * 4)?;
         s.copy_d2d(buf + CaptureLayout::TOP_W as u64, ws.top_w + (row * TOP_K * 4) as u64, TOP_K * 4)?;
     }
-    if small {
-        carry.pending = Some(ws.y);
-    } else {
-        op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, ws.y, ws.inj, t));
-    }
+    // The block output is added to the residual by whatever reads it next (the next HyperConnection
+    // fuses it with its norm).
+    carry.pending = Some(ws.y);
     Ok(())
 }
 

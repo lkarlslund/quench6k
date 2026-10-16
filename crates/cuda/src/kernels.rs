@@ -44,6 +44,14 @@ pub fn gemm_f32(s: &Stream, x: u64, ldx: usize, fmt: WeightFormat, w: u64, ldw: 
     check(err, "gemm_bf16_f32")
 }
 
+/// HyperConnection up-projection fused with the mix: m [rows, 2560] BF16 = mean over the 4 streams of
+/// sigmoid(z . W^T) * n * (1 + g), W [10240, k] (g optional).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_hc_up_mix(s: &Stream, z: u64, fmt: WeightFormat, w: u64, scale: u64, n: u64, g: u64, m: u64, rows: usize, k: usize) -> Result<()> {
+    let err = unsafe { ffi::squash_gemm_hc_up_mix(fmt as i32, p(z), k as i32, p(w), k as i32, opt_f(scale), p(n), p(g), pm(m), rows as i32, k as i32, s.raw()) };
+    check(err, "gemm_hc_up_mix")
+}
+
 /// As [`gemm_f32`] with a BF16 output.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_bf16(s: &Stream, x: u64, ldx: usize, fmt: WeightFormat, w: u64, ldw: usize, scale: u64, y: u64, ldy: usize, m: usize, n: usize, k: usize, alpha: f32, accumulate: bool) -> Result<()> {
@@ -127,6 +135,11 @@ pub fn hc_act(s: &Stream, x: u64, ld: usize, z: u64, inj: u64, t: usize) -> Resu
 /// m = mean over streams of sigmoid(u) · n · (1 + g); `g` 0 omits the norm weight.
 pub fn hc_mix(s: &Stream, u: u64, n: u64, g: u64, m: u64, t: usize) -> Result<()> {
     launch!("hc_mix", ffi::squash_hc_mix(f(u), p(n), p(g), pm(m), n32(t), s.raw()))
+}
+
+/// [`hc_combine`] followed by [`grouped_rmsnorm`] without weight, in one pass (same results).
+pub fn hc_combine_norm(s: &Stream, h: u64, y: u64, inj: u64, n: u64, t: usize) -> Result<()> {
+    launch!("hc_combine_norm", ffi::squash_hc_combine_norm(fm(h), f(y), f(inj), pm(n), n32(t), s.raw()))
 }
 
 pub fn hc_combine(s: &Stream, h: u64, y: u64, inj: u64, t: usize) -> Result<()> {

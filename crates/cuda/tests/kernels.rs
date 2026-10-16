@@ -437,3 +437,53 @@ fn fp4_grouped_gemm_matches_cpu() {
         assert!(err < 0.2, "fp4 activation quantization error {err}");
     }
 }
+
+/// The fused HyperConnection up-projection + mix equals the GEMM followed by hc_mix, bit for bit.
+#[test]
+fn hc_up_mix_fused_matches_unfused() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x4c4c_0001);
+    let (m, k, h) = (300usize, 320usize, 10240usize);
+    let z = upload(&s, &to_bf16(&rng.vec(m * k)));
+    let n = upload(&s, &to_bf16(&rng.vec(m * h)));
+    let g = upload(&s, &to_bf16(&rng.vec(h).iter().map(|v| v * 0.1).collect::<Vec<_>>()));
+    let wf = rng.vec(h * k).iter().map(|v| v * 0.05).collect::<Vec<_>>();
+    let w = upload(&s, &to_bf16(&wf));
+    let wq = DeviceBuffer::new(h * k).unwrap();
+    let wsc = DeviceBuffer::new(h * k / 64 * 4).unwrap();
+    kernels::quantize_int8_groups(&s, w.addr(), h, k, wq.addr(), wsc.addr()).unwrap();
+    for (fmt, waddr, scale) in [(WeightFormat::Bf16, w.addr(), 0), (WeightFormat::Int8Group, wq.addr(), wsc.addr())] {
+        let u = DeviceBuffer::new(m * h * 4).unwrap();
+        let m1 = DeviceBuffer::new(m * 2560 * 2).unwrap();
+        let m2 = DeviceBuffer::new(m * 2560 * 2).unwrap();
+        kernels::gemm_f32(&s, z.addr(), k, fmt, waddr, k, scale, u.addr(), h, m, h, k, 1.0, false).unwrap();
+        kernels::hc_mix(&s, u.addr(), n.addr(), g.addr(), m1.addr(), m).unwrap();
+        kernels::gemm_hc_up_mix(&s, z.addr(), fmt, waddr, scale, n.addr(), g.addr(), m2.addr(), m, k).unwrap();
+        let a: Vec<u16> = s.download(m1.addr(), m * 2560).unwrap();
+        let b: Vec<u16> = s.download(m2.addr(), m * 2560).unwrap();
+        let diff = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        assert_eq!(diff, 0, "{fmt:?}: {diff} of {} outputs differ", a.len());
+    }
+}
+
+/// hc_combine_norm equals hc_combine followed by grouped_rmsnorm, bit for bit.
+#[test]
+fn hc_combine_norm_matches_separate() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0xc0b1_0001);
+    let t = 37usize;
+    let h0 = rng.vec(t * 10240);
+    let y = upload(&s, &rng.vec(t * 2560));
+    let inj = upload(&s, &rng.vec(t * 4));
+    let (ha, hb) = (upload(&s, &h0), upload(&s, &h0));
+    let (na, nb) = (DeviceBuffer::new(t * 10240 * 2).unwrap(), DeviceBuffer::new(t * 10240 * 2).unwrap());
+    kernels::hc_combine(&s, ha.addr(), y.addr(), inj.addr(), t).unwrap();
+    kernels::grouped_rmsnorm(&s, ha.addr(), 0, na.addr(), t).unwrap();
+    kernels::hc_combine_norm(&s, hb.addr(), y.addr(), inj.addr(), nb.addr(), t).unwrap();
+    let (a, b): (Vec<f32>, Vec<f32>) = (s.download(ha.addr(), t * 10240).unwrap(), s.download(hb.addr(), t * 10240).unwrap());
+    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "residuals differ");
+    let (a, b): (Vec<u16>, Vec<u16>) = (s.download(na.addr(), t * 10240).unwrap(), s.download(nb.addr(), t * 10240).unwrap());
+    assert_eq!(a, b, "norms differ");
+}
