@@ -251,7 +251,9 @@ impl Model {
         self.weights.tensors.values().filter(|t| t.dtype == DType::I8G && t.addr != head).map(|t| t.shape.iter().product::<usize>()).max().unwrap_or(0)
     }
 
-    pub fn bind(ckpt: &Checkpoint, weights: DeviceWeights, mtp_experts: Option<(ExpertTables, (u64, u64, u64), u64, Vec<DeviceBuffer>)>, stream: &Stream) -> Result<Self> {
+    /// Binds the first `layers` text layers (all 48 for the real model).
+    pub fn bind(ckpt: &Checkpoint, weights: DeviceWeights, mtp_experts: Option<(ExpertTables, (u64, u64, u64), u64, Vec<DeviceBuffer>)>, layers: usize, stream: &Stream) -> Result<Self> {
+        ensure!((2..=LAYERS).contains(&layers), "{layers} layers: between 2 (layer 1 holds the PLE) and {LAYERS}");
         let w = |name: &str| -> Result<u64> { Ok(weights.get(name)?.addr) };
         let lin = |name: &str| -> Result<Linear> {
             let t = weights.get(name)?;
@@ -325,8 +327,9 @@ impl Model {
             })
         };
 
-        let mut layers = Vec::with_capacity(LAYERS);
-        for i in 0..LAYERS {
+        let count = layers;
+        let mut layers = Vec::with_capacity(count);
+        for i in 0..count {
             let p = format!("model.language_model.layers.{i}");
             // Expert codes, scales and weight_scale_2 as stored per expert in the checkpoint.
             let mut addrs = [[0u64; EXPERTS]; 6];
@@ -426,9 +429,9 @@ fn moe_group(layer: &str) -> (String, Vec<String>) {
 }
 
 /// Every multi-member projection group of the text model; quantized profiles store each contiguously.
-pub fn projection_groups(mtp: bool) -> Vec<(String, Vec<String>)> {
+pub fn projection_groups(mtp: bool, layers: usize) -> Vec<(String, Vec<String>)> {
     let mut groups = Vec::new();
-    for i in 0..LAYERS {
+    for i in 0..layers {
         let p = format!("model.language_model.layers.{i}");
         groups.push(hc_group(&format!("{p}.attn_hyper_connection"), true));
         groups.push(hc_group(&format!("{p}.mlp_hyper_connection"), true));
@@ -509,7 +512,12 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
         Precision::Bf16 => WeightFormat::Bf16,
         Precision::Int8Group => WeightFormat::Int8Group,
     };
-    let wanted = |n: &str| selection::text(n) || (mtp && selection::mtp(n) && !n.contains(".experts."));
+    // A truncated model (opts.layers < LAYERS) leaves out the later layers' tensors.
+    let in_layers = |n: &str| match n.strip_prefix("model.language_model.layers.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<usize>().ok()) {
+        Some(i) => i < opts.layers,
+        None => true,
+    };
+    let wanted = |n: &str| (selection::text(n) && in_layers(n)) || (mtp && selection::mtp(n) && !n.contains(".experts."));
     let quantized = |n: &str| format != WeightFormat::Bf16 && selection::eight_bit(n);
     let (mut weights, mut stats) = loader::upload(ckpt, |n| wanted(n) && !quantized(n), opts)?;
     // Fold each HyperConnection's (1 + w) norm weight into its down and injection projections (SPEC §4),
@@ -551,7 +559,7 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
         }
         stream.synchronize()?;
     } else {
-        let (converted, s) = loader::upload_quantized(ckpt, |n| wanted(n) && quantized(n), format, &projection_groups(mtp), &fold, opts, stream)?;
+        let (converted, s) = loader::upload_quantized(ckpt, |n| wanted(n) && quantized(n), format, &projection_groups(mtp, opts.layers), &fold, opts, stream)?;
         stats.bytes += s.bytes;
         stats.seconds += s.seconds;
         stats.segments += s.segments;
@@ -563,5 +571,5 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
     } else {
         None
     };
-    Ok((Model::bind(ckpt, weights, mtp_experts, stream)?, stats))
+    Ok((Model::bind(ckpt, weights, mtp_experts, opts.layers, stream)?, stats))
 }

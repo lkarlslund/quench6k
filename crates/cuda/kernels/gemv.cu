@@ -10,27 +10,28 @@
 
 #include <cuda_fp8.h>
 
+#include "variants.cuh"
 #include "wfmt.cuh"
 
 namespace {
 
 constexpr int WARPS = 8, THREADS = WARPS * 32;
 
-// grid (ceil(N / (8 R)), splits). Each split covers k_per_split columns (a multiple of 512). A warp owns
+// grid (ceil(N / (NW R)), splits). Each split covers k_per_split columns (a multiple of 512). A warp owns
 // R rows; lane l handles the 16-weight chunks at columns k_begin + 16 l + 512 c. The first PRE chunks
 // of every row (all of them for K <= 2560 per split) are loaded raw before the PDL wait, so the weight
-// stream overlaps the previous kernel; activations are read only after it.
-template <WFmt F, int M, typename XT, int R>
-__global__ void __launch_bounds__(THREADS) gemv_kernel(const XT* __restrict__ X, int ldx,
+// stream overlaps the previous kernel; activations are read only after it. NW warps per CTA. Neither
+// R, PRE nor NW changes any output's arithmetic.
+template <WFmt F, int M, typename XT, int R, int PRE = 5, int NW = WARPS>
+__global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X, int ldx,
                                                        const uint8_t* __restrict__ W, const float* __restrict__ row_scale,
                                                        float* Y, int ldy, float* partial, int ldp, int N,
                                                        int K, int k_per_split, float alpha, int accumulate) {
     pdl_launch_dependents();
-    constexpr int PRE = 5;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int k_begin = blockIdx.y * k_per_split, k_end = min(K, k_begin + k_per_split);
     const size_t row_bytes = (size_t)K * elem_bytes<F>();
-    const int n0 = (blockIdx.x * WARPS + warp) * R;
+    const int n0 = (blockIdx.x * NW + warp) * R;
     const uint8_t* rows[R];
     bool row_live[R];
 #pragma unroll
@@ -147,21 +148,58 @@ __global__ void reduce_kernel(const float* __restrict__ partial, int ldp, int sp
     *y = accumulate ? *y + acc : acc;
 }
 
+template <WFmt F, int M, int R, int PRE, int NW>
+cudaError_t launch_one(const __nv_bfloat16* X, int ldx, const uint8_t* W, const float* scale, float* Y, int ldy, float* partial,
+                       int N, int K, int splits, int k_per_split, float alpha, int accumulate, cudaStream_t st) {
+    const dim3 grid((N + NW * R - 1) / (NW * R), splits);
+    SQ_CHECK_LAUNCH(sq_launch(gemv_kernel<F, M, __nv_bfloat16, R, PRE, NW>, grid, NW * 32, 0, st, X, ldx, W, scale, Y, ldy, partial, N,
+                              N, K, k_per_split, alpha, accumulate));
+    return cudaSuccess;
+}
+
+// Variants (kbench, docs/KBENCH.md) for decode (M = 1) and verify rounds (M = 4): gemv.pre in {3, 5, 8},
+// gemv.warps in {4, 8, 16}, gemv.rows in {1, 2, 4} (0: the default choice below).
+template <WFmt F, int M, int R>
+cudaError_t launch_r(int pre, int nw, const __nv_bfloat16* X, int ldx, const uint8_t* W, const float* scale, float* Y, int ldy,
+                     float* partial, int N, int K, int splits, int k_per_split, float alpha, int accumulate, cudaStream_t st) {
+#define SQ_ARGS X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st
+    if constexpr (M == 1 || M == 4) {
+        switch (pre * 100 + nw) {
+            case 304: return launch_one<F, M, R, 3, 4>(SQ_ARGS);
+            case 308: return launch_one<F, M, R, 3, 8>(SQ_ARGS);
+            case 316: return launch_one<F, M, R, 3, 16>(SQ_ARGS);
+            case 504: return launch_one<F, M, R, 5, 4>(SQ_ARGS);
+            case 508: return launch_one<F, M, R, 5, 8>(SQ_ARGS);
+            case 516: return launch_one<F, M, R, 5, 16>(SQ_ARGS);
+            case 804: return launch_one<F, M, R, 8, 4>(SQ_ARGS);
+            case 808: return launch_one<F, M, R, 8, 8>(SQ_ARGS);
+            case 816: return launch_one<F, M, R, 8, 16>(SQ_ARGS);
+            default: return cudaErrorInvalidValue;
+        }
+    } else {
+        if (pre != 5 || nw != WARPS) return cudaErrorInvalidValue;
+        return launch_one<F, M, R, 5, WARPS>(SQ_ARGS);
+    }
+#undef SQ_ARGS
+}
+
 template <WFmt F, int M>
 cudaError_t launch_m(const __nv_bfloat16* X, int ldx, const uint8_t* W, const float* scale, float* Y, int ldy,
                      float* partial, int N, int K, int splits, float alpha, int accumulate, cudaStream_t st) {
     const int k_per_split = ((K + splits - 1) / splits + 511) / 512 * 512;
     splits = (K + k_per_split - 1) / k_per_split;
-    // Two rows per warp when that still gives at least one CTA per SM; otherwise one.
-    const bool two = (N + 2 * WARPS - 1) / (2 * WARPS) * splits >= 188;
-    const int rows_per_cta = WARPS * (two ? 2 : 1);
-    const dim3 grid((N + rows_per_cta - 1) / rows_per_cta, splits);
-    if (two)
-        SQ_CHECK_LAUNCH(sq_launch(gemv_kernel<F, M, __nv_bfloat16, 2>, grid, THREADS, 0, st, X, ldx, W, scale, Y, ldy,
-                                  partial, N, N, K, k_per_split, alpha, accumulate));
-    else
-        SQ_CHECK_LAUNCH(sq_launch(gemv_kernel<F, M, __nv_bfloat16, 1>, grid, THREADS, 0, st, X, ldx, W, scale, Y, ldy,
-                                  partial, N, N, K, k_per_split, alpha, accumulate));
+    const int variant = M == 1 || M == 4;
+    const int pre = variant ? sq_variant("gemv.pre", 5) : 5, nw = variant ? sq_variant("gemv.warps", WARPS) : WARPS;
+    int rows = variant ? sq_variant("gemv.rows", 0) : 0;
+    // Default: two rows per warp when that still gives at least one CTA per SM, otherwise one; four-row
+    // steps (MTP verify rounds) always take two (kbench: 1.1% faster per verify step).
+    if (rows == 0) rows = M == 4 || (N + 2 * nw - 1) / (2 * nw) * splits >= 188 ? 2 : 1;
+    cudaError_t e;
+    if (rows == 1) e = launch_r<F, M, 1>(pre, nw, X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st);
+    else if (rows == 2) e = launch_r<F, M, 2>(pre, nw, X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st);
+    else if (rows == 4 && variant) e = launch_r<F, M, 4>(pre, nw, X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st);
+    else e = cudaErrorInvalidValue;
+    if (e != cudaSuccess) return e;
     if (splits > 1)
         SQ_CHECK_LAUNCH(sq_launch(reduce_kernel, (M * N + 255) / 256, 256, 0, st, partial, N, splits, M, N, Y, ldy, accumulate));
     return cudaGetLastError();

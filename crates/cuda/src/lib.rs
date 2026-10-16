@@ -26,6 +26,8 @@ pub mod ffi {
 
     unsafe extern "C" {
         pub fn cudaGetErrorString(err: Error) -> *const c_char;
+        pub fn squash_set_variant(key: *const c_char, value: c_int);
+        pub fn squash_clear_variants();
         pub fn cudaSetDevice(device: c_int) -> Error;
         pub fn cudaDeviceSynchronize() -> Error;
         pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> Error;
@@ -155,6 +157,21 @@ pub mod ffi {
 
 pub mod bf16;
 pub mod kernels;
+
+/// Runtime kernel variants (docs/KBENCH.md): tuning keys that kernel launchers read when they launch
+/// (for CUDA graphs: at capture). Unset keys keep the engine's normal behaviour.
+pub mod variants {
+    /// Sets `key` (e.g. "gemv.warps") to `value` for launches from now on.
+    pub fn set(key: &str, value: i32) {
+        let k = std::ffi::CString::new(key).expect("variant key without NUL");
+        unsafe { super::ffi::squash_set_variant(k.as_ptr(), value) }
+    }
+
+    /// Removes every key (including those from SQUASH_VARIANTS).
+    pub fn clear() {
+        unsafe { super::ffi::squash_clear_variants() }
+    }
+}
 
 /// Converts a CUDA error code into a `Result`.
 pub fn check(err: ffi::Error, what: &str) -> Result<()> {

@@ -10,7 +10,7 @@ use squash_engine::model::{D, Precision};
 
 /// The first `len` tokens of the benchmark corpus (bench/context.ids, shared with NInfer 6000), or of
 /// the whitespace-separated token file named by SQUASH_BENCH_IDS.
-fn prompt(len: usize) -> Result<Vec<i32>> {
+pub(crate) fn prompt(len: usize) -> Result<Vec<i32>> {
     let path = std::env::var("SQUASH_BENCH_IDS").unwrap_or_else(|_| "bench/context.ids".into());
     let text = std::fs::read_to_string(&path)?;
     let ids: Vec<i32> = text.split_ascii_whitespace().take(len).map(|t| t.parse()).collect::<Result<_, _>>()?;

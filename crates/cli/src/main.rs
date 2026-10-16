@@ -1,4 +1,5 @@
 mod bench;
+mod kbench;
 mod chat;
 mod mtp;
 mod serve;
@@ -280,6 +281,34 @@ enum Command {
         #[arg(long)]
         adaptive: bool,
     },
+    /// Kernel variant benchmark on a truncated model (docs/KBENCH.md): bitwise check and paired timing
+    /// of each configuration against the baseline.
+    Kbench {
+        #[arg(long)]
+        model: PathBuf,
+        /// Text layers to load (one period of the layer pattern is 4).
+        #[arg(long, default_value_t = 4)]
+        layers: usize,
+        #[arg(long, default_value_t = 8192)]
+        ctx: usize,
+        /// Rows per decode step (1: plain decoding; 4: an MTP verify round).
+        #[arg(long, default_value_t = 1)]
+        rows: usize,
+        /// Replays per measurement (and per bitwise check).
+        #[arg(long, default_value_t = 16)]
+        steps: usize,
+        /// Timed baseline / variant pairs per configuration.
+        #[arg(long, default_value_t = 9)]
+        pairs: usize,
+        #[arg(long, default_value_t = 8192)]
+        chunk: usize,
+        /// key=value set for every configuration, baseline included.
+        #[arg(long)]
+        variant: Vec<String>,
+        /// key=v1,v2,...: swept (cartesian product over all --sweep keys).
+        #[arg(long)]
+        sweep: Vec<String>,
+    },
     /// Measure MTP draft acceptance on a fixture (drafts are compared with the target's greedy tokens).
     MtpProbe {
         #[arg(long)]
@@ -344,7 +373,7 @@ fn main() -> Result<()> {
             println!("indexed {} tensors in {} files in {:.2}s", ckpt.tensors.len(), ckpt.files.len(), t.elapsed().as_secs_f64());
 
             let select = |name: &str| selection::text(name) || (mtp && selection::mtp(name)) || (vision && selection::vision(name));
-            let opts = LoadOptions { threads, chunk_bytes: chunk_mib << 20, direct: !buffered };
+            let opts = LoadOptions { threads, chunk_bytes: chunk_mib << 20, direct: !buffered, ..Default::default() };
             let (weights, stats) = loader::upload(&ckpt, select, opts)?;
             let gib = stats.bytes as f64 / (1u64 << 30) as f64;
             println!(
@@ -389,6 +418,11 @@ fn main() -> Result<()> {
         Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
         Command::SpecCheck { model, precision, fixture, n, drafts, chunk, graphs, adaptive, profile_rounds, steer } => mtp::check(&model, precision.into(), &fixture, n, drafts, chunk, graphs, adaptive, profile_rounds, &steer)?,
         Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps, mtp, adaptive } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps, mtp, adaptive)?,
+        Command::Kbench { model, layers, ctx, rows, steps, pairs, chunk, variant, sweep } => {
+            let fixed = variant.iter().map(|v| kbench::parse_fixed(v)).collect::<Result<_>>()?;
+            let sweep = sweep.iter().map(|v| kbench::parse_sweep(v)).collect::<Result<_>>()?;
+            kbench::run(&model, &kbench::Options { layers, ctx, rows, steps, pairs, chunk, fixed, sweep })?
+        }
         Command::Gate { fixtures, candidates, suffix } => {
             let mut all = true;
             let mut any = false;

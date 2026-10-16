@@ -159,11 +159,13 @@ pub struct LoadOptions {
     pub chunk_bytes: usize,
     /// Read with `O_DIRECT`, bypassing the page cache (falls back to buffered reads if unsupported).
     pub direct: bool,
+    /// Text layers to load (the first `layers` of 48; fewer give a truncated model for kernel work).
+    pub layers: usize,
 }
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        Self { threads: 8, chunk_bytes: 32 << 20, direct: true }
+        Self { threads: 8, chunk_bytes: 32 << 20, direct: true, layers: crate::model::LAYERS }
     }
 }
 
