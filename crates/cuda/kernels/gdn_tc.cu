@@ -38,15 +38,17 @@ SQ_DEVICE void mma_tf32(float* c, const uint32_t* a, const uint32_t* b) {
 // c[16 x 8] += A[16 x K] B[K x 8] over k in [0, K): A(r, k) = A[r * ar + k * ak], B(k, n) = B[k * bk + n * bn].
 // The high products and the low corrections accumulate separately (two independent MMA chains) and
 // are added at the end.
+// `ks` (optional): B row k is scaled by ks[k].
 template <int K>
-SQ_DEVICE void mma_tile(float* c, const float* A, int ar, int ak, const float* B, int bk, int bn) {
+SQ_DEVICE void mma_tile(float* c, const float* A, int ar, int ak, const float* B, int bk, int bn, const float* ks = nullptr) {
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     float lo[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll 4
     for (int k = 0; k < K; k += 8) {
         const float af[4] = {A[g * ar + (k + t) * ak], A[(g + 8) * ar + (k + t) * ak], A[g * ar + (k + t + 4) * ak],
                              A[(g + 8) * ar + (k + t + 4) * ak]};
-        const float bf[2] = {B[(k + t) * bk + g * bn], B[(k + t + 4) * bk + g * bn]};
+        float bf[2] = {B[(k + t) * bk + g * bn], B[(k + t + 4) * bk + g * bn]};
+        if (ks) bf[0] *= ks[k + t], bf[1] *= ks[k + t + 4];
         uint32_t ah[4], bh[2];
 #pragma unroll
         for (int x = 0; x < 4; ++x) ah[x] = tf32(af[x]);
@@ -185,38 +187,47 @@ __global__ void __launch_bounds__(THREADS) prep_tc_kernel(const float* __restric
     }
 }
 
-// grid (VH, DV / CW), THREADS threads: the chunks in order, state columns [c0, c0 + CW).
-constexpr size_t STATE_SMEM = (DK * LDS + 3 * L * LDK + 4 * L * LDS) * sizeof(float);
-__global__ void __launch_bounds__(THREADS) state_tc_kernel(const float* __restrict__ qkv, const float* __restrict__ g,
-                                                           const float* __restrict__ scratch, float* state, float* out, int T) {
+// grid (VH, 3), ST_THREADS threads: the chunks in order, state columns [c0, c0 + nc) with slabs of 48, 40
+// and 40 columns (144 CTAs: one wave).
+constexpr int ST_THREADS = 384, NCMAX = 48, LDN = NCMAX + 4, LDP = L + 4;
+constexpr size_t STATE_SMEM = (DK * LDN + 3 * L * LDK + L * LDP + 2 * L * LDN) * sizeof(float);
+__global__ void __launch_bounds__(ST_THREADS) state_tc_kernel(const float* __restrict__ qkv, const float* __restrict__ g,
+                                                              const float* __restrict__ scratch, float* state, float* out, int T) {
     pdl_launch_dependents();
     pdl_wait();
     extern __shared__ float sm[];
-    float* Ss = sm;               // [DK][LDS]
-    float* Wb = Ss + DK * LDS;    // [L][LDK]
+    float* Ss = sm;               // [DK][LDN]
+    float* Wb = Ss + DK * LDN;    // [L][LDK]
     float* Qb = Wb + L * LDK;     // [L][LDK]
     float* Kb = Qb + L * LDK;     // [L][LDK]
-    float* Pb = Kb + L * LDK;     // [L][LDS] (L == CW)
-    float* Ub = Pb + L * LDS;     // [L][LDS]
-    float* Vn = Ub + L * LDS;     // [L][LDS]
-    float* Vk = Vn + L * LDS;     // [L][LDS] exp(G_L - G_j) Vn_j
+    float* Pb = Kb + L * LDK;     // [L][LDP]
+    float* Ub = Pb + L * LDP;     // [L][LDN]
+    float* Vn = Ub + L * LDN;     // [L][LDN]
     __shared__ float gbuf[2][L];
-    __shared__ float Gs[L];
-    const int vh = blockIdx.x, kh = vh / 3, c0 = blockIdx.y * CW, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    __shared__ float Gs[L], Kd[L];
+    const int vh = blockIdx.x, kh = vh / 3, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int c0 = blockIdx.y == 0 ? 0 : 8 + 40 * blockIdx.y, nc = blockIdx.y == 0 ? 48 : 40, nt = nc / 8;
     float* st = state + (size_t)vh * DK * DV;
-    for (int e = tid; e < DK * CW; e += THREADS) Ss[(e / CW) * LDS + e % CW] = st[(e / CW) * DV + c0 + e % CW];
+    for (int e = tid; e < DK * nc; e += ST_THREADS) Ss[(e / nc) * LDN + e % nc] = st[(e / nc) * DV + c0 + e % nc];
     const int chunks = (T + L - 1) / L;
 
     auto chunk_w = [&](int ch) { return scratch + ((size_t)ch * VH + vh) * CH_FLOATS; };
+    auto rows = [&](float* dst, int ld, int t0, int len, int col) {
+        for (int e = tid; e < L * DK / 4; e += ST_THREADS) {
+            const int r = e / (DK / 4), c4 = (e % (DK / 4)) * 4;
+            const bool ok = r < len;
+            cp_async16(dst + r * ld + c4, qkv + (size_t)(ok ? t0 + r : 0) * C + col + c4, ok);
+        }
+    };
     auto load_wq = [&](int ch) {  // W, Q and g of chunk ch
         if (ch < chunks) {
             const float* sw = chunk_w(ch);
-            for (int e = tid; e < L * DK / 4; e += THREADS) {
+            for (int e = tid; e < L * DK / 4; e += ST_THREADS) {
                 const int r = e / (DK / 4), c4 = (e % (DK / 4)) * 4;
                 cp_async16(Wb + r * LDK + c4, sw + r * DK + c4, true);
             }
             const int t0 = ch * L, len = min(L, T - t0);
-            async_rows(Qb, LDK, qkv, t0, len, kh * DK, DK);
+            rows(Qb, LDK, t0, len, kh * DK);
             if (tid < L) cp_async4(&gbuf[ch & 1][tid], g + (size_t)(tid < len ? t0 + tid : 0) * VH + vh, tid < len);
         }
         cp_async_commit();
@@ -224,9 +235,9 @@ __global__ void __launch_bounds__(THREADS) state_tc_kernel(const float* __restri
     auto load_u = [&](int ch) {
         if (ch < chunks) {
             const float* su = chunk_w(ch) + CH_W;
-            for (int e = tid; e < L * CW / 4; e += THREADS) {
-                const int r = e / (CW / 4), c4 = (e % (CW / 4)) * 4;
-                cp_async16(Ub + r * LDS + c4, su + r * DV + c0 + c4, true);
+            for (int e = tid; e < L * nc / 4; e += ST_THREADS) {
+                const int r = e / (nc / 4), c4 = (e % (nc / 4)) * 4;
+                cp_async16(Ub + r * LDN + c4, su + r * DV + c0 + c4, true);
             }
         }
         cp_async_commit();
@@ -234,9 +245,9 @@ __global__ void __launch_bounds__(THREADS) state_tc_kernel(const float* __restri
     auto load_p = [&](int ch) {
         if (ch < chunks) {
             const float* sp = chunk_w(ch) + CH_W + CH_U;
-            for (int e = tid; e < L * L / 4; e += THREADS) {
+            for (int e = tid; e < L * L / 4; e += ST_THREADS) {
                 const int r = e / (L / 4), c4 = (e % (L / 4)) * 4;
-                cp_async16(Pb + r * LDS + c4, sp + r * L + c4, true);
+                cp_async16(Pb + r * LDP + c4, sp + r * L + c4, true);
             }
         }
         cp_async_commit();
@@ -244,7 +255,7 @@ __global__ void __launch_bounds__(THREADS) state_tc_kernel(const float* __restri
     auto load_k = [&](int ch) {
         if (ch < chunks) {
             const int t0 = ch * L, len = min(L, T - t0);
-            async_rows(Kb, LDK, qkv, t0, len, KH * DK + kh * DK, DK);
+            rows(Kb, LDK, t0, len, KH * DK + kh * DK);
         }
         cp_async_commit();
     };
@@ -253,8 +264,9 @@ __global__ void __launch_bounds__(THREADS) state_tc_kernel(const float* __restri
     load_u(0);
     load_p(0);
     load_k(0);
-    // Tiles of 32 x 32 outputs (Q S, W S, O, Vn): warp (row block w / 4, columns (w % 4) * 8).
-    const int rb = warp >> 2, cb = (warp & 3) * 8;
+    // 32 x nc outputs (Q S, W S, O, Vn) as m16n8 tiles: warp w < 2 nt takes row block w % 2, n tile w / 2.
+    const bool has = warp < 2 * nt;
+    const int rb = warp & 1, cb = (warp >> 1) * 8;
     for (int ch = 0; ch < chunks; ++ch) {
         const int t0 = ch * L, len = min(L, T - t0);
         cp_async_wait<3>();  // W, Q, g of this chunk
@@ -262,31 +274,33 @@ __global__ void __launch_bounds__(THREADS) state_tc_kernel(const float* __restri
         if (warp == 0) Gs[lane] = warp_scan(gbuf[ch & 1][lane]);
         // Phase 1: W S and Q S.
         float ws[4] = {}, qs[4] = {};
-        mma_tile<DK>(ws, Wb + rb * 16 * LDK, LDK, 1, Ss + cb, LDS, 1);
-        mma_tile<DK>(qs, Qb + rb * 16 * LDK, LDK, 1, Ss + cb, LDS, 1);
+        if (has) {
+            mma_tile<DK>(ws, Wb + rb * 16 * LDK, LDK, 1, Ss + cb, LDN, 1);
+            mma_tile<DK>(qs, Qb + rb * 16 * LDK, LDK, 1, Ss + cb, LDN, 1);
+        }
         __syncthreads();  // W, Q free; Gs visible
         load_wq(ch + 1);
         const float GL = Gs[L - 1];
+        if (tid < L) Kd[tid] = __expf(GL - Gs[tid]);
         cp_async_wait<3>();  // U
         __syncthreads();
-        // Phase 2: Vn = U - W S (and the decayed copy for the state update).
+        // Phase 2: Vn = U - W S.
+        if (has)
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const int i = rb * 16 + frag_row(e), c = cb + frag_col(e);
-            const float v = Ub[i * LDS + c] - ws[e];
-            Vn[i * LDS + c] = v;
-            Vk[i * LDS + c] = __expf(GL - Gs[i]) * v;
-        }
-        __syncthreads();  // U free; Vn, Vk visible
+            for (int e = 0; e < 4; ++e) {
+                const int i = rb * 16 + frag_row(e), c = cb + frag_col(e);
+                Vn[i * LDN + c] = Ub[i * LDN + c] - ws[e];
+            }
+        __syncthreads();  // U free; Vn, Kd visible
         load_u(ch + 1);
         cp_async_wait<3>();  // P
         __syncthreads();
         // Phase 3: O = exp(G) (Q S) + P Vn.
-        {
+        if (has) {
             float o[4];
 #pragma unroll
             for (int e = 0; e < 4; ++e) o[e] = __expf(Gs[rb * 16 + frag_row(e)]) * qs[e];
-            mma_tile<L>(o, Pb + rb * 16 * LDS, LDS, 1, Vn + cb, LDS, 1);
+            mma_tile<L>(o, Pb + rb * 16 * LDP, LDP, 1, Vn + cb, LDN, 1);
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const int i = rb * 16 + frag_row(e), c = cb + frag_col(e);
@@ -297,17 +311,17 @@ __global__ void __launch_bounds__(THREADS) state_tc_kernel(const float* __restri
         load_p(ch + 1);
         cp_async_wait<3>();  // K
         __syncthreads();
-        // Phase 4: S = exp(G_L) S + K^T Vk: 128 x 32 outputs, warp (row block w, 32 columns as 4 tiles).
+        // Phase 4: S = exp(G_L) S + K^T diag(exp(G_L - G)) Vn: 128 x nc outputs, 8 row blocks x nt tiles.
         {
             const float egl = __expf(GL);
-#pragma unroll
-            for (int n = 0; n < 4; ++n) {
+            for (int id = warp; id < 8 * nt; id += ST_THREADS / 32) {
+                const int rk = id & 7, n = id >> 3;
                 float sa[4] = {};
-                mma_tile<L>(sa, Kb + warp * 16, 1, LDK, Vk + n * 8, LDS, 1);
+                mma_tile<L>(sa, Kb + rk * 16, 1, LDK, Vn + n * 8, LDN, 1, Kd);
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    const int d = warp * 16 + frag_row(e), c = n * 8 + frag_col(e);
-                    Ss[d * LDS + c] = fmaf(egl, Ss[d * LDS + c], sa[e]);
+                    const int d = rk * 16 + frag_row(e), c = n * 8 + frag_col(e);
+                    Ss[d * LDN + c] = fmaf(egl, Ss[d * LDN + c], sa[e]);
                 }
             }
         }
@@ -316,7 +330,7 @@ __global__ void __launch_bounds__(THREADS) state_tc_kernel(const float* __restri
     }
     cp_async_wait<0>();
     __syncthreads();
-    for (int e = tid; e < DK * CW; e += THREADS) st[(e / CW) * DV + c0 + e % CW] = Ss[(e / CW) * LDS + e % CW];
+    for (int e = tid; e < DK * nc; e += ST_THREADS) st[(e / nc) * DV + c0 + e % nc] = Ss[(e / nc) * LDN + e % nc];
 }
 
 }  // namespace
@@ -335,7 +349,7 @@ extern "C" cudaError_t squash_gdn_chunked_tc(const float* qkv, const float* beta
     }
     const int chunks = (T + L - 1) / L;
     SQ_CHECK_LAUNCH(sq_launch(prep_tc_kernel, dim3(chunks, VH), THREADS, PREP_SMEM, st, qkv, beta, g, scratch, T));
-    SQ_CHECK_LAUNCH(sq_launch(state_tc_kernel, dim3(VH, DV / CW), THREADS, STATE_SMEM, st, qkv, g, static_cast<const float*>(scratch),
+    SQ_CHECK_LAUNCH(sq_launch(state_tc_kernel, dim3(VH, 3), ST_THREADS, STATE_SMEM, st, qkv, g, static_cast<const float*>(scratch),
                               state, out, T));
     SQ_RETURN_LAUNCH();
 }

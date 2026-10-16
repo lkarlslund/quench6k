@@ -957,10 +957,10 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
 
 /// Prefill experts on the FP4 tensor cores (W4A4, activations quantized per row with least-error block
 /// scales); set by SQUASH_PREFILL_FP4=1 while it is evaluated.
-/// Prefill GDN on the tensor cores (SQUASH_GDN_TC=1 while it is evaluated).
+/// Prefill GDN on the tensor cores (3xTF32; the default, SQUASH_GDN_TC=0 selects the CUDA-core kernels).
 fn gdn_tc() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SQUASH_GDN_TC").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("SQUASH_GDN_TC").map_or(true, |v| v != "0"))
 }
 
 pub fn fp4_prefill() -> bool {
@@ -999,7 +999,6 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
     } else {
         op!(prof, "moe_route", s, k::moe_route(s, col(0), ld, t, ws.top_i, ws.top_w));
         op!(prof, "moe_plan", s, k::moe_plan(s, ws.top_i, t, ws.counts, ws.cursor, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row));
-        op!(prof, "moe_gather", s, k::moe_gather(s, ws.m, ws.pair_row, t, ws.xs));
         let tiles = ws.max_tiles().min((t * TOP_K).div_ceil(k::moe_tile_rows()) + EXPERTS);
         let grouped = |proj: &crate::model::ExpertProj, x: u64, y: u64, n: usize, kk: usize| {
             k::moe_nvfp4_gemm(s, x, proj.weights, proj.scales, proj.scale2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, y, n, kk)
@@ -1036,6 +1035,7 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
                 op!(prof, "experts down", s, grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH));
             }
         } else {
+        op!(prof, "moe_gather", s, k::moe_gather(s, ws.m, ws.pair_row, t, ws.xs));
         if fake_fp4 {
             k::fake_fp4_act(s, ws.xs, t * TOP_K, D)?;
         }
