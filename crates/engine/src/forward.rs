@@ -973,9 +973,16 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
         let grouped = |proj: &crate::model::ExpertProj, x: u64, y: u64, n: usize, kk: usize| {
             k::moe_nvfp4_gemm(s, x, proj.weights, proj.scales, proj.scale2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, y, n, kk)
         };
+        let fake_fp4 = std::env::var_os("SQUASH_FAKE_FP4").is_some();
+        if fake_fp4 {
+            k::fake_fp4_act(s, ws.xs, t * TOP_K, D)?;
+        }
         op!(prof, "experts gate", s, grouped(&moe.gate, ws.xs, ws.eg, EXPERT_WIDTH, D));
         op!(prof, "experts up", s, grouped(&moe.up, ws.xs, ws.eu, EXPERT_WIDTH, D));
         op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, t * TOP_K));
+        if fake_fp4 {
+            k::fake_fp4_act(s, ws.act, t * TOP_K, EXPERT_WIDTH)?;
+        }
         op!(prof, "experts down", s, grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH));
     }
     // One token: the shared-expert tail (SwiGLU, down projection, combine) in one kernel. Larger

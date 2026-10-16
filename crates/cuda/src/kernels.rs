@@ -396,6 +396,12 @@ pub fn spec_accept(s: &Stream, rc: u64, ctl: u64, n: usize) -> Result<()> {
     launch!("spec_accept", ffi::squash_spec_accept(im(rc), im(ctl), n32(n), s.raw()))
 }
 
+/// NVFP4 quantize-dequantize of BF16 activations in place (experiments): per-row scale, per-16 E4M3
+/// block scale chosen by least squared error.
+pub fn fake_fp4_act(s: &Stream, x: u64, rows: usize, cols: usize) -> Result<()> {
+    launch!("fake_fp4_act", ffi::squash_fake_fp4_act(x as *mut std::ffi::c_void, n32(rows), n32(cols), s.raw()))
+}
+
 /// Sampled verification of `n` drafts from rows 0 ..= n of sorted top-`k_list` (ids, logits): writes
 /// the per-row tokens that `spec_accept` then accepts (see the kernel). `params`: the sampling
 /// parameters and generator state, [`SAMPLE_PARAMS_BYTES`] bytes.

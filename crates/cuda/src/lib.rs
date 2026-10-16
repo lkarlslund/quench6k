@@ -111,6 +111,7 @@ pub mod ffi {
         pub fn squash_quantize_nvfp4(w: *const c_void, count: c_int, n: c_int, k: c_int, codes: *mut c_void, scales: *mut c_void, scale2: *mut f32, amax: *mut u32, stream: Stream) -> Error;
         pub fn squash_spec_layout(field: c_int) -> c_int;
         pub fn squash_spec_mtp_header(rc: *const i32, hdr: *mut i32, tokens_off: c_int, pos_off: c_int, j: c_int, c: c_int, stream: Stream) -> Error;
+        pub fn squash_fake_fp4_act(x: *mut c_void, rows: c_int, cols: c_int, stream: Stream) -> Error;
         pub fn squash_spec_accept(rc: *mut i32, ctl: *mut i32, n: c_int, stream: Stream) -> Error;
         pub fn squash_spec_sample_rows(ids: *const i32, vals: *const f32, k_list: c_int, n: c_int, rc: *mut i32, params: *mut c_void, stream: Stream) -> Error;
         pub fn squash_steer_max_rank() -> c_int;

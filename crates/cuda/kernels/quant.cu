@@ -87,3 +87,78 @@ extern "C" cudaError_t squash_quantize_nvfp4(const void* w, int count, int n, in
                               static_cast<uint8_t*>(scales), scale2));
     SQ_RETURN_LAUNCH();
 }
+
+namespace {
+
+SQ_DEVICE float e2m1_value(uint8_t c) {
+    constexpr float grid[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    return (c & 8 ? -1.0f : 1.0f) * grid[c & 7];
+}
+
+SQ_DEVICE float ue4m3_value(int code) {
+    __nv_fp8_e4m3 v;
+    v.__x = (__nv_fp8_storage_t)code;
+    return float(v);
+}
+
+// Squared error of one 16-value block quantized with block scale `bs` (values already divided by the
+// row scale).
+SQ_DEVICE float block_error(const float* v, float bs) {
+    if (bs <= 0.0f) return 3.4e38f;
+    float e = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const float d = v[i] - e2m1_value(e2m1_code(v[i] / bs)) * bs;
+        e = fmaf(d, d, e);
+    }
+    return e;
+}
+
+// NVFP4 activation quantization with a per-row scale (amax / (6 * 448)) and, per block of 16, the
+// E4M3 block scale among the nearest code to amax_b / 6 and its +-1, +-2 neighbours with the least
+// squared error. `fake`: writes the dequantized values back into x (BF16 [rows, cols], in place).
+// One warp per row.
+__global__ void fp4_act_kernel(__nv_bfloat16* x, int rows, int cols) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= rows) return;
+    __nv_bfloat16* xr = x + (size_t)row * cols;
+    float amax = 0.0f;
+    for (int i = lane; i < cols; i += 32) amax = fmaxf(amax, fabsf(bf2f(xr[i])));
+#pragma unroll
+    for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float rs = amax / (6.0f * 448.0f);
+    if (rs == 0.0f) return;
+    for (int b = lane; b < cols / 16; b += 32) {
+        float v[16], am = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            v[i] = bf2f(xr[16 * b + i]) / rs;
+            am = fmaxf(am, fabsf(v[i]));
+        }
+        const int first = (int)__nv_fp8_e4m3(am / 6.0f).__x;
+        int best = first;
+        float best_e = block_error(v, ue4m3_value(first));
+        constexpr int offs[4] = {-1, 1, -2, 2};
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int c = first + offs[t];
+            if (c < 0 || c > 0x7e) continue;
+            const float e = block_error(v, ue4m3_value(c));
+            if (e < best_e) best_e = e, best = c;
+        }
+        const float bs = ue4m3_value(best);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) xr[16 * b + i] = f2bf(bs > 0.0f ? e2m1_value(e2m1_code(v[i] / bs)) * bs * rs : 0.0f);
+    }
+}
+
+}  // namespace
+
+extern "C" cudaError_t squash_fake_fp4_act(void* x, int rows, int cols, cudaStream_t st) {
+    if (cols % 16 != 0) return cudaErrorInvalidValue;
+    if (rows == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(fp4_act_kernel, (rows + 7) / 8, 256, 0, st, (__nv_bfloat16*)x, rows, cols));
+    SQ_RETURN_LAUNCH();
+}
