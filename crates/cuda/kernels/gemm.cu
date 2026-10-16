@@ -13,10 +13,13 @@
 namespace {
 
 constexpr int BM = 128, BN = 128, BK = 32, THREADS = 256;
-constexpr int LDS = BK + 8;  // padded smem row (elements): conflict-free ldmatrix
+constexpr int LDS = BK + 8;  // padded smem row (elements) of the wide kernel
+// Tile rows are BK elements (64 bytes, four 16-byte chunks), chunk c of row r stored at c ^ ((r >> 1) & 3),
+// so ldmatrix reads of 8 consecutive rows hit distinct banks without padding.
+SQ_DEVICE int sw(int r, int c) { return r * BK + ((((c >> 3) ^ ((r >> 1) & 3))) << 3); }
 // Three stages by default; two (41 KB, two CTAs per SM) when a launch has between one and two CTAs per
 // SM, so that it runs as one wave instead of a full wave plus a small remainder.
-constexpr size_t gemm_smem_bytes(int stages, int bm = BM, int bn = BN) { return (size_t)stages * (bm + bn) * LDS * 2; }
+constexpr size_t gemm_smem_bytes(int stages, int bm = BM, int bn = BN) { return (size_t)stages * (bm + bn) * BK * 2; }
 constexpr size_t GEMM_SMEM = gemm_smem_bytes(3);
 
 template <typename OutT>
@@ -46,7 +49,7 @@ struct MixArgs {
 // BMT x BNT: CTA tile, 128 x 128 (warps 2 x 4 of 64 x 32), 256 x 128 (warps 4 x 2 of 64 x 64: each
 // staged weight tile serves twice the rows, fewer fragment loads per MMA) or 128 x 256.
 template <typename OutT, int WF, bool MIX = false, int STAGES = 3, int BNT = 128, int BMT = 128>
-__global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(const __nv_bfloat16* __restrict__ X, int ldx,
+__global__ void __launch_bounds__(THREADS, BMT == 128 && BNT == 128 ? 2 : 1) gemm_kernel(const __nv_bfloat16* __restrict__ X, int ldx,
                                                        const void* __restrict__ Wv, int ldw,
                                                        const float* __restrict__ row_scale, OutT* Y, int ldy,
                                                        int M, int N, int K, float alpha, bool accumulate,
@@ -56,10 +59,10 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(cons
     const __nv_bfloat16* W = static_cast<const __nv_bfloat16*>(Wv);
     const uint8_t* W8 = static_cast<const uint8_t*>(Wv);
     extern __shared__ __align__(16) unsigned char gemm_smem[];
-    auto sA = reinterpret_cast<__nv_bfloat16 (*)[BMT * LDS]>(gemm_smem);
-    static_assert((BNT == 128 && BMT == 128) || (!MIX && (WF == 0 || WF == 3) && BNT * BMT == 128 * 256), "unsupported tile");
+    auto sA = reinterpret_cast<__nv_bfloat16 (*)[BMT * BK]>(gemm_smem);
+    static_assert((!MIX || (size_t)4 * 64 * 33 * 4 <= (size_t)STAGES * (BMT + BNT) * BK * 2) && ((BNT == 128 && BMT == 128) || (!MIX && (WF == 0 || WF == 3) && BNT * BMT == 128 * 256)), "unsupported tile");
     constexpr int WM = BMT / 64, WN = 8 / WM, WTN = BNT / WN;  // warp grid; warp tile 64 x WTN
-    auto sB = reinterpret_cast<__nv_bfloat16 (*)[BNT * LDS]>(gemm_smem + (size_t)STAGES * BMT * LDS * 2);
+    auto sB = reinterpret_cast<__nv_bfloat16 (*)[BNT * BK]>(gemm_smem + (size_t)STAGES * BMT * BK * 2);
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int warp_m = warp / WN, warp_n = warp % WN;
@@ -78,7 +81,7 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(cons
             const int r = idx >> 2, c = (idx & 3) * 8;
             const int gm = m0 + r;
             const bool ok = gm < M;
-            cp_async16(&sA[stage][r * LDS + c], X + (size_t)(ok ? gm : 0) * ldx + k + c, ok);
+            cp_async16(&sA[stage][sw(r, c)], X + (size_t)(ok ? gm : 0) * ldx + k + c, ok);
         }
     };
     auto load = [&](int stage, int kt) {
@@ -91,34 +94,9 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(cons
                 const int r = idx >> 2, c = (idx & 3) * 8;
                 const int gn = wrow(r);
                 const bool ok = gn < N;
-                cp_async16(&sB[stage][r * LDS + c], W + (size_t)(ok ? gn : 0) * ldw + k + c, ok);
+                cp_async16(&sB[stage][sw(r, c)], W + (size_t)(ok ? gn : 0) * ldw + k + c, ok);
             }
-        } else {  // B: 128 rows x 2 chunks of 16 8-bit values, converted to BF16
-            const int r = tid >> 1, c = (tid & 1) * 16;
-            const int gn = wrow(r);
-            __nv_bfloat16* dst = &sB[stage][r * LDS + c];
-            if (gn < N) {
-                const uint4 v = __ldg(reinterpret_cast<const uint4*>(W8 + (size_t)gn * ldw + k + c));
-                if constexpr (WF == 1) {
-                    const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&v);
-#pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(p[i], __NV_E4M3);
-                        const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
-                        dst[2 * i] = f2bf(f.x);
-                        dst[2 * i + 1] = f2bf(f.y);
-                    }
-                } else {
-                    const int8_t* p = reinterpret_cast<const int8_t*>(&v);
-                    const float gs = WF == 3 ? row_scale[(size_t)gn * (K / 64) + (k + c) / 64] : 1.0f;
-#pragma unroll
-                    for (int i = 0; i < 16; ++i) dst[i] = f2bf((float)p[i] * gs);
-                }
-            } else {
-#pragma unroll
-                for (int i = 0; i < 16; ++i) dst[i] = f2bf(0.0f);
-            }
-        }
+        }  // 8-bit weights: fetch_b / store_b
     };
 
     constexpr int MI = 4;         // 16-row MMA tiles per warp
@@ -145,7 +123,8 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(cons
     auto store_b = [&](int stage) {
 #pragma unroll
         for (int u = 0; u < NU; ++u) {
-            __nv_bfloat16* dst = &sB[stage][br * LDS + bc + 16 * u];
+            __nv_bfloat16* dst0 = &sB[stage][sw(br, bc + 16 * u)];
+            __nv_bfloat16* dst1 = &sB[stage][sw(br, bc + 16 * u + 8)];
             if (bgn < N) {
                 const int8_t* p = reinterpret_cast<const int8_t*>(&braw[u]);
                 uint32_t packed[8];
@@ -154,11 +133,11 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(cons
                     const __nv_bfloat162 v = __floats2bfloat162_rn((float)p[2 * i] * bgs, (float)p[2 * i + 1] * bgs);
                     packed[i] = *reinterpret_cast<const uint32_t*>(&v);
                 }
-                *reinterpret_cast<uint4*>(dst) = make_uint4(packed[0], packed[1], packed[2], packed[3]);
-                *reinterpret_cast<uint4*>(dst + 8) = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+                *reinterpret_cast<uint4*>(dst0) = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+                *reinterpret_cast<uint4*>(dst1) = make_uint4(packed[4], packed[5], packed[6], packed[7]);
             } else {
-                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
-                *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(dst0) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(dst1) = make_uint4(0, 0, 0, 0);
             }
         }
     };
@@ -201,13 +180,13 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) gemm_kernel(cons
             for (int i = 0; i < MI; ++i) {
                 const int r = warp_m * 64 + i * 16 + (lane & 15);
                 const int c = kk + (lane >> 4) * 8;
-                ldmatrix_x4(a[i], &a_tile[r * LDS + c]);
+                ldmatrix_x4(a[i], &a_tile[sw(r, c)]);
             }
 #pragma unroll
             for (int j = 0; j < NJ / 2; ++j) {
                 const int r = warp_n * WTN + j * 16 + (lane & 7) + ((lane >> 4) << 3);
                 const int c = kk + ((lane >> 3) & 1) * 8;
-                ldmatrix_x4(b[j], &b_tile[r * LDS + c]);
+                ldmatrix_x4(b[j], &b_tile[sw(r, c)]);
             }
 #pragma unroll
             for (int i = 0; i < MI; ++i)
@@ -322,10 +301,10 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
     const size_t wide_smem = gemm_smem_bytes(3, 256, 128);
     if (fmt == 3)
         SQ_CHECK_LAUNCH(wide ? go(gemm_kernel<OutT, 3, false, 3, 128, 256>, wide_smem, grid_w)
-                        : two ? go(gemm_kernel<OutT, 3, false, 2>, gemm_smem_bytes(2), grid) : go(gemm_kernel<OutT, 3>, GEMM_SMEM, grid));
+                        : two ? go(gemm_kernel<OutT, 3>, GEMM_SMEM, grid) : go(gemm_kernel<OutT, 3>, GEMM_SMEM, grid));
     else if (fmt == 0)
         SQ_CHECK_LAUNCH(wide ? go(gemm_kernel<OutT, 0, false, 3, 128, 256>, wide_smem, grid_w)
-                        : two ? go(gemm_kernel<OutT, 0, false, 2>, gemm_smem_bytes(2), grid) : go(gemm_kernel<OutT, 0>, GEMM_SMEM, grid));
+                        : two ? go(gemm_kernel<OutT, 0>, GEMM_SMEM, grid) : go(gemm_kernel<OutT, 0>, GEMM_SMEM, grid));
     else
         return cudaErrorInvalidValue;
     SQ_RETURN_LAUNCH();
@@ -504,8 +483,8 @@ extern "C" cudaError_t squash_gemm_hc_up_mix(int fmt, const void* X, int ldx, co
     if (M == 0) return cudaSuccess;
     static bool configured = false;
     if (!configured) {
-        for (auto kern : {gemm_kernel<float, 0, true, 2>, gemm_kernel<float, 3, true, 2>}) {
-            const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gemm_smem_bytes(2));
+        for (auto kern : {gemm_kernel<float, 0, true, 3>, gemm_kernel<float, 3, true, 3>}) {
+            const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GEMM_SMEM);
             if (e != cudaSuccess) return e;
         }
         configured = true;
@@ -514,10 +493,10 @@ extern "C" cudaError_t squash_gemm_hc_up_mix(int fmt, const void* X, int ldx, co
     const dim3 grid(HC_D / 32, (M + BM - 1) / BM);
     const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
     if (fmt == 3)
-        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 3, true, 2>, grid, THREADS, gemm_smem_bytes(2), stream, x, ldx, W, ldw, scale, (float*)nullptr, 0, M,
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 3, true, 3>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, scale, (float*)nullptr, 0, M,
                                   HC_S * HC_D, K, 1.0f, false, mix, (float*)nullptr));
     else if (fmt == 0)
-        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 0, true, 2>, grid, THREADS, gemm_smem_bytes(2), stream, x, ldx, W, ldw, (const float*)nullptr,
+        SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 0, true, 3>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, (const float*)nullptr,
                                   (float*)nullptr, 0, M, HC_S * HC_D, K, 1.0f, false, mix, (float*)nullptr));
     else
         return cudaErrorInvalidValue;
