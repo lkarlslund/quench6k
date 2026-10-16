@@ -5,6 +5,7 @@
 // (dynamic shared memory).
 // K must be a multiple of 32 and rows 16-byte aligned; M and N are arbitrary.
 
+#include <cstdlib>
 #include <cuda_fp8.h>
 
 #include "mma.cuh"
@@ -309,10 +310,11 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
         configured = true;
     }
     const int ctas = grid.x * grid.y;
-    const bool two = ctas > sms && ctas <= 2 * sms;
-    // 256-row tiles when there are enough of them for several waves.
+    // 256-row tiles when there are enough of them for several waves; otherwise two CTAs per SM
+    // (2 stages), which overlaps one CTA's prologue and epilogue with another's main loop.
     const dim3 grid_w((N + BN - 1) / BN, (M + 255) / 256);
-    const bool wide = !two && (int)(grid_w.x * grid_w.y) >= 4 * sms;
+    const bool wide = ctas > 2 * sms && (int)(grid_w.x * grid_w.y) >= 4 * sms;
+    const bool two = !wide;
     const float* sc = fmt == 3 ? scale : nullptr;
     auto go = [&](auto kern, size_t smem, dim3 g) {
         return sq_launch(kern, g, THREADS, smem, stream, x, ldx, W, ldw, sc, y, ldy, M, N, K, alpha, accumulate != 0, MixArgs{}, (float*)nullptr);
