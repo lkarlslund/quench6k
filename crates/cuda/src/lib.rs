@@ -62,6 +62,7 @@ pub mod ffi {
         pub fn squash_vit_qkv_rope(qkv: *const f32, bias: *const c_void, cos: *const f32, sin: *const f32, t: c_int, q: *mut f32, k: *mut f32, v: *mut f32, stream: Stream) -> Error;
         pub fn squash_vit_attention(q: *const f32, k: *const f32, v: *const f32, t: c_int, seg: c_int, out: *mut c_void, stream: Stream) -> Error;
         pub fn squash_to_bf16(x: *const f32, n: usize, out: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_embed_rows(emb: *const f32, rows: c_int, h: *mut f32, stream: Stream) -> Error;
         pub fn squash_pad_cols(src: *const c_void, n: c_int, k: c_int, dst: *mut c_void, ldd: c_int, stream: Stream) -> Error;
         pub fn squash_gemv_max_m() -> c_int;
         pub fn squash_gemv(fmt: c_int, m: c_int, x: *const c_void, ldx: c_int, w: *const c_void, scale: *const f32, y: *mut f32, ldy: c_int, partial: *mut f32, n: c_int, k: c_int, splits: c_int, alpha: f32, accumulate: c_int, stream: Stream) -> Error;

@@ -155,7 +155,24 @@ __global__ void pad_cols_kernel(const __nv_bfloat16* __restrict__ src, int k, __
         dst[(size_t)r * ldd + j] = j < k ? src[(size_t)r * k + j] : f2bf(0.0f);
 }
 
+// h[r, s, :] = BF16(emb[r, :]) for the 4 residual streams (vision tokens' input embedding).
+__global__ void embed_rows_kernel(const float* __restrict__ emb, float* h) {
+    constexpr int D = 2560, S = 4;
+    const int r = blockIdx.x;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        const float v = bf2f(f2bf(emb[(size_t)r * D + d]));
+#pragma unroll
+        for (int s = 0; s < S; ++s) h[(size_t)r * S * D + s * D + d] = v;
+    }
+}
+
 }  // namespace
+
+extern "C" cudaError_t squash_embed_rows(const float* emb, int rows, float* h, cudaStream_t st) {
+    if (rows == 0) return cudaSuccess;
+    embed_rows_kernel<<<rows, 256, 0, st>>>(emb, h);
+    return cudaGetLastError();
+}
 
 extern "C" cudaError_t squash_vit_layernorm(const float* x, int t, int d, const void* w, const void* b, void* out, cudaStream_t st) {
     if (t == 0) return cudaSuccess;

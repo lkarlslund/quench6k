@@ -26,7 +26,22 @@ pub struct GenParams {
     pub boundaries: Vec<usize>,
     /// Record activations at the final prompt token and the final generated token (plain decoding).
     pub capture: bool,
+    /// Images of the prompt, in order; each fills a run of placeholder tokens.
+    pub images: Vec<std::sync::Arc<ImageInput>>,
 }
+
+/// A preprocessed image whose merged tokens occupy prompt positions [start, start + tokens).
+pub struct ImageInput {
+    pub start: usize,
+    pub input: crate::vision::VisionInput,
+}
+
+impl std::fmt::Debug for ImageInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ImageInput {{ start: {}, grid: {:?} }}", self.start, self.input.grid)
+    }
+}
+
 
 /// Activation capture of one request: per site (prompt_last, completion_last) the per-layer records
 /// (`forward::CaptureLayout`, 48 layers), the absolute position and token, and the top-20 next-token
@@ -91,6 +106,12 @@ pub struct Session {
     /// Activation capture records (two sites x 48 layers), and the prompt_last site of the current run.
     capture_buf: Option<DeviceBuffer>,
     prompt_site: Option<CaptureSite>,
+    vision: Option<crate::vision::VisionModel>,
+    /// Image spans of the request being prefilled on slot 0.
+    mm_pending: Vec<std::sync::Arc<forward::MmSpan>>,
+    /// Cached tokens past this index follow an image (placeholder IDs do not identify the image), so
+    /// they are never reused.
+    kv_limit: usize,
 }
 
 struct Aux {
@@ -177,6 +198,9 @@ impl Session {
             aux: None,
             capture_buf: None,
             prompt_site: None,
+            vision: None,
+            mm_pending: Vec::new(),
+            kv_limit: usize::MAX,
         })
     }
 
@@ -228,6 +252,23 @@ impl Session {
         Ok(())
     }
 
+    /// Enables image input with the given vision tower.
+    pub fn set_vision(&mut self, vision: crate::vision::VisionModel) {
+        self.vision = Some(vision);
+    }
+
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    fn encode_images(&self, s: &Stream, p: &GenParams) -> Result<Vec<std::sync::Arc<forward::MmSpan>>> {
+        if p.images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vm = self.vision.as_ref().ok_or_else(|| anyhow::anyhow!("image input needs the vision tower (--vision)"))?;
+        p.images.iter().map(|im| Ok(std::sync::Arc::new(vm.span(s, &im.input, im.start)?))).collect()
+    }
+
     pub fn has_second_slot(&self) -> bool {
         self.aux.is_some()
     }
@@ -242,7 +283,9 @@ impl Session {
         let speculate = speculate && !p.capture;
         self.prompt_site = None;
         let capture = if p.capture { Some(forward::CaptureTarget { pos: prompt.len() - 1, buf: self.capture_buf()? }) } else { None };
+        let spans = self.encode_images(s, p)?;
         if slot == 0 {
+            self.mm_pending = spans;
             self.state.reset(s)?;
             self.state.set_steering_strength(s, p.steering_strength)?;
             self.ws.capture = capture;
@@ -263,6 +306,7 @@ impl Session {
         }
         let aux = self.aux.as_mut().expect("second slot");
         aux.state.reset(s)?;
+        aux.state.mm = spans;
         aux.state.set_steering_strength(s, p.steering_strength)?;
         self.ws.capture = capture;
         // The same step boundaries as a fresh slot-0 prefill (chunks, cut at turn boundaries), so
@@ -470,7 +514,8 @@ impl Session {
             self.kv_tokens.clear();
             self.snapshots.clear();
         }
-        let mut lcp = self.kv_tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        let mm_limit = self.mm_pending.first().map(|sp| sp.start).unwrap_or(usize::MAX);
+        let mut lcp = self.kv_tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count().min(self.kv_limit).min(mm_limit);
         if strength == 0.0 && self.store.enabled() {
             // The new prompt overwrites the cached conversation past `lcp`: keep its boundary state.
             if self.snapshots.iter().any(|sn| sn.pos > lcp) {
@@ -488,6 +533,8 @@ impl Session {
         // Snapshots past the common prefix describe tokens the new prompt overwrites.
         self.snapshots.retain(|sn| sn.pos <= lcp);
         self.state.reset(s)?;
+        self.state.mm = std::mem::take(&mut self.mm_pending);
+        self.kv_limit = mm_limit;
         let best = self.snapshots.iter().enumerate().filter(|(_, sn)| sn.pos < prompt.len()).max_by_key(|(_, sn)| sn.pos).map(|(i, _)| i);
         let start = match best {
             Some(i) => {
@@ -504,7 +551,7 @@ impl Session {
             }
         };
         self.reused = start;
-        let mut pauses: Vec<usize> = boundaries.iter().copied().filter(|&b| b > start && b < prompt.len() && !self.snapshots.iter().any(|sn| sn.pos == b)).collect();
+        let mut pauses: Vec<usize> = boundaries.iter().copied().filter(|&b| b > start && b < prompt.len() && b <= mm_limit && !self.snapshots.iter().any(|sn| sn.pos == b)).collect();
         pauses.sort_unstable();
         pauses.dedup();
         let snapshots = &mut self.snapshots;
@@ -541,6 +588,7 @@ impl Session {
         if budget == 0 {
             return Ok((Finish::Length, 0));
         }
+        self.mm_pending = self.encode_images(s, p)?;
         self.prefill(model, s, prompt, &p.boundaries, p.steering_strength)?;
         if p.temperature <= 0.0 {
             self.spec.restart(&self.state, &self.dec, s)?;

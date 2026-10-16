@@ -167,6 +167,9 @@ enum Command {
         think: bool,
         #[arg(long, default_value_t = 32768)]
         context: usize,
+        /// Images to show the model (placed before the prompt text).
+        #[arg(long)]
+        image: Vec<PathBuf>,
         #[command(flatten)]
         steer: SteerArgs,
     },
@@ -225,6 +228,9 @@ enum Command {
         /// Directory with pixels.f32, embeds.f32 and meta.json.
         #[arg(long)]
         reference: PathBuf,
+        /// max_pixels the reference was preprocessed with (to compare squash's own preprocessing).
+        #[arg(long, default_value_t = 16777216)]
+        max_pixels: usize,
     },
     /// Measure prefill and greedy decode throughput at the given prompt lengths.
     Bench {
@@ -350,14 +356,14 @@ fn main() -> Result<()> {
                 println!("verified {checked} tensors byte-exact");
             }
         }
-        Command::VisionCheck { model, reference } => vision_check(&model, &reference)?,
+        Command::VisionCheck { model, reference, max_pixels } => vision_check(&model, &reference, max_pixels)?,
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, batch2, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, batch2, &steer)?,
         Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir } => {
             serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir, chat_template, tool_retries, slots, capture_dir })?
         }
         Command::BatchCheck { model, fixture, n } => batch_check(&model, &fixture, n)?,
-        Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, steer } => {
-            chat_once(&model, &prompt, max_tokens, temperature, top_p, top_k, seed, think, context, &steer)?
+        Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, image, steer } => {
+            chat_once(&model, &prompt, max_tokens, temperature, top_p, top_k, seed, think, context, &image, &steer)?
         }
         Command::Generate { model, precision, fixture, tie, steer } => generate(&model, precision.into(), &fixture, tie, &steer)?,
         Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
@@ -565,18 +571,28 @@ fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathB
 }
 
 #[allow(clippy::too_many_arguments)]
-fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32, top_k: usize, seed: u64, think: bool, context: usize, steer: &SteerArgs) -> Result<()> {
+fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32, top_k: usize, seed: u64, think: bool, context: usize, images: &[PathBuf], steer: &SteerArgs) -> Result<()> {
     use std::io::Write;
     let chat = chat::Chat::load(model_dir, None)?;
     let (mut model, stream) = load(model_dir, Precision::Int8Group, true)?;
     let strength = steer.attach(&mut model, &stream)?;
     let t0 = std::time::Instant::now();
     let mut session = squash_engine::session::Session::new(&model, &stream, context, 8192, 6, Default::default())?;
+    let mut content = vec![];
+    let mut inputs = vec![];
+    if !images.is_empty() {
+        session.set_vision(squash_engine::vision::VisionModel::load(&Checkpoint::open(model_dir)?, LoadOptions::default(), &stream)?);
+        for path in images {
+            inputs.push(squash_engine::vision::preprocess_image(&std::fs::read(path)?, 65536, 16777216)?);
+            content.push(serde_json::json!({"type": "image"}));
+        }
+    }
+    content.push(serde_json::json!({"type": "text", "text": prompt}));
     println!("session ready in {:.1}s", t0.elapsed().as_secs_f64());
-    let messages = serde_json::json!([{"role": "user", "content": prompt}]);
+    let messages = serde_json::json!([{"role": "user", "content": content}]);
     let text = chat.render(&messages, None, Some(think), None)?;
-    let ids = chat.encode(&text)?;
-    let params = squash_engine::session::GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: chat.stop_tokens.clone(), steering_strength: strength, boundaries: chat.boundaries(&ids), capture: false };
+    let (ids, images) = chat.expand_images(&chat.encode(&text)?, inputs)?;
+    let params = squash_engine::session::GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: chat.stop_tokens.clone(), steering_strength: strength, boundaries: chat.boundaries(&ids), capture: false, images };
     let mut out = chat::TextStream::default();
     let t1 = std::time::Instant::now();
     let mut first = None;
@@ -682,7 +698,7 @@ fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> R
     Ok(())
 }
 
-fn vision_check(model_dir: &std::path::Path, reference: &std::path::Path) -> Result<()> {
+fn vision_check(model_dir: &std::path::Path, reference: &std::path::Path, max_pixels: usize) -> Result<()> {
     use squash_engine::vision::{VisionInput, VisionModel};
     squash_cuda::set_device(0)?;
     let ckpt = Checkpoint::open(model_dir)?;
@@ -695,6 +711,16 @@ fn vision_check(model_dir: &std::path::Path, reference: &std::path::Path) -> Res
     let read_f32 = |name: &str| -> Result<Vec<f32>> { Ok(std::fs::read(reference.join(name))?.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()) };
     let input = VisionInput { pixels: read_f32("pixels.f32")?, grid: [grid[0], grid[1], grid[2]] };
     let want = read_f32("embeds.f32")?;
+    if let Some(path) = meta["image"].as_str() {
+        let own = squash_engine::vision::preprocess_image(&std::fs::read(path)?, 65536, max_pixels)?;
+        if own.grid == input.grid {
+            let d: Vec<f32> = own.pixels.iter().zip(&input.pixels).map(|(a, b)| (a - b).abs()).collect();
+            let off = d.iter().filter(|&&x| x > 1e-6).count();
+            println!("preprocessing: grid {:?}; pixel |diff| max {:.4} mean {:.5}; {off} of {} values differ", own.grid, d.iter().cloned().fold(0f32, f32::max), d.iter().sum::<f32>() / d.len() as f32, d.len());
+        } else {
+            println!("preprocessing: grid {:?} differs from the reference {:?}", own.grid, input.grid);
+        }
+    }
     vm.encode(&s, &input)?; // warm-up
     let t1 = std::time::Instant::now();
     let out = vm.encode(&s, &input)?;

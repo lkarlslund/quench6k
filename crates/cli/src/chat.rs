@@ -75,6 +75,28 @@ impl Chat {
 
     /// Snapshot positions for prefix reuse: the start of the prompt's final turn (its last
     /// `<|im_start|>`), which the next request of the same conversation shares.
+    /// Expands each `<|image_pad|>` placeholder of `ids` (in order) into one token per merged image
+    /// token, returning the new IDs and each image's span.
+    pub fn expand_images(&self, ids: &[i32], images: Vec<squash_engine::vision::VisionInput>) -> Result<(Vec<i32>, Vec<std::sync::Arc<squash_engine::session::ImageInput>>)> {
+        let pad = self.token_id("<|image_pad|>").ok_or_else(|| anyhow::anyhow!("tokenizer has no <|image_pad|>"))?;
+        let found = ids.iter().filter(|&&t| t == pad).count();
+        anyhow::ensure!(found == images.len(), "{} images for {found} image placeholders", images.len());
+        let mut out = Vec::with_capacity(ids.len() + images.iter().map(|i| i.tokens()).sum::<usize>());
+        let mut spans = Vec::with_capacity(images.len());
+        let mut it = images.into_iter();
+        for &t in ids {
+            if t == pad {
+                let input = it.next().unwrap();
+                let start = out.len();
+                out.extend(std::iter::repeat_n(pad, input.tokens()));
+                spans.push(std::sync::Arc::new(squash_engine::session::ImageInput { start, input }));
+            } else {
+                out.push(t);
+            }
+        }
+        Ok((out, spans))
+    }
+
     pub fn boundaries(&self, ids: &[i32]) -> Vec<usize> {
         self.im_start.and_then(|t| ids.iter().rposition(|&i| i == t)).into_iter().filter(|&p| p > 0).collect()
     }

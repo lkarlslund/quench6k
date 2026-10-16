@@ -66,6 +66,29 @@ pub struct SequenceState {
     pub spec: Option<Spec>,
     /// Device f32: strength of the model's steering pack for this sequence (0: unsteered).
     pub steer_strength: DeviceBuffer,
+    /// Image / video spans of the prompt, in order (their embeddings replace the placeholder tokens).
+    pub mm: Vec<std::sync::Arc<MmSpan>>,
+}
+
+/// A run of placeholder tokens [start, start + len) whose embeddings come from the vision tower.
+pub struct MmSpan {
+    pub start: usize,
+    /// Merger output, FP32 [len, 2560].
+    pub emb: DeviceBuffer,
+    /// (t, h, w) offsets of each token from the span's base position.
+    pub offsets: Vec<[i32; 3]>,
+    /// Positions the span occupies in the text sequence (max(h, w) of the merged grid).
+    pub advance: i32,
+}
+
+impl MmSpan {
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
 }
 
 /// Recurrent-state bookkeeping for speculative decoding. A verification step processes drafts that may
@@ -132,6 +155,7 @@ impl SequenceState {
                 None
             },
             steer_strength: DeviceBuffer::zeroed(4)?,
+            mm: Vec::new(),
         })
     }
 
@@ -140,6 +164,7 @@ impl SequenceState {
     /// stay, so graphs captured for this state remain valid.
     pub fn reset(&mut self, s: &Stream) -> Result<()> {
         self.tokens.clear();
+        self.mm.clear();
         for g in self.gdn.iter().flatten() {
             s.memset(g.conv.addr(), 0, g.conv.bytes())?;
             s.memset(g.recurrent.addr(), 0, g.recurrent.bytes())?;
@@ -161,6 +186,25 @@ impl SequenceState {
 
     pub fn len(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// MRoPE position (t, h, w) of sequence index `p`: text tokens advance all three axes by one;
+    /// a vision span occupies `advance` positions from its base, its tokens at base + their offsets.
+    pub fn position(&self, p: usize) -> [i32; 3] {
+        let mut delta = 0i32;
+        for sp in &self.mm {
+            if p < sp.start {
+                break;
+            }
+            if p < sp.start + sp.len() {
+                let base = sp.start as i32 + delta;
+                let o = sp.offsets[p - sp.start];
+                return [base + o[0], base + o[1], base + o[2]];
+            }
+            delta += sp.advance - sp.len() as i32;
+        }
+        let v = p as i32 + delta;
+        [v, v, v]
     }
 
     pub fn is_empty(&self) -> bool {
@@ -483,9 +527,10 @@ pub fn prepare_tokens(state: &mut SequenceState, ws: &mut Workspace, new_tokens:
     block[0..4].copy_from_slice(&(start as i32).to_le_bytes());
     for (j, tok) in new_tokens.iter().enumerate() {
         block[layout.tokens + 4 * j..layout.tokens + 4 * j + 4].copy_from_slice(&tok.to_le_bytes());
+        let pos = state.position(start + j);
         for a in 0..3 {
             let o = layout.pos + 12 * j + 4 * a;
-            block[o..o + 4].copy_from_slice(&((start + j) as i32).to_le_bytes());
+            block[o..o + 4].copy_from_slice(&pos[a].to_le_bytes());
         }
     }
     Ok(())
@@ -533,9 +578,10 @@ pub fn prepare_batch(model: &Model, states: &mut [&mut SequenceState], ws: &mut 
         let block = ws.step_host.as_mut_slice();
         block[4 * j..4 * j + 4].copy_from_slice(&(p as i32).to_le_bytes());
         block[layout.tokens + 4 * j..layout.tokens + 4 * j + 4].copy_from_slice(&tok.to_le_bytes());
+        let pos = st.position(p);
         for a in 0..3 {
             let o = layout.pos + 12 * j + 4 * a;
-            block[o..o + 4].copy_from_slice(&(p as i32).to_le_bytes());
+            block[o..o + 4].copy_from_slice(&pos[a].to_le_bytes());
         }
         let ids = ple_rows(&st.tokens, p, &ple.multipliers, &ple.sizes, &ple.offsets);
         rows.clear();
@@ -668,6 +714,12 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
     if part != Part::FromPle {
         op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, ctx.pos3, ctx.start, t));
         op!(prof, "embed", s, k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h));
+        for sp in &state.mm {
+            let (a, b) = (sp.start.max(first), (sp.start + sp.len()).min(first + t));
+            if a < b {
+                k::embed_rows(s, sp.emb.addr() + ((a - sp.start) * D * 4) as u64, b - a, ws.h + ((a - first) * H * 4) as u64)?;
+            }
+        }
     }
     // After layer 0 of a small batch the deferred update is the MoE output in ws.y with weights in ws.inj.
     let mut carry = Carry::new(ws, part == Part::FromPle && t <= k::gemv_max_m());

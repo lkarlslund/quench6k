@@ -190,3 +190,66 @@ impl VisionModel {
         Ok(out)
     }
 }
+
+/// Qwen2-VL `smart_resize`: dimensions rounded to multiples of 32 (patch x merge), area kept within
+/// [min_pixels, max_pixels], aspect ratio approximately preserved. Python's round-half-to-even.
+pub fn smart_resize(height: usize, width: usize, min_pixels: usize, max_pixels: usize) -> Result<(usize, usize)> {
+    let factor = (PATCH * MERGE) as f64;
+    let (h, w) = (height as f64, width as f64);
+    ensure!(h.max(w) / h.min(w) <= 200.0, "image aspect ratio over 200");
+    let round = |x: f64| x.round_ties_even();
+    let (mut hb, mut wb) = (round(h / factor) * factor, round(w / factor) * factor);
+    if hb * wb > max_pixels as f64 {
+        let beta = (h * w / max_pixels as f64).sqrt();
+        hb = factor.max((h / beta / factor).floor() * factor);
+        wb = factor.max((w / beta / factor).floor() * factor);
+    } else if hb * wb < min_pixels as f64 {
+        let beta = (min_pixels as f64 / (h * w)).sqrt();
+        hb = (h * beta / factor).ceil() * factor;
+        wb = (w * beta / factor).ceil() * factor;
+    }
+    Ok((hb as usize, wb as usize))
+}
+
+/// The checkpoint's image processor: decode, `smart_resize` with bicubic resampling (to 8-bit, as
+/// PIL does), scale to [-1, 1] (mean 0.5, std 0.5), duplicate into the 2 temporal frames and cut
+/// 16x16 patches in merge-block order.
+pub fn preprocess_image(bytes: &[u8], min_pixels: usize, max_pixels: usize) -> Result<VisionInput> {
+    let img = image::load_from_memory(bytes)?.to_rgb8();
+    let (h, w) = smart_resize(img.height() as usize, img.width() as usize, min_pixels, max_pixels)?;
+    let img = image::imageops::resize(&img, w as u32, h as u32, image::imageops::FilterType::CatmullRom);
+    let (gh, gw) = (h / PATCH, w / PATCH);
+    let coords = patch_coords(gh, gw);
+    let mut pixels = Vec::with_capacity(gh * gw * PATCH_DIM);
+    for &(r, c) in &coords {
+        for ch in 0..3 {
+            for _frame in 0..TEMPORAL {
+                for y in 0..PATCH {
+                    for x in 0..PATCH {
+                        let v = img.get_pixel((c * PATCH + x) as u32, (r * PATCH + y) as u32)[ch];
+                        pixels.push((v as f32 / 255.0 - 0.5) / 0.5);
+                    }
+                }
+            }
+        }
+    }
+    Ok(VisionInput { pixels, grid: [1, gh, gw] })
+}
+
+impl VisionModel {
+    /// Encodes `input` into a span of placeholder tokens starting at sequence index `start`.
+    pub fn span(&self, s: &Stream, input: &VisionInput, start: usize) -> Result<crate::forward::MmSpan> {
+        let emb = self.encode(s, input)?;
+        let [t, h, w] = input.grid;
+        let (gh, gw) = (h / MERGE, w / MERGE);
+        let mut offsets = Vec::with_capacity(t * gh * gw);
+        for ti in 0..t {
+            for r in 0..gh {
+                for c in 0..gw {
+                    offsets.push([ti as i32, r as i32, c as i32]);
+                }
+            }
+        }
+        Ok(crate::forward::MmSpan { start, emb, offsets, advance: gh.max(gw) as i32 })
+    }
+}

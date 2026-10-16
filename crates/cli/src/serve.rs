@@ -327,7 +327,7 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
             Some((dir.join(format!("{name}.safetensors")), meta))
         }
     };
-    let params = GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids), capture: capture.is_some() };
+    let params = GenParams { max_tokens, temperature, top_p, top_k, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids), capture: capture.is_some(), images: Vec::new() };
     Ok(Prepared { capture, ids, params, stops, thinking, tools, stream: req.get("stream").and_then(Value::as_bool).unwrap_or(false) })
 }
 

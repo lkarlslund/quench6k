@@ -475,3 +475,8 @@ pub fn to_bf16(s: &Stream, x: u64, n: usize, out: u64) -> Result<()> {
 pub fn pad_cols(s: &Stream, src: u64, n: usize, k: usize, dst: u64, ldd: usize) -> Result<()> {
     check(unsafe { ffi::squash_pad_cols(p(src), n as i32, k as i32, pm(dst), ldd as i32, s.raw()) }, "pad_cols")
 }
+
+/// Replaces `rows` embedded residual rows (h [rows, 4 x 2560] FP32) with BF16-rounded vision embeddings.
+pub fn embed_rows(s: &Stream, emb: u64, rows: usize, h: u64) -> Result<()> {
+    check(unsafe { ffi::squash_embed_rows(emb as *const f32, rows as i32, h as *mut f32, s.raw()) }, "embed_rows")
+}
