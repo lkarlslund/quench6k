@@ -1053,7 +1053,7 @@ namespace {
 // ---- draft head shortlist: a 1-bit sketch of the head ranks the vocabulary, the exact NVFP4 rows
 // rescore each slice's best candidates ------------------------------------------------------------
 
-constexpr int SK_GROUPS = D / 64, SK_SLICE = 8192, SK_PICK = 8;
+constexpr int SK_GROUPS = D / 64, SK_SLICE = 8192, SK_PICK = 8, SK_ROWS = 1;  // rows per sketch thread
 
 // masks [group][row]: bit i = (w[row, 64 group + i] >= 0); scales [group][row] = mean |w| of the group.
 __global__ void build_sketch_kernel(const __nv_bfloat16* __restrict__ w, unsigned long long* masks, __half* scales, int N) {
@@ -1072,34 +1072,56 @@ __global__ void build_sketch_kernel(const __nv_bfloat16* __restrict__ w, unsigne
     scales[item] = __float2half(sum / 64.0f);
 }
 
-// y[row] = sum_g scale_g (2 sum_{bits} x - sum_g x): lane = row, 32 rows per warp.
+// y[row] = sum_g scale_g (2 sum_{bits} x - sum_g x): one row per thread. The block first tabulates,
+// for each group and 4-bit position, the sum of x over each of the 16 bit patterns (40 KB), so a
+// group costs 16 lookups; every lane reads the same 16-entry table at a time (no bank conflicts).
 __global__ void __launch_bounds__(256) sketch_gemv_kernel(const __nv_bfloat16* __restrict__ x,
                                                           const unsigned long long* __restrict__ masks,
                                                           const __half* __restrict__ scales, float* y, int N) {
     pdl_launch_dependents();
     pdl_wait();
-    __shared__ float xs[D], gsum[SK_GROUPS];
-    for (int i = threadIdx.x; i < D; i += blockDim.x) xs[i] = bf2f(x[i]);
+    __shared__ float lut[SK_GROUPS * 16][16];  // [group * 16 + nibble position][pattern]
+    __shared__ float gsum[SK_GROUPS];
+    for (int e = threadIdx.x; e < SK_GROUPS * 16 * 16; e += blockDim.x) {
+        const int pos = e / 16, pat = e % 16;
+        const __nv_bfloat16* xp = x + pos * 4;
+        float v = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            if (pat >> i & 1) v += bf2f(xp[i]);
+        lut[pos][pat] = v;
+    }
     __syncthreads();
     if (threadIdx.x < SK_GROUPS) {
         float t = 0.0f;
-        for (int i = 0; i < 64; ++i) t += xs[threadIdx.x * 64 + i];
+        for (int p = 0; p < 16; ++p) t += lut[threadIdx.x * 16 + p][15];
         gsum[threadIdx.x] = t;
     }
     __syncthreads();
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= N) return;
-    float acc = 0.0f;
-    for (int g = 0; g < SK_GROUPS; ++g) {
-        const unsigned long long m = __ldg(masks + (size_t)g * N + row);
-        const float sc = __half2float(__ldg(scales + (size_t)g * N + row));
-        float sel = 0.0f;
-        const float* xg = xs + g * 64;
+    for (int rr = 0; rr < SK_ROWS; ++rr) {
+        const int row = (blockIdx.x * SK_ROWS + rr) * blockDim.x + threadIdx.x;
+        if (row >= N) return;
+        float acc = 0.0f;
+        constexpr int GB = 8;
+        for (int g0 = 0; g0 < SK_GROUPS; g0 += GB) {
+            unsigned long long m[GB];
+            float sc[GB];
 #pragma unroll
-        for (int i = 0; i < 64; ++i) sel += (m >> i & 1ull) ? xg[i] : 0.0f;
-        acc = fmaf(sc, 2.0f * sel - gsum[g], acc);
+            for (int j = 0; j < GB; ++j) {
+                m[j] = __ldg(masks + (size_t)(g0 + j) * N + row);
+                sc[j] = __half2float(__ldg(scales + (size_t)(g0 + j) * N + row));
+            }
+#pragma unroll
+            for (int j = 0; j < GB; ++j) {
+                const int g = g0 + j;
+                float sel = 0.0f;
+#pragma unroll
+                for (int p = 0; p < 16; ++p) sel += lut[g * 16 + p][(m[j] >> (4 * p)) & 15];
+                acc = fmaf(sc[j], 2.0f * sel - gsum[g], acc);
+            }
+        }
+        y[row] = acc;
     }
-    y[row] = acc;
 }
 
 // One block per slice of SK_SLICE rows: the SK_PICK best sketch logits, each rescored exactly with its
@@ -1242,7 +1264,7 @@ extern "C" cudaError_t squash_draft_head_argmax(const void* x, const void* sketc
     const int slices = (N + SK_SLICE - 1) / SK_SLICE;
     float* bv = static_cast<float*>(pick);
     int* bi = reinterpret_cast<int*>(bv + slices);
-    SQ_CHECK_LAUNCH(sq_launch(sketch_gemv_kernel, (N + 255) / 256, 256, 0, st, xb, masks, sc, ys, N));
+    SQ_CHECK_LAUNCH(sq_launch(sketch_gemv_kernel, (N + 256 * SK_ROWS - 1) / (256 * SK_ROWS), 256, 0, st, xb, masks, sc, ys, N));
     // Launched without PDL: reading the sketch logits right behind their producer under PDL gave stale
     // values (the buffer is rewritten for every draft).
     draft_pick_kernel<<<slices, 256, 0, st>>>(static_cast<const float*>(ys), N, xb, static_cast<const uint8_t*>(codes),
