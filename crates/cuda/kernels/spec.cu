@@ -46,30 +46,18 @@ __global__ void accept_kernel(int* rc, int* ctl, int n) {
     ctl[1] ^= 1;
 }
 
-// Sampling parameters and generator state of sampled speculative rounds.
-struct SampleParams {
-    float temperature, top_p;
-    int k;  // candidates (a prefix of the sorted top list)
-    int pad;
-    unsigned long long seed, counter;
-};
+SQ_DEVICE double uniform(SampleParams* sp) { return sample_uniform(sp); }
 
-SQ_DEVICE double uniform(SampleParams* sp) {
-    unsigned long long z = sp->seed + 0x9e3779b97f4a7c15ull * (++sp->counter);
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-    z ^= z >> 31;
-    return (double)(z >> 11) / 9007199254740992.0;
-}
-
-// Sampled verification of [x, d1 .. dn] with deterministic drafts (rows 0 .. n of sorted top-K ids and
-// logits). Each row's distribution is the plain sampler's: softmax at the temperature over the top k,
-// cut to the smallest prefix reaching top_p, renormalized. Row r < n keeps draft d_{r+1} with its
-// probability p(d) and otherwise draws from p without d; row n draws from p. The results go where the
-// greedy tokens go, so the accept kernel keeps exactly the accepted drafts and the corrected token, and
-// the output has the plain sampler's distribution.
+// Sampled verification of [x, d1 .. dn] (rows 0 .. n of sorted top-K ids and logits). Each row's
+// distribution p is the plain sampler's: softmax at the temperature over the top k, cut to the smallest
+// prefix reaching top_p, renormalized. Row n draws from p. Row r < n checks draft d_{r+1}:
+//  - greedy drafts: kept with probability p(d), otherwise a draw from p without d;
+//  - sampled drafts (d ~ q, the drafter's distribution in qs[r]): kept with probability
+//    min(1, p(d) / q(d)), otherwise a draw from max(0, p - q), renormalized.
+// Either way the output has the plain sampler's distribution. The results go where the greedy tokens
+// go, so the accept kernel keeps exactly the accepted drafts and the corrected token.
 __global__ void sample_rows_kernel(const int* __restrict__ ids, const float* __restrict__ vals, int K, int n, int* rc,
-                                   SampleParams* sp) {
+                                   SampleParams* sp, const DraftQ* __restrict__ qs) {
     pdl_launch_dependents();
     pdl_wait();
     if (threadIdx.x != 0) return;
@@ -100,6 +88,45 @@ __global__ void sample_rows_kernel(const int* __restrict__ ids, const float* __r
         }
         double mass = 0.0;
         for (int i = 0; i < keep; ++i) mass += probs[i];
+        if (r < n && sp->draft_sampled && qs != nullptr) {
+            const int d = rc[DRAFT + r];
+            const DraftQ& q = qs[r];
+            auto q_of = [&](int tok) {
+                for (int j = 0; j < q.count; ++j)
+                    if (q.ids[j] == tok) return (double)q.probs[j];
+                return 0.0;
+            };
+            double pd = 0.0;
+            for (int i = 0; i < keep; ++i)
+                if (id[i] == d) pd = probs[i] / mass;
+            const double qd = q_of(d);
+            if (qd > 0.0 && uniform(sp) * qd < pd) {
+                rc[GREEDY + r] = d;
+                continue;
+            }
+            double resid = 0.0;
+            for (int i = 0; i < keep; ++i) resid += fmax(probs[i] / mass - q_of(id[i]), 0.0);
+            int tok = -1;
+            if (resid > 0.0) {
+                double rem = resid * uniform(sp);
+                for (int i = 0; i < keep; ++i) {
+                    const double w = fmax(probs[i] / mass - q_of(id[i]), 0.0);
+                    if (w <= 0.0) continue;
+                    tok = id[i];
+                    rem -= w;
+                    if (rem <= 0.0) break;
+                }
+            } else {  // p <= q everywhere (rounding): draw from p
+                double rem = mass * uniform(sp);
+                for (int i = 0; i < keep; ++i) {
+                    tok = id[i];
+                    rem -= probs[i];
+                    if (rem <= 0.0) break;
+                }
+            }
+            rc[GREEDY + r] = tok < 0 ? id[0] : tok;
+            return;
+        }
         int skip = -1;
         double pd = 0.0;
         if (r < n) {
@@ -129,13 +156,14 @@ __global__ void sample_rows_kernel(const int* __restrict__ ids, const float* __r
 }  // namespace
 
 extern "C" cudaError_t squash_spec_sample_rows(const int* ids, const float* vals, int k_list, int n, int* rc, void* params,
-                                               cudaStream_t st) {
+                                               const void* qs, cudaStream_t st) {
     if (n > NMAX || k_list > 64) return cudaErrorInvalidValue;
-    SQ_CHECK_LAUNCH(sq_launch(sample_rows_kernel, 1, 32, 0, st, ids, vals, k_list, n, rc, (SampleParams*)params));
+    SQ_CHECK_LAUNCH(sq_launch(sample_rows_kernel, 1, 32, 0, st, ids, vals, k_list, n, rc, (SampleParams*)params, (const DraftQ*)qs));
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" int squash_spec_layout(int field) {
+    if (field == 4) return (int)sizeof(DraftQ);
     switch (field) {
         case 0: return NMAX;
         case 1: return DRAFT;

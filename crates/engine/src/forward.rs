@@ -1342,9 +1342,10 @@ pub fn head_argmax_into(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u
 /// Greedy draft token for one hidden state, written to `out`: a 1-bit sketch of the LM head shortlists
 /// 8 candidates per 8192 rows and the drafter's NVFP4 head rescores them (the NVFP4 argmax whenever
 /// it is shortlisted, which is nearly always).
-pub fn draft_head_argmax_into(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64, out: u64) -> Result<()> {
+/// `params` / `q`: sampled drafting (see [`k::draft_head_argmax`]), or 0 for greedy.
+pub fn draft_head_argmax_into(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64, out: u64, params: u64, q: u64) -> Result<()> {
     let mtp = model.mtp.as_ref().expect("model loaded without MTP");
-    k::draft_head_argmax(s, hidden, mtp.draft_sketch, mtp.draft_head, hw.logits.addr(), hw.pick.addr(), VOCAB, out)
+    k::draft_head_argmax(s, hidden, mtp.draft_sketch, mtp.draft_head, hw.logits.addr(), hw.pick.addr(), VOCAB, out, params, q)
 }
 
 /// LM-head logits of `rows` consecutive hidden rows into the head workspace.

@@ -217,7 +217,9 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
         }
         let secs = a.decode_start.elapsed().as_secs_f64();
         let n = a.generated.len();
-        eprintln!("done: slot {}, prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s), {:?}",
+        let (rounds, accepted) = session.spec_stats();
+        let mtp = if a.run.slot == 0 && a.run.is_spec() && rounds > 0 { format!(", MTP {:.2} tokens/round", (rounds + accepted) as f64 / rounds as f64) } else { String::new() };
+        eprintln!("done: slot {}, prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s){mtp}, {:?}",
                   a.run.slot, a.prompt, a.reused, a.prefill, (a.prompt - a.reused) as f64 / a.prefill.max(1e-9), n, secs,
                   n.saturating_sub(1) as f64 / secs.max(1e-9), f);
         if let Some(path) = std::env::var_os("SQUASH_TRACE") {

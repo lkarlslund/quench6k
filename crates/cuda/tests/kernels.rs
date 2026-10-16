@@ -377,7 +377,7 @@ fn draft_sketch_matches_full_head() {
         let target = (trial * 7919) % n;
         let x: Vec<f32> = (0..D).map(|i| w[target * D + i] * 20.0 + rng.next() * 0.5).collect();
         let dx = upload(&s, &to_bf16(&x));
-        kernels::draft_head_argmax(&s, dx.addr(), sketch.addr(), (codes.addr(), scales.addr(), s2.addr()), ys.addr(), pick.addr(), n, out.addr()).unwrap();
+        kernels::draft_head_argmax(&s, dx.addr(), sketch.addr(), (codes.addr(), scales.addr(), s2.addr()), ys.addr(), pick.addr(), n, out.addr(), 0, 0).unwrap();
         kernels::nvfp4_dense_gemv(&s, dx.addr(), codes.addr(), scales.addr(), s2.addr(), full.addr(), n).unwrap();
         kernels::argmax(&s, full.addr(), 1, n, n, scratch.addr(), out.addr() + 4).unwrap();
         let r: Vec<i32> = s.download(out.addr(), 2).unwrap();

@@ -25,6 +25,12 @@ build (FP4 prefill experts, MXFP8 GDN input projections, tensor-core GDN, multi-
 - Sampled requests (temperature > 0) use MTP too (exact rejection sampling against the deterministic
   drafts): 262-273 tok/s against 166-179 plain on three prompts at temperature 0.6 and 1.0, with the
   token distribution equal to plain sampling (two-sample test, 600 samples per position).
+- Sampled drafts (later): drafts drawn from the drafter's distribution over its 248 rescored
+  candidates (top-k / top-p as the target), accepted with min(1, p/q), rejections drawn from
+  max(0, p - q). 36 runs (3 prompts x 2 temperatures x 3 seeds, 600 tokens): 3.44 tokens/round and
+  311 tok/s against 3.36 and 305 with greedy drafts: +2%, about the noise (+8% on prose, -3% on code).
+  Drafting at 30-75% of the temperature measured the same. Distribution test passes (z within +-1.6).
+  `SQUASH_SAMPLED_DRAFTS=0` restores greedy drafts.
 
 ## Prefill, later the same day
 

@@ -340,6 +340,11 @@ impl Session {
         Ok(spans)
     }
 
+    /// Speculative rounds and accepted drafts of the slot-0 run since its prefill.
+    pub fn spec_stats(&self) -> (usize, usize) {
+        (self.dec.rounds, self.dec.accepted)
+    }
+
     pub fn has_second_slot(&self) -> bool {
         self.aux.is_some()
     }

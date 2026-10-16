@@ -1143,7 +1143,7 @@ __global__ void __launch_bounds__(256) draft_pick_kernel(const float* __restrict
                                                          const __nv_bfloat16* __restrict__ x,
                                                          const uint8_t* __restrict__ codes,
                                                          const uint8_t* __restrict__ scales, const float* scale2,
-                                                         float* best_v, int* best_i) {
+                                                         float* best_v, int* best_i, float* all_v, int* all_i) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float wv[8];
@@ -1213,7 +1213,12 @@ __global__ void __launch_bounds__(256) draft_pick_kernel(const float* __restrict
             }
             acc = warp_sum(acc) * *scale2;
         }
-        if (lane == 0) exact[warp] = r >= 0 ? acc : -INFINITY;
+        if (lane == 0) {
+            exact[warp] = r >= 0 ? acc : -INFINITY;
+            // Every rescored candidate, for sampled drafts.
+            all_v[blockIdx.x * SK_PICK + warp] = r >= 0 ? acc : -INFINITY;
+            all_i[blockIdx.x * SK_PICK + warp] = r;
+        }
     }
     __syncthreads();
     if (tid == 0) {
@@ -1229,10 +1234,77 @@ __global__ void __launch_bounds__(256) draft_pick_kernel(const float* __restrict
     }
 }
 
-__global__ void draft_final_kernel(const float* __restrict__ best_v, const int* __restrict__ best_i, int slices, int* out) {
+// Greedy: the best slice winner. Sampled (sp->draft_sampled): a draw from the drafter's distribution q
+// over every rescored candidate (all_v / all_i, `count`), built like the target sampler's: softmax at
+// the temperature over the top k, cut at top_p, renormalized; q goes to *qd for the verifier.
+__global__ void draft_final_kernel(const float* __restrict__ best_v, const int* __restrict__ best_i, int slices, int* out,
+                                   const float* __restrict__ all_v, const int* __restrict__ all_i, int count, SampleParams* sp,
+                                   DraftQ* qd) {
     pdl_launch_dependents();
     pdl_wait();
     const int lane = threadIdx.x;
+    if (sp != nullptr && sp->draft_sampled && qd != nullptr) {
+        // Top k candidates by repeated warp argmax (count <= 32 * 8).
+        constexpr int PER = 8;
+        float v[PER];
+        int id[PER];
+#pragma unroll
+        for (int j = 0; j < PER; ++j) {
+            const int c = lane + 32 * j;
+            const bool ok = c < count && all_i[c] >= 0;
+            v[j] = ok ? all_v[c] : -INFINITY;
+            id[j] = ok ? all_i[c] : 0x7fffffff;
+        }
+        __shared__ float tv[DRAFT_Q_MAX];
+        __shared__ int ti[DRAFT_Q_MAX];
+        const int k = min(min(sp->k, DRAFT_Q_MAX), count);
+        int got = 0;
+        for (; got < k; ++got) {
+            float bv = -INFINITY;
+            int bi = 0x7fffffff, bj = -1;
+#pragma unroll
+            for (int j = 0; j < PER; ++j)
+                if (v[j] > bv || (v[j] == bv && id[j] < bi)) bv = v[j], bi = id[j], bj = j;
+            float wv = bv;
+            int wi = bi;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffff, wv, o);
+                const int oi = __shfl_xor_sync(0xffffffff, wi, o);
+                if (ov > wv || (ov == wv && oi < wi)) wv = ov, wi = oi;
+            }
+            if (wv == -INFINITY) break;
+            if (bj >= 0 && bi == wi && bv == wv) v[bj] = -INFINITY;  // the owner drops it
+            if (lane == 0) tv[got] = wv, ti[got] = wi;
+        }
+        __syncwarp();
+        if (lane == 0) {
+            const double t = fmax((double)sp->temperature * sp->draft_sampled / 100.0, 1e-4);
+            double p[DRAFT_Q_MAX], total = 0.0;
+            for (int i = 0; i < got; ++i) total += (p[i] = exp(((double)tv[i] - (double)tv[0]) / t));
+            int keep = got;
+            if (sp->top_p < 1.0f) {
+                double acc = 0.0;
+                for (int i = 0; i < got; ++i)
+                    if ((acc += p[i] / total) >= (double)sp->top_p) {
+                        keep = i + 1;
+                        break;
+                    }
+            }
+            double mass = 0.0;
+            for (int i = 0; i < keep; ++i) mass += p[i];
+            double rem = mass * sample_uniform(sp);
+            int tok = ti[0];
+            for (int i = 0; i < keep; ++i) {
+                tok = ti[i];
+                if ((rem -= p[i]) <= 0.0) break;
+            }
+            qd->count = keep;
+            for (int i = 0; i < keep; ++i) qd->ids[i] = ti[i], qd->probs[i] = (float)(p[i] / mass);
+            *out = got > 0 ? tok : best_i[0];
+        }
+        return;
+    }
     float bv = -INFINITY;
     int bi = 0x7fffffff;
     for (int s = lane; s < slices; s += 32)
@@ -1256,6 +1328,7 @@ __global__ void draft_final_kernel(const float* __restrict__ best_v, const int* 
 
 extern "C" size_t squash_draft_sketch_bytes(int N) { return (size_t)N * SK_GROUPS * (8 + 2); }
 extern "C" int squash_draft_slices(int N) { return (N + SK_SLICE - 1) / SK_SLICE; }
+extern "C" int squash_draft_picks() { return SK_PICK; }
 
 // sketch: squash_draft_sketch_bytes(N) bytes (masks, then scales), from the BF16 head w [N, 2560].
 extern "C" cudaError_t squash_build_draft_sketch(const void* w, void* sketch, int N, cudaStream_t st) {
@@ -1269,20 +1342,25 @@ extern "C" cudaError_t squash_build_draft_sketch(const void* w, void* sketch, in
 // Draft token for one hidden row x: sketch ranking (logits into ys [N]), per-slice NVFP4 rescoring of
 // the best candidates (pick: 2 * slices words), argmax into *out.
 extern "C" cudaError_t squash_draft_head_argmax(const void* x, const void* sketch, const void* codes, const void* scales,
-                                                const float* scale2, float* ys, void* pick, int N, int* out,
-                                                cudaStream_t st) {
+                                                const float* scale2, float* ys, void* pick, int N, int* out, void* params,
+                                                void* q, cudaStream_t st) {
+    if ((N + SK_SLICE - 1) / SK_SLICE * SK_PICK > 32 * 8) return cudaErrorInvalidValue;
     const auto* xb = static_cast<const __nv_bfloat16*>(x);
     const auto* masks = static_cast<const unsigned long long*>(sketch);
     const auto* sc = reinterpret_cast<const __half*>(masks + (size_t)N * SK_GROUPS);
     const int slices = (N + SK_SLICE - 1) / SK_SLICE;
     float* bv = static_cast<float*>(pick);
     int* bi = reinterpret_cast<int*>(bv + slices);
+    float* av = reinterpret_cast<float*>(bi + slices);
+    int* ai = reinterpret_cast<int*>(av + slices * SK_PICK);
     SQ_CHECK_LAUNCH(sq_launch(sketch_gemv_kernel, (N + 256 * SK_ROWS - 1) / (256 * SK_ROWS), 256, 0, st, xb, masks, sc, ys, N));
     // Launched without PDL: reading the sketch logits right behind their producer under PDL gave stale
     // values (the buffer is rewritten for every draft).
     draft_pick_kernel<<<slices, 256, 0, st>>>(static_cast<const float*>(ys), N, xb, static_cast<const uint8_t*>(codes),
-                                               static_cast<const uint8_t*>(scales), scale2, bv, bi);
-    SQ_CHECK_LAUNCH(sq_launch(draft_final_kernel, 1, 32, 0, st, static_cast<const float*>(bv), static_cast<const int*>(bi), slices, out));
+                                               static_cast<const uint8_t*>(scales), scale2, bv, bi, av, ai);
+    SQ_CHECK_LAUNCH(sq_launch(draft_final_kernel, 1, 32, 0, st, static_cast<const float*>(bv), static_cast<const int*>(bi), slices, out,
+                              static_cast<const float*>(av), static_cast<const int*>(ai), slices * SK_PICK, static_cast<SampleParams*>(params),
+                              static_cast<DraftQ*>(q)));
     SQ_RETURN_LAUNCH();
 }
 

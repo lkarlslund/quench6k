@@ -194,11 +194,17 @@ pub struct SpecGraphs {
     sample_params: DeviceBuffer,
     _top_ids: DeviceBuffer,
     _top_vals: DeviceBuffer,
+    /// Distributions of the round's sampled drafts (one record per draft).
+    _draft_q: DeviceBuffer,
     sampled: bool,
 }
 
 /// Candidates per verified row in sampled rounds (the request's top_k is a prefix of them).
 pub const SAMPLE_TOP: usize = 64;
+
+/// Sampled rounds draw their drafts at this percentage of the request's temperature (a sharper proposal
+/// than the target's distribution is accepted more often; any proposal keeps the output exact).
+const DRAFT_TEMPERATURE_PERCENT: u32 = 100;
 
 struct GraphSet {
     n: usize,
@@ -293,6 +299,7 @@ impl SpecGraphs {
         let sample_params = DeviceBuffer::zeroed(k::SAMPLE_PARAMS_BYTES)?;
         let top_ids = DeviceBuffer::new((nmax + 1) * SAMPLE_TOP * 4)?;
         let top_vals = DeviceBuffer::new((nmax + 1) * SAMPLE_TOP * 4)?;
+        let draft_q = DeviceBuffer::zeroed(nmax * k::draft_q_bytes())?;
         let rc_host = squash_cuda::PinnedBuffer::new(ints * 4)?;
         let ctl = state.spec.as_ref().context("sequence without speculative state")?.ctl.addr();
         let (tok_off, pos_off) = forward::step_offsets(ws);
@@ -311,7 +318,8 @@ impl SpecGraphs {
                         let t = if j == 0 { c + 1 } else { 1 };
                         k::spec_mtp_header(s, rc.addr(), ws.mtp_step, tok_off, pos_off, j, c)?;
                         forward::forward_mtp_staged(model, state, ws, s, t, ws.mtp_hin, None)?;
-                        forward::draft_head_argmax_into(model, &dec.head, s, ws.out + ((t - 1) * D * 2) as u64, rc.addr() + ((draft_at + j) * 4) as u64)?;
+                        let q = draft_q.addr() + (j * k::draft_q_bytes()) as u64;
+                        forward::draft_head_argmax_into(model, &dec.head, s, ws.out + ((t - 1) * D * 2) as u64, rc.addr() + ((draft_at + j) * 4) as u64, sample_params.addr(), q)?;
                         s.copy_d2d(ws.mtp_hin, ws.h + ((t - 1) as u64) * ROW, H * 4)?;
                     }
                     unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
@@ -331,7 +339,7 @@ impl SpecGraphs {
                 forward::forward_part(model, state, ws, s, n + 1, bytes, Part::FromPle, true, None)?;
                 forward::head_logits_rows(model, &dec.head, s, ws.out, n + 1)?;
                 k::topk(s, dec.head.logits_addr(), n + 1, crate::model::VOCAB, crate::model::VOCAB, SAMPLE_TOP, false, top_ids.addr(), top_vals.addr())?;
-                k::spec_sample_rows(s, top_ids.addr(), top_vals.addr(), SAMPLE_TOP, n, rc.addr(), sample_params.addr())?;
+                k::spec_sample_rows(s, top_ids.addr(), top_vals.addr(), SAMPLE_TOP, n, rc.addr(), sample_params.addr(), draft_q.addr())?;
                 k::spec_accept(s, rc.addr(), ctl, n)?;
                 s.copy_d2d(dec.verified.addr(), ws.h, (n + 1) * H * 4)?;
                 unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
@@ -340,25 +348,29 @@ impl SpecGraphs {
         }
         // Round state: next token at position len(state), nothing to catch up yet.
         s.upload_to(rc.addr(), &[state.len() as i32, dec.next, 0, 0])?;
-        Ok(Self { sets, _rc: rc, rc_host, policy: DraftPolicy::new(lengths), sample_params, _top_ids: top_ids, _top_vals: top_vals, sampled: false })
+        Ok(Self { sets, _rc: rc, rc_host, policy: DraftPolicy::new(lengths), sample_params, _top_ids: top_ids, _top_vals: top_vals, _draft_q: draft_q, sampled: false })
     }
 
     /// Greedy rounds (`None`), or sampled rounds with (temperature, top_p, top_k, seed); top_k is capped
-    /// at [`SAMPLE_TOP`] (0: all of them).
+    /// at [`SAMPLE_TOP`] (0: all of them). Sampled rounds draw their drafts from the drafter's
+    /// distribution (`SQUASH_SAMPLED_DRAFTS=0`: its most likely token, as greedy rounds do).
     pub fn set_sampling(&mut self, s: &Stream, sampling: Option<(f32, f32, usize, u64)>) -> Result<()> {
         self.sampled = sampling.is_some();
+        let mut b = vec![0u8; squash_cuda::kernels::SAMPLE_PARAMS_BYTES];
         if let Some((t, top_p, k, seed)) = sampling {
             let k = if k == 0 { SAMPLE_TOP } else { k.min(SAMPLE_TOP) } as u32;
-            let mut b = Vec::with_capacity(32);
+            // Drafts are drawn at this percentage of the temperature (0: greedy drafts).
+            let draft_sampled: u32 = std::env::var("SQUASH_SAMPLED_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(DRAFT_TEMPERATURE_PERCENT);
+            b.clear();
             b.extend_from_slice(&t.to_le_bytes());
             b.extend_from_slice(&top_p.to_le_bytes());
             b.extend_from_slice(&k.to_le_bytes());
-            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&draft_sampled.to_le_bytes());
             b.extend_from_slice(&seed.to_le_bytes());
             b.extend_from_slice(&0u64.to_le_bytes());
-            s.upload_to(self.sample_params.addr(), &b)?;
         }
-        Ok(())
+        // Greedy rounds read the parameters too (the draft flag), so they are always rewritten.
+        s.upload_to(self.sample_params.addr(), &b)
     }
 
     /// Points the round control at a decoder restarted on a new prompt.

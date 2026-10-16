@@ -534,8 +534,10 @@ pub fn fake_fp4_act(s: &Stream, x: u64, rows: usize, cols: usize) -> Result<()> 
 /// Sampled verification of `n` drafts from rows 0 ..= n of sorted top-`k_list` (ids, logits): writes
 /// the per-row tokens that `spec_accept` then accepts (see the kernel). `params`: the sampling
 /// parameters and generator state, [`SAMPLE_PARAMS_BYTES`] bytes.
-pub fn spec_sample_rows(s: &Stream, ids: u64, vals: u64, k_list: usize, n: usize, rc: u64, params: u64) -> Result<()> {
-    launch!("spec_sample_rows", ffi::squash_spec_sample_rows(i(ids), f(vals), n32(k_list), n32(n), im(rc), params as *mut std::ffi::c_void, s.raw()))
+/// `qs`: the round's sampled-draft distributions (one [`draft_q_bytes`] record per draft), or 0.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_sample_rows(s: &Stream, ids: u64, vals: u64, k_list: usize, n: usize, rc: u64, params: u64, qs: u64) -> Result<()> {
+    launch!("spec_sample_rows", ffi::squash_spec_sample_rows(i(ids), f(vals), n32(k_list), n32(n), im(rc), params as *mut std::ffi::c_void, p(qs), s.raw()))
 }
 
 /// Layout of the sampled-round parameters: temperature f32, top_p f32, k i32, pad, seed u64, counter u64.
@@ -552,7 +554,12 @@ pub fn draft_sketch_bytes(n: usize) -> usize {
 
 /// Words of the per-slice pick buffer for [`draft_head_argmax`].
 pub fn draft_pick_words(n: usize) -> usize {
-    2 * unsafe { ffi::squash_draft_slices(n as i32) } as usize
+    2 * unsafe { ffi::squash_draft_slices(n as i32) } as usize * (1 + unsafe { ffi::squash_draft_picks() } as usize)
+}
+
+/// Bytes of one sampled draft's distribution record (see [`draft_head_argmax`]).
+pub fn draft_q_bytes() -> usize {
+    unsafe { ffi::squash_spec_layout(4) as usize }
 }
 
 pub fn build_draft_sketch(s: &Stream, w: u64, sketch: u64, n: usize) -> Result<()> {
@@ -562,8 +569,11 @@ pub fn build_draft_sketch(s: &Stream, w: u64, sketch: u64, n: usize) -> Result<(
 /// Draft token of one BF16 hidden row: the sketch shortlists 8 candidates per 8192-row slice, the NVFP4
 /// head rescores them, and the best goes to `out` (i32). `ys`: n floats; `pick`: [`draft_pick_words`].
 #[allow(clippy::too_many_arguments)]
-pub fn draft_head_argmax(s: &Stream, x: u64, sketch: u64, head: (u64, u64, u64), ys: u64, pick: u64, n: usize, out: u64) -> Result<()> {
-    launch!("draft_head_argmax", ffi::squash_draft_head_argmax(p(x), p(sketch), p(head.0), p(head.1), f(head.2), fm(ys), pm(pick), n32(n), im(out), s.raw()))
+/// With sampling parameters `params` whose draft flag is set (see [`SAMPLE_PARAMS_BYTES`]), the draft is
+/// drawn from the drafter's distribution instead, which is written to `q` ([`draft_q_bytes`]); 0: greedy.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_head_argmax(s: &Stream, x: u64, sketch: u64, head: (u64, u64, u64), ys: u64, pick: u64, n: usize, out: u64, params: u64, q: u64) -> Result<()> {
+    launch!("draft_head_argmax", ffi::squash_draft_head_argmax(p(x), p(sketch), p(head.0), p(head.1), f(head.2), fm(ys), pm(pick), n32(n), im(out), pm(params), pm(q), s.raw()))
 }
 
 pub fn steer_max_rank() -> usize {

@@ -115,13 +115,14 @@ pub mod ffi {
         pub fn squash_fake_mxfp8(x: *mut c_void, rows: c_int, cols: c_int, ld: c_int, stream: Stream) -> Error;
         pub fn squash_fake_fp4_act(x: *mut c_void, rows: c_int, cols: c_int, stream: Stream) -> Error;
         pub fn squash_spec_accept(rc: *mut i32, ctl: *mut i32, n: c_int, stream: Stream) -> Error;
-        pub fn squash_spec_sample_rows(ids: *const i32, vals: *const f32, k_list: c_int, n: c_int, rc: *mut i32, params: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_spec_sample_rows(ids: *const i32, vals: *const f32, k_list: c_int, n: c_int, rc: *mut i32, params: *mut c_void, qs: *const c_void, stream: Stream) -> Error;
         pub fn squash_steer_max_rank() -> c_int;
         pub fn squash_steer(h: *mut f32, t: c_int, directions: *const f32, ranks: *const i32, masks: *const i32, norm_preserve: c_int, strength: *const f32, layer: c_int, stream: Stream) -> Error;
         pub fn squash_draft_sketch_bytes(n: c_int) -> usize;
         pub fn squash_draft_slices(n: c_int) -> c_int;
         pub fn squash_build_draft_sketch(w: *const c_void, sketch: *mut c_void, n: c_int, stream: Stream) -> Error;
-        pub fn squash_draft_head_argmax(x: *const c_void, sketch: *const c_void, codes: *const c_void, scales: *const c_void, scale2: *const f32, ys: *mut f32, pick: *mut c_void, n: c_int, out: *mut i32, stream: Stream) -> Error;
+        pub fn squash_draft_head_argmax(x: *const c_void, sketch: *const c_void, codes: *const c_void, scales: *const c_void, scale2: *const f32, ys: *mut f32, pick: *mut c_void, n: c_int, out: *mut i32, params: *mut c_void, q: *mut c_void, stream: Stream) -> Error;
+        pub fn squash_draft_picks() -> c_int;
         pub fn squash_nvfp4_dense_gemv(x: *const c_void, codes: *const c_void, scales: *const c_void, scale2: *const f32, y: *mut f32, n: c_int, stream: Stream) -> Error;
         pub fn squash_qsa_split_floats(t: c_int) -> usize;
         pub fn squash_qsa_attention_split(q: *const f32, qg: *const f32, ld: c_int, kcache: *const c_void, vcache: *const c_void, sel: *const i32, start: *const i32, t: c_int, fp8: c_int, part: *mut f32, out: *mut c_void, stream: Stream) -> Error;

@@ -97,3 +97,29 @@ cudaError_t sq_launch(void (*kernel)(Exp...), dim3 grid, dim3 block, size_t smem
     cfg.numAttrs = 1;
     return cudaLaunchKernelEx(&cfg, kernel, static_cast<Exp>(args)...);
 }
+
+// Sampling parameters and generator state of sampled speculative rounds (32 bytes). `draft_sampled`
+// > 0: drafts are sampled from the drafter's distribution (and verified against it) instead of greedy,
+// at draft_sampled percent of the temperature.
+struct SampleParams {
+    float temperature, top_p;
+    int k;  // candidates (a prefix of the sorted top list)
+    int draft_sampled;
+    unsigned long long seed, counter;
+};
+
+SQ_DEVICE double sample_uniform(SampleParams* sp) {
+    unsigned long long z = sp->seed + 0x9e3779b97f4a7c15ull * (++sp->counter);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    z ^= z >> 31;
+    return (double)(z >> 11) / 9007199254740992.0;
+}
+
+// A sampled draft's distribution: `count` (id, probability) pairs, most likely first.
+constexpr int DRAFT_Q_MAX = 64;
+struct DraftQ {
+    int count;
+    int ids[DRAFT_Q_MAX];
+    float probs[DRAFT_Q_MAX];
+};
