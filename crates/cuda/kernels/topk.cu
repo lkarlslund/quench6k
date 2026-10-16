@@ -21,21 +21,30 @@ SQ_DEVICE unsigned order_key(float f) {
 
 // With `start_ptr` set (QSA group selection), row r covers n = (start + r + 1) / group values and is
 // skipped when n <= k: such queries attend densely.
+// MODE 0: one block per row. MODE 1 (first stage of large rows): block b takes slice b % slices of
+// row b / slices (n values at x + row * ld + slice * n) and writes its top k with row-global indices.
+// MODE 2 (second stage): block b merges row b's slices * k candidates (values x, indices cand_idx,
+// n = slices * k). The top k of a row is among its slices' top k, so both stages pick the same set.
+template <int MODE>
 __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__ x, int n, size_t ld, int k,
                                                        int sort_by_index, int* out_idx, float* out_val,
-                                                       const int* __restrict__ start_ptr, int group) {
+                                                       const int* __restrict__ start_ptr, int group, int slices = 1,
+                                                       const int* __restrict__ cand_idx = nullptr) {
     pdl_launch_dependents();
     pdl_wait();
     if (start_ptr) {
         n = (*start_ptr + (int)blockIdx.x + 1) / group;
         if (n <= k) return;
     }
+    const int slice = MODE == 1 ? blockIdx.x % slices : 0;
+    const float* row = MODE == 0 ? x + blockIdx.x * ld : MODE == 1 ? x + (blockIdx.x / slices) * ld + (size_t)slice * n : x + (size_t)blockIdx.x * n;
+    // Row-global index of element i.
+    auto gidx = [&](int i) { return MODE == 0 ? i : MODE == 1 ? slice * n + i : cand_idx[(size_t)blockIdx.x * n + i]; };
     __shared__ unsigned hist[256];
-    __shared__ unsigned s_prefix, s_mask, s_remaining, s_gt, s_eq;
+    __shared__ unsigned s_prefix, s_mask, s_remaining, s_gt, s_eq, s_digit, s_above, s_wsum[8];
     __shared__ int pick_idx[MAXK];
     __shared__ float pick_val[MAXK];
 
-    const float* row = x + blockIdx.x * ld;
     const int tid = threadIdx.x;
     if (tid == 0) {
         s_prefix = 0;
@@ -51,17 +60,32 @@ __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__
             if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 255], 1u);
         }
         __syncthreads();
-        if (tid == 0) {
-            unsigned above = 0, digit = 0;
-            for (int d = 255; d >= 0; --d) {
-                if (above + hist[d] >= s_remaining) {
-                    digit = d;
-                    break;
-                }
-                above += hist[d];
+        // The digit: the largest d with (count of digits >= d) >= remaining. Suffix sums over the 256
+        // bins by a block scan of the reversed histogram (threads 0..255, eight warps).
+        unsigned incl = 0;
+        if (tid < 256) {
+            incl = hist[255 - tid];
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const unsigned y = __shfl_up_sync(0xffffffff, incl, o);
+                if ((tid & 31) >= o) incl += y;
             }
-            s_remaining -= above;
-            s_prefix |= digit << shift;
+            if ((tid & 31) == 31) s_wsum[tid >> 5] = incl;
+        }
+        __syncthreads();
+        if (tid < 256) {
+            for (int w = 0; w < (tid >> 5); ++w) incl += s_wsum[w];
+            const int d = 255 - tid;
+            const unsigned at_least = incl, above = incl - hist[d];  // digits >= d, digits > d
+            if (at_least >= s_remaining && above < s_remaining) {
+                s_digit = d;
+                s_above = above;
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            s_remaining -= s_above;
+            s_prefix |= s_digit << shift;
             s_mask |= 255u << shift;
             s_gt = 0;
             s_eq = 0;
@@ -75,12 +99,12 @@ __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__
         const unsigned u = order_key(v);
         if (u > threshold) {
             const unsigned slot = atomicAdd(&s_gt, 1u);
-            pick_idx[slot] = i;
+            pick_idx[slot] = gidx(i);
             pick_val[slot] = v;
         } else if (u == threshold) {
             const unsigned slot = atomicAdd(&s_eq, 1u);
             if (slot < take_equal) {
-                pick_idx[greater + slot] = i;
+                pick_idx[greater + slot] = gidx(i);
                 pick_val[greater + slot] = v;
             }
         }
@@ -123,11 +147,32 @@ __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__
 
 }  // namespace
 
+namespace {
+// Candidates of the two-stage path: rows * TK_SLICES * k (index, value) pairs.
+constexpr int TK_SLICES = 32, TK_CAND = 32 * TK_SLICES * 64;
+__device__ int tk_cand_idx[TK_CAND];
+__device__ float tk_cand_val[TK_CAND];
+}  // namespace
+
 extern "C" cudaError_t squash_topk(const float* x, int rows, int n, size_t ld, int k, int sort_by_index, int* out_idx,
                                    float* out_val, cudaStream_t st) {
     if (k > MAXK || k > n || k <= 0) return cudaErrorInvalidValue;
     if (rows == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(topk_kernel, rows, THREADS, 0, st, x, n, ld, k, sort_by_index, out_idx, out_val, nullptr, 0));
+    // Long rows (vocabulary logits): slices in parallel, then a merge of their candidates (one block
+    // per row would stream the whole row through one SM five times).
+    if (n >= 65536 && n % TK_SLICES == 0 && n / TK_SLICES >= k && (size_t)rows * TK_SLICES * k <= TK_CAND &&
+        !getenv("SQUASH_TOPK_ONE_PASS")) {
+        int* ci;
+        float* cv;
+        SQ_CHECK_LAUNCH(cudaGetSymbolAddress((void**)&ci, tk_cand_idx));
+        SQ_CHECK_LAUNCH(cudaGetSymbolAddress((void**)&cv, tk_cand_val));
+        SQ_CHECK_LAUNCH(sq_launch(topk_kernel<1>, rows * TK_SLICES, THREADS, 0, st, x, n / TK_SLICES, ld, k, 0, ci, cv, nullptr, 0,
+                                  TK_SLICES, nullptr));
+        SQ_CHECK_LAUNCH(sq_launch(topk_kernel<2>, rows, THREADS, 0, st, (const float*)cv, TK_SLICES * k, ld, k, sort_by_index, out_idx,
+                                  out_val, nullptr, 0, TK_SLICES, (const int*)ci));
+        SQ_RETURN_LAUNCH();
+    }
+    SQ_CHECK_LAUNCH(sq_launch(topk_kernel<0>, rows, THREADS, 0, st, x, n, ld, k, sort_by_index, out_idx, out_val, nullptr, 0, 1, nullptr));
     SQ_RETURN_LAUNCH();
 }
 

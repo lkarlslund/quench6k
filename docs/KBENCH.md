@@ -155,3 +155,14 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
 - Drafting only from a frequent-token subset of the vocabulary would cut the draft head's 1-bit
   sketch pass (238 us of an 839 us draft graph) but covers only 94% of generated tokens; not worth the
   lost acceptance.
+- Sampled rounds (koder's default: temperature 1.0, top_p 0.95, top_k 20) had serial tails: top-64
+  of 248K logits per verified row with one block per row (105 us for 4 rows), the sampled draft's
+  proposal in FP64 on one lane (45 us per draft), the verifier's sampling in FP64 on one thread
+  (41-85 us per round). Now: top-k in 32 slices then a merge, with the radix digit found by a block
+  scan (17 us; exact, test against a CPU reference); the draft proposal warp-parallel in FP32 (15 us;
+  any proposal keeps sampling exact since the verifier uses its recorded probabilities; MTP and plain
+  draws agree, z within +-1.3); the verifier's exponentials on 32 lanes (bit-identical outputs).
+- Prompt tokenization: 26 ms per request at 26K tokens, now cached per `<|im_start|>` segment
+  (0.4 ms for a re-sent conversation, exact). Streaming detokenization is O(1) per token.
+- Single-TF32 GDN prefill is 4% faster but fails the tool-call completion bound (also with TF32
+  only in the per-chunk products); 3xTF32 stays.

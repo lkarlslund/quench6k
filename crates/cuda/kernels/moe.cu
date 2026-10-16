@@ -1302,35 +1302,60 @@ __global__ void draft_final_kernel(const float* __restrict__ best_v, const int* 
             if (lane == 0) tv[got] = wv, ti[got] = wi;
         }
         __syncwarp();
+        // The proposal distribution, warp-parallel in FP32 (lanes own candidates lane and lane + 32):
+        // softmax at the draft temperature, cut to the top_p prefix and above min_p of the best, then
+        // one draw. Any proposal keeps sampled rounds exact, as long as the verifier sees these
+        // probabilities (qd), which it does.
+        const float t = fmaxf(sp->temperature * sp->draft_sampled / 100.0f, 1e-4f);
+        float p[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int i = lane + 32 * h;
+            p[h] = i < got ? __expf((tv[i] - tv[0]) / t) : 0.0f;
+        }
+        // Inclusive prefix sums over candidate order (i = 32 h + lane).
+        auto scan = [&](float x) {
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const float y = __shfl_up_sync(0xffffffff, x, o);
+                if (lane >= o) x += y;
+            }
+            return x;
+        };
+        float c0 = scan(p[0]);
+        const float half0 = __shfl_sync(0xffffffff, c0, 31);
+        float c1 = scan(p[1]) + half0;
+        const float total = __shfl_sync(0xffffffff, c1, 31);
+        int keep = got;
+        if (sp->top_p < 1.0f) {
+            const unsigned b0 = __ballot_sync(0xffffffff, lane < got && c0 / total >= sp->top_p);
+            const unsigned b1 = __ballot_sync(0xffffffff, lane + 32 < got && c1 / total >= sp->top_p);
+            if (b0) keep = min(keep, __ffs(b0));
+            else if (b1) keep = min(keep, 32 + __ffs(b1));
+        }
+        {
+            const float p0 = __shfl_sync(0xffffffff, p[0], 0);
+            const unsigned m0 = __ballot_sync(0xffffffff, lane >= 1 && lane < keep && p[0] < sp->min_p * p0);
+            const unsigned m1 = __ballot_sync(0xffffffff, lane + 32 < keep && p[1] < sp->min_p * p0);
+            if (m0) keep = __ffs(m0) - 1;
+            else if (m1) keep = 32 + __ffs(m1) - 1;
+        }
+        const float mass = keep == 0 ? 0.0f : keep <= 32 ? __shfl_sync(0xffffffff, c0, keep - 1) : __shfl_sync(0xffffffff, c1, keep - 33);
+        float u = 0.0f;
+        if (lane == 0) u = (float)sample_uniform(sp);
+        const float rem = mass * __shfl_sync(0xffffffff, u, 0);
+        // The first candidate whose inclusive sum reaches rem (the last kept one otherwise).
+        const unsigned r0 = __ballot_sync(0xffffffff, lane < keep && c0 >= rem);
+        const unsigned r1 = __ballot_sync(0xffffffff, lane + 32 < keep && c1 >= rem);
+        const int pick = r0 ? __ffs(r0) - 1 : r1 ? 32 + __ffs(r1) - 1 : max(keep - 1, 0);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int i = lane + 32 * h;
+            if (i < keep) qd->ids[i] = ti[i], qd->probs[i] = p[h] / mass;
+        }
         if (lane == 0) {
-            const double t = fmax((double)sp->temperature * sp->draft_sampled / 100.0, 1e-4);
-            double p[DRAFT_Q_MAX], total = 0.0;
-            for (int i = 0; i < got; ++i) total += (p[i] = exp(((double)tv[i] - (double)tv[0]) / t));
-            int keep = got;
-            if (sp->top_p < 1.0f) {
-                double acc = 0.0;
-                for (int i = 0; i < got; ++i)
-                    if ((acc += p[i] / total) >= (double)sp->top_p) {
-                        keep = i + 1;
-                        break;
-                    }
-            }
-            for (int i = 1; i < keep; ++i)
-                if (p[i] < (double)sp->min_p * p[0]) {
-                    keep = i;
-                    break;
-                }
-            double mass = 0.0;
-            for (int i = 0; i < keep; ++i) mass += p[i];
-            double rem = mass * sample_uniform(sp);
-            int tok = ti[0];
-            for (int i = 0; i < keep; ++i) {
-                tok = ti[i];
-                if ((rem -= p[i]) <= 0.0) break;
-            }
             qd->count = keep;
-            for (int i = 0; i < keep; ++i) qd->ids[i] = ti[i], qd->probs[i] = (float)(p[i] / mass);
-            *out = got > 0 ? tok : best_i[0];
+            *out = got > 0 ? ti[pick] : best_i[0];
         }
         return;
     }

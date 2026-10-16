@@ -870,3 +870,64 @@ fn gemv_rows_are_independent_of_m() {
         }
     }
 }
+
+/// Row-wise top-k equals the CPU selection (value descending, ties by lower index; or by index), for
+/// short rows (one block per row) and vocabulary-length rows (sliced, then merged).
+#[test]
+fn topk_matches_cpu() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x7091_0001);
+    for &(rows, n, k) in &[(3usize, 5000usize, 64usize), (5, 248_320, 64), (9, 248_320, 20), (1, 131_072, 64)] {
+        // Distinct values (ties at the selection threshold are taken in no particular order).
+        let mut x: Vec<f32> = rng.vec(rows * n);
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = *v * 8.0 + (i % n) as f32 * 1e-7;
+        }
+        let dx = upload(&s, &x);
+        let (di, dv) = (DeviceBuffer::new(rows * k * 4).unwrap(), DeviceBuffer::new(rows * k * 4).unwrap());
+        for by_index in [false, true] {
+            kernels::topk(&s, dx.addr(), rows, n, n, k, by_index, di.addr(), dv.addr()).unwrap();
+            let gi: Vec<i32> = s.download(di.addr(), rows * k).unwrap();
+            let gv: Vec<f32> = s.download(dv.addr(), rows * k).unwrap();
+            for r in 0..rows {
+                let row = &x[r * n..(r + 1) * n];
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
+                let mut want: Vec<usize> = order[..k].to_vec();
+                if by_index {
+                    want.sort();
+                }
+                let got: Vec<usize> = gi[r * k..(r + 1) * k].iter().map(|&i| i as usize).collect();
+                assert_eq!(got, want, "rows {rows} n {n} k {k} by_index {by_index} row {r}");
+                for j in 0..k {
+                    assert_eq!(gv[r * k + j].to_bits(), row[want[j]].to_bits());
+                }
+            }
+        }
+    }
+}
+
+/// Timing of vocabulary-row top-k (run with --ignored --nocapture; SQUASH_TOPK_ONE_PASS=1 for the
+/// one-block-per-row path).
+#[test]
+#[ignore]
+fn topk_timing() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x7091_0002);
+    let (rows, n, k) = (4usize, 248_320usize, 64usize);
+    let dx = upload(&s, &rng.vec(rows * n));
+    let (di, dv) = (DeviceBuffer::new(rows * k * 4).unwrap(), DeviceBuffer::new(rows * k * 4).unwrap());
+    for _ in 0..3 {
+        kernels::topk(&s, dx.addr(), rows, n, n, k, false, di.addr(), dv.addr()).unwrap();
+    }
+    let (a, b) = (squash_cuda::Event::timing().unwrap(), squash_cuda::Event::timing().unwrap());
+    a.record(&s).unwrap();
+    for _ in 0..100 {
+        kernels::topk(&s, dx.addr(), rows, n, n, k, false, di.addr(), dv.addr()).unwrap();
+    }
+    b.record(&s).unwrap();
+    b.synchronize().unwrap();
+    println!("topk {rows} x {n}, k {k}: {:.1} us", squash_cuda::Event::elapsed_ms(&a, &b).unwrap() * 10.0);
+}

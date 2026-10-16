@@ -60,16 +60,22 @@ __global__ void sample_rows_kernel(const int* __restrict__ ids, const float* __r
                                    SampleParams* sp, const DraftQ* __restrict__ qs) {
     pdl_launch_dependents();
     pdl_wait();
-    if (threadIdx.x != 0) return;
+    // The exponentials (slow in FP64) of every row on all lanes of the warp; lane 0 does the rest.
     const int k = min(sp->k, K);
     const double t = fmax((double)sp->temperature, 1e-4);
+    __shared__ double ex[17][64];
+    for (int r = 0; r <= n; ++r)
+        for (int i = threadIdx.x; i < k; i += 32) ex[r][i] = exp(((double)vals[(size_t)r * K + i] - (double)vals[(size_t)r * K]) / t);
+    __syncwarp();
+    if (threadIdx.x != 0) return;
     double probs[64];
     for (int r = 0; r <= n; ++r) {
         const int* id = ids + (size_t)r * K;
         const float* v = vals + (size_t)r * K;
+        (void)v;
         double total = 0.0;
         for (int i = 0; i < k; ++i) {
-            probs[i] = exp(((double)v[i] - (double)v[0]) / t);
+            probs[i] = ex[r][i];
             total += probs[i];
         }
         int keep = k;
