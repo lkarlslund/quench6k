@@ -179,6 +179,12 @@ enum Command {
         name: String,
         #[command(flatten)]
         steer: SteerArgs,
+        /// Pinned host memory for stored conversation contexts, in GiB (0: none).
+        #[arg(long, default_value_t = 16.0)]
+        cache_host_gib: f64,
+        /// Directory for the disk tier of stored contexts, kept across restarts.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
     },
     /// Measure prefill and greedy decode throughput at the given prompt lengths.
     Bench {
@@ -303,7 +309,9 @@ fn main() -> Result<()> {
             }
         }
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, &steer)?,
-        Command::Serve { model, listen, context, drafts, name, steer } => serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer })?,
+        Command::Serve { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir } => {
+            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, cache_host_gib, cache_dir })?
+        }
         Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, steer } => {
             chat_once(&model, &prompt, max_tokens, temperature, top_p, top_k, seed, think, context, &steer)?
         }
@@ -498,7 +506,7 @@ fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, tempe
     let (mut model, stream) = load(model_dir, Precision::Int8Group, true)?;
     let strength = steer.attach(&mut model, &stream)?;
     let t0 = std::time::Instant::now();
-    let mut session = squash_engine::session::Session::new(&model, &stream, context, 8192, 6)?;
+    let mut session = squash_engine::session::Session::new(&model, &stream, context, 8192, 6, Default::default())?;
     println!("session ready in {:.1}s", t0.elapsed().as_secs_f64());
     let messages = serde_json::json!([{"role": "user", "content": prompt}]);
     let text = chat.render(&messages, None, Some(think), None)?;

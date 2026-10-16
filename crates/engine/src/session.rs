@@ -7,6 +7,7 @@ use squash_cuda::{DeviceBuffer, Stream};
 
 use crate::forward::{DecodeGraph, HeadWorkspace, SequenceState, Workspace};
 use crate::model::{Model, VOCAB};
+use crate::context_store::{ContextStore, StoreOptions};
 use crate::spec::{SpecDecoder, SpecGraphs};
 
 /// Sampling and stopping for one request. `temperature == 0` is greedy.
@@ -52,6 +53,10 @@ pub struct Session {
     snapshots: Vec<Snapshot>,
     /// Prompt tokens served from a snapshot in the last request.
     pub reused: usize,
+    /// Steering strength the cached state was computed with (reuse needs the same strength).
+    kv_strength: f32,
+    /// Host and disk tiers of stored contexts.
+    store: ContextStore,
 }
 
 /// The recurrent state at a position: every GDN layer's conv history and delta-rule state, the PLE conv
@@ -69,7 +74,7 @@ pub const MAX_TOP_K: usize = 64;
 impl Session {
     /// `capacity`: longest prompt + completion; `chunk`: prefill tokens per forward pass; `max_drafts`:
     /// longest speculative draft (adaptive 1..=max_drafts).
-    pub fn new(model: &Model, s: &Stream, capacity: usize, chunk: usize, max_drafts: usize) -> Result<Self> {
+    pub fn new(model: &Model, s: &Stream, capacity: usize, chunk: usize, max_drafts: usize, store: StoreOptions) -> Result<Self> {
         let slack = 2 * (max_drafts + 2) + 16;
         let mut ws = Workspace::new(chunk, capacity + slack)?;
         let mut state = SequenceState::with_mtp(capacity + slack, true)?;
@@ -92,7 +97,93 @@ impl Session {
             kv_tokens: Vec::new(),
             snapshots: Vec::new(),
             reused: 0,
+            kv_strength: 0.0,
+            store: ContextStore::open(store)?,
         })
+    }
+
+    /// Stored contexts (host and disk tiers).
+    pub fn stored_contexts(&self) -> usize {
+        self.store.len()
+    }
+
+    /// Writes host-tier contexts to the disk tier (persistence).
+    pub fn persist(&mut self) -> Result<()> {
+        if self.kv_strength == 0.0 {
+            self.stash(usize::MAX)?;
+        }
+        self.store.persist()
+    }
+
+    /// The live cache pieces holding positions [0, len): position table, then per attention cache (the
+    /// target's QSA layers, then the drafter's) K, V, index keys and pooled index groups.
+    fn kv_pieces(&self, len: usize) -> Vec<(u64, usize)> {
+        use crate::forward::QsaCache;
+        let mut v = vec![(self.state.pos3.addr(), len * 3 * 4)];
+        let caches: Vec<&QsaCache> = self.state.qsa.iter().flatten().chain(self.state.mtp_qsa.iter()).collect();
+        for c in caches {
+            let per = |b: &DeviceBuffer, rows: usize, total_rows: usize| (b.addr(), b.bytes() / total_rows * rows);
+            let cap = self.state.capacity;
+            v.push(per(&c.k, len, cap));
+            v.push(per(&c.v, len, cap));
+            v.push(per(&c.raw, len, cap));
+            v.push(per(&c.pooled, len / 4, cap / 4));
+        }
+        v
+    }
+
+    /// Saves the GPU context at the largest snapshot position (at most `limit`) to the store unless it
+    /// is stored already.
+    fn stash(&mut self, limit: usize) -> Result<()> {
+        if !self.store.enabled() {
+            return Ok(());
+        }
+        let Some(snap) = self.snapshots.iter().filter(|sn| sn.pos <= limit && sn.pos <= self.kv_tokens.len()).max_by_key(|sn| sn.pos) else { return Ok(()) };
+        let tokens = self.kv_tokens[..snap.pos].to_vec();
+        if self.store.contains(&tokens) {
+            return Ok(());
+        }
+        let rec: usize = Self::pieces(&self.state, self.dec.pending_addr()).iter().map(|p| p.1).sum();
+        let kv = self.kv_pieces(snap.pos);
+        let total = rec + kv.iter().map(|p| p.1).sum::<usize>();
+        let buf = squash_cuda::PinnedBuffer::new(total)?;
+        let s = Stream::new()?;
+        unsafe {
+            s.copy_d2h(buf.as_ptr(), snap.buf.addr(), rec)?;
+            let mut off = rec;
+            for (addr, bytes) in kv {
+                s.copy_d2h(buf.as_ptr().add(off), addr, bytes)?;
+                off += bytes;
+            }
+        }
+        s.synchronize()?;
+        self.store.insert(tokens, buf)
+    }
+
+    /// Loads stored entry `i` into the live caches and makes it the GPU context (one snapshot at its
+    /// end).
+    fn load_entry(&mut self, s: &Stream, i: usize) -> Result<()> {
+        let rec: usize = Self::pieces(&self.state, self.dec.pending_addr()).iter().map(|p| p.1).sum();
+        let (tokens, _) = self.store.get(i)?;
+        let kv = self.kv_pieces(tokens.len());
+        let snap_buf = match self.snapshots.pop() {
+            Some(sn) if sn.buf.bytes() >= rec => sn.buf,
+            _ => DeviceBuffer::new(rec)?,
+        };
+        self.snapshots.clear();
+        let (_, data) = self.store.get(i)?;
+        unsafe {
+            s.copy_h2d(snap_buf.addr(), data.as_ptr(), rec)?;
+            let mut off = rec;
+            for (addr, bytes) in kv {
+                s.copy_h2d(addr, data.as_ptr().add(off), bytes)?;
+                off += bytes;
+            }
+        }
+        s.synchronize()?;
+        self.snapshots.push(Snapshot { pos: tokens.len(), buf: snap_buf });
+        self.kv_tokens = tokens;
+        Ok(())
     }
 
     pub fn capacity(&self) -> usize {
@@ -134,8 +225,27 @@ impl Session {
 
     /// Positions the state, target and MTP caches on the longest snapshot whose prefix the caches still
     /// hold, prefills the rest of `prompt`, and takes new snapshots at `boundaries`.
-    fn prefill(&mut self, model: &Model, s: &Stream, prompt: &[i32], boundaries: &[usize]) -> Result<()> {
-        let lcp = self.kv_tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+    fn prefill(&mut self, model: &Model, s: &Stream, prompt: &[i32], boundaries: &[usize], strength: f32) -> Result<()> {
+        // Steered state is never reused across strengths, and the store holds unsteered state only.
+        if self.kv_strength != strength {
+            self.kv_tokens.clear();
+            self.snapshots.clear();
+        }
+        let mut lcp = self.kv_tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        if strength == 0.0 && self.store.enabled() {
+            // The new prompt overwrites the cached conversation past `lcp`: keep its boundary state.
+            if self.snapshots.iter().any(|sn| sn.pos > lcp) {
+                self.stash(usize::MAX)?;
+            }
+            let gpu_best = self.snapshots.iter().filter(|sn| sn.pos <= lcp && sn.pos < prompt.len()).map(|sn| sn.pos).max().unwrap_or(0);
+            if let Some((i, len)) = self.store.best(prompt) {
+                if len > gpu_best {
+                    self.load_entry(s, i)?;
+                    lcp = len;
+                }
+            }
+        }
+        self.kv_strength = strength;
         // Snapshots past the common prefix describe tokens the new prompt overwrites.
         self.snapshots.retain(|sn| sn.pos <= lcp);
         self.state.reset(s)?;
@@ -192,7 +302,7 @@ impl Session {
         if budget == 0 {
             return Ok((Finish::Length, 0));
         }
-        self.prefill(model, s, prompt, &p.boundaries)?;
+        self.prefill(model, s, prompt, &p.boundaries, p.steering_strength)?;
         if p.temperature <= 0.0 {
             self.spec.restart(&self.state, &self.dec, s)?;
             // The target's first token, then speculative rounds (each commits the previous `next`

@@ -29,6 +29,25 @@ pub struct ServeOptions {
     pub drafts: usize,
     pub name: String,
     pub steer: crate::SteerArgs,
+    pub cache_host_gib: f64,
+    pub cache_dir: Option<PathBuf>,
+}
+
+/// Identity of the served model and numerics for stored contexts: config.json plus the profile.
+pub fn model_id(model_dir: &std::path::Path) -> String {
+    let config = std::fs::read(model_dir.join("config.json")).unwrap_or_default();
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in config.iter().chain(b"int8g/squash-1".iter()) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+enum Work {
+    Generate(Job),
+    /// Write stored contexts to disk, then acknowledge.
+    Persist(mpsc::Sender<()>),
 }
 
 /// A queued generation and where its tokens go.
@@ -47,7 +66,7 @@ enum Msg {
 
 struct App {
     chat: Chat,
-    jobs: mpsc::Sender<Job>,
+    jobs: mpsc::Sender<Work>,
     name: String,
     /// Steering strength used when a request carries none (the loaded pack's, or 0).
     default_strength: f32,
@@ -56,15 +75,21 @@ struct App {
 
 pub fn run(opts: ServeOptions) -> Result<()> {
     let chat = Chat::load(&opts.model)?;
-    let (jobs_tx, jobs_rx) = mpsc::channel::<Job>();
+    let (jobs_tx, jobs_rx) = mpsc::channel::<Work>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<f32>>();
     let (model_dir, context, drafts, steer) = (opts.model.clone(), opts.context, opts.drafts, opts.steer.clone());
+    let store = squash_engine::context_store::StoreOptions {
+        host_bytes: (opts.cache_host_gib * 1073741824.0) as usize,
+        dir: opts.cache_dir.clone(),
+        model_id: model_id(&opts.model),
+    };
     let steering = steer.steering.is_some();
     std::thread::spawn(move || {
         let setup = (|| -> Result<_> {
             let (mut model, stream) = crate::load(&model_dir, Precision::Int8Group, true)?;
             let strength = steer.attach(&mut model, &stream)?;
-            let session = Session::new(&model, &stream, context, 8192, drafts)?;
+            let session = Session::new(&model, &stream, context, 8192, drafts, store)?;
+            println!("context store: {} stored contexts", session.stored_contexts());
             Ok((model, stream, session, strength))
         })();
         let (model, stream, mut session) = match setup {
@@ -77,7 +102,17 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                 return;
             }
         };
-        for job in jobs_rx {
+        for work in jobs_rx {
+            let job = match work {
+                Work::Generate(job) => job,
+                Work::Persist(ack) => {
+                    if let Err(e) = session.persist() {
+                        eprintln!("persisting contexts: {e:#}");
+                    }
+                    let _ = ack.send(());
+                    continue;
+                }
+            };
             let tx = job.tx.clone();
             let result = session.generate(&model, &stream, &job.ids, &job.params, |tok| tx.send(Msg::Token(tok)).is_ok());
             let _ = match result {
@@ -87,7 +122,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         }
     });
     let default_strength = ready_rx.recv().context("worker thread")??;
-    let app = Arc::new(App { chat, jobs: jobs_tx, name: opts.name, default_strength, steering });
+    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering });
     let router = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -97,7 +132,13 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(opts.listen).await?;
         println!("serving on http://{}", opts.listen);
-        axum::serve(listener, router).await?;
+        axum::serve(listener, router).with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; }).await?;
+        // Keep stored contexts across the restart.
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if jobs_tx.send(Work::Persist(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
+        }
+        println!("stopped");
         Ok(())
     })
 }
@@ -221,7 +262,7 @@ async fn chat_completions(State(app): State<Arc<App>>, Json(req): Json<Value>) -
     };
     let (tx, rx) = tmpsc::unbounded_channel();
     let prompt_tokens = p.ids.len();
-    if app.jobs.send(Job { ids: p.ids, params: p.params, tx }).is_err() {
+    if app.jobs.send(Work::Generate(Job { ids: p.ids, params: p.params, tx })).is_err() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "generation worker stopped");
     }
     let id = format!("chatcmpl-{}", now());
@@ -537,7 +578,7 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
     };
     let (tx, mut rx) = tmpsc::unbounded_channel();
     let prompt_tokens = p.ids.len();
-    if app.jobs.send(Job { ids: p.ids, params: p.params, tx }).is_err() {
+    if app.jobs.send(Work::Generate(Job { ids: p.ids, params: p.params, tx })).is_err() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "generation worker stopped");
     }
     let id = format!("msg_{}", now());

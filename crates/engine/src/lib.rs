@@ -1,4 +1,5 @@
 pub mod checkpoint;
+pub mod context_store;
 pub mod forward;
 pub mod loader;
 pub mod model;
