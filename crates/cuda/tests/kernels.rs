@@ -680,3 +680,31 @@ fn gemm_split_matches_cpu() {
     }
     assert!(worst < 1e-4, "split gemm error {worst}");
 }
+
+/// Full-width narrow GEMM against the CPU (INT8-group weights, N = 324, a partial row tile).
+#[test]
+fn gemm_wide_matches_cpu() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x01de_0001);
+    let (m, n, k) = (150usize, 324usize, 1024usize);
+    let x = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
+    let w = rng.vec(n * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
+    let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
+    let wq = DeviceBuffer::new(n * k).unwrap();
+    let wsc = DeviceBuffer::new(n * k / 64 * 4).unwrap();
+    kernels::quantize_int8_groups(&s, dw.addr(), n, k, wq.addr(), wsc.addr()).unwrap();
+    let q: Vec<i8> = s.download(wq.addr(), n * k).unwrap();
+    let sc: Vec<f32> = s.download(wsc.addr(), n * k / 64).unwrap();
+    let dy = DeviceBuffer::zeroed(m * 330 * 4).unwrap();
+    kernels::gemm_wide(&s, dx.addr(), k, wq.addr(), k, wsc.addr(), dy.addr(), 330, m, n, k).unwrap();
+    let y: Vec<f32> = s.download(dy.addr(), m * 330).unwrap();
+    let mut worst = 0f64;
+    for i in 0..m {
+        for j in 0..n {
+            let dot: f64 = (0..k).map(|t| x[i * k + t] as f64 * bf16::round(q[j * k + t] as f32 * sc[(j * k + t) / 64]) as f64).sum();
+            worst = worst.max((y[i * 330 + j] as f64 - dot).abs() / (k as f64).sqrt());
+        }
+    }
+    assert!(worst < 1e-4, "wide gemm error {worst}");
+}

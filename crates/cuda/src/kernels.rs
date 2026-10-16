@@ -63,6 +63,13 @@ pub fn gemm_f32_split(s: &Stream, x: u64, ldx: usize, fmt: WeightFormat, w: u64,
     check(err, "gemm_bf16_f32_split")
 }
 
+/// Narrow-output GEMM (n <= 336, INT8-group weights): every output column of 64 rows in one CTA.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_wide(s: &Stream, x: u64, ldx: usize, w: u64, ldw: usize, scale: u64, y: u64, ldy: usize, m: usize, n: usize, k: usize) -> Result<()> {
+    let err = unsafe { ffi::squash_gemm_wide(p(x), ldx as i32, p(w), ldw as i32, opt_f(scale), y as *mut f32, ldy as i32, m as i32, n as i32, k as i32, s.raw()) };
+    check(err, "gemm_wide")
+}
+
 /// As [`gemm_f32`] with a BF16 output.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_bf16(s: &Stream, x: u64, ldx: usize, fmt: WeightFormat, w: u64, ldw: usize, scale: u64, y: u64, ldy: usize, m: usize, n: usize, k: usize, alpha: f32, accumulate: bool) -> Result<()> {

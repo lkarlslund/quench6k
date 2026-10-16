@@ -343,7 +343,127 @@ __global__ void split_reduce_kernel(const float* __restrict__ partial, int split
     store_out(&Y[(size_t)m * ldy + n], alpha * v, accumulate);
 }
 
+// Full-width GEMM for narrow outputs (N <= 336, INT8 weights with a scale per 64): one CTA covers every
+// output column of 64 rows, so each activation tile is read once (the HyperConnection down-projection:
+// N = 324, K = 10240). 12 warps of 32 x 56, three stages; the weight tile of the k-tile two ahead is
+// fetched into registers and converted to BF16 in shared memory after the MMAs.
+constexpr int WB_M = 64, WB_N = 336, WB_THREADS = 384;
+constexpr size_t WIDE_SMEM = (size_t)3 * (WB_M + WB_N) * LDS * 2;
+
+__global__ void __launch_bounds__(WB_THREADS) gemm_wide_kernel(const __nv_bfloat16* __restrict__ X, int ldx, const int8_t* __restrict__ W,
+                                                               int ldw, const float* __restrict__ gscale, float* Y, int ldy, int M, int N,
+                                                               int K) {
+    pdl_launch_dependents();
+    pdl_wait();
+    constexpr int ST = 3;
+    extern __shared__ __align__(16) unsigned char wide_smem[];
+    auto sA = reinterpret_cast<__nv_bfloat16 (*)[WB_M * LDS]>(wide_smem);
+    auto sB = reinterpret_cast<__nv_bfloat16 (*)[WB_N * LDS]>(wide_smem + (size_t)ST * WB_M * LDS * 2);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, warp_m = warp / 6, warp_n = warp % 6;
+    const int m0 = blockIdx.x * WB_M, k_tiles = K / BK;
+    auto load_a = [&](int stage, int kt) {
+        if (tid < WB_M * 4) {
+            const int r = tid >> 2, c = (tid & 3) * 8, gm = m0 + r;
+            cp_async16(&sA[stage][r * LDS + c], X + (size_t)(gm < M ? gm : 0) * ldx + kt * BK + c, gm < M);
+        }
+    };
+    uint4 braw[2] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
+    float bgs = 0.0f;
+    const bool brow = tid < WB_N && tid < N;
+    auto fetch_b = [&](int kt) {
+        if (brow) {
+            const int8_t* src = W + (size_t)tid * ldw + kt * BK;
+            braw[0] = __ldg(reinterpret_cast<const uint4*>(src));
+            braw[1] = __ldg(reinterpret_cast<const uint4*>(src + 16));
+            bgs = gscale[(size_t)tid * (K / 64) + kt * BK / 64];
+        }
+    };
+    auto store_b = [&](int stage) {
+        if (tid >= WB_N) return;
+        __nv_bfloat16* dst = &sB[stage][tid * LDS];
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int8_t* p = reinterpret_cast<const int8_t*>(&braw[u]);
+            uint32_t packed[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const __nv_bfloat162 v = brow ? __floats2bfloat162_rn((float)p[2 * i] * bgs, (float)p[2 * i + 1] * bgs) : __floats2bfloat162_rn(0.f, 0.f);
+                packed[i] = *reinterpret_cast<const uint32_t*>(&v);
+            }
+            *reinterpret_cast<uint4*>(dst + 16 * u) = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+            *reinterpret_cast<uint4*>(dst + 16 * u + 8) = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+        }
+    };
+    float acc[2][7][4] = {};
+#pragma unroll
+    for (int s = 0; s < ST - 1; ++s) {
+        if (s < k_tiles) {
+            load_a(s, s);
+            fetch_b(s);
+            store_b(s);
+        }
+        cp_async_commit();
+    }
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        cp_async_wait<ST - 2>();
+        __syncthreads();
+        const int next = kt + ST - 1;
+        if (next < k_tiles) {
+            load_a(next % ST, next);
+            fetch_b(next);
+        }
+        cp_async_commit();
+        const __nv_bfloat16* a_tile = sA[kt % ST];
+        const __nv_bfloat16* b_tile = sB[kt % ST];
+#pragma unroll
+        for (int kk = 0; kk < BK; kk += 16) {
+            uint32_t a[2][4];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) ldmatrix_x4(a[i], &a_tile[(warp_m * 32 + i * 16 + (lane & 15)) * LDS + kk + (lane >> 4) * 8]);
+#pragma unroll
+            for (int j = 0; j < 7; ++j) {
+                uint32_t b[2];
+                ldmatrix_x2(b, &b_tile[(warp_n * 56 + j * 8 + (lane & 7)) * LDS + kk + ((lane >> 3) & 1) * 8]);
+#pragma unroll
+                for (int i = 0; i < 2; ++i) mma_bf16(acc[i][j], a[i], b);
+            }
+        }
+        if (next < k_tiles) store_b(next % ST);
+    }
+    cp_async_wait<0>();
+    const int g = lane >> 2, t4 = lane & 3;
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int m = m0 + warp_m * 32 + i * 16 + g + h * 8;
+            if (m >= M) continue;
+#pragma unroll
+            for (int j = 0; j < 7; ++j) {
+                const int n = warp_n * 56 + j * 8 + t4 * 2;
+                if (n < N) Y[(size_t)m * ldy + n] = acc[i][j][h * 2];
+                if (n + 1 < N) Y[(size_t)m * ldy + n + 1] = acc[i][j][h * 2 + 1];
+            }
+        }
+}
+
 }  // namespace
+
+// Narrow outputs (N <= 336), INT8 weights with group scales: Y[M, N] = X . W^T (see gemm_wide_kernel).
+extern "C" cudaError_t squash_gemm_wide(const void* X, int ldx, const void* W, int ldw, const float* scale, float* Y, int ldy, int M, int N,
+                                        int K, cudaStream_t stream) {
+    if (N > WB_N || K % BK != 0 || ldx % 8 != 0 || ldw % 16 != 0) return cudaErrorInvalidValue;
+    if (M == 0 || N == 0) return cudaSuccess;
+    static bool configured = false;
+    if (!configured) {
+        const cudaError_t e = cudaFuncSetAttribute(gemm_wide_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)WIDE_SMEM);
+        if (e != cudaSuccess) return e;
+        configured = true;
+    }
+    SQ_CHECK_LAUNCH(sq_launch(gemm_wide_kernel, (M + WB_M - 1) / WB_M, WB_THREADS, WIDE_SMEM, stream, static_cast<const __nv_bfloat16*>(X), ldx,
+                              static_cast<const int8_t*>(W), ldw, scale, Y, ldy, M, N, K));
+    SQ_RETURN_LAUNCH();
+}
 
 // Split-K GEMM for small grids: `splits` CTAs along K per output tile (K a multiple of 32 * splits),
 // partial sums [splits, M, N] in `partial`, reduced in split order.
