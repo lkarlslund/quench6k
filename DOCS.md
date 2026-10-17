@@ -95,8 +95,9 @@ model verifies them in one step, and the draft length adapts to the observed acc
 is identical to plain greedy decoding; sampled output has exactly the distribution of plain sampling.
 Penalties are applied in the verification step, so they keep this property.
 
-When a second request arrives, both continue in one batched decode step without speculation; the
-first request's speculative state is committed first.
+Two concurrent requests decode speculatively together: both drafters run, then one batched
+verification step covers both requests' drafts, and each request accepts and samples on its own.
+If one of them uses plain decoding (`"mtp": false`, capture), both continue with batched plain steps.
 
 ## Tool calls
 

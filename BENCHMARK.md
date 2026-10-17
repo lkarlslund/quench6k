@@ -37,6 +37,10 @@ Real prompts through the server (`--kv fp8`, sampled at temperature 0.6 and 1.0 
 top_k 20, 600-token answers to a coding, an explanation and a story prompt): 223–338 tokens/s,
 282 overall. Code is fastest, prose slowest.
 
+Two concurrent requests (`batch-check`, greedy, the code and multiturn fixtures, 192 tokens each):
+418 tokens/s together with speculative pair rounds (3.4 tokens per request and round), 276 with
+batched plain steps.
+
 ## Method
 
 - `quench6k bench`: the prompt is the first N tokens of `bench/context.ids` (the 256K row uses

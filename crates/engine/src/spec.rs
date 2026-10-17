@@ -60,6 +60,14 @@ impl SpecDecoder {
         self.prefill_from(model, state, ws, s, prompt, 0, chunk, &[], |_, _, _| Ok(()), None)
     }
 
+    /// As [`restart`](Self::restart), breaking the chunking at `pauses` (as a fresh prompt is chunked at
+    /// turn boundaries) and reporting `progress`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_new(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], chunk: usize, pauses: &[usize], progress: Option<&(dyn Fn(usize) + Send + Sync)>) -> Result<()> {
+        s.memset(self.pending.addr(), 0, H * 4)?;
+        self.prefill_from(model, state, ws, s, prompt, 0, chunk, pauses, |_, _, _| Ok(()), progress)
+    }
+
     /// Prefills `prompt[start..]` into `state`, which already holds `prompt[..start]` (target and MTP
     /// caches, recurrent state, and the pending row: see `pending_addr`). At each position in
     /// `pauses` (ascending, in start..len) the chunking breaks and `at_pause(state, pos, pending)` runs.
@@ -228,6 +236,9 @@ struct GraphSet {
     /// The sampled verification with repetition/presence penalties: the verified rows are penalized
     /// before top-k, and the committed tokens join the history.
     verify_from_ple_penalized: Option<quench6k_cuda::Graph>,
+    /// Pair rounds ([`PairGraphs`]): the head, acceptance and bookkeeping of this sequence's rows of a
+    /// batched verification step, per mode (greedy, sampled, penalized).
+    pair_tail: [Option<quench6k_cuda::Graph>; 3],
     bytes: usize,
 }
 
@@ -306,7 +317,10 @@ impl SpecGraphs {
     /// Captures the graphs for `dec` (after its prefill) with the fixed draft length `dec.drafts`, or with
     /// every length 1 ..= `dec.drafts` when `adaptive`, and loads the round control buffer.
     /// `pen`: the penalty history (state, flags, list; see `kernels::penalty_apply`), for penalized rounds.
-    pub fn capture(model: &Model, state: &SequenceState, ws: &mut Workspace, dec: &SpecDecoder, s: &Stream, adaptive: bool, pen: Option<(u64, u64, u64)>) -> Result<Self> {
+    /// `pair_slot`: also capture the tails of pair rounds, for this sequence as segment 0 or 1 of the
+    /// batched verification.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture(model: &Model, state: &SequenceState, ws: &mut Workspace, dec: &SpecDecoder, s: &Stream, adaptive: bool, pen: Option<(u64, u64, u64)>, pair_slot: Option<usize>) -> Result<Self> {
         use quench6k_cuda::kernels as k;
         let nmax = dec.drafts;
         let (layout_max, draft_at, greedy_at, ints) = k::spec_layout();
@@ -345,34 +359,46 @@ impl SpecGraphs {
             }
             let bytes = forward::step_bytes(n + 1);
             let verify_before_ple = quench6k_cuda::Graph::capture(s, |s| forward::forward_part(model, state, ws, s, n + 1, bytes, Part::BeforePle, true, None))?;
-            let verify_from_ple = quench6k_cuda::Graph::capture(s, |s| {
-                forward::forward_part(model, state, ws, s, n + 1, bytes, Part::FromPle, true, None)?;
-                forward::head_argmax_into(model, &dec.head, s, ws.out, n + 1, rc.addr() + (greedy_at * 4) as u64)?;
+            // The verification's head, sampling, acceptance and bookkeeping for rows `off ..= off + n` of
+            // the step output. Modes: 0 greedy, 1 sampled, 2 sampled with penalties.
+            let tail = |s: &Stream, mode: usize, off: usize| -> Result<()> {
+                let (out, h) = (ws.out + (off * D * 2) as u64, ws.h + off as u64 * ROW);
+                if mode == 0 {
+                    forward::head_argmax_into(model, &dec.head, s, out, n + 1, rc.addr() + (greedy_at * 4) as u64)?;
+                } else {
+                    forward::head_logits_rows(model, &dec.head, s, out, n + 1)?;
+                    if mode == 2 {
+                        let pen = pen.context("graphs captured without penalties")?;
+                        k::penalty_apply(s, dec.head.logits_addr(), n + 1, crate::model::VOCAB, pen.0, pen.1, pen.2, rc.addr())?;
+                    }
+                    k::topk(s, dec.head.logits_addr(), n + 1, crate::model::VOCAB, crate::model::VOCAB, SAMPLE_TOP, false, top_ids.addr(), top_vals.addr())?;
+                    k::spec_sample_rows(s, top_ids.addr(), top_vals.addr(), SAMPLE_TOP, n, rc.addr(), sample_params.addr(), draft_q.addr())?;
+                }
                 k::spec_accept(s, rc.addr(), ctl, n)?;
-                s.copy_d2d(dec.verified.addr(), ws.h, (n + 1) * H * 4)?;
+                if mode == 2 {
+                    let pen = pen.context("graphs captured without penalties")?;
+                    k::penalty_mark(s, pen.0, pen.1, pen.2, rc.addr() + (commit_at * 4) as u64, 0, rc.addr() + (commit_count * 4) as u64, 3)?;
+                }
+                s.copy_d2d(dec.verified.addr(), h, (n + 1) * H * 4)?;
                 unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
-            })?;
-            let verify_from_ple_sampled = quench6k_cuda::Graph::capture(s, |s| {
+            };
+            let verify = |mode: usize| quench6k_cuda::Graph::capture(s, |s| {
                 forward::forward_part(model, state, ws, s, n + 1, bytes, Part::FromPle, true, None)?;
-                forward::head_logits_rows(model, &dec.head, s, ws.out, n + 1)?;
-                k::topk(s, dec.head.logits_addr(), n + 1, crate::model::VOCAB, crate::model::VOCAB, SAMPLE_TOP, false, top_ids.addr(), top_vals.addr())?;
-                k::spec_sample_rows(s, top_ids.addr(), top_vals.addr(), SAMPLE_TOP, n, rc.addr(), sample_params.addr(), draft_q.addr())?;
-                k::spec_accept(s, rc.addr(), ctl, n)?;
-                s.copy_d2d(dec.verified.addr(), ws.h, (n + 1) * H * 4)?;
-                unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
-            })?;
-            let verify_from_ple_penalized = pen.map(|pen| quench6k_cuda::Graph::capture(s, |s| {
-                forward::forward_part(model, state, ws, s, n + 1, bytes, Part::FromPle, true, None)?;
-                forward::head_logits_rows(model, &dec.head, s, ws.out, n + 1)?;
-                k::penalty_apply(s, dec.head.logits_addr(), n + 1, crate::model::VOCAB, pen.0, pen.1, pen.2, rc.addr())?;
-                k::topk(s, dec.head.logits_addr(), n + 1, crate::model::VOCAB, crate::model::VOCAB, SAMPLE_TOP, false, top_ids.addr(), top_vals.addr())?;
-                k::spec_sample_rows(s, top_ids.addr(), top_vals.addr(), SAMPLE_TOP, n, rc.addr(), sample_params.addr(), draft_q.addr())?;
-                k::spec_accept(s, rc.addr(), ctl, n)?;
-                k::penalty_mark(s, pen.0, pen.1, pen.2, rc.addr() + (commit_at * 4) as u64, 0, rc.addr() + (commit_count * 4) as u64, 3)?;
-                s.copy_d2d(dec.verified.addr(), ws.h, (n + 1) * H * 4)?;
-                unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
-            })).transpose()?;
-            sets.push(GraphSet { n, mtp, verify_before_ple, verify_from_ple, verify_from_ple_sampled, verify_from_ple_penalized, bytes });
+                tail(s, mode, 0)
+            });
+            let verify_from_ple = verify(0)?;
+            let verify_from_ple_sampled = verify(1)?;
+            let verify_from_ple_penalized = pen.map(|_| verify(2)).transpose()?;
+            let mut pair_tail = [None, None, None];
+            if let Some(slot) = pair_slot {
+                let off = slot * (n + 1);
+                for (mode, g) in pair_tail.iter_mut().enumerate() {
+                    if mode < 2 || pen.is_some() {
+                        *g = Some(quench6k_cuda::Graph::capture(s, |s| tail(s, mode, off))?);
+                    }
+                }
+            }
+            sets.push(GraphSet { n, mtp, verify_before_ple, verify_from_ple, verify_from_ple_sampled, verify_from_ple_penalized, pair_tail, bytes });
         }
         // Round state: next token at position len(state), nothing to catch up yet.
         s.upload_to(rc.addr(), &[state.len() as i32, dec.next, 0, 0])?;
@@ -440,6 +466,15 @@ impl SpecGraphs {
         }
         s.synchronize()?;
         dec.verify_secs += t1.elapsed().as_secs_f64();
+        let (a, committed) = self.commit(state, dec, &verify, p);
+        self.policy.record(n, a, t0.elapsed().as_secs_f64());
+        Ok(committed)
+    }
+
+    /// After a verification (read back into `rc_host`): truncates the sequence to the accepted tokens
+    /// and positions the decoder on the target's next token. Returns the accepted draft count and the
+    /// committed tokens.
+    fn commit(&self, state: &mut SequenceState, dec: &mut SpecDecoder, verify: &[i32], p: usize) -> (usize, Vec<i32>) {
         let a = self.rc_word(3) as usize;
         state.tokens.truncate(p + a + 1);
         let committed = verify[..=a].to_vec();
@@ -447,7 +482,78 @@ impl SpecGraphs {
         dec.next = self.rc_word(1);
         dec.rounds += 1;
         dec.accepted += a;
-        self.policy.record(n, a, t0.elapsed().as_secs_f64());
-        Ok(committed)
+        (a, committed)
+    }
+
+    /// The tail mode of this sequence's rounds (greedy, sampled, penalized).
+    fn mode(&self) -> usize {
+        if self.penalized { 2 } else if self.sampled { 1 } else { 0 }
+    }
+}
+
+/// Speculative rounds of two sequences together: both drafters run, then one batched verification
+/// step over `[x, d1 .. dn]` of each (segments of [`forward::forward_segments`], recurrent commits
+/// deferred per sequence), then each sequence's own tail (head, sampling, acceptance; captured in its
+/// [`SpecGraphs`] with `pair_slot`). Both sequences draft the same length, chosen by a policy fed
+/// with both sequences' acceptance.
+pub struct PairGraphs {
+    sets: Vec<(usize, quench6k_cuda::Graph, quench6k_cuda::Graph, usize)>,
+    pub policy: DraftPolicy,
+}
+
+impl PairGraphs {
+    /// Captures the batched verification for every draft length both decoders support (1 ..= the
+    /// shorter longest draft) over `states` (slot 0, slot 1).
+    pub fn capture(model: &Model, states: [&SequenceState; 2], ws: &Workspace, s: &Stream, max_drafts: usize) -> Result<Self> {
+        let mut sets = Vec::with_capacity(max_drafts);
+        for n in 1..=max_drafts {
+            let segs = [forward::Seg { state: states[0], rows: n + 1, defer: Some(true) }, forward::Seg { state: states[1], rows: n + 1, defer: Some(true) }];
+            let bytes = forward::segments_bytes(2 * (n + 1));
+            let before = quench6k_cuda::Graph::capture(s, |s| forward::forward_segments(model, &segs, ws, s, bytes, Part::BeforePle))?;
+            let from = quench6k_cuda::Graph::capture(s, |s| forward::forward_segments(model, &segs, ws, s, bytes, Part::FromPle))?;
+            sets.push((n, before, from, bytes));
+        }
+        Ok(Self { sets, policy: DraftPolicy::new((1..=max_drafts).collect()) })
+    }
+
+    /// One round of both sequences; returns each one's committed tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn round(&mut self, model: &Model, ws: &mut Workspace, s: &Stream, a: (&mut SpecGraphs, &mut SequenceState, &mut SpecDecoder), b: (&mut SpecGraphs, &mut SequenceState, &mut SpecDecoder)) -> Result<[Vec<i32>; 2]> {
+        let (_, draft_at, _, _) = quench6k_cuda::kernels::spec_layout();
+        let (ga, sa, da) = a;
+        let (gb, sb, db) = b;
+        let n = self.policy.choose();
+        let (_, before, from, bytes) = self.sets.iter().find(|x| x.0 == n).context("no pair graphs for this draft length")?;
+        let seta = ga.sets.iter().find(|g| g.n == n).context("slot 0 lacks this draft length")?;
+        let setb = gb.sets.iter().find(|g| g.n == n).context("slot 1 lacks this draft length")?;
+        let t0 = std::time::Instant::now();
+        seta.mtp[da.catch_up.len()].launch(s)?;
+        setb.mtp[db.catch_up.len()].launch(s)?;
+        s.synchronize()?;
+        let t1 = std::time::Instant::now();
+        let mut va = vec![da.next];
+        va.extend((0..n).map(|j| ga.rc_word(draft_at + j)));
+        let mut vb = vec![db.next];
+        vb.extend((0..n).map(|j| gb.rc_word(draft_at + j)));
+        let (pa, pb) = (sa.len(), sb.len());
+        forward::prepare_segments_tokens(&mut [&mut *sa, &mut *sb], ws, &[&va, &vb])?;
+        before.launch(s)?;
+        let used = forward::prepare_segments_ple(model, &[&*sa, &*sb], ws, &[n + 1, n + 1])?;
+        debug_assert_eq!(used, *bytes);
+        from.launch(s)?;
+        seta.pair_tail[ga.mode()].as_ref().context("slot 0 graphs captured without pair tails")?.launch(s)?;
+        setb.pair_tail[gb.mode()].as_ref().context("slot 1 graphs captured without pair tails")?.launch(s)?;
+        s.synchronize()?;
+        let (draft, verify) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
+        for d in [&mut *da, &mut *db] {
+            d.draft_secs += draft / 2.0;
+            d.verify_secs += verify / 2.0;
+        }
+        let (acc_a, ca) = ga.commit(sa, da, &va, pa);
+        let (acc_b, cb) = gb.commit(sb, db, &vb, pb);
+        let secs = t0.elapsed().as_secs_f64();
+        self.policy.record(n, acc_a, secs);
+        self.policy.record(n, acc_b, secs);
+        Ok([ca, cb])
     }
 }

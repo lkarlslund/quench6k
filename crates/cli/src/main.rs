@@ -697,7 +697,7 @@ fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> R
         tokens: Vec<i32>,
         prompt_len: usize,
     }
-    let (model, s) = load(model_dir, Precision::Int8Group, false)?;
+    let (model, s) = load(model_dir, Precision::Int8Group, true)?;
     let prompts: Vec<Vec<i32>> = fixtures
         .iter()
         .map(|f| -> Result<Vec<i32>> {
@@ -765,8 +765,42 @@ fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> R
         let same = batched[i].iter().zip(&single[i]).take_while(|(x, y)| x == y).count();
         println!("sequence {i}: {same}/{n} tokens identical to single-sequence decoding");
     }
+    drop(g);
+    drop((a, b));
+    // Speculative pair rounds (both sequences draft, one batched verification), greedy: each sequence
+    // must reproduce its single-sequence decoding.
+    use quench6k_engine::spec::{PairGraphs, SpecDecoder, SpecGraphs};
+    const DRAFTS: usize = 6;
+    let cap = cap + 4 * (DRAFTS + 2);
+    let mut ws = Workspace::for_model(&model, 2048, cap)?;
+    let mut sa = SequenceState::with_mtp(cap, true)?;
+    let mut sb = SequenceState::with_mtp(cap, true)?;
+    let mut da = SpecDecoder::prefill(&model, &mut sa, &mut ws, &s, &prompts[0], DRAFTS, 2048)?;
+    let mut db = SpecDecoder::prefill(&model, &mut sb, &mut ws, &s, &prompts[1], DRAFTS, 2048)?;
+    let mut ga = SpecGraphs::capture(&model, &sa, &mut ws, &da, &s, true, None, Some(0))?;
+    let mut gb = SpecGraphs::capture(&model, &sb, &mut ws, &db, &s, true, None, Some(1))?;
+    let mut pair = PairGraphs::capture(&model, [&sa, &sb], &ws, &s, DRAFTS)?;
+    let mut spec = [Vec::new(), Vec::new()];
+    let t3 = std::time::Instant::now();
+    let mut rounds = 0;
+    while spec.iter().any(|x| x.len() < n) {
+        let [ca, cb] = pair.round(&model, &mut ws, &s, (&mut ga, &mut sa, &mut da), (&mut gb, &mut sb, &mut db))?;
+        spec[0].extend(ca);
+        spec[1].extend(cb);
+        rounds += 1;
+    }
+    let produced: usize = spec.iter().map(|x| x.len()).sum();
+    println!("pair rounds: {:.1} tok/s (2 sequences, {:.2} tokens per sequence and round)", produced as f64 / t3.elapsed().as_secs_f64(), produced as f64 / (2 * rounds) as f64);
+    let mut ok = true;
+    for i in 0..2 {
+        let same = spec[i].iter().zip(&single[i]).take_while(|(x, y)| x == y).count();
+        println!("sequence {i}: {same}/{n} pair-round tokens identical to single-sequence decoding");
+        ok &= same == n;
+    }
+    anyhow::ensure!(ok, "pair rounds diverge from single-sequence decoding");
     Ok(())
 }
+
 
 fn vision_check(model_dir: &std::path::Path, reference: &std::path::Path, max_pixels: usize) -> Result<()> {
     use quench6k_engine::vision::{VisionInput, VisionModel};

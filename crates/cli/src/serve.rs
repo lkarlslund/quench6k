@@ -218,8 +218,8 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
         }
         let secs = a.decode_start.elapsed().as_secs_f64();
         let n = a.generated.len();
-        let (rounds, accepted) = session.spec_stats();
-        let mtp = if a.run.slot == 0 && a.run.is_spec() && rounds > 0 { format!(", MTP {:.2} tokens/round", (rounds + accepted) as f64 / rounds as f64) } else { String::new() };
+        let (rounds, accepted) = session.spec_stats(a.run.slot);
+        let mtp = if a.run.is_spec() && rounds > 0 { format!(", MTP {:.2} tokens/round", (rounds + accepted) as f64 / rounds as f64) } else { String::new() };
         eprintln!("done: slot {}, prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s){mtp}, {:?}",
                   a.run.slot, a.prompt, a.reused, a.prefill, (a.prompt - a.reused) as f64 / a.prefill.max(1e-9), n, secs,
                   n.saturating_sub(1) as f64 / secs.max(1e-9), f);
@@ -256,23 +256,9 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
         // Admit queued requests into free slots (the main slot first: MTP and the prefix cache).
         while let Some(free) = (0..nslots).find(|&i| slots[i].is_none()) {
             let Some(job) = queue.pop_front() else { break };
-            let other = 1 - free;
-            if let Some(a) = slots[other].as_mut() {
-                if a.run.is_spec() {
-                    match session.to_plain(model, s, &mut a.run) {
-                        Ok(toks) => {
-                            if let Some(f) = emit(a, &toks) {
-                                complete(slots[other].take().unwrap(), f, session);
-                            }
-                        }
-                        Err(e) => {
-                            let _ = a.tx.send(Msg::Error(format!("{e:#}")));
-                            slots[other] = None;
-                        }
-                    }
-                }
-            }
-            let speculate = job.mtp && slots[other].is_none() && queue.is_empty();
+            // Both slots decode speculatively, together in pair rounds when both are busy (a request
+            // with plain decoding makes the other switch to batched plain steps; see Session::step).
+            let speculate = job.mtp;
             let t0 = std::time::Instant::now();
             match session.begin(model, s, free, &job.ids, &job.params, speculate) {
                 Ok((run, toks)) => {

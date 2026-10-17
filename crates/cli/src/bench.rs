@@ -243,7 +243,7 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         let (prompt, want, what) = reference(model_dir, &model, &stream, chunk)?;
         let mut state = SequenceState::with_mtp(prompt.len() + CHECK + slack, true)?;
         let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &stream, &prompt, drafts, chunk)?;
-        let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive, None)?;
+        let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive, None, None)?;
         if sampled {
             g.set_sampling(&stream, Some(Sampling { top_k: 1, ..defaults(1) }))?;
         }
@@ -277,7 +277,7 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
             if seed == 0 {
                 prefill = ctx as f64 / t0.elapsed().as_secs_f64();
             }
-            let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive, None)?;
+            let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive, None, None)?;
             if sampled {
                 g.set_sampling(&stream, Some(defaults(1 + seed as u64)))?;
             }

@@ -786,32 +786,126 @@ pub fn prepare_batch(model: &Model, states: &mut [&mut SequenceState], ws: &mut 
 /// weight-bound operations batched over the rows, stateful ones per sequence. `ws.out` row b holds
 /// sequence b's final mixer output.
 pub fn forward_batch(model: &Model, states: &[&SequenceState], ws: &Workspace, s: &Stream, bytes: usize) -> Result<()> {
-    let t = states.len();
-    let layout = StepLayout::new(t);
-    unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? };
-    for (b, st) in states.iter().enumerate() {
-        k::store_positions(s, ws.step + (layout.pos + 12 * b) as u64, st.pos3.addr(), ws.step + 4 * b as u64, 1)?;
+    let segs: Vec<Seg> = states.iter().map(|&state| Seg { state, rows: 1, defer: None }).collect();
+    forward_segments(model, &segs, ws, s, bytes, Part::Whole)
+}
+
+/// One sequence's rows in a batched step: `rows` consecutive tokens of `state`. `defer`: None runs the
+/// recurrent layers without speculative bookkeeping (plain batched decode); Some(d) as
+/// [`forward_part`]'s `defer` (needs `state.spec`).
+#[derive(Clone, Copy)]
+pub struct Seg<'a> {
+    pub state: &'a SequenceState,
+    pub rows: usize,
+    pub defer: Option<bool>,
+}
+
+/// Row offset of each segment, and the total.
+fn seg_rows(segs: &[Seg]) -> (Vec<usize>, usize) {
+    let mut r = Vec::with_capacity(segs.len());
+    let mut t = 0;
+    for g in segs {
+        r.push(t);
+        t += g.rows;
     }
-    k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h)?;
+    (r, t)
+}
+
+/// Runs a batched step over segments (at most 4 sequences, capturable): the step block holds each
+/// segment's start at word b and its rows' tokens, positions and PLE rows in segment order (see
+/// [`prepare_segments`]). Weight-bound operations run over all rows, stateful ones per segment.
+/// `part` splits the step around PLE as in [`forward_part`].
+pub fn forward_segments(model: &Model, segs: &[Seg], ws: &Workspace, s: &Stream, bytes: usize, part: Part) -> Result<()> {
+    let (offsets, t) = seg_rows(segs);
+    ensure!((1..=4).contains(&segs.len()) && t <= ws.max_tokens, "batch of {} segments, {t} rows", segs.len());
+    let layout = StepLayout::new(t);
+    match part {
+        Part::Whole => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? },
+        Part::BeforePle => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), layout.ple)? },
+        Part::FromPle => unsafe { s.copy_h2d(ws.step + layout.ple as u64, ws.step_host.as_ptr().add(layout.ple), bytes - layout.ple)? },
+        Part::Staged => {}
+    }
+    let from_ple = matches!(part, Part::FromPle | Part::Staged);
+    if !from_ple {
+        for (b, (g, &r)) in segs.iter().zip(&offsets).enumerate() {
+            k::store_positions(s, ws.step + (layout.pos + 12 * r) as u64, g.state.pos3.addr(), ws.step + 4 * b as u64, g.rows)?;
+        }
+        k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h)?;
+    }
+    let steer = model.steering.as_ref().map(|p| (p.directions.addr(), p.ranks.addr(), p.masks.addr(), p.norm_preserve, 0));
     let ctx = LayerCtx {
         ws,
         s,
         t,
         start: ws.step,
         pos3: 0,
-        capacity: states[0].capacity,
+        capacity: segs[0].state.capacity,
         ple_rows: ws.step + layout.ple as u64,
         ple_state: 0,
         spec: None,
-        steer: None,
-        batch: Some(states),
+        steer,
+        batch: Some(segs),
         capture: None,
     };
-    let mut carry = Carry::new(ws, false);
-    for i in 0..model.layers.len() {
+    let mut carry = Carry::new(ws, from_ple);
+    let layers = match part {
+        Part::Whole => 0..model.layers.len(),
+        Part::BeforePle => 0..1,
+        Part::FromPle | Part::Staged => 1..model.layers.len(),
+    };
+    for i in layers {
         layer_forward(i, &model.layers[i], None, None, None, &ctx, &mut carry, None)?;
     }
+    if part == Part::BeforePle {
+        carry.materialize(s, ws, t)?;
+        return Ok(());
+    }
     final_mixer(&model.final_hc, &ctx, &mut carry, None)
+}
+
+/// First half of [`prepare_segments`]: segment b's start at word b, then its tokens and positions
+/// (appended to each state).
+pub fn prepare_segments_tokens(states: &mut [&mut SequenceState], ws: &mut Workspace, tokens: &[&[i32]]) -> Result<()> {
+    let t: usize = tokens.iter().map(|x| x.len()).sum();
+    ensure!((1..=4).contains(&states.len()) && tokens.len() == states.len() && t <= ws.max_tokens, "batch of {} segments, {t} rows", states.len());
+    let layout = StepLayout::new(t);
+    let block = ws.step_host.as_mut_slice();
+    let mut r = 0;
+    for (b, (st, toks)) in states.iter_mut().zip(tokens).enumerate() {
+        let p = st.len();
+        ensure!(!toks.is_empty() && p + toks.len() <= st.capacity, "sequence would exceed its capacity of {}", st.capacity);
+        st.tokens.extend_from_slice(toks);
+        block[4 * b..4 * b + 4].copy_from_slice(&(p as i32).to_le_bytes());
+        for (j, tok) in toks.iter().enumerate() {
+            block[layout.tokens + 4 * (r + j)..layout.tokens + 4 * (r + j) + 4].copy_from_slice(&tok.to_le_bytes());
+            let pos = st.position(p + j);
+            for a in 0..3 {
+                let o = layout.pos + 12 * (r + j) + 4 * a;
+                block[o..o + 4].copy_from_slice(&pos[a].to_le_bytes());
+            }
+        }
+        r += toks.len();
+    }
+    Ok(())
+}
+
+/// Second half of [`prepare_segments`]: the PLE rows of each segment's last `rows[b]` tokens. Returns
+/// the bytes of step block to transfer.
+pub fn prepare_segments_ple(model: &Model, states: &[&SequenceState], ws: &mut Workspace, rows: &[usize]) -> Result<usize> {
+    let t: usize = rows.iter().sum();
+    let layout = StepLayout::new(t);
+    let mut r = 0;
+    for (st, &n) in states.iter().zip(rows) {
+        let o = layout.ple + 2 * D * r;
+        gather_ple(model, st, n, 0, &mut ws.step_host.as_mut_slice()[o..o + 2 * D * n]);
+        r += n;
+    }
+    Ok(layout.used(t))
+}
+
+/// Bytes of step block for a batched step of `t` rows.
+pub fn segments_bytes(t: usize) -> usize {
+    StepLayout::new(t).used(t)
 }
 
 /// Commits a speculative sequence's deferred recurrent state (the accepted tokens of its last round,
@@ -1004,7 +1098,7 @@ struct LayerCtx<'a> {
     steer: Option<(u64, u64, u64, bool, u64)>,
     /// Batched decode: row b is the next token of sequence b (with its start position at
     /// `start + 4 b`); stateful operations run per sequence.
-    batch: Option<&'a [&'a SequenceState]>,
+    batch: Option<&'a [Seg<'a>]>,
     /// Activation capture: (record buffer, row of this step).
     capture: Option<(u64, usize)>,
 }
@@ -1064,10 +1158,16 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
         let spec = ctx.spec.map(|(ctl, rec, defer)| k::Deferral { rec, ctl, defer });
         match ctx.batch {
             None => op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv, ws.xn, ple.conv, ctx.ple_state, ws.h, t, spec)),
-            Some(seqs) => {
-                for (b, st) in seqs.iter().enumerate() {
-                    let row = (b * H * 4) as u64;
-                    op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv + row, ws.xn + row, ple.conv, st.ple_conv.addr(), ws.h + row, 1, None));
+            Some(segs) => {
+                let mut r = 0;
+                for g in segs {
+                    let row = (r * H * 4) as u64;
+                    let spec = g.defer.map(|defer| {
+                        let sp = g.state.spec.as_ref().expect("deferred segment without speculative state");
+                        k::Deferral { rec: sp.ple_rec.addr(), ctl: sp.ctl.addr(), defer }
+                    });
+                    op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv + row, ws.xn + row, ple.conv, g.state.ple_conv.addr(), ws.h + row, g.rows, spec));
+                    r += g.rows;
                 }
             }
         }
@@ -1080,7 +1180,16 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
         if let Some(y) = carry.pending.take() {
             op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, carry.inj, t));
         }
-        op!(prof, "steer", s, k::steer(s, ws.h, t, dirs, ranks, masks, norm_preserve, strength, index));
+        match ctx.batch {
+            None => op!(prof, "steer", s, k::steer(s, ws.h, t, dirs, ranks, masks, norm_preserve, strength, index)),
+            Some(segs) => {
+                let mut r = 0;
+                for g in segs {
+                    op!(prof, "steer", s, k::steer(s, ws.h + (r * H * 4) as u64, g.rows, dirs, ranks, masks, norm_preserve, g.state.steer_strength.addr(), index));
+                    r += g.rows;
+                }
+            }
+        }
     }
     let rec = ctx.capture.filter(|_| index < LAYERS).map(|(buf, row)| (buf + (index * CaptureLayout::BYTES) as u64, row));
     if let Some((buf, row)) = rec {
@@ -1112,11 +1221,17 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
                 (Some((ctl, _, defer)), Some(rec)) => Some(k::Deferral { rec, ctl, defer }),
                 _ => None,
             };
-            if let Some(seqs) = ctx.batch {
-                for (b, sq) in seqs.iter().enumerate() {
-                    let sg = sq.gdn[index].as_ref().expect("GDN layer state");
-                    let (xr, yr) = (x + (b * ld * 4) as u64, ws.o_bf + (b * GDN_Z * 2) as u64);
-                    op!(prof, "gdn_fused_small", s, k::gdn_fused_small(s, xr, ld, 1, g.conv, sg.conv.addr(), sg.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), yr, None));
+            if let Some(segs) = ctx.batch {
+                let mut r = 0;
+                for sgm in segs {
+                    let sg = sgm.state.gdn[index].as_ref().expect("GDN layer state");
+                    let (xr, yr) = (x + (r * ld * 4) as u64, ws.o_bf + (r * GDN_Z * 2) as u64);
+                    let spec = sgm.defer.map(|defer| {
+                        let sp = sgm.state.spec.as_ref().expect("deferred segment without speculative state");
+                        k::Deferral { rec: sp.gdn_rec[index].as_ref().expect("GDN record buffer").addr(), ctl: sp.ctl.addr(), defer }
+                    });
+                    op!(prof, "gdn_fused_small", s, k::gdn_fused_small(s, xr, ld, sgm.rows, g.conv, sg.conv.addr(), sg.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), yr, spec));
+                    r += sgm.rows;
                 }
             } else if t <= k::gemv_max_m() {
                 op!(prof, "gdn_fused_small", s, k::gdn_fused_small(s, x, ld, t, g.conv, st().conv.addr(), st().recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, spec));
@@ -1139,22 +1254,25 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
             let (ld, x) = (q.proj.n, ws.proj);
             let col = |j: usize| x + (q.proj.col(j) * 4) as u64;
             op!(prof, "qsa proj", s, project(s, ws, ws.m, &q.proj, x, t));
-            if let Some(seqs) = ctx.batch {
-                for (b, sq) in seqs.iter().enumerate() {
+            if let Some(segs) = ctx.batch {
+                let mut r = 0;
+                for (b, g) in segs.iter().enumerate() {
+                    let (sq, n) = (g.state, g.rows);
                     let c = sq.qsa[index].as_ref().expect("QSA layer cache");
-                    let (row, start_b, pos3_b) = ((b * ld * 4) as u64, start + 4 * b as u64, sq.pos3.addr());
+                    let (row, start_b, pos3_b) = ((r * ld * 4) as u64, start + 4 * b as u64, sq.pos3.addr());
                     let colr = |j: usize| col(j) + row;
-                    let (qr, iqr) = (ws.q + (b * QSA_HEADS * QSA_DIM * 4) as u64, ws.iq + (b * 4 * INDEX_DIM * 4) as u64);
-                    let (scores, sel) = (ws.scores + (b * ws.score_cols * 4) as u64, ws.sel + (b * TOP_GROUPS * 4) as u64);
-                    let att = ws.att + (b * QSA_HEADS * QSA_DIM * 2) as u64;
-                    op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, colr(0), colr(1), ld, q.q_norm, q.k_norm, qr, c.k.addr(), c.v.addr(), pos3_b, start_b, 1, c.fp8));
-                    op!(prof, "qsa_index_prep", s, k::qsa_index_prep(s, colr(3), ld, q.index_q_norm, iqr, c.raw.addr(), pos3_b, start_b, 1));
-                    op!(prof, "qsa_pool", s, k::qsa_pool(s, c.raw.addr(), q.index_k_norm, c.pooled.addr(), pos3_b, start_b, 1));
+                    let (qr, iqr) = (ws.q + (r * QSA_HEADS * QSA_DIM * 4) as u64, ws.iq + (r * 4 * INDEX_DIM * 4) as u64);
+                    let (scores, sel) = (ws.scores + (r * ws.score_cols * 4) as u64, ws.sel + (r * TOP_GROUPS * 4) as u64);
+                    let att = ws.att + (r * QSA_HEADS * QSA_DIM * 2) as u64;
+                    op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, colr(0), colr(1), ld, q.q_norm, q.k_norm, qr, c.k.addr(), c.v.addr(), pos3_b, start_b, n, c.fp8));
+                    op!(prof, "qsa_index_prep", s, k::qsa_index_prep(s, colr(3), ld, q.index_q_norm, iqr, c.raw.addr(), pos3_b, start_b, n));
+                    op!(prof, "qsa_pool", s, k::qsa_pool(s, c.raw.addr(), q.index_k_norm, c.pooled.addr(), pos3_b, start_b, n));
                     if sq.capacity / 4 > TOP_GROUPS {
-                        op!(prof, "qsa_index_scores", s, k::qsa_index_scores(s, iqr, c.pooled.addr(), scores, ws.score_cols, start_b, 1));
-                        op!(prof, "qsa_select", s, k::qsa_select(s, scores, 1, ws.score_cols, start_b, sel));
+                        op!(prof, "qsa_index_scores", s, k::qsa_index_scores(s, iqr, c.pooled.addr(), scores, ws.score_cols, start_b, n));
+                        op!(prof, "qsa_select", s, k::qsa_select(s, scores, n, ws.score_cols, start_b, sel));
                     }
-                    op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, qr, colr(0), ld, c.k.addr(), c.v.addr(), sel, start_b, 1, c.fp8, ws.att_part, att));
+                    op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, qr, colr(0), ld, c.k.addr(), c.v.addr(), sel, start_b, n, c.fp8, ws.att_part, att));
+                    r += n;
                 }
                 op!(prof, "qsa o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
                 return finish_layer(layer, ctx, carry, prof, None);

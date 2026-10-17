@@ -150,7 +150,7 @@ pub struct Session {
     kv_strength: f32,
     /// Host and disk tiers of stored contexts.
     store: ContextStore,
-    /// The second, plain-decoding slot for a concurrent request.
+    /// The second slot for a concurrent request (speculative or plain, without the prefix cache).
     aux: Option<Aux>,
     /// Activation capture records (two sites x 48 layers), and the prompt_last site of the current run.
     capture_buf: Option<DeviceBuffer>,
@@ -164,6 +164,10 @@ pub struct Session {
 struct Aux {
     state: SequenceState,
     graph: DecodeGraph,
+    dec: SpecDecoder,
+    spec: SpecGraphs,
+    /// Speculative rounds of both slots together.
+    pair: crate::spec::PairGraphs,
     batch: BatchGraph,
     hw2: HeadWorkspace,
     _out2: DeviceBuffer,
@@ -301,7 +305,7 @@ impl Session {
         let dec = SpecDecoder::prefill(model, &mut state, &mut ws, s, &[0], max_drafts, chunk)?;
         let graph = DecodeGraph::capture(model, &state, &ws, &hw, s)?;
         let pen = Penalties::new()?;
-        let spec = SpecGraphs::capture(model, &state, &mut ws, &dec, s, true, Some(pen.addrs()))?;
+        let spec = SpecGraphs::capture(model, &state, &mut ws, &dec, s, true, Some(pen.addrs()), Some(0))?;
         Ok(Self {
             ws,
             state,
@@ -363,15 +367,19 @@ impl Session {
         Ok(Some(CaptureResult { sites: vec![prompt_site, site] }))
     }
 
-    /// Adds the second slot (plain decoding, batched with the main slot when both are busy).
+    /// Adds the second slot: speculative decoding of its own, pair rounds with the main slot when both
+    /// decode speculatively, batched plain steps otherwise.
     pub fn enable_second_slot(&mut self, model: &Model, s: &Stream) -> Result<()> {
-        let mut state = SequenceState::new(self.state.capacity)?;
-        forward::forward(model, &mut state, &mut self.ws, s, &[0])?;
+        let mut state = SequenceState::with_mtp(self.state.capacity, true)?;
+        let dec = SpecDecoder::prefill(model, &mut state, &mut self.ws, s, &[0], self.dec.drafts, self.chunk)?;
         let graph = DecodeGraph::capture(model, &state, &self.ws, &self.hw, s)?;
+        let pen = Penalties::new()?;
+        let spec = SpecGraphs::capture(model, &state, &mut self.ws, &dec, s, true, Some(pen.addrs()), Some(1))?;
+        let pair = crate::spec::PairGraphs::capture(model, [&self.state, &state], &self.ws, s, self.dec.drafts)?;
         let hw2 = HeadWorkspace::new(2, MAX_TOP_K)?;
         let out2 = DeviceBuffer::new(8)?;
         let batch = BatchGraph::capture(model, &[&self.state, &state], &self.ws, &hw2, s, out2.addr())?;
-        self.aux = Some(Aux { state, graph, batch, hw2, _out2: out2, pen: Penalties::new()? });
+        self.aux = Some(Aux { state, graph, dec, spec, pair, batch, hw2, _out2: out2, pen });
         Ok(())
     }
 
@@ -417,9 +425,10 @@ impl Session {
         Ok(spans)
     }
 
-    /// Speculative rounds and accepted drafts of the slot-0 run since its prefill.
-    pub fn spec_stats(&self) -> (usize, usize) {
-        (self.dec.rounds, self.dec.accepted)
+    /// Speculative rounds and accepted drafts of a slot's run since its prefill.
+    pub fn spec_stats(&self, slot: usize) -> (usize, usize) {
+        let dec = if slot == 0 { &self.dec } else { &self.aux.as_ref().expect("second slot").dec };
+        (dec.rounds, dec.accepted)
     }
 
     pub fn has_second_slot(&self) -> bool {
@@ -472,6 +481,26 @@ impl Session {
         // The same step boundaries as a fresh slot-0 prefill (chunks, cut at turn boundaries), so
         // both slots compute identical results for the same prompt.
         let (ws, chunk) = (&mut self.ws, self.chunk);
+        if speculate {
+            let progress = p.progress.as_ref().map(|f| move |pos: usize| (f.0)(pos, 0));
+            let progress = progress.as_ref().map(|f| f as &(dyn Fn(usize) + Send + Sync));
+            let r = with_ple_warm(model, prompt, 0, || aux.dec.prefill_new(model, &mut aux.state, ws, s, prompt, chunk, &p.boundaries, progress));
+            self.ws.capture = None;
+            r?;
+            let aux = self.aux.as_mut().expect("second slot");
+            if p.temperature > 0.0 || aux.pen.active {
+                let logits = aux.dec.last_logits_addr();
+                let aux = self.aux.as_ref().unwrap();
+                let tok = self.sample(s, logits, p, &aux.pen, &mut run.rng)?;
+                self.aux.as_mut().unwrap().dec.next = tok;
+            }
+            let aux = self.aux.as_mut().expect("second slot");
+            aux.spec.set_sampling(s, sampling(p, aux.pen.active))?;
+            aux.spec.penalized = aux.pen.active;
+            aux.spec.restart(&aux.state, &aux.dec, s)?;
+            run.spec = true;
+            return Ok((run, Vec::new()));
+        }
         let r = with_ple_warm(model, prompt, 0, || -> Result<usize> {
             let mut c0 = 0;
             let mut last_rows = 0;
@@ -508,19 +537,43 @@ impl Session {
         if !run.spec {
             return Ok(Vec::new());
         }
-        forward::flush_spec(model, &mut self.state, &self.ws, s)?;
+        let (state, next) = if run.slot == 0 {
+            (&mut self.state, self.dec.next)
+        } else {
+            let aux = self.aux.as_mut().expect("second slot");
+            (&mut aux.state, aux.dec.next)
+        };
+        forward::flush_spec(model, state, &self.ws, s)?;
         run.spec = false;
-        run.pending = self.dec.next;
-        Ok(vec![self.dec.next])
+        run.pending = next;
+        Ok(vec![next])
     }
 
     /// One step of the given runs (one, or one per slot, both plain); returns each run's new tokens.
     pub fn step(&mut self, model: &Model, s: &Stream, runs: &mut [&mut Run]) -> Result<Vec<Vec<i32>>> {
         match runs {
-            [run] if run.spec => {
+            [run] if run.spec && run.slot == 0 => {
                 let committed = self.spec.round(model, &mut self.state, &mut self.ws, &mut self.dec, s)?;
                 self.sync_kv_tokens();
                 Ok(vec![committed])
+            }
+            [run] if run.spec => {
+                let aux = self.aux.as_mut().expect("second slot");
+                Ok(vec![aux.spec.round(model, &mut aux.state, &mut self.ws, &mut aux.dec, s)?])
+            }
+            [a, b] if a.spec && b.spec => {
+                ensure!(a.slot == 0 && b.slot == 1, "pair rounds take slot 0, then slot 1");
+                let aux = self.aux.as_mut().expect("second slot");
+                let [ca, cb] = aux.pair.round(model, &mut self.ws, s, (&mut self.spec, &mut self.state, &mut self.dec), (&mut aux.spec, &mut aux.state, &mut aux.dec))?;
+                self.sync_kv_tokens();
+                Ok(vec![ca, cb])
+            }
+            [a, b] if a.spec || b.spec => {
+                // One run decodes plainly: the speculative one switches to plain steps, emitting the
+                // target's next token now; the batched steps start with the next call.
+                let ta = self.to_plain(model, s, a)?;
+                let tb = self.to_plain(model, s, b)?;
+                Ok(vec![ta, tb])
             }
             [run] => {
                 if run.slot == 0 {

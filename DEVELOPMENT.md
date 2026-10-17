@@ -41,7 +41,8 @@ quench6k vision-check --model $M --reference out/vision/shapes
 
 Changes that are meant to be exact must leave the `score` outputs byte-identical; changes to
 numerics must pass `gate`. `spec-check` requires speculative greedy decoding to match plain greedy
-decoding token for token.
+decoding token for token; `batch-check` requires the same of batched plain steps and of speculative
+pair rounds (two sequences).
 
 ## Kernel iteration
 
