@@ -6,6 +6,7 @@
   `quench6k bench --ctx N` uses its first N tokens. The text is tiled, so long prompts repeat it and
   MTP acceptance on it is high.
 - `results.jsonl`: quench6k measurements, written by `quench6k bench --json`.
+- `radixark.jsonl`: quench6k on the RadixArk/Qwen3.8-Flash-Next-NVFP4 checkpoint (not in the chart).
 - `ninfer-6000.jsonl`: NInfer 6000 measurements on the same machine (8-bit variant, BF16 KV, 600 W).
 - `results.svg`: rendered from both by `crates/benchplot` (see [DEVELOPMENT.md](../DEVELOPMENT.md)).
 
