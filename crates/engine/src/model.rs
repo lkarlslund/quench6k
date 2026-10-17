@@ -150,6 +150,7 @@ impl PleTable {
             let map = unsafe { Mmap::map(&file.file) }.with_context(|| format!("mapping {}", file.path.display()))?;
             // Rows are read at random: without this every fault also reads ahead ~128 KiB around a
             // 320-byte row, and cold prompts become bound by disk bandwidth.
+            #[cfg(unix)]
             map.advise(memmap2::Advice::Random).context("madvise(MADV_RANDOM) on the PLE table")?;
             maps.push((map, info.offset as usize));
         }
@@ -159,9 +160,14 @@ impl PleTable {
     /// Asks the kernel to start reading row `r` from disk if it is not resident, so that a batch of cold
     /// rows is fetched in parallel instead of one page fault at a time.
     pub fn prefetch(&self, r: usize) {
-        let (map, base) = &self.maps[r / self.rows_per_shard];
-        let start = base + (r % self.rows_per_shard) * Self::WIDTH * 2;
-        let _ = map.advise_range(memmap2::Advice::WillNeed, start, Self::WIDTH * 2);
+        #[cfg(unix)]
+        {
+            let (map, base) = &self.maps[r / self.rows_per_shard];
+            let start = base + (r % self.rows_per_shard) * Self::WIDTH * 2;
+            let _ = map.advise_range(memmap2::Advice::WillNeed, start, Self::WIDTH * 2);
+        }
+        #[cfg(not(unix))]
+        let _ = r;
     }
 
     /// Reads row `r`, faulting it into the page cache (blocking).

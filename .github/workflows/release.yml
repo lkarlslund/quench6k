@@ -69,6 +69,8 @@ jobs:
           ci/fetch-cuda.sh "$CUDA_VERSION" "${{ matrix.cuda }}" "$dir"
           echo "CUDA_HOME=$dir" >> "$GITHUB_ENV"
       - name: Build
+        # PowerShell on Windows: Git Bash's /usr/bin/link would shadow MSVC's link.exe.
+        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
         run: cargo build --release --locked -p quench6k-cli
       - name: Package
         run: |
