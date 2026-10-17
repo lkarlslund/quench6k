@@ -260,4 +260,4 @@ rules are specified in detail at M10.
 | positions | per position, 3 axes | needed for the indexer's group RoPE |
 
 Speculative decoding must be able to roll this state back to any accepted prefix of a draft. The
-context cache (GOAL.md §3) snapshots exactly this set.
+context cache (dev/GOAL.md §3) snapshots exactly this set.

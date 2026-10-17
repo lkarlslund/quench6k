@@ -18,10 +18,53 @@ pub(crate) fn prompt(len: usize) -> Result<Vec<i32>> {
     Ok(ids)
 }
 
+/// Where `bench --json` appends its records, and the run's KV format.
+pub struct JsonOut {
+    pub path: std::path::PathBuf,
+    pub kv: String,
+}
+
+impl JsonOut {
+    /// Appends one record: a measurement at one context.
+    #[allow(clippy::too_many_arguments)]
+    fn record(&self, mode: &str, drafts: usize, adaptive: bool, ctx: usize, generate: usize, prefill: f64, decode: f64, per_round: Option<f64>) -> Result<()> {
+        use std::io::Write;
+        let rec = serde_json::json!({"engine": "quench6k", "date": utc_date(), "mode": mode, "drafts": drafts, "adaptive": adaptive, "kv": self.kv,
+                                     "ctx": ctx, "generate": generate, "prefill_tok_s": (prefill * 10.0).round() / 10.0, "decode_tok_s": (decode * 10.0).round() / 10.0,
+                                     "tokens_per_round": per_round.map(|r| (r * 100.0).round() / 100.0)});
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+        writeln!(f, "{rec}")?;
+        Ok(())
+    }
+}
+
+/// The contexts to measure, each after an unreported warm-up run at the same context: the first run
+/// pays for lazy initialization, and the tokens a run generates have their embedding rows read from
+/// the checkpoint (the page cache keeps them for the measured run, as a running server does).
+fn with_warmup(contexts: &[usize]) -> Vec<(usize, bool)> {
+    contexts.iter().flat_map(|&c| [(c, false), (c, true)]).collect()
+}
+
+/// Today's UTC date, YYYY-MM-DD.
+fn utc_date() -> String {
+    let days = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() / 86_400) as i64;
+    // Days since 1970-01-01 to a civil date (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, profile: bool, ncu_steps: usize, mtp: usize, adaptive: bool) -> Result<()> {
+pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, profile: bool, ncu_steps: usize, mtp: usize, adaptive: bool, json: Option<&JsonOut>) -> Result<()> {
     if mtp > 0 {
-        return run_mtp(model_dir, precision, contexts, generate, chunk, mtp, adaptive, ncu_steps);
+        return run_mtp(model_dir, precision, contexts, generate, chunk, mtp, adaptive, ncu_steps, json);
     }
     let (model, stream) = crate::load(model_dir, precision, false)?;
     let capacity = contexts.iter().max().copied().unwrap_or(0) + generate + 16 + ncu_steps;
@@ -30,7 +73,7 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
 
     sanity(&model, &stream, chunk)?;
     println!("{:>8} {:>14} {:>14}", "context", "prefill tok/s", "decode tok/s");
-    for &ctx in contexts {
+    for (ctx, report) in with_warmup(contexts) {
         let tokens = prompt(ctx)?;
         let mut state = SequenceState::new(ctx + generate + 16 + ncu_steps)?;
         let t0 = Instant::now();
@@ -55,18 +98,24 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let decode = runs[1];
         let generate = 3 * per_run;
-        if ncu_steps > 0 {
+        if ncu_steps > 0 && report {
             quench6k_cuda::profiler_start()?;
             for _ in 0..ncu_steps {
                 next = graph.step(&model, &mut state, &mut ws, &hw, &stream, next)?;
             }
             quench6k_cuda::profiler_stop()?;
         }
+        if !report {
+            continue;
+        }
         println!(
             "{ctx:>8} {prefill:>14.1} {decode:>14.1}   per token: host prepare {:.3} ms, graph {:.3} ms",
             1e3 * times[0] / generate as f64,
             1e3 * times[1] / generate as f64
         );
+        if let Some(j) = json {
+            j.record("plain", 0, false, ctx, generate, prefill, decode, None)?;
+        }
         if profile {
             const STEPS: usize = 16;
             let mut prof = quench6k_engine::profile::Profiler::default();
@@ -119,7 +168,7 @@ fn sanity(model: &quench6k_engine::model::Model, stream: &quench6k_cuda::Stream,
 /// MTP speculative decoding benchmark: prefill, then greedy draft-and-verify rounds as CUDA graphs.
 /// The sanity check runs the same path on the code fixture against its reference tokens first.
 #[allow(clippy::too_many_arguments)]
-fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, drafts: usize, adaptive: bool, ncu_rounds: usize) -> Result<()> {
+fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, drafts: usize, adaptive: bool, ncu_rounds: usize, json: Option<&JsonOut>) -> Result<()> {
     use quench6k_engine::spec::{SpecDecoder, SpecGraphs};
     let (model, stream) = crate::load(model_dir, precision, true)?;
     let max_ctx = contexts.iter().max().copied().unwrap_or(0).max(512);
@@ -150,7 +199,7 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
     }
 
     println!("{:>8} {:>14} {:>14} {:>16}", "context", "prefill tok/s", "decode tok/s", "tokens/round");
-    for &ctx in contexts {
+    for (ctx, report) in with_warmup(contexts) {
         let tokens = prompt(ctx)?;
         let mut state = SequenceState::with_mtp(ctx + generate + slack, true)?;
         let t0 = Instant::now();
@@ -164,11 +213,17 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         }
         let decode = produced as f64 / t1.elapsed().as_secs_f64();
         let per_round = produced as f64 / dec.rounds as f64;
+        if !report {
+            continue;
+        }
         println!(
             "{ctx:>8} {prefill:>14.1} {decode:>14.1} {per_round:>16.2}   per round: draft {:.3} ms, verify {:.3} ms",
             1e3 * dec.draft_secs / dec.rounds as f64,
             1e3 * dec.verify_secs / dec.rounds as f64
         );
+        if let Some(j) = json {
+            j.record("mtp", drafts, adaptive, ctx, produced, prefill, decode, Some(per_round))?;
+        }
         if ncu_rounds > 0 {
             quench6k_cuda::profiler_start()?;
             for _ in 0..ncu_rounds {

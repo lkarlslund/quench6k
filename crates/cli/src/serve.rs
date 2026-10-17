@@ -49,7 +49,8 @@ pub fn model_id(model_dir: &std::path::Path) -> String {
     let config = std::fs::read(model_dir.join("config.json")).unwrap_or_default();
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let kv: &[u8] = if quench6k_engine::forward::KV_FP8.load(std::sync::atomic::Ordering::Relaxed) { b"/kv8" } else { b"" };
-    for b in config.iter().chain(b"int8g/quench6k-1".iter()).chain(kv) {
+    // "squash" is the project's former name, kept so stored contexts stay valid.
+    for b in config.iter().chain(b"int8g/squash-1".iter()).chain(kv) {
         h ^= *b as u64;
         h = h.wrapping_mul(0x100_0000_01b3);
     }

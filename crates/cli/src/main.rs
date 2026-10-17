@@ -129,7 +129,7 @@ enum Command {
         #[command(flatten)]
         steer: SteerArgs,
     },
-    /// Greedy generation from each fixture prompt, checked against the fixture sequence (GOAL.md §1).
+    /// Greedy generation from each fixture prompt, checked against the fixture sequence (dev/GOAL.md §1).
     Generate {
         #[arg(long)]
         model: PathBuf,
@@ -177,7 +177,7 @@ enum Command {
         #[command(flatten)]
         steer: SteerArgs,
     },
-    /// OpenAI-compatible HTTP server (/v1/models, /v1/chat/completions with streaming and tool calls).
+    /// HTTP server: OpenAI (/v1/chat/completions, /v1/models) and Anthropic (/v1/messages) APIs.
     Serve {
         #[arg(long)]
         model: PathBuf,
@@ -186,7 +186,7 @@ enum Command {
         /// Longest prompt + completion in tokens.
         #[arg(long, default_value_t = 65536)]
         context: usize,
-        /// Longest speculative draft (adaptive 1..=N) for greedy requests.
+        /// Longest speculative draft (adaptive 1..=N).
         #[arg(long, default_value_t = 6)]
         drafts: usize,
         /// Model name reported by /v1/models.
@@ -280,8 +280,11 @@ enum Command {
         /// With --mtp N: choose each round's draft length in 1..=N from the observed acceptance.
         #[arg(long)]
         adaptive: bool,
+        /// Append one JSON record per context to this file (JSON lines; see bench/README.md).
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
-    /// Kernel variant benchmark on a truncated model (docs/KBENCH.md): bitwise check and paired timing
+    /// Kernel variant benchmark on a truncated model (dev/KBENCH.md): bitwise check and paired timing
     /// of each configuration against the baseline.
     Kbench {
         #[arg(long)]
@@ -348,7 +351,7 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         profile_rounds: usize,
     },
-    /// Apply the correctness gate (GOAL.md §1) to teacher-forced candidate distributions.
+    /// Apply the correctness gate (dev/GOAL.md §1) to teacher-forced candidate distributions.
     Gate {
         /// Fixture root containing one directory per fixture.
         #[arg(long, default_value = "oracle/fixtures")]
@@ -417,7 +420,10 @@ fn main() -> Result<()> {
         Command::Generate { model, precision, fixture, tie, steer } => generate(&model, precision.into(), &fixture, tie, &steer)?,
         Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
         Command::SpecCheck { model, precision, fixture, n, drafts, chunk, graphs, adaptive, profile_rounds, steer } => mtp::check(&model, precision.into(), &fixture, n, drafts, chunk, graphs, adaptive, profile_rounds, &steer)?,
-        Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps, mtp, adaptive } => bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps, mtp, adaptive)?,
+        Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps, mtp, adaptive, json } => {
+            let out = json.map(|path| bench::JsonOut { path, kv: cli.kv.clone() });
+            bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps, mtp, adaptive, out.as_ref())?
+        }
         Command::Kbench { model, layers, ctx, rows, steps, pairs, chunk, variant, sweep } => {
             let fixed = variant.iter().map(|v| kbench::parse_fixed(v)).collect::<Result<_>>()?;
             let sweep = sweep.iter().map(|v| kbench::parse_sweep(v)).collect::<Result<_>>()?;

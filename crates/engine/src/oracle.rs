@@ -1,4 +1,4 @@
-//! Oracle distributions (`oracle.distributions/1`) and the correctness gate of GOAL.md §1.
+//! Oracle distributions (`oracle.distributions/1`) and the correctness gate of dev/GOAL.md §1.
 //!
 //! A distribution file pair `<stem>.json` + `<stem>.bin` describes, for each of `positions` P
 //! teacher-forced positions, the log-sum-exp of the logits, the logit of the sequence's next token,
@@ -109,7 +109,7 @@ pub struct FixtureVerdict {
     pub pass: bool,
 }
 
-/// Applies the GOAL.md gate to a teacher-forced candidate against fixture references A and B.
+/// Applies the dev/GOAL.md gate to a teacher-forced candidate against fixture references A and B.
 pub fn gate(fixture: &Path, candidate: &Distributions) -> Result<FixtureVerdict> {
     let a = Distributions::load(&fixture.join("llama-w4a4"))?;
     let b = Distributions::load(&fixture.join("llama-q8"))?;

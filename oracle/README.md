@@ -1,6 +1,6 @@
 # Oracle fixtures
 
-Reference token distributions for the correctness gate in [GOAL.md](../GOAL.md). Each fixture
+Reference token distributions for the correctness gate in [dev/GOAL.md](../dev/GOAL.md). Each fixture
 directory holds:
 
 - `fixture.json`: prompt token IDs; `spec.json`: the rendered prompt text and generation settings;

@@ -1,4 +1,4 @@
-//! Fast kernel benchmarking on a truncated model (docs/KBENCH.md): the first K layers with real weights,
+//! Fast kernel benchmarking on a truncated model (dev/KBENCH.md): the first K layers with real weights,
 //! a real prefilled context, and a decode step of R rows captured as a CUDA graph per kernel variant.
 //! Each variant is checked bit for bit against the baseline (hashes of the final hidden state and the
 //! residual stream after every replay) and timed against it in alternating pairs.

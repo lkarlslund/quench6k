@@ -165,7 +165,7 @@ pub mod ffi {
 pub mod bf16;
 pub mod kernels;
 
-/// Runtime kernel variants (docs/KBENCH.md): tuning keys that kernel launchers read when they launch
+/// Runtime kernel variants (dev/KBENCH.md): tuning keys that kernel launchers read when they launch
 /// (for CUDA graphs: at capture). Unset keys keep the engine's normal behaviour.
 pub mod variants {
     /// Sets `key` (e.g. "gemv.warps") to `value` for launches from now on.

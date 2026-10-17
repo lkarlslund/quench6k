@@ -157,7 +157,7 @@ cudaError_t launch_one(const __nv_bfloat16* X, int ldx, const uint8_t* W, const 
     return cudaSuccess;
 }
 
-// Variants (kbench, docs/KBENCH.md) for decode (M = 1) and verify rounds (M = 4): gemv.pre in {3, 5, 8},
+// Variants (kbench, dev/KBENCH.md) for decode (M = 1) and verify rounds (M = 4): gemv.pre in {3, 5, 8},
 // gemv.warps in {4, 8, 16}, gemv.rows in {1, 2, 4} (0: the default choice below).
 template <WFmt F, int M, int R>
 cudaError_t launch_r(int pre, int nw, const __nv_bfloat16* X, int ldx, const uint8_t* W, const float* scale, float* Y, int ldy,

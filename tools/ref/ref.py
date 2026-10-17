@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent PyTorch reference of SPEC.md for Qwen3.8 Flash-Next (text model).
+"""Independent PyTorch reference of dev/SPEC.md for Qwen3.8 Flash-Next (text model).
 
 It runs a whole token sequence through the model one layer at a time (teacher forcing), streaming
 each layer's weights from the safetensors checkpoint, so the GPU only ever holds one layer. All
