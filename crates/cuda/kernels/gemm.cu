@@ -271,15 +271,15 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
     static bool configured = false;
     static int sms = 0;
     if (!configured) {
-        for (auto kern : {gemm_kernel<OutT, 0>, gemm_kernel<OutT, 3>}) {
+        for (const void* kern : {(const void*)gemm_kernel<OutT, 0>, (const void*)gemm_kernel<OutT, 3>}) {
             const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GEMM_SMEM);
             if (e != cudaSuccess) return e;
         }
-        for (auto kern : {gemm_kernel<OutT, 0, false, 2>, gemm_kernel<OutT, 3, false, 2>}) {
+        for (const void* kern : {(const void*)gemm_kernel<OutT, 0, false, 2>, (const void*)gemm_kernel<OutT, 3, false, 2>}) {
             const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gemm_smem_bytes(2));
             if (e != cudaSuccess) return e;
         }
-        for (auto kern : {gemm_kernel<OutT, 0, false, 3, 128, 256>, gemm_kernel<OutT, 3, false, 3, 128, 256>}) {
+        for (const void* kern : {(const void*)gemm_kernel<OutT, 0, false, 3, 128, 256>, (const void*)gemm_kernel<OutT, 3, false, 3, 128, 256>}) {
             const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gemm_smem_bytes(3, 256, 128));
             if (e != cudaSuccess) return e;
         }
@@ -455,7 +455,7 @@ extern "C" cudaError_t quench6k_gemm_bf16_f32_split(int fmt, const void* X, int 
     if (M == 0 || N == 0) return cudaSuccess;
     static bool configured = false;
     if (!configured) {
-        for (auto kern : {gemm_kernel<float, 0>, gemm_kernel<float, 3>}) {
+        for (const void* kern : {(const void*)gemm_kernel<float, 0>, (const void*)gemm_kernel<float, 3>}) {
             const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GEMM_SMEM);
             if (e != cudaSuccess) return e;
         }
@@ -483,7 +483,7 @@ extern "C" cudaError_t quench6k_gemm_hc_up_mix(int fmt, const void* X, int ldx, 
     if (M == 0) return cudaSuccess;
     static bool configured = false;
     if (!configured) {
-        for (auto kern : {gemm_kernel<float, 0, true, 3>, gemm_kernel<float, 3, true, 3>}) {
+        for (const void* kern : {(const void*)gemm_kernel<float, 0, true, 3>, (const void*)gemm_kernel<float, 3, true, 3>}) {
             const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GEMM_SMEM);
             if (e != cudaSuccess) return e;
         }

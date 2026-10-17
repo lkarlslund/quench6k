@@ -1064,7 +1064,7 @@ extern "C" cudaError_t quench6k_qsa_attention(const float* q, const float* qg, i
     if (T == 0) return cudaSuccess;
     static bool configured = false;
     if (!configured) {
-        for (auto kern : {attention_mma_kernel<false>, attention_mma_kernel<true>}) {
+        for (const void* kern : {(const void*)attention_mma_kernel<false>, (const void*)attention_mma_kernel<true>}) {
             const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)MMA_ATT_SMEM);
             if (e != cudaSuccess) return e;
         }
@@ -1073,7 +1073,7 @@ extern "C" cudaError_t quench6k_qsa_attention(const float* q, const float* qg, i
     if (std::getenv("QUENCH6K_ATT_SINGLE") == nullptr) {
         static bool mq_configured = false;
         if (!mq_configured) {
-            for (auto kern : {attention_mq_kernel<false>, attention_mq_kernel<true>}) {
+            for (const void* kern : {(const void*)attention_mq_kernel<false>, (const void*)attention_mq_kernel<true>}) {
                 const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)MQ_SMEM);
                 if (e != cudaSuccess) return e;
             }
