@@ -12,6 +12,18 @@ Development commands (`score`, `gate`, `generate`, `spec-check`, `batch-check`, 
 `kbench`, `mtp-probe`, `load`) are described in [DEVELOPMENT.md](DEVELOPMENT.md). Every command
 prints its options with `--help`.
 
+## Checkpoints
+
+ModelOpt NVFP4 exports that quantize only the routed experts of the 48 text layers and keep every
+other tensor in BF16; the PLE n-gram table may be BF16 or FP8 E4M3 with a scale (Qwen's FP8 table).
+
+| Checkpoint | |
+|---|---|
+| [ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) | The correctness gate's reference model (a finetune) |
+| [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | Qwen's model; FP8 PLE table |
+
+Not supported: quantized attention or shared experts, compressed-tensors exports, GGUF.
+
 ## Server options
 
 | Option | Default | |

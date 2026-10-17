@@ -75,7 +75,9 @@ pub fn upload_quantized(
     let is_mx8 = |group: Option<&str>| mx8_on && group.is_some_and(|g| g.ends_with(".linear_attn.quench6k.in_proj"));
     let scale_bytes = |mx8: bool, rows: usize, kk: usize| if mx8 { rows * kk / 32 } else { rows * (kk / k::int8_group()) * 4 };
 
-    // Units of contiguous placement: a group's members, or a single tensor.
+    // Units of contiguous placement: a group's members, or a single tensor. Units are uploaded in
+    // batches per checkpoint file (a group with the file of its first member; the others are read
+    // from wherever they are).
     let mut grouped = std::collections::HashSet::new();
     let mut units: Vec<Vec<usize>> = vec![Vec::new(); ckpt.files.len()];
     let mut unit_list: Vec<(Option<&str>, Vec<&str>)> = Vec::new();
@@ -86,7 +88,7 @@ pub fn upload_quantized(
         for m in members {
             anyhow::ensure!(select(m), "fusion group {name}: member {m} is not selected for quantization");
             let info = ckpt.get(m)?;
-            anyhow::ensure!(info.file == file && info.shape[1] == kk, "fusion group {name}: members differ in file or K");
+            anyhow::ensure!(info.shape[1] == kk, "fusion group {name}: members differ in K");
             grouped.insert(m.as_str());
         }
         units[file].push(unit_list.len());

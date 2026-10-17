@@ -77,7 +77,7 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
     let mut ws = Workspace::for_model(&model, chunk, capacity)?;
     let hw = HeadWorkspace::new(1, 1)?;
 
-    sanity(&model, &stream, chunk)?;
+    sanity(model_dir, &model, &stream, chunk)?;
     println!("{:>8} {:>14} {:>14}", "context", "prefill tok/s", "decode tok/s");
     for (ctx, report) in with_warmup(contexts) {
         let tokens = prompt(ctx)?;
@@ -137,22 +137,55 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
     Ok(())
 }
 
-/// Before timing anything, decodes the `code` fixture with the same prefill + graph path that is
-/// benchmarked and checks the greedy tokens against the reference sequence (which quench6k reproduces
-/// exactly under the correctness gate). Fails the benchmark on a mismatch.
-fn sanity(model: &quench6k_engine::model::Model, stream: &quench6k_cuda::Stream, chunk: usize) -> Result<()> {
+/// Greedy tokens of the sanity check.
+const CHECK: usize = 64;
+
+/// The `code` fixture's prompt and the CHECK greedy tokens the benchmarked paths must reproduce, and
+/// what they are. For the oracle's checkpoint (identified by its config.json) they are the fixture's
+/// reference sequence, which quench6k reproduces exactly under the correctness gate; for any other
+/// checkpoint they come from eager decoding (one forward pass per token, no CUDA graphs, no MTP).
+fn reference(model_dir: &Path, model: &quench6k_engine::model::Model, stream: &quench6k_cuda::Stream, chunk: usize) -> Result<(Vec<i32>, Vec<i32>, &'static str)> {
     #[derive(serde::Deserialize)]
     struct Sequence {
         tokens: Vec<i32>,
         prompt_len: usize,
     }
-    const CHECK: usize = 64;
     let seq: Sequence = serde_json::from_slice(&std::fs::read("oracle/fixtures/code/sequence.json")?)?;
-    let prompt = &seq.tokens[..seq.prompt_len];
-    let want = &seq.tokens[seq.prompt_len..seq.prompt_len + CHECK];
-    let mut ws = Workspace::for_model(&model, chunk, seq.tokens.len())?;
+    let prompt = seq.tokens[..seq.prompt_len].to_vec();
+    let config = std::fs::read(model_dir.join("config.json"))?;
+    if fnv(&config) == ORACLE_CONFIG_FNV {
+        return Ok((prompt, seq.tokens[seq.prompt_len..seq.prompt_len + CHECK].to_vec(), "the reference"));
+    }
+    let mut ws = Workspace::for_model(model, chunk, prompt.len() + CHECK + 1)?;
     let hw = HeadWorkspace::new(1, 1)?;
-    let mut state = SequenceState::new(seq.tokens.len())?;
+    let mut state = SequenceState::new(prompt.len() + CHECK + 1)?;
+    for c in prompt.chunks(chunk) {
+        forward::forward(model, &mut state, &mut ws, stream, c)?;
+    }
+    let last = ws.out + (((prompt.len() - 1) % chunk) * D * 2) as u64;
+    let mut want = vec![forward::head_stats(model, &hw, stream, last, &[0], 1)?.top_ids[0]];
+    while want.len() < CHECK {
+        forward::forward(model, &mut state, &mut ws, stream, &[*want.last().unwrap()])?;
+        want.push(forward::head_stats(model, &hw, stream, ws.out, &[0], 1)?.top_ids[0]);
+    }
+    Ok((prompt, want, "eager decoding (this checkpoint is not the oracle's)"))
+}
+
+/// FNV-1a of the oracle checkpoint's config.json (ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4).
+const ORACLE_CONFIG_FNV: u64 = 0x312a_2326_caf4_35b3;
+
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+/// Before timing anything, decodes the `code` fixture with the same prefill + graph path that is
+/// benchmarked and checks the greedy tokens against [`reference`]. Fails the benchmark on a mismatch.
+fn sanity(model_dir: &Path, model: &quench6k_engine::model::Model, stream: &quench6k_cuda::Stream, chunk: usize) -> Result<()> {
+    let (prompt, want, what) = reference(model_dir, model, stream, chunk)?;
+    let prompt = &prompt[..];
+    let mut ws = Workspace::for_model(model, chunk, prompt.len() + CHECK + 1)?;
+    let hw = HeadWorkspace::new(1, 1)?;
+    let mut state = SequenceState::new(prompt.len() + CHECK + 1)?;
     for c in prompt.chunks(chunk) {
         forward::forward(model, &mut state, &mut ws, stream, c)?;
     }
@@ -164,9 +197,9 @@ fn sanity(model: &quench6k_engine::model::Model, stream: &quench6k_cuda::Stream,
         got.push(next);
         next = graph.step(model, &mut state, &mut ws, &hw, stream, next)?;
     }
-    match got.iter().zip(want).position(|(a, b)| a != b) {
-        None => println!("sanity: {CHECK}/{CHECK} greedy tokens of the code fixture match the reference"),
-        Some(i) => anyhow::bail!("sanity check failed: greedy token {i} is {} where the reference has {}", got[i], want[i]),
+    match got.iter().zip(&want).position(|(a, b)| a != b) {
+        None => println!("sanity: {CHECK}/{CHECK} greedy tokens of the code fixture match {what}"),
+        Some(i) => anyhow::bail!("sanity check failed: greedy token {i} is {} where {what} has {}", got[i], want[i]),
     }
     Ok(())
 }
@@ -184,17 +217,12 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
     let slack = (ncu_rounds + 4) * (drafts + 1) + 16;
     let mut ws = Workspace::for_model(&model, chunk, max_ctx + generate + slack)?;
 
-    // Sanity: speculative greedy tokens of the code fixture equal its reference.
+    // Sanity: speculative greedy tokens of the code fixture equal the reference (sampled runs: through
+    // the sampling kernels with top_k 1).
     {
-        #[derive(serde::Deserialize)]
-        struct Sequence {
-            tokens: Vec<i32>,
-            prompt_len: usize,
-        }
-        const CHECK: usize = 64;
-        let seq: Sequence = serde_json::from_slice(&std::fs::read("oracle/fixtures/code/sequence.json")?)?;
-        let mut state = SequenceState::with_mtp(seq.tokens.len() + slack, true)?;
-        let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &stream, &seq.tokens[..seq.prompt_len], drafts, chunk)?;
+        let (prompt, want, what) = reference(model_dir, &model, &stream, chunk)?;
+        let mut state = SequenceState::with_mtp(prompt.len() + CHECK + slack, true)?;
+        let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &stream, &prompt, drafts, chunk)?;
         let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive, None)?;
         if sampled {
             g.set_sampling(&stream, Some(Sampling { top_k: 1, ..defaults(1) }))?;
@@ -203,10 +231,9 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         while got.len() < CHECK {
             got.extend(g.round(&model, &mut state, &mut ws, &mut dec, &stream)?);
         }
-        let want = &seq.tokens[seq.prompt_len..seq.prompt_len + CHECK];
-        match got.iter().zip(want).position(|(a, b)| a != b) {
-            None => println!("sanity: {CHECK}/{CHECK} speculative greedy tokens of the code fixture match the reference"),
-            Some(i) => anyhow::bail!("sanity check failed: speculative token {i} is {} where the reference has {}", got[i], want[i]),
+        match got.iter().zip(&want).position(|(a, b)| a != b) {
+            None => println!("sanity: {CHECK}/{CHECK} speculative greedy tokens of the code fixture match {what}"),
+            Some(i) => anyhow::bail!("sanity check failed: speculative token {i} is {} where {what} has {}", got[i], want[i]),
         }
     }
 

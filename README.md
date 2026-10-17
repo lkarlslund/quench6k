@@ -1,9 +1,8 @@
 # quench6k
 
-An inference engine for one model on one GPU: Qwen3.8 Flash-Next 125B-A6B
-([ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4))
-on an NVIDIA RTX PRO 6000 Blackwell (96 GB). Rust host code, hand-written CUDA kernels for `sm_120a`,
-weights loaded directly from the NVFP4 safetensors checkpoint.
+An inference engine for one model on one GPU: Qwen3.8 Flash-Next 125B-A6B in NVFP4 on an NVIDIA RTX
+PRO 6000 Blackwell (96 GB). Rust host code, hand-written CUDA kernels for `sm_120a`, weights loaded
+directly from the safetensors checkpoint ([supported checkpoints](DOCS.md#checkpoints)).
 
 [![Decode and prefill throughput by context length](bench/results.svg)](BENCHMARK.md)
 
@@ -32,7 +31,7 @@ cargo build --release
 ## Run
 
 ```
-quench6k serve --model /path/to/Swift-1.5-Qwen3.8-Flash-Next-NVFP4 --listen 0.0.0.0:8003 \
+quench6k serve --model /path/to/Qwen3.8-Flash-Next-NVFP4 --listen 0.0.0.0:8003 \
     --context 262144 --kv fp8 --cache-dir ~/.cache/quench6k
 ```
 

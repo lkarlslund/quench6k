@@ -121,10 +121,13 @@ pub struct Layer {
     pub ple: Option<Ple>,
 }
 
-/// The host-resident PLE table: 128 memory-mapped shards of `[rows, 160]` BF16.
+/// The host-resident PLE table: 128 memory-mapped shards of `[rows, 160]`, BF16 or FP8 E4M3 with a
+/// scale for the whole table (as in Qwen's FP8 release); FP8 rows are dequantized to BF16 when gathered.
 pub struct PleTable {
     maps: Vec<(Mmap, usize)>,
     rows_per_shard: usize,
+    /// FP8 tables: each code's value times the table scale.
+    fp8: Option<Box<[f32; 256]>>,
 }
 
 impl PleTable {
@@ -139,12 +142,28 @@ impl PleTable {
             .collect();
         shards.sort();
         ensure!(!shards.is_empty(), "checkpoint has no PLE table");
+        let dtype = ckpt.get(shards[0].1)?.dtype;
+        let fp8 = match dtype {
+            DType::BF16 => None,
+            DType::F8E4M3 => {
+                let name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale";
+                let info = ckpt.get(name).context("FP8 PLE table without a weight_scale")?;
+                let b = ckpt.read(name)?;
+                let scale = match (info.dtype, b.len()) {
+                    (DType::BF16, 2) => f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16),
+                    (DType::F32, 4) => f32::from_le_bytes(b[..4].try_into().unwrap()),
+                    _ => anyhow::bail!("{name}: expected one BF16 or F32 value"),
+                };
+                Some(Box::new(std::array::from_fn(|c| e4m3(c as u8) * scale)))
+            }
+            other => anyhow::bail!("PLE table: {other:?} is not supported (BF16 or F8_E4M3)"),
+        };
         let mut maps = Vec::with_capacity(shards.len());
         let mut rows_per_shard = 0;
         for (i, (index, name)) in shards.iter().enumerate() {
             ensure!(*index == i, "PLE shard {i} missing");
             let info = ckpt.get(name)?;
-            ensure!(info.dtype == DType::BF16 && info.shape[1] == Self::WIDTH, "{name}: unexpected PLE shard layout");
+            ensure!(info.dtype == dtype && info.shape[1] == Self::WIDTH, "{name}: unexpected PLE shard layout");
             rows_per_shard = info.shape[0];
             let file = &ckpt.files[info.file];
             let map = unsafe { Mmap::map(&file.file) }.with_context(|| format!("mapping {}", file.path.display()))?;
@@ -154,7 +173,12 @@ impl PleTable {
             map.advise(memmap2::Advice::Random).context("madvise(MADV_RANDOM) on the PLE table")?;
             maps.push((map, info.offset as usize));
         }
-        Ok(Self { maps, rows_per_shard })
+        Ok(Self { maps, rows_per_shard, fp8 })
+    }
+
+    /// Bytes per row.
+    fn row_bytes(&self) -> usize {
+        Self::WIDTH * if self.fp8.is_some() { 1 } else { 2 }
     }
 
     /// Asks the kernel to start reading row `r` from disk if it is not resident, so that a batch of cold
@@ -163,8 +187,8 @@ impl PleTable {
         #[cfg(unix)]
         {
             let (map, base) = &self.maps[r / self.rows_per_shard];
-            let start = base + (r % self.rows_per_shard) * Self::WIDTH * 2;
-            let _ = map.advise_range(memmap2::Advice::WillNeed, start, Self::WIDTH * 2);
+            let start = base + (r % self.rows_per_shard) * self.row_bytes();
+            let _ = map.advise_range(memmap2::Advice::WillNeed, start, self.row_bytes());
         }
         #[cfg(not(unix))]
         let _ = r;
@@ -173,18 +197,41 @@ impl PleTable {
     /// Reads row `r`, faulting it into the page cache (blocking).
     pub fn touch(&self, r: usize) -> u8 {
         let (map, base) = &self.maps[r / self.rows_per_shard];
-        let start = base + (r % self.rows_per_shard) * Self::WIDTH * 2;
+        let start = base + (r % self.rows_per_shard) * self.row_bytes();
         // The row may straddle a page boundary.
-        unsafe { std::ptr::read_volatile(&map[start]) ^ std::ptr::read_volatile(&map[start + Self::WIDTH * 2 - 1]) }
+        unsafe { std::ptr::read_volatile(&map[start]) ^ std::ptr::read_volatile(&map[start + self.row_bytes() - 1]) }
     }
 
     /// Appends row `r` (160 BF16 values) to `out`.
     pub fn gather(&self, r: usize, out: &mut Vec<u16>) {
         let (map, base) = &self.maps[r / self.rows_per_shard];
-        let start = base + (r % self.rows_per_shard) * Self::WIDTH * 2;
-        let bytes = &map[start..start + Self::WIDTH * 2];
-        out.extend(bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])));
+        let start = base + (r % self.rows_per_shard) * self.row_bytes();
+        let bytes = &map[start..start + self.row_bytes()];
+        match &self.fp8 {
+            None => out.extend(bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]))),
+            Some(lut) => out.extend(bytes.iter().map(|&c| bf16_rne(lut[c as usize]))),
+        }
     }
+}
+
+/// FP8 E4M3 (fn: no infinities, 0x7f/0xff NaN) to f32.
+fn e4m3(c: u8) -> f32 {
+    let (s, e, m) = ((c >> 7) as u32, ((c >> 3) & 15) as i32, (c & 7) as f32);
+    let v = match (e, c & 0x7f) {
+        (_, 0x7f) => f32::NAN,
+        (0, _) => m / 8.0 * 2f32.powi(-6),
+        _ => (1.0 + m / 8.0) * 2f32.powi(e - 7),
+    };
+    if s == 1 { -v } else { v }
+}
+
+/// f32 to BF16, rounding to nearest even (the product of two BF16 values as PyTorch rounds it).
+fn bf16_rne(x: f32) -> u16 {
+    let b = x.to_bits();
+    if x.is_nan() {
+        return ((b >> 16) | 0x40) as u16;
+    }
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }
 
 /// The MTP drafter (SPEC §10): one QSA decoder layer with its own mixer, sharing the embedding and LM head.
@@ -604,4 +651,31 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
         None
     };
     Ok((Model::bind(ckpt, weights, mtp_experts, opts.layers, stream)?, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bf16_rne, e4m3};
+
+    #[test]
+    fn e4m3_values() {
+        assert_eq!(e4m3(0x38), 1.0);
+        assert_eq!(e4m3(0x7e), 448.0);
+        assert_eq!(e4m3(0xfe), -448.0);
+        assert_eq!(e4m3(0x01), 2f32.powi(-9));
+        assert_eq!(e4m3(0x08), 2f32.powi(-6));
+        assert_eq!(e4m3(0x3c), 1.5);
+        assert!(e4m3(0x7f).is_nan() && e4m3(0xff).is_nan());
+        // Monotone over the positive codes.
+        assert!((1..0x7f).all(|c| e4m3(c) > e4m3(c - 1)));
+    }
+
+    #[test]
+    fn bf16_rounding() {
+        assert_eq!(bf16_rne(1.0), 0x3f80);
+        assert_eq!(bf16_rne(f32::from_bits(0x3f80_8000)), 0x3f80); // tie, even stays
+        assert_eq!(bf16_rne(f32::from_bits(0x3f81_8000)), 0x3f82); // tie, odd rounds up
+        assert_eq!(bf16_rne(f32::from_bits(0x3f80_8001)), 0x3f81);
+        assert_eq!(bf16_rne(-2.5), 0xc020);
+    }
 }

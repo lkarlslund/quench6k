@@ -59,7 +59,9 @@ cargo run --release -p quench6k-benchplot -- bench/ninfer-6000.jsonl bench/resul
     --svg bench/results.svg --markdown BENCHMARK.md
 ```
 
-`bench/README.md` describes the corpus and the record format.
+`bench/README.md` describes the corpus and the record format. Before timing, `bench` checks 64 greedy
+tokens of the benchmarked path against the code fixture's reference sequence, or, for a checkpoint
+other than the oracle's, against eager decoding of the same checkpoint.
 
 ## Releases
 
