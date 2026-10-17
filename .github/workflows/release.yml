@@ -47,9 +47,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04, target: linux-x86_64, cuda: linux-x86_64, exe: quench6k }
-          - { os: ubuntu-22.04-arm, target: linux-arm64, cuda: linux-sbsa, exe: quench6k }
-          - { os: windows-2022, target: windows-x86_64, cuda: windows-x86_64, exe: quench6k.exe }
+          - { os: ubuntu-22.04, target: linux-x86_64, cuda: linux-x86_64, exe: quench6k, build_shell: bash }
+          - { os: ubuntu-22.04-arm, target: linux-arm64, cuda: linux-sbsa, exe: quench6k, build_shell: bash }
+          - { os: windows-2022, target: windows-x86_64, cuda: windows-x86_64, exe: quench6k.exe, build_shell: pwsh }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -70,7 +70,7 @@ jobs:
           echo "CUDA_HOME=$dir" >> "$GITHUB_ENV"
       - name: Build
         # PowerShell on Windows: Git Bash's /usr/bin/link would shadow MSVC's link.exe.
-        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
+        shell: ${{ matrix.build_shell }}
         run: cargo build --release --locked -p quench6k-cli
       - name: Package
         run: |
