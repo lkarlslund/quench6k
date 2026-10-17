@@ -54,6 +54,7 @@ selected at run time (`--variant key=value`, `--sweep key=v1,v2`). See [dev/KBEN
 ```
 quench6k bench --model $M --ctx 512 1024 8192 65536 131072 260000 --json bench/results.jsonl
 quench6k bench --model $M --ctx ... --mtp 6 --adaptive --json bench/results.jsonl
+quench6k bench --model $M --ctx ... --mtp 6 --adaptive --sampled --json bench/results.jsonl
 cargo run --release -p quench6k-benchplot -- bench/ninfer-6000.jsonl bench/results.jsonl \
     --svg bench/results.svg --markdown BENCHMARK.md
 ```

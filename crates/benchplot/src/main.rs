@@ -3,8 +3,8 @@
 //!
 //!     benchplot <records.jsonl>... --svg bench/results.svg --markdown BENCHMARK.md
 //!
-//! Later records replace earlier ones with the same engine, mode, drafts, adaptive flag, KV format
-//! and context. The Markdown file's text between `<!-- bench:begin -->` and `<!-- bench:end -->` is
+//! Later records replace earlier ones with the same engine, mode, drafts, adaptive and sampled flags,
+//! KV format and context. The Markdown file's text between `<!-- bench:begin -->` and `<!-- bench:end -->` is
 //! replaced with the tables.
 
 use std::collections::BTreeMap;
@@ -19,6 +19,7 @@ struct Rec {
     mode: String,
     drafts: u64,
     adaptive: bool,
+    sampled: bool,
     kv: String,
     ctx: u64,
     prefill: Option<f64>,
@@ -26,8 +27,8 @@ struct Rec {
 }
 
 impl Rec {
-    fn key(&self) -> (String, String, u64, bool, String, u64) {
-        (self.engine.clone(), self.mode.clone(), self.drafts, self.adaptive, self.kv.clone(), self.ctx)
+    fn key(&self) -> (String, String, u64, bool, bool, String, u64) {
+        (self.engine.clone(), self.mode.clone(), self.drafts, self.adaptive, self.sampled, self.kv.clone(), self.ctx)
     }
 }
 
@@ -38,22 +39,24 @@ struct Series {
     mode: &'static str,
     drafts: u64,
     adaptive: bool,
+    sampled: bool,
     kv: &'static str,
     color: &'static str,
     dashed: bool,
 }
 
 const DECODE: &[Series] = &[
-    Series { label: "quench6k MTP (adaptive, up to 6 drafts)", engine: "quench6k", mode: "mtp", drafts: 6, adaptive: true, kv: "bf16", color: "#d9480f", dashed: false },
-    Series { label: "quench6k MTP (3 drafts)", engine: "quench6k", mode: "mtp", drafts: 3, adaptive: false, kv: "bf16", color: "#f08c00", dashed: false },
-    Series { label: "NInfer 6000 MTP (3 drafts, LM-head draft)", engine: "ninfer", mode: "mtp", drafts: 3, adaptive: false, kv: "bf16", color: "#868e96", dashed: true },
-    Series { label: "quench6k plain", engine: "quench6k", mode: "plain", drafts: 0, adaptive: false, kv: "bf16", color: "#1971c2", dashed: false },
-    Series { label: "NInfer 6000 plain", engine: "ninfer", mode: "plain", drafts: 0, adaptive: false, kv: "bf16", color: "#adb5bd", dashed: true },
+    Series { label: "quench6k MTP sampled (adaptive, up to 6 drafts)", engine: "quench6k", mode: "mtp", drafts: 6, adaptive: true, sampled: true, kv: "bf16", color: "#2f9e44", dashed: false },
+    Series { label: "quench6k MTP greedy (adaptive, up to 6 drafts)", engine: "quench6k", mode: "mtp", drafts: 6, adaptive: true, sampled: false, kv: "bf16", color: "#d9480f", dashed: false },
+    Series { label: "quench6k MTP greedy (3 drafts)", engine: "quench6k", mode: "mtp", drafts: 3, adaptive: false, sampled: false, kv: "bf16", color: "#f08c00", dashed: false },
+    Series { label: "NInfer 6000 MTP (3 drafts, LM-head draft)", engine: "ninfer", mode: "mtp", drafts: 3, adaptive: false, sampled: false, kv: "bf16", color: "#868e96", dashed: true },
+    Series { label: "quench6k plain", engine: "quench6k", mode: "plain", drafts: 0, adaptive: false, sampled: false, kv: "bf16", color: "#1971c2", dashed: false },
+    Series { label: "NInfer 6000 plain", engine: "ninfer", mode: "plain", drafts: 0, adaptive: false, sampled: false, kv: "bf16", color: "#adb5bd", dashed: true },
 ];
 
 const PREFILL: &[Series] = &[
-    Series { label: "quench6k", engine: "quench6k", mode: "plain", drafts: 0, adaptive: false, kv: "bf16", color: "#1971c2", dashed: false },
-    Series { label: "NInfer 6000", engine: "ninfer", mode: "plain", drafts: 0, adaptive: false, kv: "bf16", color: "#adb5bd", dashed: true },
+    Series { label: "quench6k", engine: "quench6k", mode: "plain", drafts: 0, adaptive: false, sampled: false, kv: "bf16", color: "#1971c2", dashed: false },
+    Series { label: "NInfer 6000", engine: "ninfer", mode: "plain", drafts: 0, adaptive: false, sampled: false, kv: "bf16", color: "#adb5bd", dashed: true },
 ];
 
 fn parse(line: &str) -> Result<Rec> {
@@ -64,6 +67,7 @@ fn parse(line: &str) -> Result<Rec> {
         mode: s("mode")?,
         drafts: v.get("drafts").and_then(Value::as_u64).unwrap_or(0),
         adaptive: v.get("adaptive").and_then(Value::as_bool).unwrap_or(false),
+        sampled: v.get("sampled").and_then(Value::as_bool).unwrap_or(false),
         kv: s("kv")?,
         ctx: v.get("ctx").and_then(Value::as_u64).context("missing ctx")?,
         prefill: v.get("prefill_tok_s").and_then(Value::as_f64),
@@ -72,7 +76,7 @@ fn parse(line: &str) -> Result<Rec> {
 }
 
 fn find<'a>(recs: &'a [Rec], s: &Series, kv: &str, ctx: u64) -> Option<&'a Rec> {
-    recs.iter().find(|r| r.engine == s.engine && r.mode == s.mode && r.drafts == s.drafts && r.adaptive == s.adaptive && r.kv == kv && r.ctx == ctx)
+    recs.iter().find(|r| r.engine == s.engine && r.mode == s.mode && r.drafts == s.drafts && r.adaptive == s.adaptive && r.sampled == s.sampled && r.kv == kv && r.ctx == ctx)
 }
 
 /// "512", "8K", ...; within 3% of a power of two it is named after it (260,000 tokens: "256K").
@@ -150,11 +154,11 @@ fn legend(svg: &mut String, series: &[Series], x: f64, y: f64) {
 
 fn svg(recs: &[Rec], ctxs: &[u64]) -> String {
     let mut s = String::new();
-    let (w, h) = (880.0, 420.0);
+    let (w, h) = (880.0, 440.0);
     let _ = writeln!(s, r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">"#);
     s.push_str(r#"<style>.title{font-size:15px;font-weight:600;fill:#212529}.grid{stroke:#e9ecef}.ytick{font-size:11px;fill:#495057;text-anchor:end}.xtick{font-size:11px;fill:#495057;text-anchor:middle}.axis{font-size:11px;fill:#868e96;text-anchor:middle}.legend{font-size:12px;fill:#343a40}</style>"#);
     let _ = writeln!(s, r##"<rect width="{w}" height="{h}" fill="#ffffff"/>"##);
-    panel(&mut s, recs, ctxs, DECODE, |r| r.decode, 0.0, "Decode, tokens/s (one request, greedy)");
+    panel(&mut s, recs, ctxs, DECODE, |r| r.decode, 0.0, "Decode, tokens/s (one request)");
     panel(&mut s, recs, ctxs, PREFILL, |r| r.prefill, 440.0, "Prefill, tokens/s");
     legend(&mut s, DECODE, 60.0, 318.0);
     legend(&mut s, PREFILL, 500.0, 318.0);
@@ -181,13 +185,13 @@ fn table(recs: &[Rec], ctxs: &[u64], kv: &str, cols: &[(&str, &Series, fn(&Rec) 
 }
 
 fn markdown(recs: &[Rec], ctxs: &[u64]) -> String {
-    let (q_mtp6, q_mtp3, n_mtp, q_plain, n_plain) = (&DECODE[0], &DECODE[1], &DECODE[2], &DECODE[3], &DECODE[4]);
+    let (q_sampled, q_mtp6, q_mtp3, n_mtp, q_plain, n_plain) = (&DECODE[0], &DECODE[1], &DECODE[2], &DECODE[3], &DECODE[4], &DECODE[5]);
     let d: fn(&Rec) -> Option<f64> = |r| r.decode;
     let p: fn(&Rec) -> Option<f64> = |r| r.prefill;
     let mut m = String::from("BF16 KV cache (the NInfer 6000 baseline's configuration):\n\n");
-    m.push_str(&table(recs, ctxs, "bf16", &[("Decode", q_plain, d), ("NInfer decode", n_plain, d), ("MTP, 3 drafts", q_mtp3, d), ("NInfer MTP, 3 drafts", n_mtp, d), ("MTP, adaptive ≤ 6", q_mtp6, d), ("Prefill", q_plain, p), ("NInfer prefill", n_plain, p)]));
+    m.push_str(&table(recs, ctxs, "bf16", &[("Decode", q_plain, d), ("NInfer decode", n_plain, d), ("MTP greedy, 3 drafts", q_mtp3, d), ("NInfer MTP, 3 drafts", n_mtp, d), ("MTP greedy, adaptive ≤ 6", q_mtp6, d), ("MTP sampled, adaptive ≤ 6", q_sampled, d), ("Prefill", q_plain, p), ("NInfer prefill", n_plain, p)]));
     m.push_str("\nFP8 KV cache (`--kv fp8`, the serving configuration):\n\n");
-    m.push_str(&table(recs, ctxs, "fp8", &[("Decode", q_plain, d), ("MTP, adaptive ≤ 6", q_mtp6, d), ("Prefill", q_plain, p)]));
+    m.push_str(&table(recs, ctxs, "fp8", &[("Decode", q_plain, d), ("MTP greedy, adaptive ≤ 6", q_mtp6, d), ("MTP sampled, adaptive ≤ 6", q_sampled, d), ("Prefill", q_plain, p)]));
     m
 }
 

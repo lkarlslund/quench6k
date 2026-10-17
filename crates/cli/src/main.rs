@@ -280,6 +280,10 @@ enum Command {
         /// With --mtp N: choose each round's draft length in 1..=N from the observed acceptance.
         #[arg(long)]
         adaptive: bool,
+        /// With --mtp N: sample with the server's defaults (temperature 1.0, top_p 0.95, top_k 20)
+        /// instead of greedy decoding.
+        #[arg(long)]
+        sampled: bool,
         /// Append one JSON record per context to this file (JSON lines; see bench/README.md).
         #[arg(long)]
         json: Option<PathBuf>,
@@ -420,9 +424,9 @@ fn main() -> Result<()> {
         Command::Generate { model, precision, fixture, tie, steer } => generate(&model, precision.into(), &fixture, tie, &steer)?,
         Command::MtpProbe { model, precision, fixture, steps, chunk } => mtp::probe(&model, precision.into(), &fixture, steps, chunk)?,
         Command::SpecCheck { model, precision, fixture, n, drafts, chunk, graphs, adaptive, profile_rounds, steer } => mtp::check(&model, precision.into(), &fixture, n, drafts, chunk, graphs, adaptive, profile_rounds, &steer)?,
-        Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps, mtp, adaptive, json } => {
-            let out = json.map(|path| bench::JsonOut { path, kv: cli.kv.clone() });
-            bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps, mtp, adaptive, out.as_ref())?
+        Command::Bench { model, precision, ctx, generate, chunk, profile, ncu_steps, mtp, adaptive, sampled, json } => {
+            let out = json.map(|path| bench::JsonOut { path, kv: cli.kv.clone(), sampled });
+            bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps, mtp, adaptive, sampled, out.as_ref())?
         }
         Command::Kbench { model, layers, ctx, rows, steps, pairs, chunk, variant, sweep } => {
             let fixed = variant.iter().map(|v| kbench::parse_fixed(v)).collect::<Result<_>>()?;

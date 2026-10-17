@@ -17,11 +17,12 @@ One JSON object per line:
 | `date` | UTC date of the run |
 | `mode` | `plain` or `mtp` |
 | `drafts`, `adaptive` | MTP draft length, and whether each round picks 1..drafts |
+| `sampled` | Sampled with the server's defaults instead of greedy (absent: greedy) |
 | `kv` | `bf16` or `fp8` |
 | `ctx` | Prompt length in tokens |
 | `generate` | Tokens generated for the decode measurement |
 | `prefill_tok_s`, `decode_tok_s` | Throughput |
 | `tokens_per_round` | MTP tokens per draft-and-verify round |
 
-Later records replace earlier ones with the same engine, mode, drafts, adaptive flag, KV format and
-context.
+Later records replace earlier ones with the same engine, mode, drafts, adaptive and sampled flags, KV
+format and context.

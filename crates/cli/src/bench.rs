@@ -1,5 +1,6 @@
 //! Throughput benchmark with NInfer 6000's methodology: one request, a prompt of the given length,
-//! then greedy decoding of a fixed number of tokens.
+//! then greedy decoding of a fixed number of tokens (or, with `--sampled`, MTP decoding sampled with the
+//! server's default parameters).
 
 use std::path::Path;
 use std::time::Instant;
@@ -22,6 +23,7 @@ pub(crate) fn prompt(len: usize) -> Result<Vec<i32>> {
 pub struct JsonOut {
     pub path: std::path::PathBuf,
     pub kv: String,
+    pub sampled: bool,
 }
 
 impl JsonOut {
@@ -31,12 +33,15 @@ impl JsonOut {
         use std::io::Write;
         let rec = serde_json::json!({"engine": "quench6k", "date": utc_date(), "mode": mode, "drafts": drafts, "adaptive": adaptive, "kv": self.kv,
                                      "ctx": ctx, "generate": generate, "prefill_tok_s": (prefill * 10.0).round() / 10.0, "decode_tok_s": (decode * 10.0).round() / 10.0,
-                                     "tokens_per_round": per_round.map(|r| (r * 100.0).round() / 100.0)});
+                                     "tokens_per_round": per_round.map(|r| (r * 100.0).round() / 100.0), "sampled": self.sampled});
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
         writeln!(f, "{rec}")?;
         Ok(())
     }
 }
+
+/// Seeds per context in sampled benchmarks.
+const SAMPLED_SEEDS: usize = 4;
 
 /// The contexts to measure, each after an unreported warm-up run at the same context: the first run
 /// pays for lazy initialization, and the tokens a run generates have their embedding rows read from
@@ -62,10 +67,11 @@ fn utc_date() -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, profile: bool, ncu_steps: usize, mtp: usize, adaptive: bool, json: Option<&JsonOut>) -> Result<()> {
+pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, profile: bool, ncu_steps: usize, mtp: usize, adaptive: bool, sampled: bool, json: Option<&JsonOut>) -> Result<()> {
     if mtp > 0 {
-        return run_mtp(model_dir, precision, contexts, generate, chunk, mtp, adaptive, ncu_steps, json);
+        return run_mtp(model_dir, precision, contexts, generate, chunk, mtp, adaptive, sampled, ncu_steps, json);
     }
+    anyhow::ensure!(!sampled, "--sampled needs --mtp");
     let (model, stream) = crate::load(model_dir, precision, false)?;
     let capacity = contexts.iter().max().copied().unwrap_or(0) + generate + 16 + ncu_steps;
     let mut ws = Workspace::for_model(&model, chunk, capacity)?;
@@ -165,11 +171,14 @@ fn sanity(model: &quench6k_engine::model::Model, stream: &quench6k_cuda::Stream,
     Ok(())
 }
 
-/// MTP speculative decoding benchmark: prefill, then greedy draft-and-verify rounds as CUDA graphs.
-/// The sanity check runs the same path on the code fixture against its reference tokens first.
+/// MTP speculative decoding benchmark: prefill, then draft-and-verify rounds as CUDA graphs, greedy
+/// or sampled with the server's defaults (temperature 1.0, top_p 0.95, top_k 20).
+/// The sanity check runs the same path on the code fixture against its reference tokens first; sampled
+/// runs check it through the sampling kernels with top_k 1.
 #[allow(clippy::too_many_arguments)]
-fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, drafts: usize, adaptive: bool, ncu_rounds: usize, json: Option<&JsonOut>) -> Result<()> {
-    use quench6k_engine::spec::{SpecDecoder, SpecGraphs};
+fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, drafts: usize, adaptive: bool, sampled: bool, ncu_rounds: usize, json: Option<&JsonOut>) -> Result<()> {
+    use quench6k_engine::spec::{Sampling, SpecDecoder, SpecGraphs};
+    let defaults = |seed| Sampling { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0.0, seed };
     let (model, stream) = crate::load(model_dir, precision, true)?;
     let max_ctx = contexts.iter().max().copied().unwrap_or(0).max(512);
     let slack = (ncu_rounds + 4) * (drafts + 1) + 16;
@@ -187,6 +196,9 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         let mut state = SequenceState::with_mtp(seq.tokens.len() + slack, true)?;
         let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &stream, &seq.tokens[..seq.prompt_len], drafts, chunk)?;
         let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive, None)?;
+        if sampled {
+            g.set_sampling(&stream, Some(Sampling { top_k: 1, ..defaults(1) }))?;
+        }
         let mut got = Vec::new();
         while got.len() < CHECK {
             got.extend(g.round(&model, &mut state, &mut ws, &mut dec, &stream)?);
@@ -199,37 +211,60 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
     }
 
     println!("{:>8} {:>14} {:>14} {:>16}", "context", "prefill tok/s", "decode tok/s", "tokens/round");
+    // Sampled runs average SAMPLED_SEEDS seeds: one 256-token sample's acceptance depends on the
+    // text it happens to produce.
+    let seeds = if sampled { SAMPLED_SEEDS } else { 1 };
+    let chat = if sampled { Some(crate::chat::Chat::load(model_dir, None)?) } else { None };
     for (ctx, report) in with_warmup(contexts) {
         let tokens = prompt(ctx)?;
-        let mut state = SequenceState::with_mtp(ctx + generate + slack, true)?;
-        let t0 = Instant::now();
-        let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &stream, &tokens, drafts, chunk)?;
-        let prefill = ctx as f64 / t0.elapsed().as_secs_f64();
-        let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive, None)?;
-        let t1 = Instant::now();
-        let mut produced = 0;
-        while produced < generate {
-            produced += g.round(&model, &mut state, &mut ws, &mut dec, &stream)?.len();
+        let (mut prefill, mut produced, mut secs, mut rounds, mut draft, mut verify) = (0.0, 0, 0.0, 0, 0.0, 0.0);
+        let mut first = Vec::new();
+        for seed in 0..seeds {
+            let mut state = SequenceState::with_mtp(ctx + generate + slack, true)?;
+            let t0 = Instant::now();
+            let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &stream, &tokens, drafts, chunk)?;
+            if seed == 0 {
+                prefill = ctx as f64 / t0.elapsed().as_secs_f64();
+            }
+            let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive, None)?;
+            if sampled {
+                g.set_sampling(&stream, Some(defaults(1 + seed as u64)))?;
+            }
+            let t1 = Instant::now();
+            let mut out = Vec::new();
+            while out.len() < generate {
+                out.extend(g.round(&model, &mut state, &mut ws, &mut dec, &stream)?);
+            }
+            secs += t1.elapsed().as_secs_f64();
+            produced += out.len();
+            (rounds, draft, verify) = (rounds + dec.rounds, draft + dec.draft_secs, verify + dec.verify_secs);
+            if seed == 0 {
+                first = out;
+            }
+            if ncu_rounds > 0 && report && seed + 1 == seeds {
+                quench6k_cuda::profiler_start()?;
+                for _ in 0..ncu_rounds {
+                    g.round(&model, &mut state, &mut ws, &mut dec, &stream)?;
+                }
+                quench6k_cuda::profiler_stop()?;
+            }
         }
-        let decode = produced as f64 / t1.elapsed().as_secs_f64();
-        let per_round = produced as f64 / dec.rounds as f64;
         if !report {
             continue;
         }
+        let decode = produced as f64 / secs;
+        let per_round = produced as f64 / rounds as f64;
         println!(
             "{ctx:>8} {prefill:>14.1} {decode:>14.1} {per_round:>16.2}   per round: draft {:.3} ms, verify {:.3} ms",
-            1e3 * dec.draft_secs / dec.rounds as f64,
-            1e3 * dec.verify_secs / dec.rounds as f64
+            1e3 * draft / rounds as f64,
+            1e3 * verify / rounds as f64
         );
+        if let Some(chat) = &chat {
+            // Sampled output has no reference; print its start to show it is text, not noise.
+            println!("         output: {:?}", chat.decode(&first[..first.len().min(40)], false)?);
+        }
         if let Some(j) = json {
             j.record("mtp", drafts, adaptive, ctx, produced, prefill, decode, Some(per_round))?;
-        }
-        if ncu_rounds > 0 {
-            quench6k_cuda::profiler_start()?;
-            for _ in 0..ncu_rounds {
-                g.round(&model, &mut state, &mut ws, &mut dec, &stream)?;
-            }
-            quench6k_cuda::profiler_stop()?;
         }
     }
     Ok(())
