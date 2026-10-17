@@ -286,9 +286,9 @@ __global__ void __launch_bounds__(THREADS, 2) fp4_gemm_kernel(const uint8_t* __r
 
 }  // namespace
 
-extern "C" int squash_fp4_tile_rows() { return BM; }
+extern "C" int quench6k_fp4_tile_rows() { return BM; }
 
-extern "C" cudaError_t squash_fp4_quant_rows(const void* x, int rows, int K, uint8_t* codes, uint8_t* scales, float* rscale,
+extern "C" cudaError_t quench6k_fp4_quant_rows(const void* x, int rows, int K, uint8_t* codes, uint8_t* scales, float* rscale,
                                              cudaStream_t st) {
     if (K % 256 != 0 && K % 128 != 0) return cudaErrorInvalidValue;
     if (rows == 0) return cudaSuccess;
@@ -297,7 +297,7 @@ extern "C" cudaError_t squash_fp4_quant_rows(const void* x, int rows, int K, uin
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_fp4_gather(const uint8_t* codes, const uint8_t* scales, const float* rscale, const int* pair_row,
+extern "C" cudaError_t quench6k_fp4_gather(const uint8_t* codes, const uint8_t* scales, const float* rscale, const int* pair_row,
                                          int T, int K, uint8_t* gcodes, uint8_t* gscales, float* grscale, cudaStream_t st) {
     if (K % 256 != 0) return cudaErrorInvalidValue;
     if (T == 0) return cudaSuccess;
@@ -305,7 +305,7 @@ extern "C" cudaError_t squash_fp4_gather(const uint8_t* codes, const uint8_t* sc
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_moe_fp4_gemm(const uint8_t* a, const uint8_t* as, const float* ar, const uint64_t* w_ptr,
+extern "C" cudaError_t quench6k_moe_fp4_gemm(const uint8_t* a, const uint8_t* as, const float* ar, const uint64_t* w_ptr,
                                            const uint64_t* s_ptr, const float* ws2, const int* offsets, const int* tile_expert,
                                            const int* tile_row, const int* num_tiles, int max_tiles, void* y, int N, int K,
                                            int out_bf16, cudaStream_t st) {
@@ -331,7 +331,7 @@ extern "C" cudaError_t squash_moe_fp4_gemm(const uint8_t* a, const uint8_t* as, 
 }
 
 // Gate and up projections (weights w_*, u_*) with SwiGLU: act BF16 [rows, N].
-extern "C" cudaError_t squash_moe_fp4_gate_up(const uint8_t* a, const uint8_t* as, const float* ar, const uint64_t* w_ptr,
+extern "C" cudaError_t quench6k_moe_fp4_gate_up(const uint8_t* a, const uint8_t* as, const float* ar, const uint64_t* w_ptr,
                                               const uint64_t* s_ptr, const float* ws2, const uint64_t* u_ptr, const uint64_t* us_ptr,
                                               const float* us2, const int* offsets, const int* tile_expert, const int* tile_row,
                                               const int* num_tiles, int max_tiles, void* act, int N, int K, cudaStream_t st) {

@@ -128,7 +128,7 @@ __global__ void conv_advance_kernel(const float* __restrict__ xn, float* state, 
 
 }  // namespace
 
-extern "C" cudaError_t squash_ple_gate(const float* kp, const float* h, const float* v, const void* wk, const void* wq,
+extern "C" cudaError_t quench6k_ple_gate(const float* kp, const float* h, const float* v, const void* wk, const void* wq,
                                        const void* wc, float* gv, float* xn, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(gate_kernel, T * S, 256, 0, st, kp, h, v, static_cast<const __nv_bfloat16*>(wk),
@@ -137,10 +137,10 @@ extern "C" cudaError_t squash_ple_gate(const float* kp, const float* h, const fl
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" size_t squash_ple_record_floats() { return (size_t)2 * REC_TOKENS * H; }
+extern "C" size_t quench6k_ple_record_floats() { return (size_t)2 * REC_TOKENS * H; }
 
-// rec/ctl/defer as for squash_gdn_fused_small (records: squash_ple_record_floats() floats).
-extern "C" cudaError_t squash_ple_conv(const float* gv, const float* xn, const void* w, float* state, float* h, int T,
+// rec/ctl/defer as for quench6k_gdn_fused_small (records: quench6k_ple_record_floats() floats).
+extern "C" cudaError_t quench6k_ple_conv(const float* gv, const float* xn, const void* w, float* state, float* h, int T,
                                        float* rec, const int* ctl, int defer, cudaStream_t st) {
     if (T > REC_TOKENS && rec && defer) return cudaErrorInvalidValue;
     if (T >= 64 && !defer) {

@@ -431,7 +431,7 @@ __global__ void __launch_bounds__(WB_THREADS) gemm_wide_kernel(const __nv_bfloat
 }  // namespace
 
 // Narrow outputs (N <= 336), INT8 weights with group scales: Y[M, N] = X . W^T (see gemm_wide_kernel).
-extern "C" cudaError_t squash_gemm_wide(const void* X, int ldx, const void* W, int ldw, const float* scale, float* Y, int ldy, int M, int N,
+extern "C" cudaError_t quench6k_gemm_wide(const void* X, int ldx, const void* W, int ldw, const float* scale, float* Y, int ldy, int M, int N,
                                         int K, cudaStream_t stream) {
     if (N > WB_N || K % BK != 0 || ldx % 8 != 0 || ldw % 16 != 0) return cudaErrorInvalidValue;
     if (M == 0 || N == 0) return cudaSuccess;
@@ -448,7 +448,7 @@ extern "C" cudaError_t squash_gemm_wide(const void* X, int ldx, const void* W, i
 
 // Split-K GEMM for small grids: `splits` CTAs along K per output tile (K a multiple of 32 * splits),
 // partial sums [splits, M, N] in `partial`, reduced in split order.
-extern "C" cudaError_t squash_gemm_bf16_f32_split(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
+extern "C" cudaError_t quench6k_gemm_bf16_f32_split(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
                                                   float* Y, int ldy, int M, int N, int K, float alpha, int accumulate,
                                                   float* partial, int splits, cudaStream_t stream) {
     if (K % (BK * splits) != 0 || ldx % 8 != 0 || ldw % 16 != 0 || (fmt != 0 && fmt != 3)) return cudaErrorInvalidValue;
@@ -477,7 +477,7 @@ extern "C" cudaError_t squash_gemm_bf16_f32_split(int fmt, const void* X, int ld
 
 // HyperConnection up-projection (W [10240, K]) fused with the mix: m [M, 2560] BF16 from
 // z [M, K] BF16, n [M, 10240] BF16 and the optional norm weight g [10240] (see MIX above).
-extern "C" cudaError_t squash_gemm_hc_up_mix(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
+extern "C" cudaError_t quench6k_gemm_hc_up_mix(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
                                              const void* n, const void* g, void* m, int M, int K, cudaStream_t stream) {
     if (K % BK != 0 || ldx % 8 != 0 || ldw % 16 != 0) return cudaErrorInvalidValue;
     if (M == 0) return cudaSuccess;
@@ -504,13 +504,13 @@ extern "C" cudaError_t squash_gemm_hc_up_mix(int fmt, const void* X, int ldx, co
 }
 
 // fmt 0: BF16 weights; 3: INT8 weights with an FP32 scale per 64 weights of a row.
-extern "C" cudaError_t squash_gemm_bf16_f32(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
+extern "C" cudaError_t quench6k_gemm_bf16_f32(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
                                             float* Y, int ldy, int M, int N, int K, float alpha, int accumulate,
                                             cudaStream_t stream) {
     return launch<float>(fmt, X, ldx, W, ldw, scale, Y, ldy, M, N, K, alpha, accumulate, stream);
 }
 
-extern "C" cudaError_t squash_gemm_bf16_bf16(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
+extern "C" cudaError_t quench6k_gemm_bf16_bf16(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale,
                                              void* Y, int ldy, int M, int N, int K, float alpha, int accumulate,
                                              cudaStream_t stream) {
     return launch<__nv_bfloat16>(fmt, X, ldx, W, ldw, scale, Y, ldy, M, N, K, alpha, accumulate, stream);

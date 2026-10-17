@@ -1,0 +1,17 @@
+# Example systemd user unit: copy to ~/.config/systemd/user/, adjust the paths, then
+#   systemctl --user enable --now quench6k.service
+[Unit]
+Description=quench6k Qwen3.8-Flash-Next NVFP4 server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/quench6k/quench6k serve --model %h/models/Swift-1.5-Qwen3.8-Flash-Next-NVFP4 --listen 0.0.0.0:8003 --name Qwen/Qwen3.8-Flash-Next --tool-retries 2 --context 262144 --slots 2 --kv fp8 --cache-dir %h/.cache/quench6k
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target

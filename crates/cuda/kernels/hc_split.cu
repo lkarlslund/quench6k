@@ -284,11 +284,11 @@ cudaError_t dispatch_t(float* h, int T, const float* y, const float* inj_prev, c
 
 }  // namespace
 
-extern "C" size_t squash_hc_small_scratch_floats(int T) { return (size_t)SPLITS * T * (RANK + S) + SPLITS * T; }
+extern "C" size_t quench6k_hc_small_scratch_floats(int T) { return (size_t)SPLITS * T * (RANK + S) + SPLITS * T; }
 
 // fmt: weight format of down, injection and up (0 BF16 or 3 INT8 with a scale per 64 weights).
-// scratch: squash_hc_small_scratch_floats(T) floats; z [T, 320] BF16 and r [T, 4] are small-batch buffers.
-extern "C" cudaError_t squash_hc_small(int fmt, float* h, int T, const float* y, const float* inj_prev, const void* wd,
+// scratch: quench6k_hc_small_scratch_floats(T) floats; z [T, 320] BF16 and r [T, 4] are small-batch buffers.
+extern "C" cudaError_t quench6k_hc_small(int fmt, float* h, int T, const float* y, const float* inj_prev, const void* wd,
                                        const float* sd, const void* wi, const float* si, const void* wu, const float* su,
                                        const void* g, float* scratch, void* z, float* r, float* inj, void* m,
                                        cudaStream_t st) {

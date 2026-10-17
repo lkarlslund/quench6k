@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
-use squash_cuda::{DeviceBuffer, Stream};
+use quench6k_cuda::{DeviceBuffer, Stream};
 
 use crate::model::{D, LAYERS, S};
 
@@ -28,7 +28,7 @@ pub struct Steering {
 
 impl Steering {
     pub fn load(path: &Path, stream: &Stream) -> Result<Self> {
-        let max_rank = squash_cuda::kernels::steer_max_rank();
+        let max_rank = quench6k_cuda::kernels::steer_max_rank();
         let bytes = std::fs::read(path).with_context(|| format!("reading steering pack {}", path.display()))?;
         ensure!(bytes.len() >= 8, "steering pack too short");
         let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;

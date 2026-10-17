@@ -1,9 +1,9 @@
 [package]
-name = "squash-cuda"
+name = "quench6k-cuda"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
-links = "squash_kernels"
+links = "quench6k_kernels"
 build = "build.rs"
 
 [dependencies]

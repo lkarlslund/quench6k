@@ -1,18 +1,18 @@
 [package]
-name = "squash-cli"
+name = "quench6k-cli"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "squash"
+name = "quench6k"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-squash-cuda.workspace = true
-squash-engine.workspace = true
+quench6k-cuda.workspace = true
+quench6k-engine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }

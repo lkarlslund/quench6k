@@ -1,0 +1,115 @@
+# Daily release builds of main. A release is tagged rNNNN, the number of commits on main; days
+# without new commits build nothing.
+name: release
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CUDA_VERSION: 13.4.3
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=r$(printf '%04d' "$(git rev-list --count HEAD)")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already released"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, target: linux-x86_64, cuda: linux-x86_64, exe: quench6k }
+          - { os: ubuntu-22.04-arm, target: linux-arm64, cuda: linux-sbsa, exe: quench6k }
+          - { os: windows-2022, target: windows-x86_64, cuda: windows-x86_64, exe: quench6k.exe }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: CUDA ${{ env.CUDA_VERSION }}
+        run: |
+          dir="$RUNNER_TEMP/cuda"
+          ci/fetch-cuda.sh "$CUDA_VERSION" "${{ matrix.cuda }}" "$dir"
+          echo "CUDA_HOME=$dir" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked -p quench6k-cli
+      - name: Package
+        run: |
+          name=quench6k-${{ needs.plan.outputs.tag }}-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cp "target/release/${{ matrix.exe }}" README.md "dist/$name/"
+          cp -r contrib "dist/$name/"
+          cd dist
+          if [ "${{ runner.os }}" = Windows ]; then 7z a -bd "$name.zip" "$name" >/dev/null; else tar -czf "$name.tar.gz" "$name"; fi
+          rm -rf "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          prev=$(gh release list --limit 1 --json tagName -q '.[0].tagName' || true)
+          {
+            echo "Build of main at ${SHA:0:12} (CUDA $CUDA_VERSION, sm_120a; needs an NVIDIA driver supporting CUDA 13.4)."
+            echo
+            if [ -n "$prev" ] && git rev-parse -q --verify "refs/tags/$prev" >/dev/null; then
+              echo "Changes since $prev:"
+              git log --format='- %s' "$prev..$SHA"
+            fi
+          } > notes.md
+          (cd dist && sha256sum * > SHA256SUMS)
+          gh release create "$TAG" dist/* --target "$SHA" --title "$TAG" --notes-file notes.md

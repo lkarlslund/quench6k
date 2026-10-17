@@ -433,7 +433,7 @@ def score(args):
         f.write(target.float().numpy().tobytes())
         f.write(top_ids.numpy().astype("<i4").tobytes())
         f.write(top_logits.float().numpy().tobytes())
-    meta = {"engine": "squash-ref", "format": "oracle.distributions/1", "mode": "teacher_forced",
+    meta = {"engine": "quench6k-ref", "format": "oracle.distributions/1", "mode": "teacher_forced",
             "positions": P, "prompt_len": seq["prompt_len"], "top_k": args.top_k,
             "act_quant": args.act_quant, "dtype": str(dtype), "seconds": time.time() - t0}
     out_path.with_suffix(".json").write_text(json.dumps(meta, indent=1) + "\n")

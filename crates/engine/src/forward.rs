@@ -1,7 +1,7 @@
 //! Eager forward pass of the text model over a chunk of new tokens for one sequence.
 
 use anyhow::{Result, ensure};
-use squash_cuda::{DeviceBuffer, Event, PinnedBuffer, Stream, kernels as k};
+use quench6k_cuda::{DeviceBuffer, Event, PinnedBuffer, Stream, kernels as k};
 
 use crate::profile::Profiler;
 
@@ -325,7 +325,7 @@ impl Workspace {
             ws.bufs.push(b);
         }
         let elems = model.max_int8g_elems();
-        if max_tokens >= DEQUANT_MIN_ROWS && elems > 0 && std::env::var("SQUASH_DEQUANT_GEMM").as_deref() != Ok("0") {
+        if max_tokens >= DEQUANT_MIN_ROWS && elems > 0 && std::env::var("QUENCH6K_DEQUANT_GEMM").as_deref() != Ok("0") {
             eprintln!("BF16 weight buffer for prefill GEMMs: {} MiB", (elems * 2) >> 20);
             let b = DeviceBuffer::new(elems * 2)?;
             ws.dq = b.addr();
@@ -451,7 +451,7 @@ fn linear_ld(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, l
         }
         return Ok(());
     }
-    if t > k::gemv_max_m() && std::env::var_os("SQUASH_FAKE_MXFP8").is_some() && w.k % 32 == 0 {
+    if t > k::gemv_max_m() && std::env::var_os("QUENCH6K_FAKE_MXFP8").is_some() && w.k % 32 == 0 {
         k::fake_mxfp8(s, x, t, w.k, ldx)?;
     }
     if t <= k::gemv_max_m() {
@@ -542,7 +542,7 @@ fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, pending: Opti
         if t > k::gemv_max_m() && fake_set("hc") {
             k::fake_mxfp8(s, ws.low_bf, t, hc.up.k, hc.up.k)?;
         }
-        if t > 4 * k::gemv_max_m() && std::env::var_os("SQUASH_HC_UNFUSED").is_none() {
+        if t > 4 * k::gemv_max_m() && std::env::var_os("QUENCH6K_HC_UNFUSED").is_none() {
             let up = dequantized(s, ws, &hc.up, t)?.unwrap_or(hc.up);
             op!(prof, "hc up+mix", s, k::gemm_hc_up_mix(s, ws.low_bf, up.fmt, up.addr, up.scale, ws.n, hc.norm, out, t, up.k));
         } else {
@@ -841,7 +841,7 @@ pub fn flush_spec(model: &Model, state: &mut SequenceState, ws: &Workspace, s: &
 /// is prepared on the host with [`prepare_batch`], then one graph runs the forward pass and the
 /// greedy argmax of every row into `out` (i32 per sequence).
 pub struct BatchGraph {
-    graph: squash_cuda::Graph,
+    graph: quench6k_cuda::Graph,
     bytes: usize,
     rows: usize,
 }
@@ -849,7 +849,7 @@ pub struct BatchGraph {
 impl BatchGraph {
     pub fn capture(model: &Model, states: &[&SequenceState], ws: &Workspace, hw: &HeadWorkspace, s: &Stream, out: u64) -> Result<Self> {
         let bytes = StepLayout::new(states.len()).used(states.len());
-        let graph = squash_cuda::Graph::capture(s, |s| {
+        let graph = quench6k_cuda::Graph::capture(s, |s| {
             forward_batch(model, states, ws, s, bytes)?;
             head_argmax_into(model, hw, s, ws.out, states.len(), out)
         })?;
@@ -921,7 +921,7 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
     };
     // Small batches (decode, verify rounds): optionally prefetch the next layer's static weights into L2
     // on a side stream while this layer runs (kbench variant l2.prefetch = MiB per layer, 0: off).
-    let prefetch_mib = if t <= k::gemv_max_m() { squash_cuda::variants::get("l2.prefetch", 0) } else { 0 };
+    let prefetch_mib = if t <= k::gemv_max_m() { quench6k_cuda::variants::get("l2.prefetch", 0) } else { 0 };
     let mut forked = false;
     for i in layers {
         if prefetch_mib > 0 && i + 1 < model.layers.len() && i + 1 < ws.prefetch.len() {
@@ -1183,16 +1183,16 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
 }
 
 /// Prefill experts on the FP4 tensor cores (W4A4, activations quantized per row with least-error block
-/// scales): the default (gate PASS); SQUASH_PREFILL_FP4=0 keeps BF16 activations.
-/// Prefill GDN on the tensor cores (3xTF32; the default, SQUASH_GDN_TC=0 selects the CUDA-core kernels).
+/// scales): the default (gate PASS); QUENCH6K_PREFILL_FP4=0 keeps BF16 activations.
+/// Prefill GDN on the tensor cores (3xTF32; the default, QUENCH6K_GDN_TC=0 selects the CUDA-core kernels).
 fn gdn_tc() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SQUASH_GDN_TC").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| std::env::var("QUENCH6K_GDN_TC").map_or(true, |v| v != "0"))
 }
 
-/// Experiment: whether projection class `c` is fake-quantized to MXFP8 (SQUASH_FAKE_MXFP8_SET).
+/// Experiment: whether projection class `c` is fake-quantized to MXFP8 (QUENCH6K_FAKE_MXFP8_SET).
 fn fake_set(c: &str) -> bool {
-    std::env::var("SQUASH_FAKE_MXFP8_SET").is_ok_and(|v| v.split(',').any(|x| x == c))
+    std::env::var("QUENCH6K_FAKE_MXFP8_SET").is_ok_and(|v| v.split(',').any(|x| x == c))
 }
 
 pub fn fp4_prefill() -> bool {
@@ -1203,7 +1203,7 @@ pub fn fp4_prefill() -> bool {
 /// only, 4: gate/up only (down BF16).
 fn fp4_mode() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SQUASH_PREFILL_FP4").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
+    *ON.get_or_init(|| std::env::var("QUENCH6K_PREFILL_FP4").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
 }
 
 /// The second half of a layer: the MLP HyperConnection, the MoE block and its output.
@@ -1221,8 +1221,8 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
     let col = |j: usize| x + (moe.proj.col(j) * 4) as u64;
     op!(prof, "moe proj", s, project(s, ws, ws.m, &moe.proj, x, t));
     let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
-    // FP4 prefill: the routed experts' down projection is written in BF16 (SQUASH_YD_BF16=0: FP32).
-    let yd_bf16 = t > k::moe_small_tokens() && matches!(fp4_mode(), 1 | 3) && std::env::var("SQUASH_YD_BF16").map_or(true, |v| v != "0");
+    // FP4 prefill: the routed experts' down projection is written in BF16 (QUENCH6K_YD_BF16=0: FP32).
+    let yd_bf16 = t > k::moe_small_tokens() && matches!(fp4_mode(), 1 | 3) && std::env::var("QUENCH6K_YD_BF16").map_or(true, |v| v != "0");
     if t == 1 {
         op!(prof, "experts t1", s, k::moe_experts_t1(s, ws.m, col(0), tables(&moe.gate), tables(&moe.up), tables(&moe.down), ws.top_i, ws.top_w, ws.pair_row, ws.act, ws.yd));
     } else if t <= k::moe_small_tokens() {
@@ -1232,7 +1232,7 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
         op!(prof, "experts down", s, k::moe_down_small(s, ws.act, tables(&moe.down), ws.offsets, ws.active, ws.num_active, max_active, t, ws.yd));
     } else {
         op!(prof, "moe_route", s, k::moe_route(s, col(0), ld, t, ws.top_i, ws.top_w));
-        if std::env::var_os("SQUASH_CHECK_ROUTE").is_some() {
+        if std::env::var_os("QUENCH6K_CHECK_ROUTE").is_some() {
             let ti: Vec<i32> = s.download(ws.top_i, t * TOP_K)?;
             if let Some(bad) = ti.iter().position(|&e| !(0..EXPERTS as i32).contains(&e)) {
                 let row = bad / TOP_K;
@@ -1247,7 +1247,7 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
         let grouped = |proj: &crate::model::ExpertProj, x: u64, y: u64, n: usize, kk: usize| {
             k::moe_nvfp4_gemm(s, x, proj.weights, proj.scales, proj.scale2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, y, n, kk)
         };
-        let fake_fp4 = std::env::var_os("SQUASH_FAKE_FP4").is_some();
+        let fake_fp4 = std::env::var_os("QUENCH6K_FAKE_FP4").is_some();
         if fp4_prefill() {
             // W4A4: quantize each token once (into yd, free until the down projection), gather the
             // quantized rows by expert (into xs), FP4 tensor-core GEMMs; the SwiGLU output is
@@ -1409,16 +1409,16 @@ pub fn forward(model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: 
 /// The step is split into two graphs around PLE: the first (embedding, layer 0) is launched as soon as
 /// the token is known, and the host gathers the token's PLE rows while it runs.
 pub struct DecodeGraph {
-    before_ple: squash_cuda::Graph,
-    from_ple: squash_cuda::Graph,
+    before_ple: quench6k_cuda::Graph,
+    from_ple: quench6k_cuda::Graph,
     bytes: usize,
 }
 
 impl DecodeGraph {
     pub fn capture(model: &Model, state: &SequenceState, ws: &Workspace, hw: &HeadWorkspace, s: &Stream) -> Result<Self> {
         let bytes = StepLayout::new(1).used(1);
-        let before_ple = squash_cuda::Graph::capture(s, |s| forward_part(model, state, ws, s, 1, bytes, Part::BeforePle, false, None))?;
-        let from_ple = squash_cuda::Graph::capture(s, |s| {
+        let before_ple = quench6k_cuda::Graph::capture(s, |s| forward_part(model, state, ws, s, 1, bytes, Part::BeforePle, false, None))?;
+        let from_ple = quench6k_cuda::Graph::capture(s, |s| {
             forward_part(model, state, ws, s, 1, bytes, Part::FromPle, false, None)?;
             head_argmax(model, hw, s, ws.out)
         })?;

@@ -220,14 +220,14 @@ __global__ void penalty_apply_kernel(float* logits, int ld, const PenState* st, 
 
 }  // namespace
 
-extern "C" cudaError_t squash_spec_sample_rows(const int* ids, const float* vals, int k_list, int n, int* rc, void* params,
+extern "C" cudaError_t quench6k_spec_sample_rows(const int* ids, const float* vals, int k_list, int n, int* rc, void* params,
                                                const void* qs, cudaStream_t st) {
     if (n > NMAX || k_list > 64) return cudaErrorInvalidValue;
     SQ_CHECK_LAUNCH(sq_launch(sample_rows_kernel, 1, 32, 0, st, ids, vals, k_list, n, rc, (SampleParams*)params, (const DraftQ*)qs));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" int squash_spec_layout(int field) {
+extern "C" int quench6k_spec_layout(int field) {
     if (field == 4) return (int)sizeof(DraftQ);
     if (field == 5) return CATCH;
     if (field == 6) return CNT;
@@ -239,29 +239,29 @@ extern "C" int squash_spec_layout(int field) {
     }
 }
 
-extern "C" cudaError_t squash_spec_mtp_header(const int* rc, int* hdr, int tokens_off, int pos_off, int j, int c,
+extern "C" cudaError_t quench6k_spec_mtp_header(const int* rc, int* hdr, int tokens_off, int pos_off, int j, int c,
                                               cudaStream_t st) {
     if (c > NMAX + 1) return cudaErrorInvalidValue;
     SQ_CHECK_LAUNCH(sq_launch(mtp_header_kernel, 1, 32, 0, st, rc, hdr, tokens_off, pos_off, j, c));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_spec_accept(int* rc, int* ctl, int n, cudaStream_t st) {
+extern "C" cudaError_t quench6k_spec_accept(int* rc, int* ctl, int n, cudaStream_t st) {
     if (n > NMAX) return cudaErrorInvalidValue;
     SQ_CHECK_LAUNCH(sq_launch(accept_kernel, 1, 32, 0, st, rc, ctl, n));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" int squash_penalty_state_bytes() { return (int)sizeof(PenState); }
+extern "C" int quench6k_penalty_state_bytes() { return (int)sizeof(PenState); }
 
-extern "C" cudaError_t squash_penalty_mark(void* st, unsigned* flags, int* list, const int* ids, int n, const int* n_ptr, unsigned bits,
+extern "C" cudaError_t quench6k_penalty_mark(void* st, unsigned* flags, int* list, const int* ids, int n, const int* n_ptr, unsigned bits,
                                            cudaStream_t s) {
     const int blocks = n_ptr != nullptr ? 1 : max(1, min(256, (n + 255) / 256));
     SQ_CHECK_LAUNCH(sq_launch(penalty_mark_kernel, blocks, 256, 0, s, (PenState*)st, flags, list, ids, n, n_ptr, bits));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_penalty_apply(float* logits, int rows, int ld, const void* st, const unsigned* flags, const int* list,
+extern "C" cudaError_t quench6k_penalty_apply(float* logits, int rows, int ld, const void* st, const unsigned* flags, const int* list,
                                             const int* rc, cudaStream_t s) {
     if (rows > NMAX + 1 || (rc == nullptr && rows != 1)) return cudaErrorInvalidValue;
     SQ_CHECK_LAUNCH(sq_launch(penalty_apply_kernel, dim3(rows, 32), 256, 0, s, logits, ld, (const PenState*)st, flags, list, rc));

@@ -927,9 +927,9 @@ __global__ void __launch_bounds__(EW * 32) nvfp4_dense_kernel(const __nv_bfloat1
 
 }  // namespace
 
-extern "C" int squash_moe_tile_rows() { return BM; }
+extern "C" int quench6k_moe_tile_rows() { return BM; }
 
-extern "C" cudaError_t squash_moe_route(const float* logits, int ld, int T, int* top_i, float* top_w, cudaStream_t st) {
+extern "C" cudaError_t quench6k_moe_route(const float* logits, int ld, int T, int* top_i, float* top_w, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(route_kernel, (T + 7) / 8, 256, 0, st, logits, ld, T, top_i, top_w));
     SQ_RETURN_LAUNCH();
@@ -937,7 +937,7 @@ extern "C" cudaError_t squash_moe_route(const float* logits, int ld, int T, int*
 
 // Groups the T*10 routed pairs by expert. Scratch: counts/cursor [512], offsets [513],
 // tile_expert/tile_row [max tiles], num_tiles [1], pair_row [T*10].
-extern "C" cudaError_t squash_moe_plan(const int* top_i, int T, int* counts, int* cursor, int* offsets, int* tile_expert,
+extern "C" cudaError_t quench6k_moe_plan(const int* top_i, int T, int* counts, int* cursor, int* offsets, int* tile_expert,
                                        int* tile_row, int* num_tiles, int* pair_row, int tile_rows, cudaStream_t st) {
     const int pairs = T * TOPK;
     cudaError_t err = cudaMemsetAsync(counts, 0, E * sizeof(int), st);
@@ -948,14 +948,14 @@ extern "C" cudaError_t squash_moe_plan(const int* top_i, int T, int* counts, int
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_moe_gather(const void* m, const int* pair_row, int T, void* xs, cudaStream_t st) {
+extern "C" cudaError_t quench6k_moe_gather(const void* m, const int* pair_row, int T, void* xs, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(gather_kernel, T * TOPK, 128, 0, st, static_cast<const __nv_bfloat16*>(m), pair_row, T * TOPK,
                                             static_cast<__nv_bfloat16*>(xs)));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_moe_nvfp4_gemm(const void* xs, const uint64_t* w_ptr, const uint64_t* s_ptr,
+extern "C" cudaError_t quench6k_moe_nvfp4_gemm(const void* xs, const uint64_t* w_ptr, const uint64_t* s_ptr,
                                              const float* ws2, const int* offsets, const int* tile_expert,
                                              const int* tile_row, const int* num_tiles, int max_tiles, float* y, int N,
                                              int K, cudaStream_t st) {
@@ -965,7 +965,7 @@ extern "C" cudaError_t squash_moe_nvfp4_gemm(const void* xs, const uint64_t* w_p
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_swiglu(const float* gate, const float* up, int ld, int width, void* act, size_t count,
+extern "C" cudaError_t quench6k_swiglu(const float* gate, const float* up, int ld, int width, void* act, size_t count,
                                      cudaStream_t st) {
     if (count == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(swiglu_kernel, (unsigned)((count + 255) / 256), 256, 0, st, gate, up, ld, width, static_cast<__nv_bfloat16*>(act),
@@ -973,15 +973,15 @@ extern "C" cudaError_t squash_swiglu(const float* gate, const float* up, int ld,
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_moe_combine(const float* yd, const int* pair_row, const float* top_w, const float* sg,
+extern "C" cudaError_t quench6k_moe_combine(const float* yd, const int* pair_row, const float* top_w, const float* sg,
                                           int ld_sg, const float* sh, float* y, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(combine_kernel<float>, dim3(T, D / 256), 256, 0, st, yd, pair_row, top_w, sg, ld_sg, sh, y));
     SQ_RETURN_LAUNCH();
 }
 
-// As squash_moe_combine with BF16 expert outputs.
-extern "C" cudaError_t squash_moe_combine_bf16(const void* yd, const int* pair_row, const float* top_w, const float* sg,
+// As quench6k_moe_combine with BF16 expert outputs.
+extern "C" cudaError_t quench6k_moe_combine_bf16(const void* yd, const int* pair_row, const float* top_w, const float* sg,
                                                int ld_sg, const float* sh, float* y, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(combine_kernel<__nv_bfloat16>, dim3(T, D / 256), 256, 0, st, static_cast<const __nv_bfloat16*>(yd), pair_row,
@@ -989,14 +989,14 @@ extern "C" cudaError_t squash_moe_combine_bf16(const void* yd, const int* pair_r
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_moe_active(const int* counts, int* active, int* num_active, cudaStream_t st) {
+extern "C" cudaError_t quench6k_moe_active(const int* counts, int* active, int* num_active, cudaStream_t st) {
     SQ_CHECK_LAUNCH(sq_launch(active_kernel, 1, E, 0, st, counts, active, num_active));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" int squash_moe_small_tokens() { return SMALL_T; }
+extern "C" int quench6k_moe_small_tokens() { return SMALL_T; }
 
-extern "C" cudaError_t squash_moe_route_small(const float* logits, int ld, int T, int* top_i, float* top_w, int* offsets,
+extern "C" cudaError_t quench6k_moe_route_small(const float* logits, int ld, int T, int* top_i, float* top_w, int* offsets,
                                               int* pair_row, int* row_token, int* active, int* num_active,
                                               cudaStream_t st) {
     if (T == 0 || T > SMALL_T) return T == 0 ? cudaSuccess : cudaErrorInvalidValue;
@@ -1005,7 +1005,7 @@ extern "C" cudaError_t squash_moe_route_small(const float* logits, int ld, int T
 }
 
 // gate/up tables: [codes, scales] u64 x 512 each and weight_scale_2 f32 x 512. T bounds the rows per expert.
-extern "C" cudaError_t squash_moe_gate_up_small(const void* m, const int* row_token, const uint64_t* gw,
+extern "C" cudaError_t quench6k_moe_gate_up_small(const void* m, const int* row_token, const uint64_t* gw,
                                                 const uint64_t* gs, const float* g2, const uint64_t* uw,
                                                 const uint64_t* us, const float* u2, const int* offsets,
                                                 const int* active, const int* num_active, int max_active, int T,
@@ -1025,7 +1025,7 @@ extern "C" cudaError_t squash_moe_gate_up_small(const void* m, const int* row_to
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_moe_down_small(const void* act, const uint64_t* dw, const uint64_t* ds, const float* d2,
+extern "C" cudaError_t quench6k_moe_down_small(const void* act, const uint64_t* dw, const uint64_t* ds, const float* d2,
                                              const int* offsets, const int* active, const int* num_active,
                                              int max_active, int T, float* yd, cudaStream_t st) {
     if (max_active == 0) return cudaSuccess;
@@ -1042,7 +1042,7 @@ extern "C" cudaError_t squash_moe_down_small(const void* act, const uint64_t* dw
 }
 
 // fmt 0 BF16 or 3 INT8 (scale per 64) shared-expert down weights [2560, 640].
-extern "C" cudaError_t squash_moe_shared_combine(int fmt, const float* proj, int ld, int T, const void* w,
+extern "C" cudaError_t quench6k_moe_shared_combine(int fmt, const float* proj, int ld, int T, const void* w,
                                                  const float* scale, const float* yd, const int* pair_row,
                                                  const float* top_w, float* y, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
@@ -1068,8 +1068,8 @@ extern "C" cudaError_t squash_moe_shared_combine(int fmt, const float* proj, int
 }
 
 // Single-token MoE experts: routing (from the router logits row) fused into gate/up, then down.
-// Writes top_i, top_w, pair_row (= slot) and yd [10, 2560] for squash_moe_shared_combine.
-extern "C" cudaError_t squash_moe_experts_t1(const void* m, const float* logits, const uint64_t* gw, const uint64_t* gs,
+// Writes top_i, top_w, pair_row (= slot) and yd [10, 2560] for quench6k_moe_shared_combine.
+extern "C" cudaError_t quench6k_moe_experts_t1(const void* m, const float* logits, const uint64_t* gw, const uint64_t* gs,
                                             const float* g2, const uint64_t* uw, const uint64_t* us, const float* u2,
                                             const uint64_t* dw, const uint64_t* ds, const float* d2, int* top_i,
                                             float* top_w, int* pair_row, void* act, float* yd, cudaStream_t st) {
@@ -1386,12 +1386,12 @@ __global__ void draft_final_kernel(const float* __restrict__ best_v, const int* 
 
 }  // namespace
 
-extern "C" size_t squash_draft_sketch_bytes(int N) { return (size_t)N * SK_GROUPS * (8 + 2); }
-extern "C" int squash_draft_slices(int N) { return (N + SK_SLICE - 1) / SK_SLICE; }
-extern "C" int squash_draft_picks() { return SK_PICK; }
+extern "C" size_t quench6k_draft_sketch_bytes(int N) { return (size_t)N * SK_GROUPS * (8 + 2); }
+extern "C" int quench6k_draft_slices(int N) { return (N + SK_SLICE - 1) / SK_SLICE; }
+extern "C" int quench6k_draft_picks() { return SK_PICK; }
 
-// sketch: squash_draft_sketch_bytes(N) bytes (masks, then scales), from the BF16 head w [N, 2560].
-extern "C" cudaError_t squash_build_draft_sketch(const void* w, void* sketch, int N, cudaStream_t st) {
+// sketch: quench6k_draft_sketch_bytes(N) bytes (masks, then scales), from the BF16 head w [N, 2560].
+extern "C" cudaError_t quench6k_build_draft_sketch(const void* w, void* sketch, int N, cudaStream_t st) {
     auto* masks = static_cast<unsigned long long*>(sketch);
     auto* sc = reinterpret_cast<__half*>(masks + (size_t)N * SK_GROUPS);
     const size_t items = (size_t)N * SK_GROUPS;
@@ -1401,7 +1401,7 @@ extern "C" cudaError_t squash_build_draft_sketch(const void* w, void* sketch, in
 
 // Draft token for one hidden row x: sketch ranking (logits into ys [N]), per-slice NVFP4 rescoring of
 // the best candidates (pick: 2 * slices words), argmax into *out.
-extern "C" cudaError_t squash_draft_head_argmax(const void* x, const void* sketch, const void* codes, const void* scales,
+extern "C" cudaError_t quench6k_draft_head_argmax(const void* x, const void* sketch, const void* codes, const void* scales,
                                                 const float* scale2, float* ys, void* pick, int N, int* out, void* params,
                                                 void* q, cudaStream_t st) {
     if ((N + SK_SLICE - 1) / SK_SLICE * SK_PICK > 32 * 8) return cudaErrorInvalidValue;
@@ -1424,7 +1424,7 @@ extern "C" cudaError_t squash_draft_head_argmax(const void* x, const void* sketc
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_nvfp4_dense_gemv(const void* x, const void* codes, const void* scales, const float* scale2,
+extern "C" cudaError_t quench6k_nvfp4_dense_gemv(const void* x, const void* codes, const void* scales, const float* scale2,
                                                float* y, int N, cudaStream_t st) {
     SQ_CHECK_LAUNCH(sq_launch(nvfp4_dense_kernel, (N + 2 * EW - 1) / (2 * EW), EW * 32, 0, st,
                               static_cast<const __nv_bfloat16*>(x), static_cast<const uint8_t*>(codes),

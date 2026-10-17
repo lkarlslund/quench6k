@@ -168,53 +168,53 @@ __global__ void embed_rows_kernel(const float* __restrict__ emb, float* h) {
 
 }  // namespace
 
-extern "C" cudaError_t squash_embed_rows(const float* emb, int rows, float* h, cudaStream_t st) {
+extern "C" cudaError_t quench6k_embed_rows(const float* emb, int rows, float* h, cudaStream_t st) {
     if (rows == 0) return cudaSuccess;
     embed_rows_kernel<<<rows, 256, 0, st>>>(emb, h);
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t squash_vit_layernorm(const float* x, int t, int d, const void* w, const void* b, void* out, cudaStream_t st) {
+extern "C" cudaError_t quench6k_vit_layernorm(const float* x, int t, int d, const void* w, const void* b, void* out, cudaStream_t st) {
     if (t == 0) return cudaSuccess;
     layernorm_kernel<<<t, 256, 0, st>>>(x, d, static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(b),
                                         static_cast<__nv_bfloat16*>(out));
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t squash_vit_bias_act(const float* y, int t, int n, const void* bias, int act, void* out, int ldo, cudaStream_t st) {
+extern "C" cudaError_t quench6k_vit_bias_act(const float* y, int t, int n, const void* bias, int act, void* out, int ldo, cudaStream_t st) {
     if (t == 0) return cudaSuccess;
     bias_act_kernel<<<dim3((n + 255) / 256, t), 256, 0, st>>>(y, n, static_cast<const __nv_bfloat16*>(bias), act,
                                                                static_cast<__nv_bfloat16*>(out), ldo);
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t squash_vit_residual(float* h, const float* y, const void* bias, const float* extra, int t, int n, int assign,
+extern "C" cudaError_t quench6k_vit_residual(float* h, const float* y, const void* bias, const float* extra, int t, int n, int assign,
                                            cudaStream_t st) {
     if (t == 0) return cudaSuccess;
     residual_kernel<<<dim3((n + 255) / 256, t), 256, 0, st>>>(h, y, static_cast<const __nv_bfloat16*>(bias), extra, n, assign);
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t squash_vit_qkv_rope(const float* qkv, const void* bias, const float* cos, const float* sin, int t, float* q,
+extern "C" cudaError_t quench6k_vit_qkv_rope(const float* qkv, const void* bias, const float* cos, const float* sin, int t, float* q,
                                            float* k, float* v, cudaStream_t st) {
     if (t == 0) return cudaSuccess;
     qkv_rope_kernel<<<t, 384, 0, st>>>(qkv, static_cast<const __nv_bfloat16*>(bias), cos, sin, q, k, v);
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t squash_vit_attention(const float* q, const float* k, const float* v, int t, int seg, void* out, cudaStream_t st) {
+extern "C" cudaError_t quench6k_vit_attention(const float* q, const float* k, const float* v, int t, int seg, void* out, cudaStream_t st) {
     if (t == 0) return cudaSuccess;
     attention_kernel<<<dim3((t + AQ - 1) / AQ, VH), AQ * 32, 0, st>>>(q, k, v, t, seg, static_cast<__nv_bfloat16*>(out));
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t squash_to_bf16(const float* x, size_t n, void* out, cudaStream_t st) {
+extern "C" cudaError_t quench6k_to_bf16(const float* x, size_t n, void* out, cudaStream_t st) {
     if (n == 0) return cudaSuccess;
     to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(x, static_cast<__nv_bfloat16*>(out), n);
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t squash_pad_cols(const void* src, int n, int k, void* dst, int ldd, cudaStream_t st) {
+extern "C" cudaError_t quench6k_pad_cols(const void* src, int n, int k, void* dst, int ldd, cudaStream_t st) {
     pad_cols_kernel<<<dim3((ldd + 255) / 256, n), 256, 0, st>>>(static_cast<const __nv_bfloat16*>(src), k, static_cast<__nv_bfloat16*>(dst), ldd);
     return cudaGetLastError();
 }

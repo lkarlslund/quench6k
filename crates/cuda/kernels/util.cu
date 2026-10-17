@@ -25,7 +25,7 @@ __global__ void checksum_kernel(const uint8_t* data, size_t bytes, unsigned long
 
 }  // namespace
 
-extern "C" cudaError_t squash_checksum(const void* data, size_t bytes, unsigned long long* out, cudaStream_t stream) {
+extern "C" cudaError_t quench6k_checksum(const void* data, size_t bytes, unsigned long long* out, cudaStream_t stream) {
     cudaError_t err = cudaMemsetAsync(out, 0, sizeof(*out), stream);
     if (err != cudaSuccess) return err;
     SQ_CHECK_LAUNCH(sq_launch(checksum_kernel, 264, 256, 0, stream, static_cast<const uint8_t*>(data), bytes, out));
@@ -50,7 +50,7 @@ __global__ void l2_prefetch_kernel(const unsigned long long* __restrict__ ranges
 
 }  // namespace
 
-extern "C" cudaError_t squash_l2_prefetch(const unsigned long long* ranges, int n, cudaStream_t st) {
+extern "C" cudaError_t quench6k_l2_prefetch(const unsigned long long* ranges, int n, cudaStream_t st) {
     if (n == 0) return cudaSuccess;
     l2_prefetch_kernel<<<16, 128, 0, st>>>(ranges, n);
     return cudaGetLastError();

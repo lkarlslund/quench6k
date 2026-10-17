@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::Result;
-use squash_cuda::{Event, Stream};
+use quench6k_cuda::{Event, Stream};
 
 #[derive(Default)]
 pub struct Profiler {

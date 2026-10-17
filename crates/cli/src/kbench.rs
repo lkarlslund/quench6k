@@ -6,11 +6,11 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use squash_cuda::{DeviceBuffer, Event, Graph, Stream, variants};
-use squash_engine::checkpoint::Checkpoint;
-use squash_engine::forward::{self, Part, SequenceState, Workspace};
-use squash_engine::loader::LoadOptions;
-use squash_engine::model::{D, H, Model, Precision};
+use quench6k_cuda::{DeviceBuffer, Event, Graph, Stream, variants};
+use quench6k_engine::checkpoint::Checkpoint;
+use quench6k_engine::forward::{self, Part, SequenceState, Workspace};
+use quench6k_engine::loader::LoadOptions;
+use quench6k_engine::model::{D, H, Model, Precision};
 
 pub struct Options {
     pub layers: usize,
@@ -129,12 +129,12 @@ fn set_all(keys: &[(String, i32)]) {
 
 pub fn run(model_dir: &Path, o: &Options) -> Result<()> {
     ensure!(o.rows >= 1 && o.rows <= 16, "rows in 1..=16");
-    squash_cuda::set_device(0)?;
+    quench6k_cuda::set_device(0)?;
     let ckpt = Checkpoint::open(model_dir)?;
     let s = Stream::new()?;
     let t0 = std::time::Instant::now();
     let opts = LoadOptions { layers: o.layers, direct: false, ..Default::default() };
-    let (model, stats) = squash_engine::model::load_text(&ckpt, Precision::Int8Group, false, opts, &s)?;
+    let (model, stats) = quench6k_engine::model::load_text(&ckpt, Precision::Int8Group, false, opts, &s)?;
     println!("loaded {} layers: {:.2} GiB in {:.1}s", o.layers, stats.bytes as f64 / 1073741824.0, t0.elapsed().as_secs_f64());
 
     // Prefill the context, then prepare one decode step of `rows` tokens (the corpus continuation).

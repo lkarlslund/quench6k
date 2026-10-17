@@ -1,6 +1,6 @@
 # Qwen3.8 Flash-Next 125B-A6B: model specification
 
-The exact mathematics squash implements. Sources, in order of authority:
+The exact mathematics quench6k implements. Sources, in order of authority:
 
 1. HF transformers `models/qwen4_exp/modeling_qwen4_exp.py` (text model, vision tower, PLE, QSA);
 2. llama.cpp `src/models/qwen4exp.cpp` and `conversion/qwen4exp.py` (MTP block, which HF does not
@@ -202,7 +202,7 @@ Tokens masked out of the sequence are replaced by EOS before hashing.
 - Everything else is BF16: attention, GDN, HyperConnection, router, shared experts, PLE, embedding,
   LM head, vision, and the MTP layer (whose experts are BF16 `gate_up_proj [512, 1280, D]` and
   `down_proj [512, D, 640]`).
-- squash's 8-bit option converts non-expert BF16 projections to FP8 on the GPU at load time. It is
+- quench6k's 8-bit option converts non-expert BF16 projections to FP8 on the GPU at load time. It is
   an engine choice and must pass the correctness gate like everything else.
 
 ## 10. MTP (from llama.cpp; HF ignores `mtp.*`)

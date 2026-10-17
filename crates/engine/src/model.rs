@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result, ensure};
 use memmap2::Mmap;
-use squash_cuda::kernels::WeightFormat;
-use squash_cuda::{DeviceBuffer, Stream};
+use quench6k_cuda::kernels::WeightFormat;
+use quench6k_cuda::{DeviceBuffer, Stream};
 
 use crate::checkpoint::{Checkpoint, DType};
 use crate::loader::DeviceWeights;
@@ -185,7 +185,7 @@ impl PleTable {
 pub struct Mtp {
     /// NVFP4 copy of the LM head for drafting: (codes, block scales, scale2) and their storage.
     pub draft_head: (u64, u64, u64),
-    /// 1-bit sketch of the LM head that shortlists draft candidates (see `squash_draft_head_argmax`).
+    /// 1-bit sketch of the LM head that shortlists draft candidates (see `quench6k_draft_head_argmax`).
     pub draft_sketch: u64,
     pub _draft_head: Vec<DeviceBuffer>,
     pub fc_embedding: Linear,
@@ -410,22 +410,22 @@ fn hc_group(prefix: &str, injects: bool) -> (String, Vec<String>) {
     if injects {
         members.push(format!("{prefix}.block_inject_weight.weight"));
     }
-    (format!("{prefix}.squash.down_inject"), members)
+    (format!("{prefix}.quench6k.down_inject"), members)
 }
 
 fn gdn_group(layer: &str) -> (String, Vec<String>) {
     let g = format!("{layer}.linear_attn");
-    (format!("{g}.squash.in_proj"), ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"].iter().map(|m| format!("{g}.{m}.weight")).collect())
+    (format!("{g}.quench6k.in_proj"), ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"].iter().map(|m| format!("{g}.{m}.weight")).collect())
 }
 
 fn qsa_group(layer: &str) -> (String, Vec<String>) {
     let a = format!("{layer}.self_attn");
-    (format!("{a}.squash.in_proj"), ["q_proj", "k_proj", "v_proj", "indexer.index_qk_proj"].iter().map(|m| format!("{a}.{m}.weight")).collect())
+    (format!("{a}.quench6k.in_proj"), ["q_proj", "k_proj", "v_proj", "indexer.index_qk_proj"].iter().map(|m| format!("{a}.{m}.weight")).collect())
 }
 
 fn moe_group(layer: &str) -> (String, Vec<String>) {
     let m = format!("{layer}.mlp");
-    (format!("{m}.squash.in_proj"), ["gate", "shared_expert.gate_proj", "shared_expert.up_proj", "shared_expert_gate"].iter().map(|x| format!("{m}.{x}.weight")).collect())
+    (format!("{m}.quench6k.in_proj"), ["gate", "shared_expert.gate_proj", "shared_expert.up_proj", "shared_expert_gate"].iter().map(|x| format!("{m}.{x}.weight")).collect())
 }
 
 /// Every multi-member projection group of the text model; quantized profiles store each contiguously.
@@ -456,9 +456,9 @@ fn load_draft_head(ckpt: &Checkpoint, opts: crate::loader::LoadOptions, stream: 
     let scales = DeviceBuffer::new(VOCAB * D / 16)?;
     let s2 = DeviceBuffer::new(4)?;
     let amax = DeviceBuffer::new(4)?;
-    squash_cuda::kernels::quantize_nvfp4(stream, src.addr, 1, VOCAB, D, codes.addr(), scales.addr(), s2.addr(), amax.addr())?;
-    let sketch = DeviceBuffer::new(squash_cuda::kernels::draft_sketch_bytes(VOCAB))?;
-    squash_cuda::kernels::build_draft_sketch(stream, src.addr, sketch.addr(), VOCAB)?;
+    quench6k_cuda::kernels::quantize_nvfp4(stream, src.addr, 1, VOCAB, D, codes.addr(), scales.addr(), s2.addr(), amax.addr())?;
+    let sketch = DeviceBuffer::new(quench6k_cuda::kernels::draft_sketch_bytes(VOCAB))?;
+    quench6k_cuda::kernels::build_draft_sketch(stream, src.addr, sketch.addr(), VOCAB)?;
     stream.synchronize()?;
     Ok(((codes.addr(), scales.addr(), s2.addr()), sketch.addr(), vec![codes, scales, s2, sketch]))
 }
@@ -466,7 +466,7 @@ fn load_draft_head(ckpt: &Checkpoint, opts: crate::loader::LoadOptions, stream: 
 /// Uploads the MTP layer's BF16 experts one tensor at a time and NVFP4-quantizes them into the layout
 /// of the main model's experts (gate_up [512, 1280, 2560] holds gate rows 0..640 then up rows per expert).
 fn load_mtp_experts(ckpt: &Checkpoint, opts: crate::loader::LoadOptions, stream: &Stream) -> Result<ExpertTables> {
-    use squash_cuda::kernels as k;
+    use quench6k_cuda::kernels as k;
     let mut addrs = [[0u64; EXPERTS]; 6];
     let mut scale2 = [[0f32; EXPERTS]; 3];
     let mut buffers = Vec::new();
@@ -522,9 +522,9 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
     let (mut weights, mut stats) = loader::upload(ckpt, |n| wanted(n) && !quantized(n), opts)?;
     // Fold each HyperConnection's (1 + w) norm weight into its down and injection projections (SPEC §4),
     // so small batches can project the raw residual and apply the per-stream RMS factor afterwards.
-    // Experiment: SQUASH_FAKE_FP4_W (comma-separated classes) rounds those BF16 weights to NVFP4 values
+    // Experiment: QUENCH6K_FAKE_FP4_W (comma-separated classes) rounds those BF16 weights to NVFP4 values
     // (per-row scale, least-error E4M3 block scales per 16) before they are quantized as usual.
-    let fake_fp4 = std::env::var("SQUASH_FAKE_FP4_W").ok();
+    let fake_fp4 = std::env::var("QUENCH6K_FAKE_FP4_W").ok();
     let fp4_class = |n: &str| {
         fake_fp4.as_deref().is_some_and(|set| {
             set.split(',').any(|c| match c {
@@ -543,13 +543,13 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
     let fold = |name: &str, addr: u64, n: usize, k: usize| -> Result<()> {
         let prefix = name.strip_suffix(".input_mix_weight_down.weight").or_else(|| name.strip_suffix(".block_inject_weight.weight"));
         if let Some(prefix) = prefix {
-            squash_cuda::kernels::fold_norm(stream, addr, weights.get(&format!("{prefix}.hc_norm.weight"))?.addr, n, k)?;
+            quench6k_cuda::kernels::fold_norm(stream, addr, weights.get(&format!("{prefix}.hc_norm.weight"))?.addr, n, k)?;
         }
         if fp4_class(name) {
-            // SQUASH_FAKE_BITS=b (2..8): b-bit integers with a scale per 64 instead of NVFP4.
-            match std::env::var("SQUASH_FAKE_BITS").ok().and_then(|v| v.parse::<usize>().ok()) {
-                Some(bits) => squash_cuda::kernels::fake_int(stream, addr, n, k, 64, bits)?,
-                None => squash_cuda::kernels::fake_fp4_act(stream, addr, n, k)?,
+            // QUENCH6K_FAKE_BITS=b (2..8): b-bit integers with a scale per 64 instead of NVFP4.
+            match std::env::var("QUENCH6K_FAKE_BITS").ok().and_then(|v| v.parse::<usize>().ok()) {
+                Some(bits) => quench6k_cuda::kernels::fake_int(stream, addr, n, k, 64, bits)?,
+                None => quench6k_cuda::kernels::fake_fp4_act(stream, addr, n, k)?,
             }
         }
         Ok(())
@@ -561,8 +561,8 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
             fold(&name, t.addr, t.shape[0], t.shape[1])?;
         }
         // Experiment: the projections that would be 8-bit rounded to MXFP8 in place.
-        // SQUASH_FAKE_MXFP8_SET: comma-separated classes (gdn, gdnout, attn) instead of everything.
-        let set = std::env::var("SQUASH_FAKE_MXFP8_SET").ok();
+        // QUENCH6K_FAKE_MXFP8_SET: comma-separated classes (gdn, gdnout, attn) instead of everything.
+        let set = std::env::var("QUENCH6K_FAKE_MXFP8_SET").ok();
         let in_set = |n: &str| match &set {
             None => true,
             Some(set) => set.split(',').any(|c| match c {
@@ -574,12 +574,12 @@ pub fn load_text(ckpt: &Checkpoint, precision: Precision, mtp: bool, opts: crate
                 _ => false,
             }),
         };
-        if std::env::var_os("SQUASH_FAKE_MXFP8").is_some() || set.is_some() {
+        if std::env::var_os("QUENCH6K_FAKE_MXFP8").is_some() || set.is_some() {
             let names: Vec<String> = weights.tensors.keys().filter(|n| selection::eight_bit(n) && in_set(n)).cloned().collect();
             for name in names {
                 let t = weights.get(&name)?;
                 if t.shape.len() == 2 && t.shape[1] % 32 == 0 {
-                    squash_cuda::kernels::fake_mxfp8(stream, t.addr, t.shape[0], t.shape[1], t.shape[1])?;
+                    quench6k_cuda::kernels::fake_mxfp8(stream, t.addr, t.shape[0], t.shape[1], t.shape[1])?;
                 }
             }
         }

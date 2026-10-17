@@ -12,8 +12,8 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
-squash-cuda = { path = "crates/cuda" }
-squash-engine = { path = "crates/engine" }
+quench6k-cuda = { path = "crates/cuda" }
+quench6k-engine = { path = "crates/engine" }
 
 [profile.release]
 debug = "line-tables-only"

@@ -5,13 +5,13 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
-use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
-use squash_engine::model::{D, Precision};
+use quench6k_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
+use quench6k_engine::model::{D, Precision};
 
 /// The first `len` tokens of the benchmark corpus (bench/context.ids, shared with NInfer 6000), or of
-/// the whitespace-separated token file named by SQUASH_BENCH_IDS.
+/// the whitespace-separated token file named by QUENCH6K_BENCH_IDS.
 pub(crate) fn prompt(len: usize) -> Result<Vec<i32>> {
-    let path = std::env::var("SQUASH_BENCH_IDS").unwrap_or_else(|_| "bench/context.ids".into());
+    let path = std::env::var("QUENCH6K_BENCH_IDS").unwrap_or_else(|_| "bench/context.ids".into());
     let text = std::fs::read_to_string(&path)?;
     let ids: Vec<i32> = text.split_ascii_whitespace().take(len).map(|t| t.parse()).collect::<Result<_, _>>()?;
     anyhow::ensure!(ids.len() == len, "{path} holds only {} tokens", ids.len());
@@ -56,11 +56,11 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         let decode = runs[1];
         let generate = 3 * per_run;
         if ncu_steps > 0 {
-            squash_cuda::profiler_start()?;
+            quench6k_cuda::profiler_start()?;
             for _ in 0..ncu_steps {
                 next = graph.step(&model, &mut state, &mut ws, &hw, &stream, next)?;
             }
-            squash_cuda::profiler_stop()?;
+            quench6k_cuda::profiler_stop()?;
         }
         println!(
             "{ctx:>8} {prefill:>14.1} {decode:>14.1}   per token: host prepare {:.3} ms, graph {:.3} ms",
@@ -69,7 +69,7 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         );
         if profile {
             const STEPS: usize = 16;
-            let mut prof = squash_engine::profile::Profiler::default();
+            let mut prof = quench6k_engine::profile::Profiler::default();
             for _ in 0..STEPS {
                 forward::forward_profiled(&model, &mut state, &mut ws, &stream, &[next], &mut prof)?;
                 prof.time("head_argmax", &stream, || forward::head_argmax(&model, &hw, &stream, ws.out))?;
@@ -83,9 +83,9 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
 }
 
 /// Before timing anything, decodes the `code` fixture with the same prefill + graph path that is
-/// benchmarked and checks the greedy tokens against the reference sequence (which squash reproduces
+/// benchmarked and checks the greedy tokens against the reference sequence (which quench6k reproduces
 /// exactly under the correctness gate). Fails the benchmark on a mismatch.
-fn sanity(model: &squash_engine::model::Model, stream: &squash_cuda::Stream, chunk: usize) -> Result<()> {
+fn sanity(model: &quench6k_engine::model::Model, stream: &quench6k_cuda::Stream, chunk: usize) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct Sequence {
         tokens: Vec<i32>,
@@ -120,7 +120,7 @@ fn sanity(model: &squash_engine::model::Model, stream: &squash_cuda::Stream, chu
 /// The sanity check runs the same path on the code fixture against its reference tokens first.
 #[allow(clippy::too_many_arguments)]
 fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate: usize, chunk: usize, drafts: usize, adaptive: bool, ncu_rounds: usize) -> Result<()> {
-    use squash_engine::spec::{SpecDecoder, SpecGraphs};
+    use quench6k_engine::spec::{SpecDecoder, SpecGraphs};
     let (model, stream) = crate::load(model_dir, precision, true)?;
     let max_ctx = contexts.iter().max().copied().unwrap_or(0).max(512);
     let slack = (ncu_rounds + 4) * (drafts + 1) + 16;
@@ -170,11 +170,11 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
             1e3 * dec.verify_secs / dec.rounds as f64
         );
         if ncu_rounds > 0 {
-            squash_cuda::profiler_start()?;
+            quench6k_cuda::profiler_start()?;
             for _ in 0..ncu_rounds {
                 g.round(&model, &mut state, &mut ws, &mut dec, &stream)?;
             }
-            squash_cuda::profiler_stop()?;
+            quench6k_cuda::profiler_stop()?;
         }
     }
     Ok(())

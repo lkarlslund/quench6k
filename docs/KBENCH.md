@@ -1,4 +1,4 @@
-# Fast kernel iteration: `squash kbench`
+# Fast kernel iteration: `quench6k kbench`
 
 Goal: try many kernel variants (tuning parameters, fused kernels) for the decode path in seconds each,
 with real weights and real activations, a bit-exact correctness check, and timings that resolve 1-2%,
@@ -35,7 +35,7 @@ each time and the GDN state evolves deterministically: every replay sequence is 
 ### 3. Runtime kernel variants
 
 Kernels read tuning parameters (rows per block, warps, prefetch depth, which steps are fused) from a
-small variant table set from Rust (`squash_cuda::variants::set("gemv.warps", 4)`), at launch time. All
+small variant table set from Rust (`quench6k_cuda::variants::set("gemv.warps", 4)`), at launch time. All
 variants are compiled into the binary as template instantiations, so a sweep needs no rebuild: kbench
 sets a configuration, re-captures the decode graph, and measures. A variant that is not compiled in is
 rejected at launch, not silently replaced. Every key defaults to the engine's current behaviour.
@@ -49,8 +49,8 @@ milliseconds and checks every layer type, every kernel in the chain and the stat
 steps. Candidates that pass go on to the slow tiers only when they are finalists:
 
 1. kbench bitwise check (seconds, every candidate)
-2. kernel unit tests (`cargo test -p squash-cuda --test kernels`)
-3. engine: `squash generate` on all fixtures, `squash gate`, `squash bench` greedy check (finalists)
+2. kernel unit tests (`cargo test -p quench6k-cuda --test kernels`)
+3. engine: `quench6k generate` on all fixtures, `quench6k gate`, `quench6k bench` greedy check (finalists)
 
 ### 5. Timing that resolves small differences
 
@@ -63,7 +63,7 @@ steps. Candidates that pass go on to the slow tiers only when they are finalists
 
 ### 6. Sweeps
 
-`squash kbench --sweep gemv.warps=4,8 --sweep gemv.rows=1,2` runs the cartesian product, prints one
+`quench6k kbench --sweep gemv.warps=4,8 --sweep gemv.rows=1,2` runs the cartesian product, prints one
 line per configuration (median ratio, spread, bitwise yes/no) and the best exact configuration.
 Variant kernels are templates over these keys; new fused kernels are added as further values of a key
 (for example `hc.mode=split|fused`), so a hand-written fusion is swept like any parameter.
@@ -72,7 +72,7 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
 
 - K layers time the per-layer kernels; the LM head and the MTP drafter are outside the truncated model
   and are measured by the full engine.
-- The final numbers (tok/s) still come from `squash bench` on the full model; kbench ranks candidates
+- The final numbers (tok/s) still come from `quench6k bench` on the full model; kbench ranks candidates
   and proves exactness.
 - Prefill kernels need captured 8K-token batches (about 1 GB of activations per layer); the same
   structure applies, with R = chunk rows, but the first version covers decode.
@@ -131,7 +131,7 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
 ## Findings (2026-10-16, night): precision, host overhead, prefill shapes
 
 - Lower-precision dense weights do not fit the gate. Fake-quantized at load
-  (`SQUASH_FAKE_FP4_W=classes`, `SQUASH_FAKE_BITS=b` for integers with a scale per 64; classes qkv, z,
+  (`QUENCH6K_FAKE_FP4_W=classes`, `QUENCH6K_FAKE_BITS=b` for integers with a scale per 64; classes qkv, z,
   gdnout, attnin, attno, shared, hc, router, plus mtp), each scored and gated against out/g7:
   NVFP4 for every large dense class fails 11 of 12 checks; alone, each of z, qkv, gdnout, attno, hc,
   shared and attnin fails at least one completion bound (z and qkv only narrowly); INT6 and INT5 for

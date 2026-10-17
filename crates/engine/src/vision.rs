@@ -6,8 +6,8 @@
 //! Qwen2-VL image processor — so that every 4 consecutive patches form one merged token.
 
 use anyhow::{Result, ensure};
-use squash_cuda::kernels::{self as k, VitAct, WeightFormat};
-use squash_cuda::{DeviceBuffer, Stream};
+use quench6k_cuda::kernels::{self as k, VitAct, WeightFormat};
+use quench6k_cuda::{DeviceBuffer, Stream};
 
 use crate::checkpoint::Checkpoint;
 use crate::loader::{self, DeviceWeights, LoadOptions};

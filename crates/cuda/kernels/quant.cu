@@ -58,7 +58,7 @@ __global__ void quantize_kernel(const __nv_bfloat16* __restrict__ w, size_t per,
 
 // `count` consecutive BF16 matrices of n x k (k a multiple of 16) -> codes [count, n, k/2],
 // scales [count, n, k/16], scale2 [count]. `amax` is scratch for `count` u32.
-extern "C" cudaError_t squash_quantize_nvfp4(const void* w, int count, int n, int k, void* codes, void* scales,
+extern "C" cudaError_t quench6k_quantize_nvfp4(const void* w, int count, int n, int k, void* codes, void* scales,
                                              float* scale2, unsigned* amax, cudaStream_t st) {
     if (count == 0) return cudaSuccess;
     if (k % 16 != 0) return cudaErrorInvalidValue;
@@ -103,7 +103,7 @@ __global__ void fp4_act_kernel(__nv_bfloat16* x, int rows, int cols) {
 
 }  // namespace
 
-extern "C" cudaError_t squash_fake_fp4_act(void* x, int rows, int cols, cudaStream_t st) {
+extern "C" cudaError_t quench6k_fake_fp4_act(void* x, int rows, int cols, cudaStream_t st) {
     if (cols % 16 != 0) return cudaErrorInvalidValue;
     if (rows == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(fp4_act_kernel, (rows + 7) / 8, 256, 0, st, (__nv_bfloat16*)x, rows, cols));
@@ -132,7 +132,7 @@ __global__ void fake_mxfp8_kernel(__nv_bfloat16* x, int rows, int cols, int ld) 
 
 }  // namespace
 
-extern "C" cudaError_t squash_fake_mxfp8(void* x, int rows, int cols, int ld, cudaStream_t st) {
+extern "C" cudaError_t quench6k_fake_mxfp8(void* x, int rows, int cols, int ld, cudaStream_t st) {
     if (cols % 32 != 0) return cudaErrorInvalidValue;
     const size_t n = (size_t)rows * (cols / 32);
     if (n == 0) return cudaSuccess;
@@ -159,7 +159,7 @@ __global__ void fake_int_kernel(__nv_bfloat16* x, size_t groups, int group, floa
 
 }  // namespace
 
-extern "C" cudaError_t squash_fake_int(void* x, int rows, int cols, int group, int bits, cudaStream_t st) {
+extern "C" cudaError_t quench6k_fake_int(void* x, int rows, int cols, int group, int bits, cudaStream_t st) {
     if (cols % group != 0 || bits < 2 || bits > 8) return cudaErrorInvalidValue;
     const size_t n = (size_t)rows * (cols / group);
     if (n == 0) return cudaSuccess;

@@ -1,6 +1,6 @@
 # Tools
 
-Development tooling. None of it is part of the `squash` binary, which is Rust host code plus CUDA
+Development tooling. None of it is part of the `quench6k` binary, which is Rust host code plus CUDA
 kernels only.
 
 - `ref/ref.py`: an independent PyTorch implementation of [SPEC.md](../SPEC.md), used as a dev-only
@@ -9,7 +9,7 @@ kernels only.
 
   ```
   python3 -I tools/ref/ref.py --model <checkpoint> --fixture oracle/fixtures/code --out out/ref/code-a16
-  squash gate --candidates out/ref --suffix=-a16
+  quench6k gate --candidates out/ref --suffix=-a16
   ```
 
   `--act-quant` emulates NVFP4 W4A4 expert activations; `--fp64` computes in FP64.

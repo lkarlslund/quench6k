@@ -1,7 +1,7 @@
 // MXFP8 tensor-core GEMM: Y[M, N] = A[M, K] . W[N, K]^T with both operands FP8 E4M3 and a power-of-two
 // (UE8M0) scale per 32 consecutive values of a row, applied by the MMA
 // (mma.sync kind::mxf8f6f4.block_scale.scale_vec::1X m16n8k32, FP32 accumulation). Activations are
-// quantized per row by squash_mxfp8_rows with the same rule as the weights:
+// quantized per row by quench6k_mxfp8_rows with the same rule as the weights:
 //   scale = 2^ceil(log2(amax / 448)), value = e4m3(x / scale) (round to nearest, saturating).
 //
 // Tiles of 64 rows x 128 columns, k-tiles of 128 values (128 bytes per row, chunk c of row r stored at
@@ -175,7 +175,7 @@ __global__ void __launch_bounds__(THREADS) mx8_gemm_kernel(const uint8_t* __rest
 
 }  // namespace
 
-extern "C" cudaError_t squash_mxfp8_rows(const void* x, int rows, int cols, int ld, uint8_t* codes, uint8_t* scales, cudaStream_t st) {
+extern "C" cudaError_t quench6k_mxfp8_rows(const void* x, int rows, int cols, int ld, uint8_t* codes, uint8_t* scales, cudaStream_t st) {
     if (cols % 32 != 0 || ld % 8 != 0) return cudaErrorInvalidValue;
     const size_t n = (size_t)rows * (cols / 32);
     if (n == 0) return cudaSuccess;
@@ -184,7 +184,7 @@ extern "C" cudaError_t squash_mxfp8_rows(const void* x, int rows, int cols, int 
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_gemm_mx8(const uint8_t* a, const uint8_t* as, const uint8_t* w, const uint8_t* ws, float* y, int ldy,
+extern "C" cudaError_t quench6k_gemm_mx8(const uint8_t* a, const uint8_t* as, const uint8_t* w, const uint8_t* ws, float* y, int ldy,
                                        int M, int N, int K, cudaStream_t st) {
     if (K % BK != 0) return cudaErrorInvalidValue;
     if (M == 0 || N == 0) return cudaSuccess;

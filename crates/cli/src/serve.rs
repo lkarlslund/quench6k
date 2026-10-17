@@ -1,4 +1,4 @@
-//! OpenAI-compatible HTTP serving (`squash serve`): `/v1/models` and `/v1/chat/completions` with
+//! OpenAI-compatible HTTP serving (`quench6k serve`): `/v1/models` and `/v1/chat/completions` with
 //! streaming, reasoning (`reasoning_content`) and tool calls. One GPU worker thread owns the model and
 //! the generation session; requests queue for it.
 
@@ -15,8 +15,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use squash_engine::model::Precision;
-use squash_engine::session::{Finish, GenParams, Progress, Session};
+use quench6k_engine::model::Precision;
+use quench6k_engine::session::{Finish, GenParams, Progress, Session};
 use tokio::sync::mpsc as tmpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -48,8 +48,8 @@ pub struct ServeOptions {
 pub fn model_id(model_dir: &std::path::Path) -> String {
     let config = std::fs::read(model_dir.join("config.json")).unwrap_or_default();
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    let kv: &[u8] = if squash_engine::forward::KV_FP8.load(std::sync::atomic::Ordering::Relaxed) { b"/kv8" } else { b"" };
-    for b in config.iter().chain(b"int8g/squash-1".iter()).chain(kv) {
+    let kv: &[u8] = if quench6k_engine::forward::KV_FP8.load(std::sync::atomic::Ordering::Relaxed) { b"/kv8" } else { b"" };
+    for b in config.iter().chain(b"int8g/quench6k-1".iter()).chain(kv) {
         h ^= *b as u64;
         h = h.wrapping_mul(0x100_0000_01b3);
     }
@@ -107,7 +107,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     let (jobs_tx, jobs_rx) = mpsc::channel::<Work>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<f32>>();
     let (model_dir, context, drafts, steer, slots) = (opts.model.clone(), opts.context, opts.drafts, opts.steer.clone(), opts.slots);
-    let store = squash_engine::context_store::StoreOptions {
+    let store = quench6k_engine::context_store::StoreOptions {
         host_bytes: (opts.cache_host_gib * 1073741824.0) as usize,
         dir: opts.cache_dir.clone(),
         model_id: model_id(&opts.model),
@@ -120,8 +120,8 @@ pub fn run(opts: ServeOptions) -> Result<()> {
             let strength = steer.attach(&mut model, &stream)?;
             let mut session = Session::new(&model, &stream, context, 8192, drafts, store)?;
             if vision {
-                let ckpt = squash_engine::checkpoint::Checkpoint::open(&model_dir)?;
-                session.set_vision(squash_engine::vision::VisionModel::load(&ckpt, squash_engine::loader::LoadOptions::default(), &stream)?);
+                let ckpt = quench6k_engine::checkpoint::Checkpoint::open(&model_dir)?;
+                session.set_vision(quench6k_engine::vision::VisionModel::load(&ckpt, quench6k_engine::loader::LoadOptions::default(), &stream)?);
             }
             println!("context store: {} stored contexts", session.stored_contexts());
             Ok((model, stream, session, strength))
@@ -177,8 +177,8 @@ pub fn run(opts: ServeOptions) -> Result<()> {
 
 /// The GPU worker: admits queued requests into free slots and steps the running ones, one alone
 /// (speculatively when it started alone) or both batched.
-fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, session: &mut Session, jobs: &mpsc::Receiver<Work>) {
-    use squash_engine::session::Run;
+fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, session: &mut Session, jobs: &mpsc::Receiver<Work>) {
+    use quench6k_engine::session::Run;
     struct Active {
         run: Run,
         tx: tmpsc::UnboundedSender<Msg>,
@@ -222,7 +222,7 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
         eprintln!("done: slot {}, prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s){mtp}, {:?}",
                   a.run.slot, a.prompt, a.reused, a.prefill, (a.prompt - a.reused) as f64 / a.prefill.max(1e-9), n, secs,
                   n.saturating_sub(1) as f64 / secs.max(1e-9), f);
-        if let Some(path) = std::env::var_os("SQUASH_TRACE") {
+        if let Some(path) = std::env::var_os("QUENCH6K_TRACE") {
             use std::io::Write;
             if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
                 let _ = writeln!(file, "{}", json!({"slot": a.run.slot, "finish": format!("{f:?}"), "generated": a.generated}));
@@ -277,7 +277,7 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
                 Ok((run, toks)) => {
                     let mut a = Active { run, tx: job.tx, reused: if free == 0 { session.reused } else { 0 }, capture: job.capture, generated: Vec::new(),
                                          prompt: job.ids.len(), prefill: t0.elapsed().as_secs_f64(), decode_start: std::time::Instant::now() };
-                    if let Some(path) = std::env::var_os("SQUASH_TRACE") {
+                    if let Some(path) = std::env::var_os("QUENCH6K_TRACE") {
                         use std::io::Write;
                         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
                             let _ = writeln!(f, "{}", json!({"slot": free, "reused": a.reused, "ids": job.ids}));
@@ -324,9 +324,9 @@ fn schedule(model: &squash_engine::model::Model, s: &squash_cuda::Stream, sessio
 }
 
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
-    let mut data = vec![json!({"id": app.name, "object": "model", "owned_by": "squash"})];
+    let mut data = vec![json!({"id": app.name, "object": "model", "owned_by": "quench6k"})];
     if let Some((name, _)) = &app.steered {
-        data.push(json!({"id": name, "object": "model", "owned_by": "squash"}));
+        data.push(json!({"id": name, "object": "model", "owned_by": "quench6k"}));
     }
     Json(json!({"object": "list", "data": data}))
 }
@@ -367,7 +367,7 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
     let thinking = text.ends_with("<think>\n");
     let t1 = std::time::Instant::now();
     let ids = app.chat.encode(&text).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    if std::env::var_os("SQUASH_TIMING").is_some() {
+    if std::env::var_os("QUENCH6K_TIMING").is_some() {
         eprintln!("prepare: render {:.1} ms, encode {:.1} ms ({} tokens)", (t1 - t0).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3, ids.len());
     }
     let (mut ids, images) = app.chat.expand_media(&ids, images, videos).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
@@ -410,7 +410,7 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
                 return Err(error(StatusCode::BAD_REQUEST, "capture.name must be a plain file name"));
             }
             let Some(dir) = &app.capture_dir else { return Err(error(StatusCode::BAD_REQUEST, "capture requested but the server has no --capture-dir")) };
-            let meta = json!({"engine": "squash", "model_id": app.model_id, "prompt_ids": ids, "temperature": temperature, "top_p": top_p,
+            let meta = json!({"engine": "quench6k", "model_id": app.model_id, "prompt_ids": ids, "temperature": temperature, "top_p": top_p,
                               "top_k": top_k, "min_p": min_p, "presence_penalty": presence_penalty, "repetition_penalty": repetition_penalty, "seed": seed, "steering_strength": steering_strength, "request": c});
             Some((dir.join(format!("{name}.safetensors")), meta))
         }
@@ -426,7 +426,7 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
 /// Replaces image and video parts of message contents (OpenAI-style `image_url` / `video_url` with
 /// a data URL) by template placeholders and preprocesses them, in order.
 #[allow(clippy::type_complexity)]
-fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<squash_engine::vision::VisionInput>, Vec<squash_engine::vision::VideoClip>), Response> {
+fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<quench6k_engine::vision::VisionInput>, Vec<quench6k_engine::vision::VideoClip>), Response> {
     use base64::Engine;
     let mut out = messages.clone();
     let (mut images, mut videos) = (Vec::new(), Vec::new());
@@ -448,14 +448,14 @@ fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<squash_engi
             let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|e| error(StatusCode::BAD_REQUEST, format!("media base64: {e}")))?;
             if kind.starts_with("video") {
                 // ffmpeg reads the clip from a private temporary file.
-                let path = std::env::temp_dir().join(format!("squash-video-{}-{}", std::process::id(), now() ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9)));
+                let path = std::env::temp_dir().join(format!("quench6k-video-{}-{}", std::process::id(), now() ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9)));
                 std::fs::write(&path, &bytes).map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("video: {e}")))?;
-                let clip = squash_engine::vision::preprocess_video(&path, 4096, 25165824, app.video_max_frames);
+                let clip = quench6k_engine::vision::preprocess_video(&path, 4096, 25165824, app.video_max_frames);
                 let _ = std::fs::remove_file(&path);
                 videos.push(clip.map_err(|e| error(StatusCode::BAD_REQUEST, format!("video: {e:#}")))?);
                 *part = json!({"type": "video"});
             } else {
-                let input = squash_engine::vision::preprocess_image(&bytes, 65536, app.image_max_pixels).map_err(|e| error(StatusCode::BAD_REQUEST, format!("image: {e:#}")))?;
+                let input = quench6k_engine::vision::preprocess_image(&bytes, 65536, app.image_max_pixels).map_err(|e| error(StatusCode::BAD_REQUEST, format!("image: {e:#}")))?;
                 images.push(input);
                 *part = json!({"type": "image"});
             }
@@ -758,8 +758,8 @@ async fn generate(app: &App, p: &Prepared, mut on_seg: impl FnMut(Seg)) -> Resul
         let (Some(tools), Some(tc)) = (p.tools.as_ref(), app.tool_call_token) else { return Ok((seg, total, finish, cached_first.unwrap_or(0))) };
         let body = if p.thinking { think_end(&seg.text).map(|(_, j)| &seg.text[j..]).unwrap_or("") } else { seg.text.as_str() };
         let problem = match validate_calls(body, tools) {
-            // SQUASH_TEST_TOOL_RETRY: treat the first attempt's tool calls as invalid (exercises retries).
-            Ok(()) if attempt == 0 && body.contains("<tool_call>") && std::env::var_os("SQUASH_TEST_TOOL_RETRY").is_some() => Some("forced by SQUASH_TEST_TOOL_RETRY".to_string()),
+            // QUENCH6K_TEST_TOOL_RETRY: treat the first attempt's tool calls as invalid (exercises retries).
+            Ok(()) if attempt == 0 && body.contains("<tool_call>") && std::env::var_os("QUENCH6K_TEST_TOOL_RETRY").is_some() => Some("forced by QUENCH6K_TEST_TOOL_RETRY".to_string()),
             Ok(()) => None,
             Err(e) => Some(e),
         };
@@ -1151,8 +1151,8 @@ mod tests {
 /// (premix F32 [4, 2560], mix BF16 [2560], block F32 [2560], moe F32 [2560], router_logits F32 [512],
 /// router_top_ids I32 [10], router_top_weights F32 [10]), `top_ids.{site}` / `top_logprobs.{site}` [20],
 /// and JSON metadata (request, prompt and completion ids, positions, fire count).
-fn write_capture(path: &std::path::Path, meta: &Value, generated: &[i32], c: &squash_engine::session::CaptureResult) -> Result<()> {
-    use squash_engine::forward::CaptureLayout as L;
+fn write_capture(path: &std::path::Path, meta: &Value, generated: &[i32], c: &quench6k_engine::session::CaptureResult) -> Result<()> {
+    use quench6k_engine::forward::CaptureLayout as L;
     let fields: [(&str, &str, usize, Vec<usize>, usize); 7] = [
         ("premix", "F32", L::PREMIX, vec![4, 2560], L::MIX - L::PREMIX),
         ("mix", "BF16", L::MIX, vec![2560], L::BLOCK - L::MIX),
@@ -1168,7 +1168,7 @@ fn write_capture(path: &std::path::Path, meta: &Value, generated: &[i32], c: &sq
         header.insert(name, json!({"dtype": dtype, "shape": shape, "data_offsets": [data.len(), data.len() + bytes.len()]}));
         data.extend_from_slice(bytes);
     };
-    let layers = squash_engine::model::LAYERS;
+    let layers = quench6k_engine::model::LAYERS;
     for site in &c.sites {
         for l in 0..layers {
             let rec = &site.records[l * L::BYTES..(l + 1) * L::BYTES];
@@ -1185,7 +1185,7 @@ fn write_capture(path: &std::path::Path, meta: &Value, generated: &[i32], c: &sq
     m["completion_ids"] = json!(generated);
     m["sites"] = Value::Array(c.sites.iter().map(|s| json!({"site": s.name, "position": s.position, "token": s.token})).collect());
     m["fire_count"] = json!(layers * c.sites.len());
-    header.insert("__metadata__".into(), json!({"squash.capture": m.to_string()}));
+    header.insert("__metadata__".into(), json!({"quench6k.capture": m.to_string()}));
     let mut h = Value::Object(header).to_string().into_bytes();
     while h.len() % 8 != 0 {
         h.push(b' ');

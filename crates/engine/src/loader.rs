@@ -6,14 +6,13 @@
 //! read fixed-size chunks into double-buffered pinned memory and stream them to the device.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::fs::File;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use squash_cuda::{DeviceBuffer, Event, PinnedBuffer, Stream};
+use quench6k_cuda::{DeviceBuffer, Event, PinnedBuffer, Stream};
 
 use crate::checkpoint::{Checkpoint, DType};
 
@@ -61,19 +60,19 @@ impl DeviceWeights {
 pub fn upload_quantized(
     ckpt: &Checkpoint,
     select: impl Fn(&str) -> bool,
-    format: squash_cuda::kernels::WeightFormat,
+    format: quench6k_cuda::kernels::WeightFormat,
     groups: &[(String, Vec<String>)],
     prep: &dyn Fn(&str, u64, usize, usize) -> Result<()>,
     opts: LoadOptions,
-    stream: &squash_cuda::Stream,
+    stream: &quench6k_cuda::Stream,
 ) -> Result<(DeviceWeights, LoadStats)> {
-    use squash_cuda::kernels::{self as k, WeightFormat};
+    use quench6k_cuda::kernels::{self as k, WeightFormat};
     anyhow::ensure!(format == WeightFormat::Int8Group, "upload_quantized produces group-scaled INT8 only");
     let start = Instant::now();
     // GDN input projections become MXFP8 (gate PASS; FP8 tensor cores for prefill), the rest INT8 with
-    // group scales. SQUASH_GDN_MXFP8=0 keeps them INT8.
-    let mx8_on = std::env::var("SQUASH_GDN_MXFP8").map_or(true, |v| v != "0");
-    let is_mx8 = |group: Option<&str>| mx8_on && group.is_some_and(|g| g.ends_with(".linear_attn.squash.in_proj"));
+    // group scales. QUENCH6K_GDN_MXFP8=0 keeps them INT8.
+    let mx8_on = std::env::var("QUENCH6K_GDN_MXFP8").map_or(true, |v| v != "0");
+    let is_mx8 = |group: Option<&str>| mx8_on && group.is_some_and(|g| g.ends_with(".linear_attn.quench6k.in_proj"));
     let scale_bytes = |mx8: bool, rows: usize, kk: usize| if mx8 { rows * kk / 32 } else { rows * (kk / k::int8_group()) * 4 };
 
     // Units of contiguous placement: a group's members, or a single tensor.
@@ -262,10 +261,9 @@ pub fn upload(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, opts: LoadOption
 
 /// Direct I/O block size: offsets, lengths and buffer addresses of `O_DIRECT` reads are multiples of it.
 const DIRECT_ALIGN: u64 = 4096;
-const O_DIRECT: i32 = 0o40000;
 
 fn open_direct(files: &[crate::checkpoint::SafetensorsFile]) -> Option<Vec<File>> {
-    files.iter().map(|f| OpenOptions::new().read(true).custom_flags(O_DIRECT).open(&f.path).ok()).collect()
+    files.iter().map(|f| crate::fileio::open_direct(&f.path)).collect()
 }
 
 fn upload_worker(ckpt: &Checkpoint, direct: Option<&[File]>, chunks: &[Chunk], next: &AtomicUsize, chunk_bytes: usize) -> Result<()> {
@@ -291,14 +289,14 @@ fn upload_worker(ckpt: &Checkpoint, direct: Option<&[File]>, chunks: &[Chunk], n
                 let skip = (chunk.offset - begin) as usize;
                 let mut filled = 0;
                 while filled < skip + chunk.len {
-                    let n = files[chunk.file].read_at(&mut window[filled..], begin + filled as u64)?;
+                    let n = crate::fileio::read_at(&files[chunk.file], &mut window[filled..], begin + filled as u64)?;
                     anyhow::ensure!(n > 0, "unexpected end of {}", ckpt.files[chunk.file].path.display());
                     filled += n;
                 }
                 &buffer[skip..skip + chunk.len]
             }
             None => {
-                ckpt.files[chunk.file].file.read_exact_at(&mut buffer[..chunk.len], chunk.offset)?;
+                crate::fileio::read_exact_at(&ckpt.files[chunk.file].file, &mut buffer[..chunk.len], chunk.offset)?;
                 &buffer[..chunk.len]
             }
         };

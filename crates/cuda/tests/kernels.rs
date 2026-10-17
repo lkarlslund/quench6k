@@ -1,7 +1,7 @@
 //! Kernel tests against straightforward CPU implementations.
 
-use squash_cuda::kernels::WeightFormat;
-use squash_cuda::{DeviceBuffer, Stream, bf16, kernels};
+use quench6k_cuda::kernels::WeightFormat;
+use quench6k_cuda::{DeviceBuffer, Stream, bf16, kernels};
 
 struct Rng(u64);
 impl Rng {
@@ -28,7 +28,7 @@ fn upload<T: Copy>(s: &Stream, v: &[T]) -> DeviceBuffer {
 
 #[test]
 fn gemm_matches_cpu() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x1234_5678_9abc_def1);
     for &(m, n, k) in &[(1, 320, 10240), (7, 4, 2560), (130, 300, 64), (64, 128, 32), (200, 1000, 2560)] {
@@ -68,7 +68,7 @@ fn max_rel(got: &[f32], want: &[f64], k: usize) -> f64 {
 
 #[test]
 fn gemv_and_int8_group_paths_match_cpu() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     for &(m, n, k, splits) in &[(1, 320, 10240, 16), (3, 10240, 320, 1), (16, 2560, 6144, 3), (2, 33, 2560, 1), (5, 48, 2560, 4)] {
@@ -118,7 +118,7 @@ fn fp8_e4m3(b: u8) -> f32 {
 
 #[test]
 fn nvfp4_quantization_round_trips() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x0dd_ba11);
     let (count, n, k) = (3, 64, 256);
@@ -157,7 +157,7 @@ fn nvfp4_value(code: u8) -> f32 {
 /// Small-batch expert gate/up (+SwiGLU) against the CPU, two tokens routed to overlapping experts.
 #[test]
 fn expert_gate_up_small_matches_cpu() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0xfeed_beef);
     const E: usize = 512;
@@ -223,7 +223,7 @@ fn expert_gate_up_small_matches_cpu() {
 /// The small-batch HyperConnection gives every token the same bits whatever the batch size.
 #[test]
 fn hc_small_is_batch_invariant() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x5eed_0f_4c);
     const D: usize = 2560;
@@ -274,7 +274,7 @@ fn hc_small_is_batch_invariant() {
 /// ties to the lowest index, in ascending index order.
 #[test]
 fn qsa_select_matches_cpu() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0xa11c_e5e1_ec7);
     for &(start, ld, coarse) in &[(8_000usize, 2048usize, true), (131_000, 32_768, true), (262_000, 65_536, true), (40_000, 65_536, true), (131_000, 32_768, false), (262_000, 65_536, false), (20_000, 65_536, false), (30_000, 65_536, true)] {
@@ -306,7 +306,7 @@ fn qsa_select_matches_cpu() {
 /// The chunked GDN recurrence (used from 64 tokens) matches the token-sequential kernel.
 #[test]
 fn gdn_chunked_matches_sequential() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x6d6e_1234_abcd);
     const C: usize = 10240;
@@ -357,7 +357,7 @@ fn gdn_chunked_matches_sequential() {
 /// The sketch-shortlisted draft head returns the NVFP4 head's argmax for typical rows.
 #[test]
 fn draft_sketch_matches_full_head() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x5ce7_c4ed);
     const D: usize = 2560;
@@ -396,7 +396,7 @@ fn draft_sketch_matches_full_head() {
 /// the dequantized operands (one expert, three row tiles, a partial last tile).
 #[test]
 fn fp4_grouped_gemm_matches_cpu() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0xf4f4_0001);
     for &(m, n, k) in &[(150usize, 256usize, 640usize), (70, 128, 2560)] {
@@ -468,7 +468,7 @@ fn fp4_grouped_gemm_matches_cpu() {
 /// The fused HyperConnection up-projection + mix equals the GEMM followed by hc_mix, bit for bit.
 #[test]
 fn hc_up_mix_fused_matches_unfused() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x4c4c_0001);
     let (m, k, h) = (300usize, 320usize, 10240usize);
@@ -497,7 +497,7 @@ fn hc_up_mix_fused_matches_unfused() {
 /// hc_combine_norm equals hc_combine followed by grouped_rmsnorm, bit for bit.
 #[test]
 fn hc_combine_norm_matches_separate() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0xc0b1_0001);
     let t = 37usize;
@@ -519,7 +519,7 @@ fn hc_combine_norm_matches_separate() {
 #[test]
 #[ignore]
 fn gemm_throughput() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     for &(m, n, k) in &[(8192usize, 16512usize, 2560usize), (8192, 2560, 6144), (8192, 324, 10240), (8192, 10240, 320)] {
         let x = DeviceBuffer::zeroed(m * k * 2).unwrap();
@@ -549,7 +549,7 @@ fn gemm_tall_tiles_match_cpu() {
 }
 
 fn gemm_tiles_match_cpu(m: usize, n: usize, k: usize) {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x7a11_0001);
     let x = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
@@ -580,7 +580,7 @@ fn gemm_tiles_match_cpu(m: usize, n: usize, k: usize) {
 /// batches take that path).
 #[test]
 fn dequant_int8_groups_gemm_is_exact() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0xde90_0001);
     let (m, n, k) = (2304usize, 1056usize, 640usize);
@@ -603,7 +603,7 @@ fn dequant_int8_groups_gemm_is_exact() {
 /// Tensor-core indexer scores against the FP32 kernel; the selected groups barely change.
 #[test]
 fn index_scores_tc_match_fp32() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x5c0e_0001);
     let (t, start, ld) = (130usize, 6000usize, 1600usize);
@@ -613,7 +613,7 @@ fn index_scores_tc_match_fp32() {
     let dstart = upload(&s, &[start as i32]);
     let run = |fp32: bool| -> (Vec<f32>, Vec<i32>) {
         unsafe {
-            if fp32 { std::env::set_var("SQUASH_SCORE_FP32", "1") } else { std::env::remove_var("SQUASH_SCORE_FP32") }
+            if fp32 { std::env::set_var("QUENCH6K_SCORE_FP32", "1") } else { std::env::remove_var("QUENCH6K_SCORE_FP32") }
         }
         let sc = DeviceBuffer::zeroed(t * ld * 4).unwrap();
         kernels::qsa_index_scores(&s, diq.addr(), dp.addr(), sc.addr(), ld, dstart.addr(), t).unwrap();
@@ -641,7 +641,7 @@ fn index_scores_tc_match_fp32() {
 /// MXFP8 GEMM against the CPU product of the dequantized operands; the GEMV reads the same weights.
 #[test]
 fn mxfp8_gemm_matches_cpu() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x88f8_0001);
     let (m, n, k) = (200usize, 300usize, 512usize);
@@ -693,7 +693,7 @@ fn mxfp8_gemm_matches_cpu() {
 /// Split-K GEMM equals the CPU product (BF16 and INT8-group weights, with accumulate).
 #[test]
 fn gemm_split_matches_cpu() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x5911_0001);
     let (m, n, k) = (300usize, 330usize, 4096usize);
@@ -718,7 +718,7 @@ fn gemm_split_matches_cpu() {
 /// Full-width narrow GEMM against the CPU (INT8-group weights, N = 324, a partial row tile).
 #[test]
 fn gemm_wide_matches_cpu() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x01de_0001);
     let (m, n, k) = (150usize, 324usize, 1024usize);
@@ -746,7 +746,7 @@ fn gemm_wide_matches_cpu() {
 /// The fused GDN conv + prep equals the two kernels, bit for bit (outputs, beta, g and conv state).
 #[test]
 fn gdn_conv_prep_fused_matches() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0xc0a7_0001);
     let (t, ld) = (37usize, 10240 + 2 * 48 + 16);
@@ -779,7 +779,7 @@ fn gdn_conv_prep_fused_matches() {
 /// The parallel prefill PLE conv equals the sequential kernel (one 100-token step vs two of 50).
 #[test]
 fn ple_conv_tiled_matches_sequential() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x91e0_0001);
     let (t, h) = (100usize, 10240usize);
@@ -809,7 +809,7 @@ fn ple_conv_tiled_matches_sequential() {
 /// The fused MoE combine + residual update + norm equals moe_combine_bf16 then hc_combine_norm.
 #[test]
 fn hc_moe_combine_norm_matches() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x30e0_0001);
     let t = 21usize;
@@ -838,7 +838,7 @@ fn hc_moe_combine_norm_matches() {
 /// with and without split K.
 #[test]
 fn gemv_rows_are_independent_of_m() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x0dd_ba11);
     let (n, k) = (1000usize, 2560usize);
@@ -875,7 +875,7 @@ fn gemv_rows_are_independent_of_m() {
 /// short rows (one block per row) and vocabulary-length rows (sliced, then merged).
 #[test]
 fn topk_matches_cpu() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x7091_0001);
     for &(rows, n, k) in &[(3usize, 5000usize, 64usize), (5, 248_320, 64), (9, 248_320, 20), (1, 131_072, 64)] {
@@ -908,12 +908,12 @@ fn topk_matches_cpu() {
     }
 }
 
-/// Timing of vocabulary-row top-k (run with --ignored --nocapture; SQUASH_TOPK_ONE_PASS=1 for the
+/// Timing of vocabulary-row top-k (run with --ignored --nocapture; QUENCH6K_TOPK_ONE_PASS=1 for the
 /// one-block-per-row path).
 #[test]
 #[ignore]
 fn topk_timing() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x7091_0002);
     let (rows, n, k) = (4usize, 248_320usize, 64usize);
@@ -922,19 +922,19 @@ fn topk_timing() {
     for _ in 0..3 {
         kernels::topk(&s, dx.addr(), rows, n, n, k, false, di.addr(), dv.addr()).unwrap();
     }
-    let (a, b) = (squash_cuda::Event::timing().unwrap(), squash_cuda::Event::timing().unwrap());
+    let (a, b) = (quench6k_cuda::Event::timing().unwrap(), quench6k_cuda::Event::timing().unwrap());
     a.record(&s).unwrap();
     for _ in 0..100 {
         kernels::topk(&s, dx.addr(), rows, n, n, k, false, di.addr(), dv.addr()).unwrap();
     }
     b.record(&s).unwrap();
     b.synchronize().unwrap();
-    println!("topk {rows} x {n}, k {k}: {:.1} us", squash_cuda::Event::elapsed_ms(&a, &b).unwrap() * 10.0);
+    println!("topk {rows} x {n}, k {k}: {:.1} us", quench6k_cuda::Event::elapsed_ms(&a, &b).unwrap() * 10.0);
 }
 
 #[test]
 fn penalties_match_cpu() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x7091_0003);
     let (n, rows) = (248_320usize, 5usize);

@@ -154,14 +154,14 @@ __device__ int tk_cand_idx[TK_CAND];
 __device__ float tk_cand_val[TK_CAND];
 }  // namespace
 
-extern "C" cudaError_t squash_topk(const float* x, int rows, int n, size_t ld, int k, int sort_by_index, int* out_idx,
+extern "C" cudaError_t quench6k_topk(const float* x, int rows, int n, size_t ld, int k, int sort_by_index, int* out_idx,
                                    float* out_val, cudaStream_t st) {
     if (k > MAXK || k > n || k <= 0) return cudaErrorInvalidValue;
     if (rows == 0) return cudaSuccess;
     // Long rows (vocabulary logits): slices in parallel, then a merge of their candidates (one block
     // per row would stream the whole row through one SM five times).
     if (n >= 65536 && n % TK_SLICES == 0 && n / TK_SLICES >= k && (size_t)rows * TK_SLICES * k <= TK_CAND &&
-        !getenv("SQUASH_TOPK_ONE_PASS")) {
+        !getenv("QUENCH6K_TOPK_ONE_PASS")) {
         int* ci;
         float* cv;
         SQ_CHECK_LAUNCH(cudaGetSymbolAddress((void**)&ci, tk_cand_idx));
@@ -199,7 +199,7 @@ __global__ void lse_kernel(const float* __restrict__ x, int n, size_t ld, const 
 
 }  // namespace
 
-extern "C" cudaError_t squash_row_lse(const float* x, int rows, int n, size_t ld, const int* targets, float* lse,
+extern "C" cudaError_t quench6k_row_lse(const float* x, int rows, int n, size_t ld, const int* targets, float* lse,
                                       float* target_logit, cudaStream_t st) {
     if (rows == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(lse_kernel, rows, 1024, 0, st, x, n, ld, targets, lse, target_logit));
@@ -289,10 +289,10 @@ __global__ void argmax_final_kernel(const float* __restrict__ pv, const int* __r
 
 }  // namespace
 
-extern "C" size_t squash_argmax_scratch(int rows, int n) { return (size_t)rows * ((n + AM_SLICE - 1) / AM_SLICE) * 8; }
+extern "C" size_t quench6k_argmax_scratch(int rows, int n) { return (size_t)rows * ((n + AM_SLICE - 1) / AM_SLICE) * 8; }
 
-// scratch: squash_argmax_scratch(rows, n) bytes.
-extern "C" cudaError_t squash_argmax(const float* x, int rows, int n, size_t ld, void* scratch, int* out, cudaStream_t st) {
+// scratch: quench6k_argmax_scratch(rows, n) bytes.
+extern "C" cudaError_t quench6k_argmax(const float* x, int rows, int n, size_t ld, void* scratch, int* out, cudaStream_t st) {
     if (rows == 0) return cudaSuccess;
     const int slices = (n + AM_SLICE - 1) / AM_SLICE;
     float* pv = static_cast<float*>(scratch);
@@ -606,7 +606,7 @@ __global__ void __launch_bounds__(CL_THREADS) qsa_select_cluster_kernel(const fl
 }  // namespace
 
 // `ld` must be a multiple of 4 (rows are read as float4).
-extern "C" cudaError_t squash_qsa_select(const float* scores, int T, size_t ld, const int* start, int* sel,
+extern "C" cudaError_t quench6k_qsa_select(const float* scores, int T, size_t ld, const int* start, int* sel,
                                             cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     if (ld % 4 != 0) return cudaErrorInvalidValue;

@@ -3,7 +3,7 @@
 //! requests decode one token per step and sample on the host from the LM head's top-k logits.
 
 use anyhow::{Result, ensure};
-use squash_cuda::{DeviceBuffer, Stream};
+use quench6k_cuda::{DeviceBuffer, Stream};
 
 use crate::forward::{self, BatchGraph, DecodeGraph, HeadWorkspace, SequenceState, Workspace};
 use crate::model::{Model, VOCAB};
@@ -184,7 +184,7 @@ pub(crate) struct Penalties {
 impl Penalties {
     fn new() -> Result<Self> {
         Ok(Self {
-            st: DeviceBuffer::zeroed(squash_cuda::kernels::penalty_state_bytes())?,
+            st: DeviceBuffer::zeroed(quench6k_cuda::kernels::penalty_state_bytes())?,
             flags: DeviceBuffer::zeroed(VOCAB * 4)?,
             list: DeviceBuffer::new(VOCAB * 4)?,
             ids: DeviceBuffer::new(VOCAB * 4)?,
@@ -219,7 +219,7 @@ impl Penalties {
             return Ok(());
         }
         s.upload_to(self.ids.addr(), ids)?;
-        squash_cuda::kernels::penalty_mark(s, self.st.addr(), self.flags.addr(), self.list.addr(), self.ids.addr(), ids.len(), 0, bits)
+        quench6k_cuda::kernels::penalty_mark(s, self.st.addr(), self.flags.addr(), self.list.addr(), self.ids.addr(), ids.len(), 0, bits)
     }
 
     /// Adds a generated token to the history.
@@ -232,7 +232,7 @@ impl Penalties {
         if !self.active {
             return Ok(());
         }
-        squash_cuda::kernels::penalty_apply(s, logits, 1, VOCAB, self.st.addr(), self.flags.addr(), self.list.addr(), 0)
+        quench6k_cuda::kernels::penalty_apply(s, logits, 1, VOCAB, self.st.addr(), self.flags.addr(), self.list.addr(), 0)
     }
 }
 
@@ -601,7 +601,7 @@ impl Session {
         let kv = self.kv_pieces(snap.pos);
         let total = rec + kv.iter().map(|p| p.1).sum::<usize>();
         let t0 = std::time::Instant::now();
-        let buf = squash_cuda::PinnedBuffer::new(total)?;
+        let buf = quench6k_cuda::PinnedBuffer::new(total)?;
         let t1 = std::time::Instant::now();
         let s = Stream::new()?;
         unsafe {
@@ -615,7 +615,7 @@ impl Session {
         s.synchronize()?;
         let t2 = std::time::Instant::now();
         self.store.insert(tokens, buf)?;
-        if std::env::var_os("SQUASH_TIMING").is_some() {
+        if std::env::var_os("QUENCH6K_TIMING").is_some() {
             eprintln!("stash {} tokens, {} MiB: alloc {:.3}s copy {:.3}s insert {:.3}s", snap.pos, total >> 20, (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64());
         }
         Ok(())
@@ -643,7 +643,7 @@ impl Session {
             }
         }
         s.synchronize()?;
-        if std::env::var_os("SQUASH_TIMING").is_some() {
+        if std::env::var_os("QUENCH6K_TIMING").is_some() {
             eprintln!("load {} tokens from the store: {:.3}s", tokens.len(), t0.elapsed().as_secs_f64());
         }
         self.snapshots.push(Snapshot { pos: tokens.len(), buf: snap_buf, periodic: false });
@@ -770,7 +770,7 @@ impl Session {
             } else {
                 // Leave headroom for per-request buffers (vision encoder, sampling).
                 let bytes = Self::snapshot_bytes(state, pending);
-                let room = squash_cuda::mem_info().map_or(false, |(free, _)| free >= bytes + SNAPSHOT_HEADROOM);
+                let room = quench6k_cuda::mem_info().map_or(false, |(free, _)| free >= bytes + SNAPSHOT_HEADROOM);
                 match if room { DeviceBuffer::new(bytes) } else { Err(anyhow::anyhow!("under {} MiB free", SNAPSHOT_HEADROOM >> 20)) } {
                     Ok(b) => Some(b),
                     Err(_) if !snapshots.is_empty() => Some(oldest(snapshots)),
@@ -859,7 +859,7 @@ impl Session {
     fn sample(&self, s: &Stream, logits: u64, p: &GenParams, pen: &Penalties, rng: &mut Rng) -> Result<i32> {
         pen.apply(s, logits)?;
         let k = if p.temperature <= 0.0 { 1 } else if p.top_k == 0 { MAX_TOP_K } else { p.top_k.min(MAX_TOP_K) };
-        squash_cuda::kernels::topk(s, logits, 1, VOCAB, VOCAB, k, false, self.top_idx.addr(), self.top_val.addr())?;
+        quench6k_cuda::kernels::topk(s, logits, 1, VOCAB, VOCAB, k, false, self.top_idx.addr(), self.top_val.addr())?;
         let ids: Vec<i32> = s.download(self.top_idx.addr(), k)?;
         let vals: Vec<f32> = s.download(self.top_val.addr(), k)?;
         let t = p.temperature.max(1e-4);
@@ -895,7 +895,7 @@ impl Session {
 /// Runs `f` (a prefill of `prompt[start..]`) while threads fault the prompt's PLE rows into the page
 /// cache ahead of it.
 fn with_ple_warm<R>(model: &Model, prompt: &[i32], start: usize, f: impl FnOnce() -> R) -> R {
-    let threads = std::env::var("SQUASH_PLE_WARM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    let threads = std::env::var("QUENCH6K_PLE_WARM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
     if prompt.len() - start < 256 || threads == 0 {
         return f();
     }

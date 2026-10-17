@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use squash_cuda::PinnedBuffer;
+use quench6k_cuda::PinnedBuffer;
 
 #[derive(Clone, Debug, Default)]
 pub struct StoreOptions {
@@ -183,7 +183,7 @@ fn read_header(path: &Path) -> Result<(String, Vec<i32>, usize)> {
     let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
-    ensure!(&magic == MAGIC, "not a squash context file");
+    ensure!(&magic == MAGIC, "not a quench6k context file");
     let mut len = [0u8; 8];
     f.read_exact(&mut len)?;
     let mut header = vec![0u8; u64::from_le_bytes(len) as usize];

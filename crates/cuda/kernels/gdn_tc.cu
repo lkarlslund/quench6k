@@ -335,9 +335,9 @@ __global__ void __launch_bounds__(ST_THREADS) state_tc_kernel(const float* __res
 
 }  // namespace
 
-extern "C" size_t squash_gdn_tc_scratch_floats(int T) { return (size_t)((T + L - 1) / L) * VH * CH_FLOATS; }
+extern "C" size_t quench6k_gdn_tc_scratch_floats(int T) { return (size_t)((T + L - 1) / L) * VH * CH_FLOATS; }
 
-extern "C" cudaError_t squash_gdn_chunked_tc(const float* qkv, const float* beta, const float* g, float* state, float* out, int T,
+extern "C" cudaError_t quench6k_gdn_chunked_tc(const float* qkv, const float* beta, const float* g, float* state, float* out, int T,
                                              float* scratch, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     static bool configured = false;

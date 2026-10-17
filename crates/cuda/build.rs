@@ -13,9 +13,14 @@ fn cuda_home() -> PathBuf {
     PathBuf::from("/opt/cuda")
 }
 
+fn exe(name: &str) -> String {
+    if cfg!(windows) { format!("{name}.exe") } else { name.to_string() }
+}
+
 fn main() {
     let cuda = cuda_home();
-    let nvcc = cuda.join("bin/nvcc");
+    let nvcc = cuda.join("bin").join(exe("nvcc"));
+    let windows = env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows";
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let kernels = Path::new("kernels");
     let profile = env::var("PROFILE").unwrap();
@@ -34,9 +39,16 @@ fn main() {
     let mut objects = Vec::new();
     for source in &sources {
         println!("cargo:rerun-if-changed={}", source.display());
-        let object = out.join(source.file_stem().unwrap()).with_extension("o");
+        let object = out.join(source.file_stem().unwrap()).with_extension(if windows { "obj" } else { "o" });
         let mut cmd = Command::new(&nvcc);
-        cmd.args(["-c", "-std=c++20", "-gencode=arch=compute_120a,code=sm_120a", "-Xcompiler=-fPIC", "--expt-relaxed-constexpr"])
+        cmd.args(["-c", "-std=c++20", "-gencode=arch=compute_120a,code=sm_120a", "--expt-relaxed-constexpr"]);
+        if windows {
+            // The dynamic CRT (/MD), as Rust's MSVC targets use; the conforming preprocessor for C++20.
+            cmd.args(["-Xcompiler=/MD", "-Xcompiler=/Zc:preprocessor"]);
+        } else {
+            cmd.arg("-Xcompiler=-fPIC");
+        }
+        cmd
             .arg("-I")
             .arg(kernels)
             .arg(if profile == "release" { "-O3" } else { "-O2" })
@@ -55,14 +67,24 @@ fn main() {
         }
     }
 
-    let library = out.join("libsquash_kernels.a");
+    let library = out.join(if windows { "quench6k_kernels.lib" } else { "libquench6k_kernels.a" });
     let _ = std::fs::remove_file(&library);
-    let status = Command::new("ar").arg("crs").arg(&library).args(&objects).status().expect("failed to run ar");
-    assert!(status.success(), "ar failed");
+    let status = Command::new(&nvcc).arg("--lib").arg("-o").arg(&library).args(&objects).status().expect("failed to run nvcc --lib");
+    assert!(status.success(), "nvcc --lib failed");
 
     println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=squash_kernels");
-    println!("cargo:rustc-link-search=native={}", cuda.join("lib64").display());
-    println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-lib=static=quench6k_kernels");
+    // The static CUDA runtime: binaries need only the NVIDIA driver.
+    if windows {
+        println!("cargo:rustc-link-search=native={}", cuda.join("lib").join("x64").display());
+        println!("cargo:rustc-link-lib=static=cudart_static");
+    } else {
+        for dir in ["lib64", "lib", "targets/sbsa-linux/lib", "targets/x86_64-linux/lib"] {
+            println!("cargo:rustc-link-search=native={}", cuda.join(dir).display());
+        }
+        println!("cargo:rustc-link-lib=static=cudart_static");
+        for lib in ["stdc++", "dl", "pthread", "rt"] {
+            println!("cargo:rustc-link-lib=dylib={lib}");
+        }
+    }
 }

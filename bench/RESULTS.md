@@ -2,7 +2,7 @@
 
 RTX PRO 6000 Blackwell at 600 W, same machine as the NInfer 6000 baseline (GOAL.md §2). One request,
 greedy, BF16 KV, `bench/context.ids` corpus, decode = 256 generated tokens after a prompt of the
-given length (`squash bench --generate 256`; 256K is measured at 260,000 tokens, the corpus length).
+given length (`quench6k bench --generate 256`; 256K is measured at 260,000 tokens, the corpus length).
 Every run first checks 64 greedy tokens of the code fixture against the reference (all passed). The 512
 row is the second, warm measurement. Correctness gate (GOAL.md §1): PASS on all fixtures for this
 build (FP4 prefill experts, MXFP8 GDN input projections, tensor-core GDN, multi-query attention).
@@ -30,14 +30,14 @@ build (FP4 prefill experts, MXFP8 GDN input projections, tensor-core GDN, multi-
   max(0, p - q). 36 runs (3 prompts x 2 temperatures x 3 seeds, 600 tokens): 3.44 tokens/round and
   311 tok/s against 3.36 and 305 with greedy drafts: +2%, about the noise (+8% on prose, -3% on code).
   Drafting at 30-75% of the temperature measured the same. Distribution test passes (z within +-1.6).
-  `SQUASH_SAMPLED_DRAFTS=0` restores greedy drafts.
+  `QUENCH6K_SAMPLED_DRAFTS=0` restores greedy drafts.
 
 ## Prefill, later the same day
 
 - INT8-group dense weights are expanded to BF16 once per GEMM for batches of 2048+ rows (68 MiB
   workspace buffer) and multiplied with the BF16 kernel, which stages tiles with cp.async instead of
   converting them in registers: 8192x2560x6144 0.86 -> 0.64 ms. Bit-identical (gate outputs equal to
-  the previous run byte for byte; kernel test). `SQUASH_DEQUANT_GEMM=0` disables.
+  the previous run byte for byte; kernel test). `QUENCH6K_DEQUANT_GEMM=0` disables.
 
 ## Prefill, what changed today (8K chunk: 1,108 ms -> about 585 ms on the GPU)
 
@@ -56,5 +56,5 @@ build (FP4 prefill experts, MXFP8 GDN input projections, tensor-core GDN, multi-
 - Host: PLE rows faulted in by 64 threads ahead of the GPU (MADV_RANDOM: no 128 KiB readahead per
   320-byte row), gathered on 16 threads, overlapping layer 0 on the GPU.
 
-Restart (`squash serve`, GPU empty): about 31 s to the first answered request, most of it loading
+Restart (`quench6k serve`, GPU empty): about 31 s to the first answered request, most of it loading
 72.5 GiB of weights from NVMe (the checkpoint does not fit the free page cache).

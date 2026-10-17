@@ -1,6 +1,6 @@
 // Gated DeltaNet (SPEC §5): causal conv, gating, the delta-rule recurrence and the gated norm.
 //
-// Per-sequence state: conv [3, 10240] FP32 (oldest first) followed by squash_gdn_conv_tickets() zeroed
+// Per-sequence state: conv [3, 10240] FP32 (oldest first) followed by quench6k_gdn_conv_tickets() zeroed
 // u32 for the small-batch kernel, and recurrent [48, 128(k), 128(v)] FP32.
 
 #include "common.cuh"
@@ -414,7 +414,7 @@ __global__ void gated_norm_kernel(const float* __restrict__ o, const float* __re
 
 }  // namespace
 
-extern "C" cudaError_t squash_gdn_conv(const float* x, int ldx, float* out, float* state, const void* w, int T,
+extern "C" cudaError_t quench6k_gdn_conv(const float* x, int ldx, float* out, float* state, const void* w, int T,
                                        cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(conv_kernel, dim3(C / 256, (T + CONV_TT - 1) / CONV_TT), 256, 0, st, x, ldx, out,
@@ -423,7 +423,7 @@ extern "C" cudaError_t squash_gdn_conv(const float* x, int ldx, float* out, floa
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_gdn_conv_prep(const float* x, int ldx, float* out, float* state, const void* w, const float* a, const float* b,
+extern "C" cudaError_t quench6k_gdn_conv_prep(const float* x, int ldx, float* out, float* state, const void* w, const float* a, const float* b,
                                             int ldab, const void* a_log, const void* dt_bias, float* beta, float* g, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(conv_prep_kernel, T * KH, DK, 0, st, x, ldx, out, static_cast<const float*>(state),
@@ -433,7 +433,7 @@ extern "C" cudaError_t squash_gdn_conv_prep(const float* x, int ldx, float* out,
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_gdn_prep(float* qkv, const float* a, const float* b, int ldab, const void* a_log,
+extern "C" cudaError_t quench6k_gdn_prep(float* qkv, const float* a, const float* b, int ldab, const void* a_log,
                                        const void* dt_bias, float* beta, float* g, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(prep_kernel, T * KH, DK, 0, st, qkv, a, b, ldab, static_cast<const __nv_bfloat16*>(a_log),
@@ -441,10 +441,10 @@ extern "C" cudaError_t squash_gdn_prep(float* qkv, const float* a, const float* 
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" size_t squash_gdn_chunk_scratch_floats(int T) { return (size_t)((T + CL - 1) / CL) * VH * CHUNK_FLOATS; }
+extern "C" size_t quench6k_gdn_chunk_scratch_floats(int T) { return (size_t)((T + CL - 1) / CL) * VH * CHUNK_FLOATS; }
 
-// With `scratch` (squash_gdn_chunk_scratch_floats(T) floats) and T >= 64: the chunked form.
-extern "C" cudaError_t squash_gdn_recurrent(const float* qkv, const float* beta, const float* g, float* state, float* out,
+// With `scratch` (quench6k_gdn_chunk_scratch_floats(T) floats) and T >= 64: the chunked form.
+extern "C" cudaError_t quench6k_gdn_recurrent(const float* qkv, const float* beta, const float* g, float* state, float* out,
                                             int T, float* scratch, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     if (scratch && T >= 64) {
@@ -466,7 +466,7 @@ extern "C" cudaError_t squash_gdn_recurrent(const float* qkv, const float* beta,
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_gdn_gated_norm(const float* o, const float* z, int ldz, const void* w, void* y, int T,
+extern "C" cudaError_t quench6k_gdn_gated_norm(const float* o, const float* z, int ldz, const void* w, void* y, int T,
                                              cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(gated_norm_kernel, T * VH, DV, 0, st, o, z, ldz, static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(y)));
@@ -661,16 +661,16 @@ __global__ void __launch_bounds__(FT) fused_small_kernel(const float* __restrict
 
 }  // namespace
 
-extern "C" size_t squash_gdn_conv_tickets() { return KH; }
+extern "C" size_t quench6k_gdn_conv_tickets() { return KH; }
 
 // proj: the fused GDN projection rows [T, ld] (qkv at column 0, z/a/b at the given columns).
-extern "C" size_t squash_gdn_record_floats() { return (size_t)2 * REC_TOKENS * REC; }
+extern "C" size_t quench6k_gdn_record_floats() { return (size_t)2 * REC_TOKENS * REC; }
 
 // rec/ctl (optional, speculative decoding): double-buffered per-token records
-// (squash_gdn_record_floats() floats) and the control word {tokens to replay, record parity}.
+// (quench6k_gdn_record_floats() floats) and the control word {tokens to replay, record parity}.
 // defer = 1: replay and commit the previous step's accepted tokens, process this step without
 // committing it, and record its tokens; defer = 0: replay, then commit everything.
-extern "C" cudaError_t squash_gdn_fused_small(const float* proj, int ld, int T, const void* conv_w, float* conv_state,
+extern "C" cudaError_t quench6k_gdn_fused_small(const float* proj, int ld, int T, const void* conv_w, float* conv_state,
                                              float* state, const void* a_log, const void* dt_bias, const void* norm_w,
                                              int z_col, int a_col, int b_col, void* y, float* rec, const int* ctl,
                                              int defer, cudaStream_t st) {

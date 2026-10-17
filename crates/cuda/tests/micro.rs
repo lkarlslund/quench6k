@@ -1,10 +1,10 @@
-//! Kernel latency microbenchmarks (ignored by default): `cargo test --release -p squash-cuda --test micro -- --ignored --nocapture`.
+//! Kernel latency microbenchmarks (ignored by default): `cargo test --release -p quench6k-cuda --test micro -- --ignored --nocapture`.
 //!
 //! Each case captures a graph of many dependent launches over distinct weights (more than L2 holds),
 //! so per-call times include weight streaming the way a decode step sees it.
 
-use squash_cuda::kernels::{self, WeightFormat};
-use squash_cuda::{DeviceBuffer, Event, Graph, Stream};
+use quench6k_cuda::kernels::{self, WeightFormat};
+use quench6k_cuda::{DeviceBuffer, Event, Graph, Stream};
 
 const D: usize = 2560;
 const H: usize = 4 * D;
@@ -77,7 +77,7 @@ fn gemv_weights(s: &Stream, n: usize) -> Gemv {
 #[test]
 #[ignore]
 fn hc_latency() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let hcs: Vec<HcWeights> = (0..CALLS).map(|_| hc_weights(&s)).collect();
     let gemvs: Vec<Gemv> = (0..CALLS).map(|_| gemv_weights(&s, 16480)).collect();
@@ -150,7 +150,7 @@ fn hc_latency() {
 #[test]
 #[ignore]
 fn expert_latency() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     const E: usize = 512;
     const W: usize = 640;
@@ -219,7 +219,7 @@ fn expert_latency() {
 #[test]
 #[ignore]
 fn gemv_latency() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let fmt = WeightFormat::Int8Group;
     let x = filled(&s, 16 * 16480 * 2, 0);
@@ -246,7 +246,7 @@ fn gemv_latency() {
 #[test]
 #[ignore]
 fn select_latency() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = 0x1234_5678_9abc_def1u64;
     let mut next = || {
@@ -275,7 +275,7 @@ fn select_latency() {
 #[test]
 #[ignore]
 fn gemm_throughput() {
-    squash_cuda::set_device(0).unwrap();
+    quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let m = 4096;
     for &(n, k) in &[(16480usize, 2560usize), (2560, 6144), (13952, 2560), (324, 10240), (10240, 320)] {

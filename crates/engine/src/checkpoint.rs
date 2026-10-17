@@ -132,10 +132,9 @@ impl Checkpoint {
 
     /// Reads a tensor's raw bytes from disk.
     pub fn read(&self, name: &str) -> Result<Vec<u8>> {
-        use std::os::unix::fs::FileExt;
         let info = self.get(name)?;
         let mut bytes = vec![0u8; info.bytes as usize];
-        self.files[info.file].file.read_exact_at(&mut bytes, info.offset)?;
+        crate::fileio::read_exact_at(&self.files[info.file].file, &mut bytes, info.offset)?;
         Ok(bytes)
     }
 }

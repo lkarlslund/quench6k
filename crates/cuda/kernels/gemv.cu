@@ -232,11 +232,11 @@ cudaError_t launch(int M, const void* Xv, int ldx, const void* Wv, const float* 
 
 }  // namespace
 
-extern "C" int squash_gemv_max_m() { return 16; }
+extern "C" int quench6k_gemv_max_m() { return 16; }
 
 // fmt: 0 BF16, 3 INT8 with one scale per 64 weights. With splits > 1 the K range is split across CTAs;
 // `partial` holds splits * M * N floats, reduced in split order.
-extern "C" cudaError_t squash_gemv(int fmt, int M, const void* X, int ldx, const void* W, const float* scale, float* Y,
+extern "C" cudaError_t quench6k_gemv(int fmt, int M, const void* X, int ldx, const void* W, const float* scale, float* Y,
                                    int ldy, float* partial, int N, int K, int splits, float alpha, int accumulate,
                                    cudaStream_t st) {
     if (M == 0) return cudaSuccess;
@@ -274,9 +274,9 @@ __global__ void quantize_int8_groups_kernel(const __nv_bfloat16* __restrict__ w,
 
 }  // namespace
 
-extern "C" int squash_int8_group() { return GROUP; }
+extern "C" int quench6k_int8_group() { return GROUP; }
 
-extern "C" cudaError_t squash_quantize_int8_groups(const void* w, int N, int K, void* q, float* scale, cudaStream_t st) {
+extern "C" cudaError_t quench6k_quantize_int8_groups(const void* w, int N, int K, void* q, float* scale, cudaStream_t st) {
     if (N == 0) return cudaSuccess;
     if (K % GROUP != 0) return cudaErrorInvalidValue;
     const int items = N * (K / GROUP);
@@ -309,7 +309,7 @@ __global__ void dequant_int8_groups_kernel(const int8_t* __restrict__ q, const f
 
 }  // namespace
 
-extern "C" cudaError_t squash_dequant_int8_groups(const void* q, const float* scale, int N, int K, void* out, cudaStream_t st) {
+extern "C" cudaError_t quench6k_dequant_int8_groups(const void* q, const float* scale, int N, int K, void* out, cudaStream_t st) {
     if (N == 0) return cudaSuccess;
     if (K % GROUP != 0) return cudaErrorInvalidValue;
     const size_t count = (size_t)N * K;
@@ -330,7 +330,7 @@ __global__ void fold_norm_kernel(__nv_bfloat16* w, const __nv_bfloat16* __restri
 
 }  // namespace
 
-extern "C" cudaError_t squash_fold_norm(void* w, const void* g, int N, int K, cudaStream_t st) {
+extern "C" cudaError_t quench6k_fold_norm(void* w, const void* g, int N, int K, cudaStream_t st) {
     const size_t count = (size_t)N * K;
     if (count == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(fold_norm_kernel, (unsigned)((count + 255) / 256), 256, 0, st, static_cast<__nv_bfloat16*>(w),

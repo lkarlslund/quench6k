@@ -472,7 +472,7 @@ __global__ void attention_merge_kernel(const float* __restrict__ part, const flo
 
 }  // namespace
 
-extern "C" cudaError_t squash_qsa_qkv_prep(const float* qg, const float* kv, int ld, const void* q_norm, const void* k_norm,
+extern "C" cudaError_t quench6k_qsa_qkv_prep(const float* qg, const float* kv, int ld, const void* q_norm, const void* k_norm,
                                            float* q, void* kcache, void* vcache, const int* pos3, const int* start, int T,
                                            int fp8, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
@@ -481,7 +481,7 @@ extern "C" cudaError_t squash_qsa_qkv_prep(const float* qg, const float* kv, int
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_qsa_index_prep(const float* idx, int ld, const void* q_ln, float* iq, void* raw, const int* pos3,
+extern "C" cudaError_t quench6k_qsa_index_prep(const float* idx, int ld, const void* q_ln, float* iq, void* raw, const int* pos3,
                                              const int* start, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(index_prep_kernel, T * (IH + 1), ID, 0, st, idx, ld, static_cast<const __nv_bfloat16*>(q_ln), iq,
@@ -489,7 +489,7 @@ extern "C" cudaError_t squash_qsa_index_prep(const float* idx, int ld, const voi
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_qsa_pool(const void* raw, const void* k_ln, void* pooled, const int* pos3, const int* start,
+extern "C" cudaError_t quench6k_qsa_pool(const void* raw, const void* k_ln, void* pooled, const int* pos3, const int* start,
                                        int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(pool_kernel, T / GROUP + 1, ID, 0, st, static_cast<const __nv_bfloat16*>(raw),
@@ -499,7 +499,7 @@ extern "C" cudaError_t squash_qsa_pool(const void* raw, const void* k_ln, void* 
 }
 
 // Scores rows that need group selection; `ld` must cover the largest possible group count.
-extern "C" cudaError_t squash_qsa_index_scores(const float* iq, const void* pooled, float* scores, int ld,
+extern "C" cudaError_t quench6k_qsa_index_scores(const float* iq, const void* pooled, float* scores, int ld,
                                                const int* start, int T, cudaStream_t st) {
     if (T == 0 || ld == 0) return cudaSuccess;
     if (T <= SCORE_MAXT) {
@@ -507,7 +507,7 @@ extern "C" cudaError_t squash_qsa_index_scores(const float* iq, const void* pool
                                   static_cast<const __nv_bfloat16*>(pooled), scores, ld, start, T));
         SQ_RETURN_LAUNCH();
     }
-    if (std::getenv("SQUASH_SCORE_FP32") == nullptr) {
+    if (std::getenv("QUENCH6K_SCORE_FP32") == nullptr) {
         static bool configured = false;
         if (!configured) {
             const cudaError_t e = cudaFuncSetAttribute(index_score_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SCORE_TC_SMEM);
@@ -1059,7 +1059,7 @@ __global__ void __launch_bounds__(MQ_W * 32) attention_mq_kernel(const float* __
 
 }  // namespace
 
-extern "C" cudaError_t squash_qsa_attention(const float* q, const float* qg, int ld, const void* kcache, const void* vcache,
+extern "C" cudaError_t quench6k_qsa_attention(const float* q, const float* qg, int ld, const void* kcache, const void* vcache,
                                             const int* sel, const int* start, int T, int fp8, void* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     static bool configured = false;
@@ -1070,7 +1070,7 @@ extern "C" cudaError_t squash_qsa_attention(const float* q, const float* qg, int
         }
         configured = true;
     }
-    if (std::getenv("SQUASH_ATT_SINGLE") == nullptr) {
+    if (std::getenv("QUENCH6K_ATT_SINGLE") == nullptr) {
         static bool mq_configured = false;
         if (!mq_configured) {
             for (auto kern : {attention_mq_kernel<false>, attention_mq_kernel<true>}) {
@@ -1100,16 +1100,16 @@ __global__ void store_positions_kernel(const int* __restrict__ src, int* pos3, c
 
 }  // namespace
 
-extern "C" cudaError_t squash_store_positions(const int* src, int* pos3, const int* start, int T, cudaStream_t st) {
+extern "C" cudaError_t quench6k_store_positions(const int* src, int* pos3, const int* start, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(store_positions_kernel, (3 * T + 255) / 256, 256, 0, st, src, pos3, start, T));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" size_t squash_qsa_split_floats(int T) { return (size_t)T * KVH * SPLITS * (2 * QPG + QPG * HD); }
+extern "C" size_t quench6k_qsa_split_floats(int T) { return (size_t)T * KVH * SPLITS * (2 * QPG + QPG * HD); }
 
-// Attention for small batches: key-split partials into `part` (squash_qsa_split_floats(T) floats), then merge.
-extern "C" cudaError_t squash_qsa_attention_split(const float* q, const float* qg, int ld, const void* kcache, const void* vcache,
+// Attention for small batches: key-split partials into `part` (quench6k_qsa_split_floats(T) floats), then merge.
+extern "C" cudaError_t quench6k_qsa_attention_split(const float* q, const float* qg, int ld, const void* kcache, const void* vcache,
                                                   const int* sel, const int* start, int T, int fp8, float* part, void* out,
                                                   cudaStream_t st) {
     if (T == 0) return cudaSuccess;

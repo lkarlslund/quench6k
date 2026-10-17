@@ -1,4 +1,4 @@
-# squash
+# quench6k
 
 A from-scratch inference engine for Qwen3.8 Flash-Next 125B-A6B on a single NVIDIA RTX PRO 6000
 Blackwell GPU: Rust host, hand-written CUDA kernels for `sm_120a`. Weights load directly from the
@@ -43,18 +43,18 @@ cargo build --release
 M=/path/to/Swift-1.5-Qwen3.8-Flash-Next-NVFP4
 
 # Serve (OpenAI + Anthropic APIs)
-./target/release/squash serve --model $M --listen 127.0.0.1:8080 --context 65536 \
-    --cache-dir ~/.cache/squash [--kv fp8] [--steering pack.nsp --strength 0.5] [--capture-dir DIR]
+./target/release/quench6k serve --model $M --listen 127.0.0.1:8080 --context 65536 \
+    --cache-dir ~/.cache/quench6k [--kv fp8] [--steering pack.nsp --strength 0.5] [--capture-dir DIR]
 
 # One-off chat, optionally with images or video
-./target/release/squash chat --model $M --prompt "Describe this." --image photo.jpg
+./target/release/quench6k chat --model $M --prompt "Describe this." --image photo.jpg
 
 # Benchmarks and checks
-./target/release/squash bench --model $M --ctx 8192 65536 --generate 256 [--mtp 3 | --mtp 6 --adaptive]
-./target/release/squash score --model $M --fixture oracle/fixtures/* --out out/squash --suffix=-x --decode
-./target/release/squash gate --candidates out/squash --suffix=-x
-./target/release/squash spec-check --model $M --fixture oracle/fixtures/code --n 192 --graphs
-./target/release/squash vision-check --model $M --reference out/vision/shapes
+./target/release/quench6k bench --model $M --ctx 8192 65536 --generate 256 [--mtp 3 | --mtp 6 --adaptive]
+./target/release/quench6k score --model $M --fixture oracle/fixtures/* --out out/quench6k --suffix=-x --decode
+./target/release/quench6k gate --candidates out/quench6k --suffix=-x
+./target/release/quench6k spec-check --model $M --fixture oracle/fixtures/code --n 192 --graphs
+./target/release/quench6k vision-check --model $M --reference out/vision/shapes
 ```
 
 Server request extensions: `"steering": {"steering_strength": x}` and

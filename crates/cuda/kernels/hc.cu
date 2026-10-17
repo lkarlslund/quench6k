@@ -155,31 +155,31 @@ int blocks(size_t n, int threads) { return (int)((n + threads - 1) / threads); }
 
 }  // namespace
 
-extern "C" cudaError_t squash_embed(const int* tokens, int T, const void* table, float* h, cudaStream_t st) {
+extern "C" cudaError_t quench6k_embed(const int* tokens, int T, const void* table, float* h, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(embed_kernel, T, 256, 0, st, tokens, static_cast<const __nv_bfloat16*>(table), h));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_grouped_rmsnorm(const float* h, const void* w, void* n, int T, cudaStream_t st) {
+extern "C" cudaError_t quench6k_grouped_rmsnorm(const float* h, const void* w, void* n, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(grouped_rmsnorm_kernel, T * S, 256, 0, st, h, static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(n)));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_hc_inject(const void* n, const void* w, float* inj, int T, cudaStream_t st) {
+extern "C" cudaError_t quench6k_hc_inject(const void* n, const void* w, float* inj, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(hc_inject_kernel, T, 256, 0, st, static_cast<const __nv_bfloat16*>(n), static_cast<const __nv_bfloat16*>(w), inj));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_hc_act(const float* x, int ld, void* z, float* inj, int T, cudaStream_t st) {
+extern "C" cudaError_t quench6k_hc_act(const float* x, int ld, void* z, float* inj, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(hc_act_kernel, blocks((size_t)T * (RANK + S), 256), 256, 0, st, x, ld, static_cast<__nv_bfloat16*>(z), inj, T));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_hc_mix(const float* u, const void* n, const void* g, void* m, int T, cudaStream_t st) {
+extern "C" cudaError_t quench6k_hc_mix(const float* u, const void* n, const void* g, void* m, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(hc_mix_kernel, blocks((size_t)T * D, 256), 256, 0, st, u, static_cast<const __nv_bfloat16*>(n),
                                                                static_cast<const __nv_bfloat16*>(g),
@@ -233,7 +233,7 @@ __global__ void __launch_bounds__(256) hc_moe_combine_norm_kernel(float* h, cons
 
 }  // namespace
 
-extern "C" cudaError_t squash_hc_moe_combine_norm(float* h, const void* yd, const int* pair_row, const float* top_w, const float* sg,
+extern "C" cudaError_t quench6k_hc_moe_combine_norm(float* h, const void* yd, const int* pair_row, const float* top_w, const float* sg,
                                                   int ld_sg, const float* sh, const float* inj, void* n, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(hc_moe_combine_norm_kernel, T, 256, 0, st, h, static_cast<const __nv_bfloat16*>(yd), pair_row, top_w, sg, ld_sg,
@@ -241,32 +241,32 @@ extern "C" cudaError_t squash_hc_moe_combine_norm(float* h, const void* yd, cons
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_hc_combine_norm(float* h, const float* y, const float* inj, void* n, int T, cudaStream_t st) {
+extern "C" cudaError_t quench6k_hc_combine_norm(float* h, const float* y, const float* inj, void* n, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     static_assert(D % 256 == 0, "D must be a multiple of 256");
     SQ_CHECK_LAUNCH(sq_launch(hc_combine_norm_kernel, T * S, 256, 0, st, h, y, inj, static_cast<__nv_bfloat16*>(n)));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_hc_combine(float* h, const float* y, const float* inj, int T, cudaStream_t st) {
+extern "C" cudaError_t quench6k_hc_combine(float* h, const float* y, const float* inj, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(hc_combine_kernel, blocks((size_t)T * H, 256), 256, 0, st, h, y, inj, T));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_f32_to_bf16(const float* x, void* y, size_t count, cudaStream_t st) {
+extern "C" cudaError_t quench6k_f32_to_bf16(const float* x, void* y, size_t count, cudaStream_t st) {
     if (count == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(f32_to_bf16_kernel, blocks(count, 256), 256, 0, st, x, static_cast<__nv_bfloat16*>(y), count));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_add_f32(float* y, const float* x, size_t count, cudaStream_t st) {
+extern "C" cudaError_t quench6k_add_f32(float* y, const float* x, size_t count, cudaStream_t st) {
     if (count == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(add_f32_kernel, blocks(count, 256), 256, 0, st, y, x, count));
     SQ_RETURN_LAUNCH();
 }
 
-extern "C" cudaError_t squash_rmsnorm_rows(const float* x, int ldx, const void* w, void* out, int rows, cudaStream_t st) {
+extern "C" cudaError_t quench6k_rmsnorm_rows(const float* x, int ldx, const void* w, void* out, int rows, cudaStream_t st) {
     if (rows == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(rmsnorm_rows_kernel, rows, 256, 0, st, x, ldx, static_cast<const __nv_bfloat16*>(w),
                               static_cast<__nv_bfloat16*>(out)));

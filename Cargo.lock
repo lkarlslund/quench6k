@@ -891,6 +891,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
+name = "quench6k-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "minijinja",
+ "minijinja-contrib",
+ "quench6k-cuda",
+ "quench6k-engine",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
+name = "quench6k-cuda"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
+name = "quench6k-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "memmap2",
+ "quench6k-cuda",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1126,44 +1164,6 @@ dependencies = [
  "nom",
  "serde",
  "unicode-segmentation",
-]
-
-[[package]]
-name = "squash-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "clap",
- "minijinja",
- "minijinja-contrib",
- "serde",
- "serde_json",
- "squash-cuda",
- "squash-engine",
- "tokenizers",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
-name = "squash-cuda"
-version = "0.1.0"
-dependencies = [
- "anyhow",
-]
-
-[[package]]
-name = "squash-engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "image",
- "memmap2",
- "serde",
- "serde_json",
- "squash-cuda",
 ]
 
 [[package]]

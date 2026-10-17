@@ -5,9 +5,9 @@
 use std::path::Path;
 
 use anyhow::Result;
-use squash_cuda::DeviceBuffer;
-use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
-use squash_engine::model::{D, H, Precision};
+use quench6k_cuda::DeviceBuffer;
+use quench6k_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
+use quench6k_engine::model::{D, H, Precision};
 
 const DRAFTS: usize = 3;
 
@@ -89,7 +89,7 @@ pub fn probe(model_dir: &Path, precision: Precision, fixture: &Path, steps: usiz
 /// decoding, and checks that both produce exactly the same tokens.
 #[allow(clippy::too_many_arguments)]
 pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, drafts: usize, chunk: usize, graphs: bool, adaptive: bool, profile_rounds: usize, steer: &crate::SteerArgs) -> Result<()> {
-    use squash_engine::spec::SpecDecoder;
+    use quench6k_engine::spec::SpecDecoder;
     #[derive(serde::Deserialize)]
     struct Sequence {
         tokens: Vec<i32>,
@@ -125,7 +125,7 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
     let mut state = SequenceState::with_mtp(cap, true)?;
     state.set_steering_strength(&s, strength)?;
     let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &s, prompt, drafts, chunk)?;
-    let mut g = if graphs { Some(squash_engine::spec::SpecGraphs::capture(&model, &state, &mut ws, &dec, &s, adaptive, None)?) } else { None };
+    let mut g = if graphs { Some(quench6k_engine::spec::SpecGraphs::capture(&model, &state, &mut ws, &dec, &s, adaptive, None)?) } else { None };
     let t0 = std::time::Instant::now();
     let mut spec = Vec::with_capacity(n + drafts);
     while spec.len() < n {
@@ -137,11 +137,11 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
     let spec_secs = t0.elapsed().as_secs_f64();
     if let Some(g) = &mut g {
         if profile_rounds > 0 {
-            squash_cuda::profiler_start()?;
+            quench6k_cuda::profiler_start()?;
             for _ in 0..profile_rounds {
                 g.round(&model, &mut state, &mut ws, &mut dec, &s)?;
             }
-            squash_cuda::profiler_stop()?;
+            quench6k_cuda::profiler_stop()?;
         }
     }
     spec.truncate(n);

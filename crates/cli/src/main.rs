@@ -8,11 +8,11 @@ use std::path::PathBuf;
 
 use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
-use squash_engine::checkpoint::Checkpoint;
-use squash_engine::loader::{self, LoadOptions};
-use squash_engine::oracle;
-use squash_engine::model::{Model, Precision};
-use squash_engine::selection;
+use quench6k_engine::checkpoint::Checkpoint;
+use quench6k_engine::loader::{self, LoadOptions};
+use quench6k_engine::oracle;
+use quench6k_engine::model::{Model, Precision};
+use quench6k_engine::selection;
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum PrecisionArg {
@@ -43,9 +43,9 @@ pub struct SteerArgs {
 
 impl SteerArgs {
     /// Loads the pack into the model; returns the strength for new sequences.
-    pub fn attach(&self, model: &mut Model, stream: &squash_cuda::Stream) -> Result<f32> {
+    pub fn attach(&self, model: &mut Model, stream: &quench6k_cuda::Stream) -> Result<f32> {
         let Some(path) = &self.steering else { return Ok(0.0) };
-        let pack = squash_engine::steering::Steering::load(path, stream)?;
+        let pack = quench6k_engine::steering::Steering::load(path, stream)?;
         let strength = self.strength.unwrap_or(pack.default_strength);
         println!(
             "steering pack {}: layers {:?}, norm_preserve {}, strength {strength} (pack model_sha {})",
@@ -59,18 +59,18 @@ impl SteerArgs {
     }
 }
 
-pub fn load(model_dir: &std::path::Path, precision: Precision, mtp: bool) -> Result<(Model, squash_cuda::Stream)> {
-    squash_cuda::set_device(0)?;
+pub fn load(model_dir: &std::path::Path, precision: Precision, mtp: bool) -> Result<(Model, quench6k_cuda::Stream)> {
+    quench6k_cuda::set_device(0)?;
     let ckpt = Checkpoint::open(model_dir)?;
-    let stream = squash_cuda::Stream::new()?;
-    let (model, stats) = squash_engine::model::load_text(&ckpt, precision, mtp, LoadOptions::default(), &stream)?;
-    let (free, _) = squash_cuda::mem_info()?;
+    let stream = quench6k_cuda::Stream::new()?;
+    let (model, stats) = quench6k_engine::model::load_text(&ckpt, precision, mtp, LoadOptions::default(), &stream)?;
+    let (free, _) = quench6k_cuda::mem_info()?;
     println!("loaded {precision:?}: {:.2} GiB read in {:.1}s; {:.1} GiB device memory free", stats.bytes as f64 / 1073741824.0, stats.seconds, free as f64 / 1073741824.0);
     Ok((model, stream))
 }
 
 #[derive(Parser)]
-#[command(name = "squash", about = "Qwen3.8 Flash-Next inference engine")]
+#[command(name = "quench6k", about = "Qwen3.8 Flash-Next inference engine")]
 struct Cli {
     /// KV cache format for attention layers: bf16, or fp8 (E4M3 with a per-position, per-head scale;
     /// about half the memory).
@@ -190,7 +190,7 @@ enum Command {
         #[arg(long, default_value_t = 6)]
         drafts: usize,
         /// Model name reported by /v1/models.
-        #[arg(long, default_value = "squash")]
+        #[arg(long, default_value = "quench6k")]
         name: String,
         #[command(flatten)]
         steer: SteerArgs,
@@ -249,7 +249,7 @@ enum Command {
         /// Directory with pixels.f32, embeds.f32 and meta.json.
         #[arg(long)]
         reference: PathBuf,
-        /// max_pixels the reference was preprocessed with (to compare squash's own preprocessing).
+        /// max_pixels the reference was preprocessed with (to compare quench6k's own preprocessing).
         #[arg(long, default_value_t = 16777216)]
         max_pixels: usize,
     },
@@ -364,10 +364,10 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    squash_engine::forward::KV_FP8.store(cli.kv == "fp8", std::sync::atomic::Ordering::Relaxed);
+    quench6k_engine::forward::KV_FP8.store(cli.kv == "fp8", std::sync::atomic::Ordering::Relaxed);
     match cli.command {
         Command::Load { model, mtp, vision, threads, chunk_mib, buffered, verify } => {
-            squash_cuda::set_device(0)?;
+            quench6k_cuda::set_device(0)?;
             let t = std::time::Instant::now();
             let ckpt = Checkpoint::open(&model)?;
             println!("indexed {} tensors in {} files in {:.2}s", ckpt.tensors.len(), ckpt.files.len(), t.elapsed().as_secs_f64());
@@ -386,19 +386,19 @@ fn main() -> Result<()> {
             );
             let misaligned = weights.tensors.values().filter(|t| t.bytes >= 16 && t.addr % 16 != 0).count();
             println!("tensors >= 16 bytes not 16-byte aligned: {misaligned}");
-            let (free, total) = squash_cuda::mem_info()?;
+            let (free, total) = quench6k_cuda::mem_info()?;
             println!("device memory: {:.2} GiB free of {:.2} GiB", free as f64 / 1073741824.0, total as f64 / 1073741824.0);
 
             if verify > 0 {
                 let mut names: Vec<&String> = weights.tensors.keys().collect();
                 names.sort();
-                let stream = squash_cuda::Stream::new()?;
+                let stream = quench6k_cuda::Stream::new()?;
                 let step = (names.len() / verify).max(1);
                 let mut checked = 0;
                 for name in names.iter().step_by(step) {
                     let tensor = weights.get(name)?;
-                    let host = squash_cuda::host_checksum(&ckpt.read(name)?);
-                    let device = squash_cuda::device_checksum(tensor.addr, tensor.bytes as usize, &stream)?;
+                    let host = quench6k_cuda::host_checksum(&ckpt.read(name)?);
+                    let device = quench6k_cuda::device_checksum(tensor.addr, tensor.bytes as usize, &stream)?;
                     ensure!(host == device, "checksum mismatch for {name}: host {host:#x}, device {device:#x}");
                     checked += 1;
                 }
@@ -467,7 +467,7 @@ fn main() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf], out: &std::path::Path, suffix: &str, chunk: usize, decode: bool, batch2: bool, steer: &SteerArgs) -> Result<()> {
-    use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
+    use quench6k_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
 
     #[derive(serde::Deserialize)]
     struct Sequence {
@@ -508,7 +508,7 @@ fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf]
         let positions = seq.tokens.len() - 1;
         let mut d = oracle::Distributions {
             meta: oracle::DistributionMeta {
-                engine: "squash".into(),
+                engine: "quench6k".into(),
                 format: "oracle.distributions/1".into(),
                 positions,
                 prompt_len: seq.prompt_len,
@@ -555,7 +555,7 @@ fn score(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf]
 }
 
 fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathBuf], tie: f32, steer: &SteerArgs) -> Result<()> {
-    use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
+    use quench6k_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
 
     #[derive(serde::Deserialize)]
     struct Sequence {
@@ -582,7 +582,7 @@ fn generate(model_dir: &std::path::Path, precision: Precision, fixtures: &[PathB
         for c in prompt.chunks(1024) {
             forward::forward(&model, &mut state, &mut ws, &stream, c)?;
         }
-        let last = ws.out + ((prompt.len() - 1) % 1024 * squash_engine::model::D * 2) as u64;
+        let last = ws.out + ((prompt.len() - 1) % 1024 * quench6k_engine::model::D * 2) as u64;
         let mut next = forward::head_stats(&model, &hw, &stream, last, &[0], 1)?.top_ids[0];
         let t0 = std::time::Instant::now();
         let mut steps = 0;
@@ -631,18 +631,18 @@ fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, tempe
     let (mut model, stream) = load(model_dir, Precision::Int8Group, true)?;
     let strength = steer.attach(&mut model, &stream)?;
     let t0 = std::time::Instant::now();
-    let mut session = squash_engine::session::Session::new(&model, &stream, context, 8192, 6, Default::default())?;
+    let mut session = quench6k_engine::session::Session::new(&model, &stream, context, 8192, 6, Default::default())?;
     let mut content = vec![];
     let mut inputs = vec![];
     let mut clips = vec![];
     if !images.is_empty() || !videos.is_empty() {
-        session.set_vision(squash_engine::vision::VisionModel::load(&Checkpoint::open(model_dir)?, LoadOptions::default(), &stream)?);
+        session.set_vision(quench6k_engine::vision::VisionModel::load(&Checkpoint::open(model_dir)?, LoadOptions::default(), &stream)?);
         for path in images {
-            inputs.push(squash_engine::vision::preprocess_image(&std::fs::read(path)?, 65536, 16777216)?);
+            inputs.push(quench6k_engine::vision::preprocess_image(&std::fs::read(path)?, 65536, 16777216)?);
             content.push(serde_json::json!({"type": "image"}));
         }
         for path in videos {
-            clips.push(squash_engine::vision::preprocess_video(path, 4096, 25165824, 768)?);
+            clips.push(quench6k_engine::vision::preprocess_video(path, 4096, 25165824, 768)?);
             content.push(serde_json::json!({"type": "video"}));
         }
     }
@@ -651,7 +651,7 @@ fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, tempe
     let messages = serde_json::json!([{"role": "user", "content": content}]);
     let text = chat.render(&messages, None, Some(think), None)?;
     let (ids, images) = chat.expand_media(&chat.encode(&text)?, inputs, clips)?;
-    let params = squash_engine::session::GenParams { max_tokens, temperature, top_p, top_k, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, seed, stop_tokens: chat.stop_tokens.clone(), steering_strength: strength, boundaries: chat.boundaries(&ids), capture: false, images, progress: None };
+    let params = quench6k_engine::session::GenParams { max_tokens, temperature, top_p, top_k, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0, seed, stop_tokens: chat.stop_tokens.clone(), steering_strength: strength, boundaries: chat.boundaries(&ids), capture: false, images, progress: None };
     let mut out = chat::TextStream::default();
     let t1 = std::time::Instant::now();
     let mut first = None;
@@ -680,7 +680,7 @@ fn chat_once(model_dir: &std::path::Path, prompt: &str, max_tokens: usize, tempe
 }
 
 fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> Result<()> {
-    use squash_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
+    use quench6k_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
     #[derive(serde::Deserialize)]
     struct Sequence {
         tokens: Vec<i32>,
@@ -697,7 +697,7 @@ fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> R
     let cap = prompts.iter().map(|p| p.len()).max().unwrap() + 2 * n + 16;
     let mut ws = Workspace::for_model(&model, 2048, cap)?;
     let hw = HeadWorkspace::new(2, 1)?;
-    let out = squash_cuda::DeviceBuffer::new(8)?;
+    let out = quench6k_cuda::DeviceBuffer::new(8)?;
     // Prefill each sequence; returns (state, first token).
     let prefill = |ws: &mut Workspace, p: &[i32]| -> Result<(SequenceState, i32)> {
         let mut st = SequenceState::new(cap)?;
@@ -758,10 +758,10 @@ fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> R
 }
 
 fn vision_check(model_dir: &std::path::Path, reference: &std::path::Path, max_pixels: usize) -> Result<()> {
-    use squash_engine::vision::{VisionInput, VisionModel};
-    squash_cuda::set_device(0)?;
+    use quench6k_engine::vision::{VisionInput, VisionModel};
+    quench6k_cuda::set_device(0)?;
     let ckpt = Checkpoint::open(model_dir)?;
-    let s = squash_cuda::Stream::new()?;
+    let s = quench6k_cuda::Stream::new()?;
     let t0 = std::time::Instant::now();
     let vm = VisionModel::load(&ckpt, LoadOptions::default(), &s)?;
     println!("vision tower loaded in {:.1}s", t0.elapsed().as_secs_f64());
@@ -771,7 +771,7 @@ fn vision_check(model_dir: &std::path::Path, reference: &std::path::Path, max_pi
     let input = VisionInput { pixels: read_f32("pixels.f32")?, grid: [grid[0], grid[1], grid[2]] };
     let want = read_f32("embeds.f32")?;
     if let Some(path) = meta["video"].as_str() {
-        let clip = squash_engine::vision::preprocess_video(std::path::Path::new(path), 4096, 25165824, 768)?;
+        let clip = quench6k_engine::vision::preprocess_video(std::path::Path::new(path), 4096, 25165824, 768)?;
         println!("video timestamps {:?}", clip.timestamps);
         if clip.input.grid == input.grid {
             let d: Vec<f32> = clip.input.pixels.iter().zip(&input.pixels).map(|(a, b)| (a - b).abs()).collect();
@@ -783,13 +783,13 @@ fn vision_check(model_dir: &std::path::Path, reference: &std::path::Path, max_pi
                 let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
                 dot / (a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt() * b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt())
             }).sum::<f64>() / input.tokens() as f64;
-            println!("embeddings from squash's own preprocessing vs the reference: mean cosine {cos:.6}");
+            println!("embeddings from quench6k's own preprocessing vs the reference: mean cosine {cos:.6}");
         } else {
             println!("video preprocessing: grid {:?} differs from the reference {:?}", clip.input.grid, input.grid);
         }
     }
     if let Some(path) = meta["image"].as_str() {
-        let own = squash_engine::vision::preprocess_image(&std::fs::read(path)?, 65536, max_pixels)?;
+        let own = quench6k_engine::vision::preprocess_image(&std::fs::read(path)?, 65536, max_pixels)?;
         if own.grid == input.grid {
             let d: Vec<f32> = own.pixels.iter().zip(&input.pixels).map(|(a, b)| (a - b).abs()).collect();
             let off = d.iter().filter(|&&x| x > 1e-6).count();

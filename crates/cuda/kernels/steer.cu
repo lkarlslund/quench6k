@@ -53,9 +53,9 @@ __global__ void __launch_bounds__(THREADS) steer_kernel(float* h, const float* _
 
 }  // namespace
 
-extern "C" int squash_steer_max_rank() { return MAX_RANK; }
+extern "C" int quench6k_steer_max_rank() { return MAX_RANK; }
 
-extern "C" cudaError_t squash_steer(float* h, int T, const float* directions, const int* ranks, const int* masks,
+extern "C" cudaError_t quench6k_steer(float* h, int T, const float* directions, const int* ranks, const int* masks,
                                     int norm_preserve, const float* strength, int layer, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(steer_kernel, dim3(T, S), THREADS, 0, st, h, directions, ranks, masks, norm_preserve, strength, layer));

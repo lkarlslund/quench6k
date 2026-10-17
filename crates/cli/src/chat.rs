@@ -85,8 +85,8 @@ impl Chat {
     /// token, and each `<|video_pad|>` into, per temporal group,
     /// `<{t:.1} seconds><|vision_start|>` + one pad per merged token + `<|vision_end|>` (the HF
     /// Qwen3-VL processor's expansion).
-    pub fn expand_media(&self, ids: &[i32], images: Vec<squash_engine::vision::VisionInput>, videos: Vec<squash_engine::vision::VideoClip>) -> Result<(Vec<i32>, Vec<std::sync::Arc<squash_engine::session::ImageInput>>)> {
-        use squash_engine::session::ImageInput;
+    pub fn expand_media(&self, ids: &[i32], images: Vec<quench6k_engine::vision::VisionInput>, videos: Vec<quench6k_engine::vision::VideoClip>) -> Result<(Vec<i32>, Vec<std::sync::Arc<quench6k_engine::session::ImageInput>>)> {
+        use quench6k_engine::session::ImageInput;
         let token = |t: &str| self.token_id(t).ok_or_else(|| anyhow::anyhow!("tokenizer has no {t}"));
         let (pad, vpad, vstart, vend) = (token("<|image_pad|>")?, token("<|video_pad|>")?, token("<|vision_start|>")?, token("<|vision_end|>")?);
         let found = ids.iter().filter(|&&t| t == pad).count();
@@ -158,7 +158,7 @@ impl Chat {
             cache.1 += seg.len();
             cache.0.insert(seg.to_string(), v);
         }
-        if std::env::var_os("SQUASH_CHECK_ENCODE").is_some() {
+        if std::env::var_os("QUENCH6K_CHECK_ENCODE").is_some() {
             anyhow::ensure!(ids == self.encode_plain(text)?, "segmented encoding differs from the whole text's");
         }
         Ok(ids)
