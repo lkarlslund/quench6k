@@ -48,6 +48,9 @@ top_k 20, 600-token answers to a coding, an explanation and a story prompt): 223
 - Sampled rows use the server's default parameters and report the mean over four seeds of 256
   tokens each. They are checked through the same sampling kernels with top_k 1 against the
   reference, and print the start of their output.
+- Each measurement records the GPU's temperature, SM clock, power and clock-event reasons (NVML) and
+  warns when the GPU slowed down. Prefill depends on the SM clock, which falls as the GPU heats
+  (2.8 GHz cool, about 2.25 GHz at 90 °C); decode is bound by memory bandwidth and barely changes.
 - MTP rows run with the MTP head's cache filled during prefill, as the server does; their prefill
   includes that work.
 - From 8K on, the corpus repeats its text, so MTP drafts are almost always accepted (about 7 tokens

@@ -1,3 +1,4 @@
+mod gpumon;
 mod bench;
 mod kbench;
 mod chat;

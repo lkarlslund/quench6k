@@ -6,6 +6,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
+
+use crate::gpumon;
 use quench6k_engine::forward::{self, HeadWorkspace, SequenceState, Workspace};
 use quench6k_engine::model::{D, Precision};
 
@@ -29,11 +31,14 @@ pub struct JsonOut {
 impl JsonOut {
     /// Appends one record: a measurement at one context.
     #[allow(clippy::too_many_arguments)]
-    fn record(&self, mode: &str, drafts: usize, adaptive: bool, ctx: usize, generate: usize, prefill: f64, decode: f64, per_round: Option<f64>) -> Result<()> {
+    fn record(&self, mode: &str, drafts: usize, adaptive: bool, ctx: usize, generate: usize, prefill: f64, decode: f64, per_round: Option<f64>, gpu: Option<&gpumon::Window>) -> Result<()> {
         use std::io::Write;
-        let rec = serde_json::json!({"engine": "quench6k", "date": utc_date(), "mode": mode, "drafts": drafts, "adaptive": adaptive, "kv": self.kv,
+        let mut rec = serde_json::json!({"engine": "quench6k", "date": utc_date(), "mode": mode, "drafts": drafts, "adaptive": adaptive, "kv": self.kv,
                                      "ctx": ctx, "generate": generate, "prefill_tok_s": (prefill * 10.0).round() / 10.0, "decode_tok_s": (decode * 10.0).round() / 10.0,
                                      "tokens_per_round": per_round.map(|r| (r * 100.0).round() / 100.0), "sampled": self.sampled});
+        if let Some(w) = gpu {
+            rec["gpu"] = w.json();
+        }
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
         writeln!(f, "{rec}")?;
         Ok(())
@@ -48,6 +53,16 @@ const SAMPLED_SEEDS: usize = 4;
 /// the checkpoint (the page cache keeps them for the measured run, as a running server does).
 fn with_warmup(contexts: &[usize]) -> Vec<(usize, bool)> {
     contexts.iter().flat_map(|&c| [(c, false), (c, true)]).collect()
+}
+
+/// Ends a GPU monitor window: prints it, warns when the GPU slowed down during the measurement.
+fn gpu_window(mon: &Option<gpumon::Monitor>) -> Option<gpumon::Window> {
+    let w = mon.as_ref()?.end();
+    println!("         {}", w.summary());
+    if w.slowed() {
+        println!("         WARNING: the GPU slowed down during this measurement ({})", w.reason_names().join(", "));
+    }
+    Some(w)
 }
 
 /// Today's UTC date, YYYY-MM-DD.
@@ -78,9 +93,13 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
     let hw = HeadWorkspace::new(1, 1)?;
 
     sanity(model_dir, &model, &stream, chunk)?;
+    let mon = gpumon::Monitor::start();
     println!("{:>8} {:>14} {:>14}", "context", "prefill tok/s", "decode tok/s");
     for (ctx, report) in with_warmup(contexts) {
         let tokens = prompt(ctx)?;
+        if let Some(m) = &mon {
+            m.begin();
+        }
         let mut state = SequenceState::new(ctx + generate + 16 + ncu_steps)?;
         let t0 = Instant::now();
         for c in tokens.chunks(chunk) {
@@ -119,8 +138,9 @@ pub fn run(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
             1e3 * times[0] / generate as f64,
             1e3 * times[1] / generate as f64
         );
+        let gpu = gpu_window(&mon);
         if let Some(j) = json {
-            j.record("plain", 0, false, ctx, generate, prefill, decode, None)?;
+            j.record("plain", 0, false, ctx, generate, prefill, decode, None, gpu.as_ref())?;
         }
         if profile {
             const STEPS: usize = 16;
@@ -242,8 +262,12 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
     // text it happens to produce.
     let seeds = if sampled { SAMPLED_SEEDS } else { 1 };
     let chat = if sampled { Some(crate::chat::Chat::load(model_dir, None)?) } else { None };
+    let mon = gpumon::Monitor::start();
     for (ctx, report) in with_warmup(contexts) {
         let tokens = prompt(ctx)?;
+        if let Some(m) = &mon {
+            m.begin();
+        }
         let (mut prefill, mut produced, mut secs, mut rounds, mut draft, mut verify) = (0.0, 0, 0.0, 0, 0.0, 0.0);
         let mut first = Vec::new();
         for seed in 0..seeds {
@@ -290,8 +314,9 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
             // Sampled output has no reference; print its start to show it is text, not noise.
             println!("         output: {:?}", chat.decode(&first[..first.len().min(40)], false)?);
         }
+        let gpu = gpu_window(&mon);
         if let Some(j) = json {
-            j.record("mtp", drafts, adaptive, ctx, produced, prefill, decode, Some(per_round))?;
+            j.record("mtp", drafts, adaptive, ctx, produced, prefill, decode, Some(per_round), gpu.as_ref())?;
         }
     }
     Ok(())
