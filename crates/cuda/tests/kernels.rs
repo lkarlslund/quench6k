@@ -931,3 +931,63 @@ fn topk_timing() {
     b.synchronize().unwrap();
     println!("topk {rows} x {n}, k {k}: {:.1} us", squash_cuda::Event::elapsed_ms(&a, &b).unwrap() * 10.0);
 }
+
+#[test]
+fn penalties_match_cpu() {
+    squash_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x7091_0003);
+    let (n, rows) = (248_320usize, 5usize);
+    let (rep, pres) = (1.3f32, 0.7f32);
+    let x: Vec<f32> = rng.vec(rows * n).iter().map(|v| v * 10.0).collect();
+    // History: prompt tokens (with repeats), then generated tokens (some also in the prompt).
+    let prompt: Vec<i32> = (0..3000).map(|i| ((i * 7919) % 20_000) as i32).collect();
+    let generated: Vec<i32> = vec![5, 7919, 30_000, 30_000, 123_456];
+    let mut pst = Vec::new();
+    pst.extend_from_slice(&rep.to_le_bytes());
+    pst.extend_from_slice(&pres.to_le_bytes());
+    pst.extend_from_slice(&[0u8; 8]);
+    let st = upload(&s, &pst);
+    let flags = DeviceBuffer::zeroed(n * 4).unwrap();
+    let list = DeviceBuffer::new(n * 4).unwrap();
+    let dp = upload(&s, &prompt);
+    kernels::penalty_mark(&s, st.addr(), flags.addr(), list.addr(), dp.addr(), prompt.len(), 0, 1).unwrap();
+    // The generated tokens through the device count, as the speculative graph adds them.
+    let mut g = generated.clone();
+    g.push(generated.len() as i32);
+    let dg = upload(&s, &g);
+    kernels::penalty_mark(&s, st.addr(), flags.addr(), list.addr(), dg.addr(), 0, dg.addr() + (generated.len() * 4) as u64, 3).unwrap();
+    // A verification of [x, d1 .. d4]: x new, d1 a prompt token, d2 = x, d3 generated, d4 new.
+    let (_, draft_at, _, ints) = kernels::spec_layout();
+    let mut rc = vec![0i32; ints];
+    let verify = [200_000, 3, 200_000, 7919, 77_777];
+    rc[1] = verify[0];
+    for j in 1..rows {
+        rc[draft_at + j - 1] = verify[j];
+    }
+    let drc = upload(&s, &rc);
+    let dx = upload(&s, &x);
+    kernels::penalty_apply(&s, dx.addr(), rows, n, st.addr(), flags.addr(), list.addr(), drc.addr()).unwrap();
+    let got: Vec<f32> = s.download(dx.addr(), rows * n).unwrap();
+    for r in 0..rows {
+        let seen: std::collections::HashSet<i32> = prompt.iter().chain(&generated).chain(&verify[..=r]).copied().collect();
+        let out: std::collections::HashSet<i32> = generated.iter().chain(&verify[..=r]).copied().collect();
+        for t in 0..n {
+            let mut v = x[r * n + t];
+            if seen.contains(&(t as i32)) {
+                v = if v > 0.0 { v / rep } else { v * rep };
+                if out.contains(&(t as i32)) {
+                    v -= pres;
+                }
+            }
+            assert_eq!(got[r * n + t].to_bits(), v.to_bits(), "row {r} token {t}");
+        }
+    }
+    // One row without a round: only the history.
+    let dx = upload(&s, &x[..n]);
+    kernels::penalty_apply(&s, dx.addr(), 1, n, st.addr(), flags.addr(), list.addr(), 0).unwrap();
+    let got: Vec<f32> = s.download(dx.addr(), n).unwrap();
+    let v = x[30_000];
+    assert_eq!(got[30_000].to_bits(), ((if v > 0.0 { v / rep } else { v * rep }) - pres).to_bits());
+    assert_eq!(got[200_000].to_bits(), x[200_000].to_bits());
+}

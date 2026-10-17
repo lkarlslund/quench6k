@@ -515,6 +515,26 @@ pub fn spec_mtp_header(s: &Stream, rc: u64, hdr: u64, tokens_off: usize, pos_off
     launch!("spec_mtp_header", ffi::squash_spec_mtp_header(i(rc), im(hdr), n32(tokens_off), n32(pos_off), n32(j), n32(c), s.raw()))
 }
 
+/// Bytes of a penalty state: repetition f32, presence f32, history size i32, pad.
+pub fn penalty_state_bytes() -> usize {
+    unsafe { ffi::squash_penalty_state_bytes() as usize }
+}
+
+/// Adds tokens to a penalty history (state `st`, flags u32 [vocab], list i32 [vocab]) with flag
+/// `bits` (1: prompt, 3: output): `ids[0 .. n)`, or `ids[0 .. *n_ptr)` when `n_ptr` is set.
+#[allow(clippy::too_many_arguments)]
+pub fn penalty_mark(s: &Stream, st: u64, flags: u64, list: u64, ids: u64, n: usize, n_ptr: u64, bits: u32) -> Result<()> {
+    launch!("penalty_mark", ffi::squash_penalty_mark(pm(st), flags as *mut u32, im(list), i(ids), n32(n), i(n_ptr), bits, s.raw()))
+}
+
+/// Applies the repetition and presence penalties of a history to `rows` logits rows (stride `ld`).
+/// With a round control buffer `rc`, the rows are a speculative verification (see the kernel); else
+/// `rows` must be 1.
+#[allow(clippy::too_many_arguments)]
+pub fn penalty_apply(s: &Stream, logits: u64, rows: usize, ld: usize, st: u64, flags: u64, list: u64, rc: u64) -> Result<()> {
+    launch!("penalty_apply", ffi::squash_penalty_apply(fm(logits), n32(rows), n32(ld), p(st), flags as *const u32, i(list), i(rc), s.raw()))
+}
+
 /// Accepts a verification of `n` drafts (see the kernel) and updates the round and control words.
 pub fn spec_accept(s: &Stream, rc: u64, ctl: u64, n: usize) -> Result<()> {
     launch!("spec_accept", ffi::squash_spec_accept(im(rc), im(ctl), n32(n), s.raw()))
@@ -564,6 +584,11 @@ pub fn draft_pick_words(n: usize) -> usize {
 }
 
 /// Bytes of one sampled draft's distribution record (see [`draft_head_argmax`]).
+/// Round control words: (first committed token, committed token count) after `spec_accept`.
+pub fn spec_commit_layout() -> (usize, usize) {
+    unsafe { (ffi::squash_spec_layout(5) as usize, ffi::squash_spec_layout(6) as usize) }
+}
+
 pub fn draft_q_bytes() -> usize {
     unsafe { ffi::squash_spec_layout(4) as usize }
 }

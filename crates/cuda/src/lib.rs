@@ -120,6 +120,9 @@ pub mod ffi {
         pub fn squash_fake_mxfp8(x: *mut c_void, rows: c_int, cols: c_int, ld: c_int, stream: Stream) -> Error;
         pub fn squash_fake_fp4_act(x: *mut c_void, rows: c_int, cols: c_int, stream: Stream) -> Error;
         pub fn squash_fake_int(x: *mut c_void, rows: c_int, cols: c_int, group: c_int, bits: c_int, stream: Stream) -> Error;
+        pub fn squash_penalty_state_bytes() -> c_int;
+        pub fn squash_penalty_mark(st: *mut c_void, flags: *mut u32, list: *mut i32, ids: *const i32, n: c_int, n_ptr: *const i32, bits: u32, stream: Stream) -> Error;
+        pub fn squash_penalty_apply(logits: *mut f32, rows: c_int, ld: c_int, st: *const c_void, flags: *const u32, list: *const i32, rc: *const i32, stream: Stream) -> Error;
         pub fn squash_spec_accept(rc: *mut i32, ctl: *mut i32, n: c_int, stream: Stream) -> Error;
         pub fn squash_spec_sample_rows(ids: *const i32, vals: *const f32, k_list: c_int, n: c_int, rc: *mut i32, params: *mut c_void, qs: *const c_void, stream: Stream) -> Error;
         pub fn squash_steer_max_rank() -> c_int;

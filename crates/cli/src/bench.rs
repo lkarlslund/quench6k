@@ -137,7 +137,7 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         let seq: Sequence = serde_json::from_slice(&std::fs::read("oracle/fixtures/code/sequence.json")?)?;
         let mut state = SequenceState::with_mtp(seq.tokens.len() + slack, true)?;
         let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &stream, &seq.tokens[..seq.prompt_len], drafts, chunk)?;
-        let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive)?;
+        let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive, None)?;
         let mut got = Vec::new();
         while got.len() < CHECK {
             got.extend(g.round(&model, &mut state, &mut ws, &mut dec, &stream)?);
@@ -156,7 +156,7 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         let t0 = Instant::now();
         let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &stream, &tokens, drafts, chunk)?;
         let prefill = ctx as f64 / t0.elapsed().as_secs_f64();
-        let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive)?;
+        let mut g = SpecGraphs::capture(&model, &state, &mut ws, &dec, &stream, adaptive, None)?;
         let t1 = Instant::now();
         let mut produced = 0;
         while produced < generate {

@@ -197,6 +197,8 @@ pub struct SpecGraphs {
     /// Distributions of the round's sampled drafts (one record per draft).
     _draft_q: DeviceBuffer,
     sampled: bool,
+    /// Sampled rounds penalize the verified rows (the session's slot-0 penalty history).
+    pub penalized: bool,
 }
 
 /// Candidates per verified row in sampled rounds (the request's top_k is a prefix of them).
@@ -223,6 +225,9 @@ struct GraphSet {
     verify_before_ple: squash_cuda::Graph,
     verify_from_ple: squash_cuda::Graph,
     verify_from_ple_sampled: squash_cuda::Graph,
+    /// The sampled verification with repetition/presence penalties: the verified rows are penalized
+    /// before top-k, and the committed tokens join the history.
+    verify_from_ple_penalized: Option<squash_cuda::Graph>,
     bytes: usize,
 }
 
@@ -300,10 +305,12 @@ impl DraftPolicy {
 impl SpecGraphs {
     /// Captures the graphs for `dec` (after its prefill) with the fixed draft length `dec.drafts`, or with
     /// every length 1 ..= `dec.drafts` when `adaptive`, and loads the round control buffer.
-    pub fn capture(model: &Model, state: &SequenceState, ws: &mut Workspace, dec: &SpecDecoder, s: &Stream, adaptive: bool) -> Result<Self> {
+    /// `pen`: the penalty history (state, flags, list; see `kernels::penalty_apply`), for penalized rounds.
+    pub fn capture(model: &Model, state: &SequenceState, ws: &mut Workspace, dec: &SpecDecoder, s: &Stream, adaptive: bool, pen: Option<(u64, u64, u64)>) -> Result<Self> {
         use squash_cuda::kernels as k;
         let nmax = dec.drafts;
         let (layout_max, draft_at, greedy_at, ints) = k::spec_layout();
+        let (commit_at, commit_count) = k::spec_commit_layout();
         ensure!(nmax <= layout_max, "at most {layout_max} drafts");
         let rc = DeviceBuffer::zeroed(ints * 4)?;
         let sample_params = DeviceBuffer::zeroed(k::SAMPLE_PARAMS_BYTES)?;
@@ -354,11 +361,22 @@ impl SpecGraphs {
                 s.copy_d2d(dec.verified.addr(), ws.h, (n + 1) * H * 4)?;
                 unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
             })?;
-            sets.push(GraphSet { n, mtp, verify_before_ple, verify_from_ple, verify_from_ple_sampled, bytes });
+            let verify_from_ple_penalized = pen.map(|pen| squash_cuda::Graph::capture(s, |s| {
+                forward::forward_part(model, state, ws, s, n + 1, bytes, Part::FromPle, true, None)?;
+                forward::head_logits_rows(model, &dec.head, s, ws.out, n + 1)?;
+                k::penalty_apply(s, dec.head.logits_addr(), n + 1, crate::model::VOCAB, pen.0, pen.1, pen.2, rc.addr())?;
+                k::topk(s, dec.head.logits_addr(), n + 1, crate::model::VOCAB, crate::model::VOCAB, SAMPLE_TOP, false, top_ids.addr(), top_vals.addr())?;
+                k::spec_sample_rows(s, top_ids.addr(), top_vals.addr(), SAMPLE_TOP, n, rc.addr(), sample_params.addr(), draft_q.addr())?;
+                k::spec_accept(s, rc.addr(), ctl, n)?;
+                k::penalty_mark(s, pen.0, pen.1, pen.2, rc.addr() + (commit_at * 4) as u64, 0, rc.addr() + (commit_count * 4) as u64, 3)?;
+                s.copy_d2d(dec.verified.addr(), ws.h, (n + 1) * H * 4)?;
+                unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
+            })).transpose()?;
+            sets.push(GraphSet { n, mtp, verify_before_ple, verify_from_ple, verify_from_ple_sampled, verify_from_ple_penalized, bytes });
         }
         // Round state: next token at position len(state), nothing to catch up yet.
         s.upload_to(rc.addr(), &[state.len() as i32, dec.next, 0, 0])?;
-        Ok(Self { sets, _rc: rc, rc_host, policy: DraftPolicy::new(lengths), sample_params, _top_ids: top_ids, _top_vals: top_vals, _draft_q: draft_q, sampled: false })
+        Ok(Self { sets, _rc: rc, rc_host, policy: DraftPolicy::new(lengths), sample_params, _top_ids: top_ids, _top_vals: top_vals, _draft_q: draft_q, sampled: false, penalized: false })
     }
 
     /// Greedy rounds (`None`), or sampled rounds; top_k is capped at [`SAMPLE_TOP`] (0: all of them).
@@ -370,7 +388,8 @@ impl SpecGraphs {
         if let Some(Sampling { temperature: t, top_p, top_k: k, min_p, seed }) = sampling {
             let k = if k == 0 { SAMPLE_TOP } else { k.min(SAMPLE_TOP) } as u32;
             // Drafts are drawn at this percentage of the temperature (0: greedy drafts).
-            let draft_sampled: u32 = std::env::var("SQUASH_SAMPLED_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(DRAFT_TEMPERATURE_PERCENT);
+            // Top-1 rounds (penalized greedy) take the drafter's most likely token.
+            let draft_sampled: u32 = if k == 1 { 0 } else { std::env::var("SQUASH_SAMPLED_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(DRAFT_TEMPERATURE_PERCENT) };
             b.clear();
             b.extend_from_slice(&t.to_le_bytes());
             b.extend_from_slice(&top_p.to_le_bytes());
@@ -412,7 +431,13 @@ impl SpecGraphs {
         set.verify_before_ple.launch(s)?;
         let bytes = forward::prepare_ple(model, state, ws, n + 1)?;
         debug_assert_eq!(bytes, set.bytes);
-        if self.sampled { set.verify_from_ple_sampled.launch(s)? } else { set.verify_from_ple.launch(s)? }
+        if self.penalized {
+            set.verify_from_ple_penalized.as_ref().context("graphs captured without penalties")?.launch(s)?
+        } else if self.sampled {
+            set.verify_from_ple_sampled.launch(s)?
+        } else {
+            set.verify_from_ple.launch(s)?
+        }
         s.synchronize()?;
         dec.verify_secs += t1.elapsed().as_secs_f64();
         let a = self.rc_word(3) as usize;

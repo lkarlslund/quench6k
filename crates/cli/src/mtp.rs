@@ -125,7 +125,7 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
     let mut state = SequenceState::with_mtp(cap, true)?;
     state.set_steering_strength(&s, strength)?;
     let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &s, prompt, drafts, chunk)?;
-    let mut g = if graphs { Some(squash_engine::spec::SpecGraphs::capture(&model, &state, &mut ws, &dec, &s, adaptive)?) } else { None };
+    let mut g = if graphs { Some(squash_engine::spec::SpecGraphs::capture(&model, &state, &mut ws, &dec, &s, adaptive, None)?) } else { None };
     let t0 = std::time::Instant::now();
     let mut spec = Vec::with_capacity(n + drafts);
     while spec.len() < n {

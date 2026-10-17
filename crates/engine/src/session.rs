@@ -19,6 +19,10 @@ pub struct GenParams {
     pub top_k: usize,
     /// Drops candidates below min_p times the most likely one's probability (0: off).
     pub min_p: f32,
+    /// Subtracted from the logits of tokens already generated (0: off).
+    pub presence_penalty: f32,
+    /// Divides positive (multiplies negative) logits of tokens in the prompt or output (1: off).
+    pub repetition_penalty: f32,
     pub seed: u64,
     /// Generation ends after any of these tokens (which is emitted).
     pub stop_tokens: Vec<i32>,
@@ -130,6 +134,8 @@ pub struct Session {
     graph: DecodeGraph,
     dec: SpecDecoder,
     spec: SpecGraphs,
+    /// Slot 0's penalty history (the speculative graphs read it).
+    pen: Penalties,
     chunk: usize,
     capacity: usize,
     top_idx: DeviceBuffer,
@@ -161,6 +167,73 @@ struct Aux {
     batch: BatchGraph,
     hw2: HeadWorkspace,
     _out2: DeviceBuffer,
+    pen: Penalties,
+}
+
+/// A slot's repetition/presence penalty history on the device: the request's parameters, flags per
+/// vocabulary id (1: seen, 2: generated) and the list of seen ids (see `kernels::penalty_apply`).
+pub(crate) struct Penalties {
+    st: DeviceBuffer,
+    flags: DeviceBuffer,
+    list: DeviceBuffer,
+    /// Staging for ids to add.
+    ids: DeviceBuffer,
+    active: bool,
+}
+
+impl Penalties {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            st: DeviceBuffer::zeroed(squash_cuda::kernels::penalty_state_bytes())?,
+            flags: DeviceBuffer::zeroed(VOCAB * 4)?,
+            list: DeviceBuffer::new(VOCAB * 4)?,
+            ids: DeviceBuffer::new(VOCAB * 4)?,
+            active: false,
+        })
+    }
+
+    /// (state, flags, list) addresses, for graphs.
+    pub(crate) fn addrs(&self) -> (u64, u64, u64) {
+        (self.st.addr(), self.flags.addr(), self.list.addr())
+    }
+
+    /// Starts a request: its parameters, and the prompt as the history (when a penalty is set).
+    fn reset(&mut self, s: &Stream, p: &GenParams, prompt: &[i32]) -> Result<()> {
+        self.active = p.repetition_penalty != 1.0 || p.presence_penalty != 0.0;
+        if !self.active {
+            return Ok(());
+        }
+        let mut st = Vec::with_capacity(16);
+        st.extend_from_slice(&p.repetition_penalty.to_le_bytes());
+        st.extend_from_slice(&p.presence_penalty.to_le_bytes());
+        st.extend_from_slice(&[0u8; 8]);
+        s.memset(self.flags.addr(), 0, VOCAB * 4)?;
+        s.upload_to(self.st.addr(), &st)?;
+        let mut seen = vec![false; VOCAB];
+        let unique: Vec<i32> = prompt.iter().copied().filter(|&t| (0..VOCAB as i32).contains(&t) && !std::mem::replace(&mut seen[t as usize], true)).collect();
+        self.add(s, &unique, 1)
+    }
+
+    fn add(&self, s: &Stream, ids: &[i32], bits: u32) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        s.upload_to(self.ids.addr(), ids)?;
+        squash_cuda::kernels::penalty_mark(s, self.st.addr(), self.flags.addr(), self.list.addr(), self.ids.addr(), ids.len(), 0, bits)
+    }
+
+    /// Adds a generated token to the history.
+    fn generated(&self, s: &Stream, tok: i32) -> Result<()> {
+        if self.active && (0..VOCAB as i32).contains(&tok) { self.add(s, &[tok], 3) } else { Ok(()) }
+    }
+
+    /// Penalizes one logits row.
+    fn apply(&self, s: &Stream, logits: u64) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        squash_cuda::kernels::penalty_apply(s, logits, 1, VOCAB, self.st.addr(), self.flags.addr(), self.list.addr(), 0)
+    }
 }
 
 const CAPTURE_LAYER_BYTES: usize = forward::CaptureLayout::BYTES;
@@ -227,7 +300,8 @@ impl Session {
         // A one-token prompt to bring the sequence into a valid state for capture.
         let dec = SpecDecoder::prefill(model, &mut state, &mut ws, s, &[0], max_drafts, chunk)?;
         let graph = DecodeGraph::capture(model, &state, &ws, &hw, s)?;
-        let spec = SpecGraphs::capture(model, &state, &mut ws, &dec, s, true)?;
+        let pen = Penalties::new()?;
+        let spec = SpecGraphs::capture(model, &state, &mut ws, &dec, s, true, Some(pen.addrs()))?;
         Ok(Self {
             ws,
             state,
@@ -235,6 +309,7 @@ impl Session {
             graph,
             dec,
             spec,
+            pen,
             chunk,
             capacity,
             top_idx: DeviceBuffer::new(MAX_TOP_K * 4)?,
@@ -296,7 +371,7 @@ impl Session {
         let hw2 = HeadWorkspace::new(2, MAX_TOP_K)?;
         let out2 = DeviceBuffer::new(8)?;
         let batch = BatchGraph::capture(model, &[&self.state, &state], &self.ws, &hw2, s, out2.addr())?;
-        self.aux = Some(Aux { state, graph, batch, hw2, _out2: out2 });
+        self.aux = Some(Aux { state, graph, batch, hw2, _out2: out2, pen: Penalties::new()? });
         Ok(())
     }
 
@@ -364,6 +439,7 @@ impl Session {
         if slot == 0 {
             self.state.reset(s)?;
             self.state.set_steering_strength(s, p.steering_strength)?;
+            self.pen.reset(s, p, prompt)?;
             self.ws.capture = capture;
             let r = self.prefill(model, s, prompt, &p.images, &p.boundaries, p.steering_strength, p.progress.as_ref());
             self.ws.capture = None;
@@ -372,16 +448,17 @@ impl Session {
                 self.prompt_site = Some(self.read_site(s, "prompt_last", c.buf, c.pos, prompt[c.pos], self.dec.last_logits_addr())?);
             }
             if speculate {
-                // Sampled runs draw the first token here; the first round commits it.
-                if p.temperature > 0.0 {
-                    self.dec.next = self.sample(s, self.dec.last_logits_addr(), p, &mut run.rng)?;
+                // Sampled (or penalized) runs draw the first token here; the first round commits it.
+                if p.temperature > 0.0 || self.pen.active {
+                    self.dec.next = self.sample(s, self.dec.last_logits_addr(), p, &self.pen, &mut run.rng)?;
                 }
-                self.spec.set_sampling(s, sampling(p))?;
+                self.spec.set_sampling(s, sampling(p, self.pen.active))?;
+                self.spec.penalized = self.pen.active;
                 self.spec.restart(&self.state, &self.dec, s)?;
                 run.spec = true;
                 return Ok((run, Vec::new()));
             }
-            let tok = if p.temperature <= 0.0 { self.dec.next } else { self.sample(s, self.dec.last_logits_addr(), p, &mut run.rng)? };
+            let tok = if p.temperature <= 0.0 && !self.pen.active { self.dec.next } else { self.sample(s, self.dec.last_logits_addr(), p, &self.pen, &mut run.rng)? };
             run.pending = tok;
             return Ok((run, vec![tok]));
         }
@@ -390,6 +467,7 @@ impl Session {
         aux.state.reset(s)?;
         aux.state.mm = spans;
         aux.state.set_steering_strength(s, p.steering_strength)?;
+        aux.pen.reset(s, p, prompt)?;
         self.ws.capture = capture;
         // The same step boundaries as a fresh slot-0 prefill (chunks, cut at turn boundaries), so
         // both slots compute identical results for the same prompt.
@@ -419,7 +497,7 @@ impl Session {
         if let Some(c) = capture {
             self.prompt_site = Some(self.read_site(s, "prompt_last", c.buf, c.pos, prompt[c.pos], self.hw.logits_addr())?);
         }
-        let tok = self.sample(s, self.hw.logits_addr(), p, &mut run.rng)?;
+        let tok = self.sample(s, self.hw.logits_addr(), p, &self.aux.as_ref().unwrap().pen, &mut run.rng)?;
         run.pending = tok;
         Ok((run, vec![tok]))
     }
@@ -446,25 +524,30 @@ impl Session {
             }
             [run] => {
                 if run.slot == 0 {
+                    self.pen.generated(s, run.pending)?;
                     self.graph.step(model, &mut self.state, &mut self.ws, &self.hw, s, run.pending)?;
                     self.sync_kv_tokens();
                 } else {
                     let aux = self.aux.as_mut().expect("second slot");
+                    aux.pen.generated(s, run.pending)?;
                     aux.graph.step(model, &mut aux.state, &mut self.ws, &self.hw, s, run.pending)?;
                 }
-                let tok = self.sample(s, self.hw.logits_addr(), &run.params.clone(), &mut run.rng)?;
+                let pen = if run.slot == 0 { &self.pen } else { &self.aux.as_ref().unwrap().pen };
+                let tok = self.sample(s, self.hw.logits_addr(), &run.params.clone(), pen, &mut run.rng)?;
                 run.pending = tok;
                 Ok(vec![vec![tok]])
             }
             [a, b] => {
                 ensure!(!a.spec && !b.spec && a.slot == 0 && b.slot == 1, "batched steps need both slots in plain mode");
                 let aux = self.aux.as_mut().expect("second slot");
+                self.pen.generated(s, a.pending)?;
+                aux.pen.generated(s, b.pending)?;
                 aux.batch.step(model, &mut [&mut self.state, &mut aux.state], &mut self.ws, s, &[a.pending, b.pending])?;
                 s.synchronize()?;
                 self.sync_kv_tokens();
                 let logits = self.aux.as_ref().unwrap().hw2.logits_addr();
-                let ta = self.sample(s, logits, &a.params.clone(), &mut a.rng)?;
-                let tb = self.sample(s, logits + (VOCAB * 4) as u64, &b.params.clone(), &mut b.rng)?;
+                let ta = self.sample(s, logits, &a.params.clone(), &self.pen, &mut a.rng)?;
+                let tb = self.sample(s, logits + (VOCAB * 4) as u64, &b.params.clone(), &self.aux.as_ref().unwrap().pen, &mut b.rng)?;
                 a.pending = ta;
                 b.pending = tb;
                 Ok(vec![vec![ta], vec![tb]])
@@ -712,8 +795,11 @@ impl Session {
     pub fn generate(&mut self, model: &Model, s: &Stream, prompt: &[i32], p: &GenParams, mut on_token: impl FnMut(i32) -> bool) -> Result<(Finish, usize)> {
         ensure!(!prompt.is_empty(), "empty prompt");
         ensure!(prompt.len() < self.capacity, "prompt of {} tokens exceeds the context of {}", prompt.len(), self.capacity);
+        ensure!(p.presence_penalty == 0.0 && p.repetition_penalty == 1.0, "penalties need begin/step");
         self.state.reset(s)?;
         self.state.set_steering_strength(s, p.steering_strength)?;
+        self.pen.active = false;
+        self.spec.penalized = false;
         let budget = p.max_tokens.min(self.capacity - prompt.len());
         let mut produced = 0usize;
         let mut emit = |tok: i32, produced: &mut usize| -> Option<Finish> {
@@ -736,9 +822,9 @@ impl Session {
         if p.temperature <= 0.0 || !p.capture {
             if p.temperature > 0.0 {
                 let mut rng = Rng::new(p.seed);
-                self.dec.next = self.sample(s, self.dec.last_logits_addr(), p, &mut rng)?;
+                self.dec.next = self.sample(s, self.dec.last_logits_addr(), p, &self.pen, &mut rng)?;
             }
-            self.spec.set_sampling(s, sampling(p))?;
+            self.spec.set_sampling(s, sampling(p, false))?;
             self.spec.restart(&self.state, &self.dec, s)?;
             // The target's first token, then speculative rounds (each commits the previous `next`
             // and the accepted drafts; the round's own `next` is emitted by the following round).
@@ -758,19 +844,20 @@ impl Session {
         }
         // Sampled: the first token from the last prompt row's logits, then one token per step.
         let mut rng = Rng::new(p.seed);
-        let mut tok = self.sample(s, self.dec.last_logits_addr(), p, &mut rng)?;
+        let mut tok = self.sample(s, self.dec.last_logits_addr(), p, &self.pen, &mut rng)?;
         loop {
             if let Some(f) = emit(tok, &mut produced) {
                 self.sync_kv_tokens();
                 return Ok((f, produced));
             }
             self.graph.step(model, &mut self.state, &mut self.ws, &self.hw, s, tok)?;
-            tok = self.sample(s, self.hw.logits_addr(), p, &mut rng)?;
+            tok = self.sample(s, self.hw.logits_addr(), p, &self.pen, &mut rng)?;
         }
     }
 
-    /// Samples from a logits row (VOCAB f32 at `logits`): top-k, temperature, top-p.
-    fn sample(&self, s: &Stream, logits: u64, p: &GenParams, rng: &mut Rng) -> Result<i32> {
+    /// Samples from a logits row (VOCAB f32 at `logits`, penalized in place): top-k, temperature, top-p.
+    fn sample(&self, s: &Stream, logits: u64, p: &GenParams, pen: &Penalties, rng: &mut Rng) -> Result<i32> {
+        pen.apply(s, logits)?;
         let k = if p.temperature <= 0.0 { 1 } else if p.top_k == 0 { MAX_TOP_K } else { p.top_k.min(MAX_TOP_K) };
         squash_cuda::kernels::topk(s, logits, 1, VOCAB, VOCAB, k, false, self.top_idx.addr(), self.top_val.addr())?;
         let ids: Vec<i32> = s.download(self.top_idx.addr(), k)?;
@@ -821,9 +908,14 @@ fn with_ple_warm<R>(model: &Model, prompt: &[i32], start: usize, f: impl FnOnce(
     })
 }
 
-/// The speculative rounds' sampling parameters for a request (None: greedy).
-fn sampling(p: &GenParams) -> Option<crate::spec::Sampling> {
-    (p.temperature > 0.0).then(|| crate::spec::Sampling { temperature: p.temperature, top_p: p.top_p, top_k: p.top_k, min_p: p.min_p, seed: p.seed ^ 0x5bd1_e995_7f4a_7c15 })
+/// The speculative rounds' sampling parameters for a request (None: greedy). Penalized greedy requests
+/// sample from the top 1 (greedy verification needs unpenalized logits).
+fn sampling(p: &GenParams, penalized: bool) -> Option<crate::spec::Sampling> {
+    let seed = p.seed ^ 0x5bd1_e995_7f4a_7c15;
+    if p.temperature <= 0.0 {
+        return penalized.then_some(crate::spec::Sampling { temperature: 1.0, top_p: 1.0, top_k: 1, min_p: 0.0, seed });
+    }
+    Some(crate::spec::Sampling { temperature: p.temperature, top_p: p.top_p, top_k: p.top_k, min_p: p.min_p, seed })
 }
 
 struct Rng(u64);

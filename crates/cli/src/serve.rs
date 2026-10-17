@@ -383,6 +383,11 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
     let top_p = req.get("top_p").and_then(Value::as_f64).unwrap_or(0.95) as f32;
     let top_k = req.get("top_k").and_then(Value::as_u64).unwrap_or(20) as usize;
     let min_p = req.get("min_p").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+    let presence_penalty = req.get("presence_penalty").and_then(Value::as_f64).unwrap_or(0.0).clamp(-2.0, 2.0) as f32;
+    let repetition_penalty = req.get("repetition_penalty").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    if !(repetition_penalty > 0.0 && repetition_penalty.is_finite()) {
+        return Err(error(StatusCode::BAD_REQUEST, "repetition_penalty must be positive"));
+    }
     let seed = req.get("seed").and_then(Value::as_u64).unwrap_or_else(|| now() ^ 0x5eed);
     let stops = match req.get("stop") {
         Some(Value::String(s)) => vec![s.clone()],
@@ -406,11 +411,11 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
             }
             let Some(dir) = &app.capture_dir else { return Err(error(StatusCode::BAD_REQUEST, "capture requested but the server has no --capture-dir")) };
             let meta = json!({"engine": "squash", "model_id": app.model_id, "prompt_ids": ids, "temperature": temperature, "top_p": top_p,
-                              "top_k": top_k, "min_p": min_p, "seed": seed, "steering_strength": steering_strength, "request": c});
+                              "top_k": top_k, "min_p": min_p, "presence_penalty": presence_penalty, "repetition_penalty": repetition_penalty, "seed": seed, "steering_strength": steering_strength, "request": c});
             Some((dir.join(format!("{name}.safetensors")), meta))
         }
     };
-    let params = GenParams { max_tokens, temperature, top_p, top_k, min_p, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids), capture: capture.is_some(), images, progress: None };
+    let params = GenParams { max_tokens, temperature, top_p, top_k, min_p, presence_penalty, repetition_penalty, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids), capture: capture.is_some(), images, progress: None };
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let progress = stream && req.get("return_progress").and_then(Value::as_bool).unwrap_or(false);
     let mtp = req.get("mtp").and_then(Value::as_bool).unwrap_or(true);
@@ -969,7 +974,7 @@ fn from_anthropic(req: &Value) -> Value {
     if !tools.is_empty() {
         out["tools"] = Value::Array(tools);
     }
-    for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("min_p", "min_p"), ("stop_sequences", "stop"), ("steering", "steering")] {
+    for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("min_p", "min_p"), ("presence_penalty", "presence_penalty"), ("repetition_penalty", "repetition_penalty"), ("stop_sequences", "stop"), ("steering", "steering")] {
         if let Some(v) = req.get(from) {
             out[to] = v.clone();
         }
