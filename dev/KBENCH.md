@@ -187,3 +187,47 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
   whole 40 KB residual, where hc_down stages 2 KB per block). The three-kernel HC stays.
 - Draft length policy: forced fixed lengths (2, 4, 6 drafts) are 7-10% slower than the adaptive
   policy on sampled requests; its decay (0.75-0.95) makes no measurable difference.
+
+## Findings (2026-10-19): decode kernels after the megakernel survey
+
+Measurement: `QUENCH6K_DUP=op` (an op launched twice inside the graph) gives each op's marginal cost
+with PDL overlap; ops whose weights fit in L2 show only their latency on the second launch, and
+differences under ~5 us are run-to-run noise. ncu cannot attach on this driver; nsys is not installed.
+Per 4-layer step at 8K, 1 row / 4 rows: experts +60 / +146 us, hc_small (9 calls) +60 / +71,
+gdn proj + out +54 / +77, qsa_attention_split +22 / +25, gdn_fused_small +23 / +19, each small
+attention-layer kernel about 5-10.
+
+Kept (all bit-identical: `score` outputs byte-identical, spec-check and batch-check exact):
+- Chained small experts (`moe.chain`, default 1): the down kernel launches while gate/up runs, loads
+  its weights at once and waits on a per-slot counter of finished gate/up blocks (zeroed by the
+  routing kernel) instead of the whole kernel. kbench -3.5% / -2.6% / -0.75% at 2 / 4 / 8 rows.
+- Weight loads that do not allocate in L1 (`ld.global.nc.L1::no_allocate`): activations re-read for
+  every weight chunk stay in L1. Experts -2.1% / -2.4% at 4 / 8 rows (`moe.nl1`, default 1); every
+  other decode weight load (dense GEMV, HC, single-token experts, NVFP4 dense) -0.5% / -1.9% at 1 / 4.
+- L2 evict_first on those weight loads (createpolicy + .L2::cache_hint), so activations, KV, GDN state
+  and the MTP draft sketch stay in L2: kbench -10% / -6% (overstated: the 4-layer model's working set
+  fits in L2), full model +5% on MTP rounds (greedy MTP 512 / 8K: 327 -> 343 / 537 -> 566 tok/s over
+  the L1 change alone). Plain 1-row decode is unchanged on the full model (5.33 ms per token).
+- Together, full model: greedy MTP 314 -> ~343 tok/s at 512, 521 -> ~564 at 8K (verify 11.7 -> 10.9
+  ms, draft 1.61 -> 1.37 ms per round); batched plain steps of two sequences 276 -> 312 tok/s.
+
+Tried and dropped:
+- hc_finish fused into hc_up_mix (every block recomputes z): +3-5% slower. hc_finish done by the
+  down kernel's last block (a ticket): +2-5% slower. A kernel boundary costs ~0.5 us; a serial tail
+  or redundant per-block work costs more. The HC's three dependent phases (~8.6 us at 1 row against a
+  ~4 us weight floor) stay.
+- Split attention with 64 / 128 keys per block: +2 / +5% at 1 row; 16 keys: +1%. 32 stays.
+- Draft sketch loads with evict_first: draft graph slower (the 99 MB sketch partly stays in L2 across
+  the drafts of a round); with evict_last: no change. GDN state loads/stores with evict_last: no change.
+- GDN state prefetch: the state is already loaded before the PDL wait. Splitting the 48-block GDN
+  kernel across more SMs would shorten only the pre-wait part.
+- Smaller MTP draft vocabulary (frequent tokens + sequence tokens): the draft head is 48 us per call
+  over the full vocabulary (microbenchmark), so a 32K subset would save ~1.5% of a round.
+- Chaining GEMV columns into per-head consumers (gdn proj -> gdn_fused): the consumer could overlap
+  only the projection's last wave; not attempted.
+
+Where the time is now: at 4-8 rows the routed experts run at their bandwidth floor (the duplicated
+cost matches ~60 unique experts per layer at 8 rows). The remainder grows with rows: about 96 / 107
+/ 138 us per layer at 1 / 4 / 8 rows against ~48 us of static weights, in the HC kernels, the GDN
+recurrence and attention. The generic GEMV holds 1.4-1.6 TB/s up to 8 rows and drops to 0.85 TB/s at
+16 rows (pair rounds).

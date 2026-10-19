@@ -20,7 +20,7 @@ SQ_DEVICE void load8(const uint8_t* row, int k, float* w);
 
 template <>
 SQ_DEVICE void load8<WFmt::BF16>(const uint8_t* row, int k, float* w) {
-    const uint4 v = __ldg(reinterpret_cast<const uint4*>(row + (size_t)k * 2));
+    const uint4 v = ld_stream(row + (size_t)k * 2);
     const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&v);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -32,7 +32,7 @@ SQ_DEVICE void load8<WFmt::BF16>(const uint8_t* row, int k, float* w) {
 
 template <>
 SQ_DEVICE void load8<WFmt::FP8>(const uint8_t* row, int k, float* w) {
-    const uint2 v = __ldg(reinterpret_cast<const uint2*>(row + k));
+    const uint2 v = ld_stream_u2(row + k);
     const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&v);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -45,7 +45,7 @@ SQ_DEVICE void load8<WFmt::FP8>(const uint8_t* row, int k, float* w) {
 
 template <>
 SQ_DEVICE void load8<WFmt::INT8>(const uint8_t* row, int k, float* w) {
-    const uint2 v = __ldg(reinterpret_cast<const uint2*>(row + k));
+    const uint2 v = ld_stream_u2(row + k);
     const int8_t* p = reinterpret_cast<const int8_t*>(&v);
 #pragma unroll
     for (int i = 0; i < 8; ++i) w[i] = (float)p[i];
@@ -84,7 +84,7 @@ SQ_DEVICE void load16(const uint8_t* row, int k, float* w) {
         load8<F>(row, k, w);
         load8<F>(row, k + 8, w + 8);
     } else {
-        const uint4 v = __ldg(reinterpret_cast<const uint4*>(row + k));
+        const uint4 v = ld_stream(row + k);
         if constexpr (F == WFmt::FP8) {
             const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&v);
 #pragma unroll
@@ -112,10 +112,10 @@ template <WFmt F>
 SQ_DEVICE Raw16<F> load_raw16(const uint8_t* row, int k) {
     Raw16<F> r;
     if constexpr (F == WFmt::BF16) {
-        r.v[0] = __ldg(reinterpret_cast<const uint4*>(row + (size_t)k * 2));
-        r.v[1] = __ldg(reinterpret_cast<const uint4*>(row + (size_t)k * 2 + 16));
+        r.v[0] = ld_stream(row + (size_t)k * 2);
+        r.v[1] = ld_stream(row + (size_t)k * 2 + 16);
     } else {
-        r.v[0] = __ldg(reinterpret_cast<const uint4*>(row + k));
+        r.v[0] = ld_stream(row + k);
     }
     return r;
 }

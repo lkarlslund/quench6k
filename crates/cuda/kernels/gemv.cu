@@ -49,7 +49,7 @@ __global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X,
             for (int r = 0; r < R; ++r) {
                 pre[r][c] = load_raw16<F>(rows[r], k);
                 if constexpr (F == WFmt::INT8G)
-                    pre_gs[r][c] = __ldg(row_scale + (size_t)min(n0 + r, N - 1) * (K / GROUP) + k / GROUP);
+                    pre_gs[r][c] = ld_stream_f32(row_scale + (size_t)min(n0 + r, N - 1) * (K / GROUP) + k / GROUP);
                 if constexpr (F == WFmt::MX8)
                     pre_gs[r][c] = ue8m0_value(reinterpret_cast<const uint8_t*>(row_scale)[(size_t)min(n0 + r, N - 1) * (K / 32) + k / 32]);
             }
@@ -89,7 +89,7 @@ __global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X,
         for (int r = 0; r < R; ++r) {
             decode_raw16<F>(load_raw16<F>(rows[r], k), w[r]);
             if constexpr (F == WFmt::INT8G) {
-                const float gs = __ldg(row_scale + (size_t)min(n0 + r, N - 1) * (K / GROUP) + k / GROUP);
+                const float gs = ld_stream_f32(row_scale + (size_t)min(n0 + r, N - 1) * (K / GROUP) + k / GROUP);
 #pragma unroll
                 for (int i = 0; i < 16; ++i) w[r][i] *= gs;
             }

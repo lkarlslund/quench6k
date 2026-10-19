@@ -303,6 +303,8 @@ __global__ void active_kernel(const int* __restrict__ counts, int* active, int* 
 }
 
 constexpr int SMALL_T = 16, SMALL_PAIRS = SMALL_T * TOPK;
+// Chained small experts: active[CHAIN_AT + slot] counts the gate/up blocks of that slot that finished.
+constexpr int CHAIN_AT = 256, CHAIN_SLOTS = 256;
 
 // One block of 512 threads for T <= 16 tokens: routing (softmax, top 10, renormalize) and grouping of
 // the pairs by expert. Outputs top_i/top_w [T, 10], offsets [513], pair_row [10 T], row_token [10 T],
@@ -316,6 +318,8 @@ __global__ void __launch_bounds__(512) route_small_kernel(const float* __restric
     __shared__ int s_count[E], s_scan[E];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     s_count[tid] = 0;
+    // Per-slot completion counters of chained gate/up -> down (moe.chain), after the slots.
+    if (tid < CHAIN_SLOTS) active[CHAIN_AT + tid] = 0;
     __syncthreads();
     // warp w routes token w (16 warps)
     if (warp < T) {
@@ -485,8 +489,8 @@ __global__ void __launch_bounds__(EW * 32) gate_up_kernel(const __nv_bfloat16* _
 #pragma unroll
         for (int c = 0; c < CHUNKS; ++c) {
             const int k = (hl + 16 * c) * 32;
-            codes[f][c] = __ldg(reinterpret_cast<const uint4*>(W + (size_t)f * (K / 2) + k / 2));
-            scales[f][c] = __ldg(reinterpret_cast<const uint16_t*>(Sc + (size_t)f * (K / 16) + k / 16));
+            codes[f][c] = ld_stream(W + (size_t)f * (K / 2) + k / 2);
+            scales[f][c] = ld_stream_u16(Sc + (size_t)f * (K / 16) + k / 16);
         }
     const __nv_bfloat16* xrow[MAXR];
 #pragma unroll
@@ -524,7 +528,7 @@ __global__ void __launch_bounds__(EW * 32) gate_up_kernel(const __nv_bfloat16* _
 // Multi-row variant of gate_up_kernel: half-warp h of warp w owns feature 2w + h and streams both its
 // gate and up rows, so each activation chunk it loads serves two weight rows. Same per-row arithmetic
 // and reduction order as gate_up_kernel (chunk k = (hl + 16 c) * 32; lanes 0..15 sum, gate then up).
-template <int MAXR>
+template <int MAXR, bool CHAIN, bool NL1>
 __global__ void __launch_bounds__(EW * 32) gate_up_pair_kernel(const __nv_bfloat16* __restrict__ m,
                                                                const int* __restrict__ row_token,
                                                                const uint64_t* __restrict__ gw,
@@ -536,6 +540,8 @@ __global__ void __launch_bounds__(EW * 32) gate_up_pair_kernel(const __nv_bfloat
                                                                const int* __restrict__ num_active, __nv_bfloat16* act) {
     constexpr int N = 640, K = D, CHUNKS = K / 32 / 16;
     pdl_wait();
+    // Chained: the down kernel may start now; its blocks wait on this slot's counter instead.
+    if constexpr (CHAIN) pdl_launch_dependents();
     if ((int)blockIdx.y >= *num_active) return;
     const int e = active[blockIdx.y];
     const int r0 = offsets[e], rows = min(offsets[e + 1] - r0, MAXR);
@@ -550,10 +556,17 @@ __global__ void __launch_bounds__(EW * 32) gate_up_pair_kernel(const __nv_bfloat
 #pragma unroll
     for (int c = 0; c < CHUNKS; ++c) {
         const int k = (hl + 16 * c) * 32;
-        gc[c] = __ldg(reinterpret_cast<const uint4*>(G + k / 2));
-        uc[c] = __ldg(reinterpret_cast<const uint4*>(U + k / 2));
-        gsc[c] = __ldg(reinterpret_cast<const uint16_t*>(GS + k / 16));
-        usc[c] = __ldg(reinterpret_cast<const uint16_t*>(US + k / 16));
+        if constexpr (NL1) {
+            gc[c] = ld_stream(G + k / 2);
+            uc[c] = ld_stream(U + k / 2);
+            gsc[c] = ld_stream_u16(GS + k / 16);
+            usc[c] = ld_stream_u16(US + k / 16);
+        } else {
+            gc[c] = __ldg(reinterpret_cast<const uint4*>(G + k / 2));
+            uc[c] = __ldg(reinterpret_cast<const uint4*>(U + k / 2));
+            gsc[c] = __ldg(reinterpret_cast<const uint16_t*>(GS + k / 16));
+            usc[c] = __ldg(reinterpret_cast<const uint16_t*>(US + k / 16));
+        }
     }
     const __nv_bfloat16* xrow[MAXR];
 #pragma unroll
@@ -584,7 +597,7 @@ __global__ void __launch_bounds__(EW * 32) gate_up_pair_kernel(const __nv_bfloat
             }
         }
     }
-    pdl_launch_dependents();
+    if constexpr (!CHAIN) pdl_launch_dependents();
     const float sg = g2[e], su = u2[e];
 #pragma unroll
     for (int mm = 0; mm < MAXR; ++mm) {
@@ -597,17 +610,24 @@ __global__ void __launch_bounds__(EW * 32) gate_up_pair_kernel(const __nv_bfloat
         }
         if (hl == 0) act[(size_t)(r0 + mm) * N + n] = f2bf(silu(g * sg) * (u * su));
     }
+    if constexpr (CHAIN) {
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) atomicAdd(const_cast<int*>(active) + CHAIN_AT + blockIdx.y, 1);
+    }
 }
 
 // yd[row, n] = down_e[n] . act[row] for every row of active expert e. grid (2560 / 64, active slots):
 // each warp owns 8 features with 4 lanes per feature, five 32-weight chunks per lane loaded up front.
-template <int MAXR>
+// CHAIN (launched while gate/up runs, see gate_up_pair_kernel): routing is complete, so the block loads
+// its weights at once and then waits until the `parts` gate/up blocks of its slot have finished.
+template <int MAXR, bool CHAIN, bool NL1>
 __global__ void __launch_bounds__(EW * 32) down_kernel(const __nv_bfloat16* __restrict__ act,
                                                        const uint64_t* __restrict__ dw, const uint64_t* __restrict__ ds,
                                                        const float* __restrict__ d2, const int* __restrict__ offsets,
                                                        const int* __restrict__ active, const int* __restrict__ num_active,
-                                                       float* yd) {
-    pdl_wait();
+                                                       float* yd, int parts) {
+    if constexpr (!CHAIN) pdl_wait();
     constexpr int K = 640, CHUNKS = K / 32 / 4;  // 5 chunks per lane
     if ((int)blockIdx.y >= *num_active) return;
     const int e = active[blockIdx.y];
@@ -621,8 +641,21 @@ __global__ void __launch_bounds__(EW * 32) down_kernel(const __nv_bfloat16* __re
 #pragma unroll
     for (int c = 0; c < CHUNKS; ++c) {
         const int k = (q + 4 * c) * 32;
-        codes[c] = __ldg(reinterpret_cast<const uint4*>(W + k / 2));
-        scales[c] = __ldg(reinterpret_cast<const uint16_t*>(Sc + k / 16));
+        if constexpr (NL1) {
+            codes[c] = ld_stream(W + k / 2);
+            scales[c] = ld_stream_u16(Sc + k / 16);
+        } else {
+            codes[c] = ld_stream(W + k / 2);
+            scales[c] = ld_stream_u16(Sc + k / 16);
+        }
+    }
+    if constexpr (CHAIN) {
+        if (threadIdx.x == 0) {
+            const volatile int* done = active + CHAIN_AT + blockIdx.y;
+            while (*done < parts) __nanosleep(64);
+            __threadfence();
+        }
+        __syncthreads();
     }
     float acc[MAXR] = {};
 #pragma unroll
@@ -672,7 +705,7 @@ __global__ void __launch_bounds__(256) shared_combine_kernel(const float* __rest
         const int k = (lane + 32 * c) * 16;
         if (k < K) {
             pre[c] = load_raw16<F>(row, k);
-            if constexpr (F == WFmt::INT8G) gs[c] = __ldg(scale + (size_t)n * (K / GROUP) + k / GROUP);
+            if constexpr (F == WFmt::INT8G) gs[c] = ld_stream_f32(scale + (size_t)n * (K / GROUP) + k / GROUP);
         }
     }
     pdl_wait();
@@ -817,8 +850,8 @@ __global__ void __launch_bounds__(EW * 32) gate_up_t1_kernel(const __nv_bfloat16
 #pragma unroll
         for (int c = 0; c < CHUNKS; ++c) {
             const int k = (hl + 16 * c) * 32;
-            codes[f][c] = __ldg(reinterpret_cast<const uint4*>(W + (size_t)f * (K / 2) + k / 2));
-            scales[f][c] = __ldg(reinterpret_cast<const uint16_t*>(Sc + (size_t)f * (K / 16) + k / 16));
+            codes[f][c] = ld_stream(W + (size_t)f * (K / 2) + k / 2);
+            scales[f][c] = ld_stream_u16(Sc + (size_t)f * (K / 16) + k / 16);
         }
     float acc[FEAT] = {};
 #pragma unroll
@@ -870,8 +903,8 @@ __global__ void __launch_bounds__(EW * 32) down_t1_kernel(const __nv_bfloat16* _
 #pragma unroll
     for (int c = 0; c < CHUNKS; ++c) {
         const int k = (q + 4 * c) * 32;
-        codes[c] = __ldg(reinterpret_cast<const uint4*>(W + k / 2));
-        scales[c] = __ldg(reinterpret_cast<const uint16_t*>(Sc + k / 16));
+        codes[c] = ld_stream(W + k / 2);
+        scales[c] = ld_stream_u16(Sc + k / 16);
     }
     if (PRE) pdl_wait();
     float acc = 0;
@@ -908,8 +941,8 @@ __global__ void __launch_bounds__(EW * 32) nvfp4_dense_kernel(const __nv_bfloat1
 #pragma unroll
     for (int i = 0; i < CHUNKS; ++i) {
         const int k = (hl + 16 * i) * 32;
-        c[i] = __ldg(reinterpret_cast<const uint4*>(W + k / 2));
-        sc[i] = __ldg(reinterpret_cast<const uint16_t*>(Sc + k / 16));
+        c[i] = ld_stream(W + k / 2);
+        sc[i] = ld_stream_u16(Sc + k / 16);
     }
     pdl_wait();
     float acc = 0;
@@ -1015,7 +1048,9 @@ extern "C" cudaError_t quench6k_moe_gate_up_small(const void* m, const int* row_
     const dim3 grid(640 / (EW * 2), max_active);
     const auto* x = static_cast<const __nv_bfloat16*>(m);
     auto* a = static_cast<__nv_bfloat16*>(act);
-#define SQ_GU(R) SQ_CHECK_LAUNCH(sq_launch(gate_up_pair_kernel<R>, grid, EW * 32, 0, st, x, row_token, gw, gs, g2, uw, us, u2, offsets, active, num_active, a))
+    const bool chain = sq_variant("moe.chain", 1) != 0;
+    const bool nl1 = sq_variant("moe.nl1", 1) != 0;
+#define SQ_GU(R) SQ_CHECK_LAUNCH(sq_launch(chain ? (nl1 ? gate_up_pair_kernel<R, true, true> : gate_up_pair_kernel<R, true, false>) : (nl1 ? gate_up_pair_kernel<R, false, true> : gate_up_pair_kernel<R, false, false>), grid, EW * 32, 0, st, x, row_token, gw, gs, g2, uw, us, u2, offsets, active, num_active, a))
     if (T <= 1) SQ_GU(1);
     else if (T <= 2) SQ_GU(2);
     else if (T <= 4) SQ_GU(4);
@@ -1031,7 +1066,10 @@ extern "C" cudaError_t quench6k_moe_down_small(const void* act, const uint64_t* 
     if (max_active == 0) return cudaSuccess;
     const dim3 grid(D / (EW * 8), max_active);
     const auto* x = static_cast<const __nv_bfloat16*>(act);
-#define SQ_DN(R) SQ_CHECK_LAUNCH(sq_launch(down_kernel<R>, grid, EW * 32, 0, st, x, dw, ds, d2, offsets, active, num_active, yd))
+    const bool chain = sq_variant("moe.chain", 1) != 0;
+    const int parts = 640 / (EW * 2);  // gate/up blocks per slot
+    const bool nl1 = sq_variant("moe.nl1", 1) != 0;
+#define SQ_DN(R) SQ_CHECK_LAUNCH(sq_launch(chain ? (nl1 ? down_kernel<R, true, true> : down_kernel<R, true, false>) : (nl1 ? down_kernel<R, false, true> : down_kernel<R, false, false>), grid, EW * 32, 0, st, x, dw, ds, d2, offsets, active, num_active, yd, parts))
     if (T <= 1) SQ_DN(1);
     else if (T <= 2) SQ_DN(2);
     else if (T <= 4) SQ_DN(4);

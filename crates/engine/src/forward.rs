@@ -7,12 +7,22 @@ use crate::profile::Profiler;
 
 /// Runs `$call` (a `Result<()>` expression) on stream `$s`, timed under `$name` when profiling.
 macro_rules! op {
-    ($prof:ident, $name:expr, $s:expr, $call:expr) => {
+    ($prof:ident, $name:expr, $s:expr, $call:expr) => {{
         match $prof.as_deref_mut() {
             Some(p) => p.time($name, $s, || $call)?,
             None => $call?,
         }
-    };
+        if dup($name) {
+            $call?;
+        }
+    }};
+}
+
+/// Measurement: QUENCH6K_DUP=name launches that op twice (its marginal cost inside a graph; results
+/// are wrong).
+fn dup(name: &str) -> bool {
+    static DUP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DUP.get_or_init(|| std::env::var("QUENCH6K_DUP").ok()).as_deref() == Some(name)
 }
 
 use crate::model::{Block, D, EOS, EXPERT_WIDTH, EXPERTS, H, HC_RANK, Hc, LAYERS, Linear, Model, Proj, S, TOP_K, VOCAB, is_attention};
@@ -413,7 +423,7 @@ impl Workspace {
             mtp_step_host: PinnedBuffer::new(StepLayout::new(t).ple)?,
             mtp_hin: alloc(t * H * 4)?,
             inj2: alloc(t * S * 4)?,
-            hc_scratch: alloc(k::hc_small_scratch_floats(t.min(k::gemv_max_m())) * 4)?,
+            hc_scratch: alloc(k::hc_small_scratch_floats(16) * 4)?,
             att_part: alloc(k::qsa_split_floats(k::gemv_max_m()) * 4)?,
             step: alloc(StepLayout::new(t).bytes)?,
             step_host: PinnedBuffer::new(StepLayout::new(t).bytes)?,
@@ -434,7 +444,11 @@ impl Workspace {
     }
 
     fn init(self) -> Result<Self> {
-        Stream::new()?.upload_to(self.ones, &vec![1f32; self.max_tokens * S])?;
+        let s = Stream::new()?;
+        s.upload_to(self.ones, &vec![1f32; self.max_tokens * S])?;
+        // The small HyperConnection's finishing ticket starts at zero.
+        s.memset(self.hc_scratch, 0, k::hc_small_scratch_floats(16) * 4)?;
+        s.synchronize()?;
         Ok(self)
     }
 

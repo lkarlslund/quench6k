@@ -229,7 +229,7 @@ fn gemv_latency() {
         let ws: Vec<(DeviceBuffer, DeviceBuffer)> =
             (0..CALLS).map(|_| (filled(&s, n * k, 3), scales(&s, n * k / kernels::int8_group()))).collect();
         let mut line = format!("N={n} K={k} splits={splits}:");
-        for t in [1usize, 4] {
+        for t in [1usize, 4, 8, 16] {
             let g = Graph::capture(&s, |s| {
                 ws.iter().try_for_each(|(w, sc)| kernels::gemv(s, t, x.addr(), k, fmt, w.addr(), sc.addr(), out.addr(), n, partial.addr(), n, k, splits, 1.0, false))
             })
@@ -292,4 +292,47 @@ fn gemm_throughput() {
         }
         println!("{line}");
     }
+}
+
+/// The MTP draft head (1-bit sketch shortlist, NVFP4 rescoring) over the full vocabulary, per call.
+#[test]
+#[ignore]
+fn draft_head_latency() {
+    quench6k_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    const V: usize = 248_320;
+    let mut seed = 0x2545F4914F6CDD1Du64;
+    let w: Vec<u16> = (0..V * D)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            quench6k_cuda::bf16::from_f32(((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.05)
+        })
+        .collect();
+    let wb = DeviceBuffer::new(V * D * 2).unwrap();
+    s.upload(&wb, &w).unwrap();
+    drop(w);
+    let codes = DeviceBuffer::new(V * D / 2).unwrap();
+    let sc = DeviceBuffer::new(V * D / 16).unwrap();
+    let s2 = DeviceBuffer::new(4).unwrap();
+    let amax = DeviceBuffer::new(4).unwrap();
+    kernels::quantize_nvfp4(&s, wb.addr(), 1, V, D, codes.addr(), sc.addr(), s2.addr(), amax.addr()).unwrap();
+    let sketch = DeviceBuffer::new(kernels::draft_sketch_bytes(V)).unwrap();
+    kernels::build_draft_sketch(&s, wb.addr(), sketch.addr(), V).unwrap();
+    s.synchronize().unwrap();
+    drop(wb);
+    let x = filled(&s, D * 2, 0x3c);
+    let ys = DeviceBuffer::new(V * 4).unwrap();
+    let pick = DeviceBuffer::new(kernels::draft_pick_words(V) * 4).unwrap();
+    let out = DeviceBuffer::new(64).unwrap();
+    let reps = 50;
+    let g = Graph::capture(&s, |s| {
+        for _ in 0..reps {
+            kernels::draft_head_argmax(s, x.addr(), sketch.addr(), (codes.addr(), sc.addr(), s2.addr()), ys.addr(), pick.addr(), V, out.addr(), 0, 0)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    println!("draft head: {:.1} us per call ({} rows, sketch {:.1} MB)", time_graph(&s, &g, reps), V, kernels::draft_sketch_bytes(V) as f64 / 1e6);
 }

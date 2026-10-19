@@ -125,3 +125,32 @@ struct DraftQ {
     int ids[DRAFT_Q_MAX];
     float probs[DRAFT_Q_MAX];
 };
+
+// Streamed (read-once) weights: a read-only load that does not allocate in L1, so data read repeatedly
+// (activations) stays cached.
+SQ_DEVICE uint4 ld_stream(const void* p) {
+    uint4 r;
+    asm volatile("{\n.reg .b64 pol;\ncreatepolicy.fractional.L2::evict_first.b64 pol, 1.0;\nld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0, %1, %2, %3}, [%4], pol;\n}" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+    return r;
+}
+SQ_DEVICE uint16_t ld_stream_u16(const void* p) {
+    uint16_t r;
+    asm volatile("{\n.reg .b64 pol;\ncreatepolicy.fractional.L2::evict_first.b64 pol, 1.0;\nld.global.nc.L1::no_allocate.L2::cache_hint.u16 %0, [%1], pol;\n}" : "=h"(r) : "l"(p));
+    return r;
+}
+SQ_DEVICE uint2 ld_stream_u2(const void* p) {
+    uint2 r;
+    asm volatile("{\n.reg .b64 pol;\ncreatepolicy.fractional.L2::evict_first.b64 pol, 1.0;\nld.global.nc.L1::no_allocate.L2::cache_hint.v2.u32 {%0, %1}, [%2], pol;\n}" : "=r"(r.x), "=r"(r.y) : "l"(p));
+    return r;
+}
+SQ_DEVICE uint32_t ld_stream_u32(const void* p) {
+    uint32_t r;
+    asm volatile("{\n.reg .b64 pol;\ncreatepolicy.fractional.L2::evict_first.b64 pol, 1.0;\nld.global.nc.L1::no_allocate.L2::cache_hint.u32 %0, [%1], pol;\n}" : "=r"(r) : "l"(p));
+    return r;
+}
+SQ_DEVICE float ld_stream_f32(const float* p) { return __uint_as_float(ld_stream_u32(p)); }
+SQ_DEVICE unsigned long long ld_stream_u64(const void* p) {
+    unsigned long long r;
+    asm volatile("{\n.reg .b64 pol;\ncreatepolicy.fractional.L2::evict_first.b64 pol, 1.0;\nld.global.nc.L1::no_allocate.L2::cache_hint.u64 %0, [%1], pol;\n}" : "=l"(r) : "l"(p));
+    return r;
+}

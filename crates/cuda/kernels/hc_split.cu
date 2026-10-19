@@ -18,19 +18,19 @@ constexpr float EPS = 1e-6f;
 
 template <WFmt F>
 SQ_DEVICE float row_scale(const float* scales, int row) {
-    return F == WFmt::FP8 || F == WFmt::INT8 ? __ldg(scales + row) : 1.0f;
+    return F == WFmt::FP8 || F == WFmt::INT8 ? ld_stream_f32(scales + row) : 1.0f;
 }
 
 // Four consecutive weights of a row at column k as floats (BF16 or INT8 storage, no scale).
 template <WFmt F>
 SQ_DEVICE void load4(const uint8_t* row, int k, float* w) {
     if constexpr (F == WFmt::BF16) {
-        const uint2 v = __ldg(reinterpret_cast<const uint2*>(row + (size_t)k * 2));
+        const uint2 v = ld_stream_u2(row + (size_t)k * 2);
         const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&v);
         const float2 a = __bfloat1622float2(p[0]), b = __bfloat1622float2(p[1]);
         w[0] = a.x, w[1] = a.y, w[2] = b.x, w[3] = b.y;
     } else {
-        const int v = __ldg(reinterpret_cast<const int*>(row + k));
+        const int v = (int)ld_stream_u32(row + k);
         const int8_t* p = reinterpret_cast<const int8_t*>(&v);
 #pragma unroll
         for (int i = 0; i < 4; ++i) w[i] = (float)p[i];
@@ -63,7 +63,7 @@ __global__ void __launch_bounds__(WARPS * 32) hc_down_kernel(const float* h, int
             const int k = k0 + 4 * lane + 128 * j;
             load4<F>(wrow, k, w[rr] + 4 * j);
             if constexpr (F == WFmt::INT8G) {
-                const float gs = __ldg((down ? sd : si) + (size_t)wr * (H / GROUP) + k / GROUP);
+                const float gs = ld_stream_f32((down ? sd : si) + (size_t)wr * (H / GROUP) + k / GROUP);
 #pragma unroll
                 for (int i = 0; i < 4; ++i) w[rr][4 * j + i] *= gs;
             }
@@ -185,7 +185,7 @@ __global__ void __launch_bounds__(WARPS * 32) hc_up_mix_kernel(float* h, int T, 
         gs[s] = 1.0f;
         if (active) {
             raw[s] = load_raw16<F>(wu + (size_t)row * RANK * elem_bytes<F>(), k);
-            if constexpr (F == WFmt::INT8G) gs[s] = __ldg(su + (size_t)row * (RANK / GROUP) + k / GROUP);
+            if constexpr (F == WFmt::INT8G) gs[s] = ld_stream_f32(su + (size_t)row * (RANK / GROUP) + k / GROUP);
         }
         rs[s] = row_scale<F>(su, row);
     }
