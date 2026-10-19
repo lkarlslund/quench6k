@@ -82,6 +82,7 @@ commits on `main`. The CUDA runtime is linked statically.
 | `QUENCH6K_CHECK_ENCODE`, `QUENCH6K_CHECK_ROUTE` | Cross-check cached tokenization and MoE routing |
 | `QUENCH6K_TEST_TOOL_RETRY` | Treats the first tool call as invalid (exercises regeneration) |
 | `QUENCH6K_BENCH_IDS=FILE` | Benchmark corpus other than `bench/context.ids` |
+| `QUENCH6K_KBENCH_PROFILE=N` | kbench: N eager steps timed per op before benchmarking |
 | `QUENCH6K_DFLASH_BF16=1` | DFlash drafter projections in BF16 instead of INT8 |
 | `QUENCH6K_DFLASH_PROFILE=N` | Times round N's DFlash drafting per op (eagerly, 10 times) |
 

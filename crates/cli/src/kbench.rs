@@ -139,13 +139,23 @@ pub fn run(model_dir: &Path, o: &Options) -> Result<()> {
 
     // Prefill the context, then prepare one decode step of `rows` tokens (the corpus continuation).
     let ids = crate::bench::prompt(o.ctx + o.rows)?;
-    let mut state = SequenceState::new(o.ctx + o.rows + 16)?;
-    let mut ws = Workspace::for_model(&model, o.chunk.max(o.rows), o.ctx + o.rows + 16)?;
+    // QUENCH6K_KBENCH_PROFILE=N: before benchmarking, N eager steps of `rows` tokens timed per op.
+    let profile: usize = std::env::var("QUENCH6K_KBENCH_PROFILE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let cap = o.ctx + (profile + 1) * o.rows + 16;
+    let mut state = SequenceState::new(cap)?;
+    let mut ws = Workspace::for_model(&model, o.chunk.max(o.rows), cap)?;
     let t1 = std::time::Instant::now();
     for c in ids[..o.ctx].chunks(o.chunk) {
         forward::forward(&model, &mut state, &mut ws, &s, c)?;
     }
     println!("prefilled {} tokens in {:.1}s", o.ctx, t1.elapsed().as_secs_f64());
+    if profile > 0 {
+        let mut prof = quench6k_engine::profile::Profiler::default();
+        for _ in 0..profile {
+            forward::forward_profiled(&model, &mut state, &mut ws, &s, &ids[o.ctx..o.ctx + o.rows], &mut prof)?;
+        }
+        println!("{} eager steps of {} row(s), per op:\n{}", profile, o.rows, prof.report());
+    }
     forward::prepare_tokens(&mut state, &mut ws, &ids[o.ctx..])?;
     let bytes = forward::prepare_ple(&model, &state, &mut ws, o.rows)?;
     let snap = Snapshot::take(&state, o.layers, &s)?;
