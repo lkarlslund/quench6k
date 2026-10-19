@@ -223,8 +223,15 @@ Tried and dropped:
   kernel across more SMs would shorten only the pre-wait part.
 - Smaller MTP draft vocabulary (frequent tokens + sequence tokens): the draft head is 48 us per call
   over the full vocabulary (microbenchmark), so a 32K subset would save ~1.5% of a round.
-- Chaining GEMV columns into per-head consumers (gdn proj -> gdn_fused): the consumer could overlap
-  only the projection's last wave; not attempted.
+- hc_finish done per 16-row block by the last of its 20 split blocks (tickets, waiting for row block
+  0's sums of squares): +0.6% / +1.7% / +1.1% at 1 / 4 / 8 rows. In-kernel cross-block handoffs
+  (fence, atomic, spin) cost more than a PDL boundary unless they let work of different waves overlap,
+  which is why chaining helps the experts (40 x ~37 gate/up blocks, several waves) and nothing else.
+- Chaining a GEMV's columns into a consumer (router columns -> routing, gdn proj -> gdn_fused, index
+  columns -> the QSA indexer chain): the producers run in one wave (moe proj ~225 blocks) or the
+  consumer could overlap only the last wave; not attempted.
+- Tensor cores for 9-16-row GEMVs (pair rounds, where the GEMV drops to 0.85 TB/s): not attempted;
+  pair rounds are rare in the service's traffic.
 
 Where the time is now: at 4-8 rows the routed experts run at their bandwidth floor (the duplicated
 cost matches ~60 unique experts per layer at 8 rows). The remainder grows with rows: about 96 / 107
