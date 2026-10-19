@@ -683,3 +683,56 @@ pub fn gemm_mx8(s: &Stream, a: u64, a_scales: u64, w: u64, w_scales: u64, y: u64
 pub fn l2_prefetch(s: &Stream, ranges: u64, n: usize) -> Result<()> {
     launch!("l2_prefetch", ffi::quench6k_l2_prefetch(ranges as *const u64, n32(n), s.raw()))
 }
+
+/// Floats of the DFlash attention split partials.
+pub fn dflash_attention_floats() -> usize {
+    unsafe { ffi::quench6k_dflash_attention_floats() as usize }
+}
+
+fn opt_i(addr: u64) -> *const i32 {
+    if addr == 0 { std::ptr::null() } else { addr as *const i32 }
+}
+
+/// out[r, tap, :] (BF16 rows of 5 × 2560) = mean of the 4 residual streams of h[r] (FP32 [rows, 10240]).
+pub fn dflash_tap(s: &Stream, h: u64, rows: usize, out: u64, tap: usize) -> Result<()> {
+    launch!("dflash_tap", ffi::quench6k_dflash_tap(f(h), n32(rows), pm(out), n32(tap), s.raw()))
+}
+
+/// Qwen3 RMSNorm (weight w): out[r] (BF16, stride `ldo`) of FP32 rows x[r] (stride `ldx`), 2560 wide.
+pub fn dflash_rmsnorm(s: &Stream, x: u64, ldx: usize, w: u64, out: u64, ldo: usize, rows: usize) -> Result<()> {
+    launch!("dflash_rmsnorm", ffi::quench6k_dflash_rmsnorm(f(x), n32(ldx), p(w), pm(out), n32(ldo), n32(rows), s.raw()))
+}
+
+/// FP32 embeddings of the 8 block tokens of the drafter header `hdr`.
+pub fn dflash_embed(s: &Stream, hdr: u64, table: u64, h: u64) -> Result<()> {
+    launch!("dflash_embed", ffi::quench6k_dflash_embed(i(hdr), p(table), fm(h), s.raw()))
+}
+
+/// Drafter header of a step with `c` context rows, from the round control's position and next token.
+pub fn dflash_header(s: &Stream, p_: u64, x: u64, c: usize, hdr: u64, mask: i32) -> Result<()> {
+    launch!("dflash_header", ffi::quench6k_dflash_header(i(p_), i(x), n32(c), im(hdr), mask, s.raw()))
+}
+
+/// Two-tap dynamic convolution of the 8 block rows: BF16 `x` into BF16 `y`, or FP32 `x` added to FP32 `y`.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_conv(s: &Stream, x: u64, x_bf16: bool, dyn_: u64, ld_dyn: usize, base: u64, y: u64, add: bool) -> Result<()> {
+    launch!("dflash_conv", ffi::quench6k_dflash_conv(p(x), x_bf16 as i32, f(dyn_), n32(ld_dyn), p(base), pm(y), add as i32, s.raw()))
+}
+
+/// Head norms and RoPE of projected rows (see the kernel); `pos` (0: none) + `pos_add` + r is row r's position.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_qkv(s: &Stream, x: u64, ld: usize, offs: (usize, usize, usize), q_norm: u64, k_norm: u64, pos: u64, pos_add: usize, rows: usize, nq: usize, q: u64, kc: u64, vc: u64, ring: bool) -> Result<()> {
+    launch!("dflash_qkv", ffi::quench6k_dflash_qkv(f(x), n32(ld), n32(offs.0), n32(offs.1), n32(offs.2), p(q_norm), p(k_norm), opt_i(pos), n32(pos_add), n32(rows), n32(nq), fm(q), pm(kc), pm(vc), ring as i32, s.raw()))
+}
+
+/// Block attention over the ring and the block keys; `part`: [`dflash_attention_floats`]; att BF16 [8, 4096].
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_attention(s: &Stream, q: u64, rk: u64, rv: u64, bk: u64, bv: u64, hdr: u64, part: u64, att: u64) -> Result<()> {
+    launch!("dflash_attention", ffi::quench6k_dflash_attention(f(q), p(rk), p(rv), p(bk), p(bv), i(hdr), fm(part), pm(att), s.raw()))
+}
+
+/// Candidate selector: 7 drafts to `drafts` (i32), their distributions to `qs` when sampling (`params`).
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_select(s: &Stream, ids: u64, vals: u64, hp: u64, pred_cb: u64, succ_cb: u64, x: u64, drafts: u64, qs: u64, params: u64) -> Result<()> {
+    launch!("dflash_select", ffi::quench6k_dflash_select(i(ids), f(vals), f(hp), p(pred_cb), p(succ_cb), i(x), im(drafts), pm(qs), pm(params), s.raw()))
+}

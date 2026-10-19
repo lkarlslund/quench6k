@@ -64,11 +64,17 @@ pub fn load(model_dir: &std::path::Path, precision: Precision, mtp: bool) -> Res
     quench6k_cuda::set_device(0)?;
     let ckpt = Checkpoint::open(model_dir)?;
     let stream = quench6k_cuda::Stream::new()?;
-    let (model, stats) = quench6k_engine::model::load_text(&ckpt, precision, mtp, LoadOptions::default(), &stream)?;
+    let (mut model, stats) = quench6k_engine::model::load_text(&ckpt, precision, mtp, LoadOptions::default(), &stream)?;
+    if let Some(dir) = DFLASH.get().and_then(|d| d.as_ref()).filter(|_| mtp) {
+        model.dflash = Some(quench6k_engine::dflash::DFlash::load(dir)?);
+    }
     let (free, _) = quench6k_cuda::mem_info()?;
     println!("loaded {precision:?}: {:.2} GiB read in {:.1}s; {:.1} GiB device memory free", stats.bytes as f64 / 1073741824.0, stats.seconds, free as f64 / 1073741824.0);
     Ok((model, stream))
 }
+
+/// The DFlash drafter directory (`--dflash`), attached by [`load`] to models loaded for speculative decoding.
+static DFLASH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
 #[derive(Parser)]
 #[command(name = "quench6k", about = "Qwen3.8 Flash-Next inference engine")]
@@ -77,6 +83,10 @@ struct Cli {
     /// about half the memory).
     #[arg(long, global = true, default_value = "bf16", value_parser = ["bf16", "fp8"])]
     kv: String,
+    /// Draft speculative rounds with this DFlash 2 block drafter (a directory with config.json and
+    /// safetensors, e.g. incoai/Qwen3.8-Flash-Next-DFlash2) instead of the MTP layer; at most 7 drafts.
+    #[arg(long, global = true)]
+    dflash: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -373,6 +383,7 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     quench6k_engine::forward::KV_FP8.store(cli.kv == "fp8", std::sync::atomic::Ordering::Relaxed);
+    DFLASH.set(cli.dflash.clone()).expect("set once");
     match cli.command {
         Command::Load { model, mtp, vision, threads, chunk_mib, buffered, verify } => {
             quench6k_cuda::set_device(0)?;
@@ -779,7 +790,7 @@ fn batch_check(model_dir: &std::path::Path, fixtures: &[PathBuf], n: usize) -> R
     let mut db = SpecDecoder::prefill(&model, &mut sb, &mut ws, &s, &prompts[1], DRAFTS, 2048)?;
     let mut ga = SpecGraphs::capture(&model, &sa, &mut ws, &da, &s, true, None, Some(0))?;
     let mut gb = SpecGraphs::capture(&model, &sb, &mut ws, &db, &s, true, None, Some(1))?;
-    let mut pair = PairGraphs::capture(&model, [&sa, &sb], &ws, &s, DRAFTS)?;
+    let mut pair = PairGraphs::capture(&model, [&sa, &sb], &mut ws, &s, DRAFTS)?;
     let mut spec = [Vec::new(), Vec::new()];
     let t3 = std::time::Instant::now();
     let mut rounds = 0;

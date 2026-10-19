@@ -375,7 +375,7 @@ impl Session {
         let graph = DecodeGraph::capture(model, &state, &self.ws, &self.hw, s)?;
         let pen = Penalties::new()?;
         let spec = SpecGraphs::capture(model, &state, &mut self.ws, &dec, s, true, Some(pen.addrs()), Some(1))?;
-        let pair = crate::spec::PairGraphs::capture(model, [&self.state, &state], &self.ws, s, self.dec.drafts)?;
+        let pair = crate::spec::PairGraphs::capture(model, [&self.state, &state], &mut self.ws, s, self.dec.drafts)?;
         let hw2 = HeadWorkspace::new(2, MAX_TOP_K)?;
         let out2 = DeviceBuffer::new(8)?;
         let batch = BatchGraph::capture(model, &[&self.state, &state], &self.ws, &hw2, s, out2.addr())?;

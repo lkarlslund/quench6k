@@ -123,6 +123,15 @@ pub mod ffi {
         pub fn quench6k_penalty_state_bytes() -> c_int;
         pub fn quench6k_penalty_mark(st: *mut c_void, flags: *mut u32, list: *mut i32, ids: *const i32, n: c_int, n_ptr: *const i32, bits: u32, stream: Stream) -> Error;
         pub fn quench6k_penalty_apply(logits: *mut f32, rows: c_int, ld: c_int, st: *const c_void, flags: *const u32, list: *const i32, rc: *const i32, stream: Stream) -> Error;
+        pub fn quench6k_dflash_attention_floats() -> c_int;
+        pub fn quench6k_dflash_tap(h: *const f32, rows: c_int, out: *mut c_void, tap: c_int, stream: Stream) -> Error;
+        pub fn quench6k_dflash_rmsnorm(x: *const f32, ldx: c_int, w: *const c_void, out: *mut c_void, ldo: c_int, rows: c_int, stream: Stream) -> Error;
+        pub fn quench6k_dflash_embed(hdr: *const i32, table: *const c_void, h: *mut f32, stream: Stream) -> Error;
+        pub fn quench6k_dflash_header(p: *const i32, x: *const i32, c: c_int, hdr: *mut i32, mask: c_int, stream: Stream) -> Error;
+        pub fn quench6k_dflash_conv(x: *const c_void, x_bf16: c_int, dyn_: *const f32, ld_dyn: c_int, base: *const c_void, y: *mut c_void, add: c_int, stream: Stream) -> Error;
+        pub fn quench6k_dflash_qkv(x: *const f32, ld: c_int, q_off: c_int, k_off: c_int, v_off: c_int, q_norm: *const c_void, k_norm: *const c_void, pos: *const i32, pos_add: c_int, rows: c_int, nq: c_int, q: *mut f32, kc: *mut c_void, vc: *mut c_void, ring: c_int, stream: Stream) -> Error;
+        pub fn quench6k_dflash_attention(q: *const f32, rk: *const c_void, rv: *const c_void, bk: *const c_void, bv: *const c_void, hdr: *const i32, part: *mut f32, att: *mut c_void, stream: Stream) -> Error;
+        pub fn quench6k_dflash_select(ids: *const i32, vals: *const f32, hp: *const f32, pred_cb: *const c_void, succ_cb: *const c_void, x: *const i32, drafts: *mut i32, qs: *mut c_void, params: *mut c_void, stream: Stream) -> Error;
         pub fn quench6k_spec_accept(rc: *mut i32, ctl: *mut i32, n: c_int, stream: Stream) -> Error;
         pub fn quench6k_spec_sample_rows(ids: *const i32, vals: *const f32, k_list: c_int, n: c_int, rc: *mut i32, params: *mut c_void, qs: *const c_void, stream: Stream) -> Error;
         pub fn quench6k_steer_max_rank() -> c_int;

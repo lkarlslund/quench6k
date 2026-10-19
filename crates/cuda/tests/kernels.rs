@@ -991,3 +991,73 @@ fn penalties_match_cpu() {
     assert_eq!(got[30_000].to_bits(), ((if v > 0.0 { v / rep } else { v * rep }) - pres).to_bits());
     assert_eq!(got[200_000].to_bits(), x[200_000].to_bits());
 }
+
+/// DFlash block attention against a CPU softmax over the window: 8 block rows at positions blk ..,
+/// keys from the ring (positions max(lo, blk - 2047) .. blk) and the 8 block keys, all visible to every
+/// row except ring keys at or before the row's position - 2048.
+#[test]
+fn dflash_attention_matches_cpu() {
+    quench6k_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let mut rng = Rng(0x0dfa_5a17);
+    const RING: usize = 2048;
+    let (kvh, hd, qh, b) = (8, 128, 32, 8);
+    for &(lo, blk) in &[(0usize, 37usize), (0, 2000), (6144, 8192), (100, 5000)] {
+        let q = rng.vec(b * qh * hd);
+        let rk: Vec<f32> = rng.vec(RING * kvh * hd).iter().map(|&v| bf16::round(v)).collect();
+        let rv: Vec<f32> = rng.vec(RING * kvh * hd).iter().map(|&v| bf16::round(v)).collect();
+        let bk: Vec<f32> = rng.vec(b * kvh * hd).iter().map(|&v| bf16::round(v)).collect();
+        let bv: Vec<f32> = rng.vec(b * kvh * hd).iter().map(|&v| bf16::round(v)).collect();
+        let hdr: Vec<i32> = vec![lo as i32, 0, blk as i32, 0, 0, 0, 0, 0, 0, 0, 0];
+        let (dq, drk, drv, dbk, dbv, dh) = (upload(&s, &q), upload(&s, &to_bf16(&rk)), upload(&s, &to_bf16(&rv)), upload(&s, &to_bf16(&bk)), upload(&s, &to_bf16(&bv)), upload(&s, &hdr));
+        let part = DeviceBuffer::new(kernels::dflash_attention_floats() * 4).unwrap();
+        let att = DeviceBuffer::new(b * qh * hd * 2).unwrap();
+        kernels::dflash_attention(&s, dq.addr(), drk.addr(), drv.addr(), dbk.addr(), dbv.addr(), dh.addr(), part.addr(), att.addr()).unwrap();
+        let got: Vec<u16> = s.download(att.addr(), b * qh * hd).unwrap();
+        let first = lo.max(blk.saturating_sub(RING - 1));
+        let mut worst = 0f32;
+        for i in 0..b {
+            for h in 0..qh {
+                let g = h / 4;
+                let qr = &q[(i * qh + h) * hd..][..hd];
+                let mut keys: Vec<(&[f32], &[f32])> = Vec::new();
+                for p in first..blk {
+                    if p + 2048 > blk + i {
+                        let o = ((p % RING) * kvh + g) * hd;
+                        keys.push((&rk[o..o + hd], &rv[o..o + hd]));
+                    }
+                }
+                for j in 0..b {
+                    let o = (j * kvh + g) * hd;
+                    keys.push((&bk[o..o + hd], &bv[o..o + hd]));
+                }
+                let sc: Vec<f32> = keys.iter().map(|(k, _)| k.iter().zip(qr).map(|(a, b)| a * b).sum::<f32>() / (hd as f32).sqrt()).collect();
+                let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let w: Vec<f32> = sc.iter().map(|x| (x - m).exp()).collect();
+                let l: f32 = w.iter().sum();
+                for d in 0..hd {
+                    let want: f32 = keys.iter().zip(&w).map(|((_, v), w)| v[d] * w).sum::<f32>() / l;
+                    let have = bf16::to_f32(got[(i * qh + h) * hd + d]);
+                    worst = worst.max((have - want).abs());
+                }
+            }
+        }
+        assert!(worst < 2e-2, "lo {lo} blk {blk}: max error {worst}");
+        let (a, z) = (quench6k_cuda::Event::timing().unwrap(), quench6k_cuda::Event::timing().unwrap());
+        a.record(&s).unwrap();
+        for _ in 0..100 {
+            kernels::dflash_attention(&s, dq.addr(), drk.addr(), drv.addr(), dbk.addr(), dbv.addr(), dh.addr(), part.addr(), att.addr()).unwrap();
+        }
+        z.record(&s).unwrap();
+        z.synchronize().unwrap();
+        let total = 10.0 * quench6k_cuda::Event::elapsed_ms(&a, &z).unwrap();
+        a.record(&s).unwrap();
+        for _ in 0..100 {
+            kernels::dflash_attention(&s, 0, 0, 0, 0, 0, dh.addr(), part.addr(), att.addr()).unwrap();
+        }
+        z.record(&s).unwrap();
+        z.synchronize().unwrap();
+        let combine = 10.0 * quench6k_cuda::Event::elapsed_ms(&a, &z).unwrap();
+        println!("dflash attention lo {lo} blk {blk}: max error {worst:.4}, {total:.1} us ({combine:.1} us combining)");
+    }
+}

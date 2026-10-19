@@ -288,6 +288,8 @@ pub struct Model {
     pub ple_table: PleTable,
     /// Direction-removal steering pack, applied with each sequence's strength (see `steering`).
     pub steering: Option<crate::steering::Steering>,
+    /// The DFlash block drafter, used for speculative rounds instead of the MTP layer when present.
+    pub dflash: Option<crate::dflash::DFlash>,
 }
 
 fn read_i64s<const N: usize>(ckpt: &Checkpoint, name: &str) -> Result<[i64; N]> {
@@ -454,6 +456,7 @@ impl Model {
             ple_table: PleTable::open(ckpt)?,
             weights,
             steering: None,
+            dflash: None,
         })
     }
 }

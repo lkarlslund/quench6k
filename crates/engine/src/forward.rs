@@ -220,6 +220,10 @@ pub struct Workspace {
     /// Activation capture for the next eager steps: the row at absolute position `pos` is recorded into
     /// `buf` (see `CaptureLayout`). Not for captured graphs.
     pub capture: Option<CaptureTarget>,
+    /// DFlash feature capture for the next steps (eager or captured into graphs); see [`crate::dflash::Taps`].
+    pub taps: Option<crate::dflash::Taps>,
+    /// DFlash drafter scratch, when the model has the drafter.
+    pub dflash: Option<crate::dflash::Scratch>,
     score_cols: usize,
     /// BF16 copy of one INT8-group weight for large batches (see `DEQUANT_MIN_ROWS`); 0 elements without.
     dq: u64,
@@ -324,6 +328,9 @@ impl Workspace {
             ws.prefetch.push((b.addr(), prefix));
             ws.bufs.push(b);
         }
+        if model.dflash.is_some() {
+            ws.dflash = Some(crate::dflash::Scratch::new()?);
+        }
         let elems = model.max_int8g_elems();
         if max_tokens >= DEQUANT_MIN_ROWS && elems > 0 && std::env::var("QUENCH6K_DEQUANT_GEMM").as_deref() != Ok("0") {
             eprintln!("BF16 weight buffer for prefill GEMMs: {} MiB", (elems * 2) >> 20);
@@ -350,6 +357,8 @@ impl Workspace {
         Self {
             max_tokens,
             capture: None,
+            taps: None,
+            dflash: None,
             score_cols,
             h: alloc(t * H * 4)?,
             proj: alloc(t * PROJ_WIDTH * 4)?,
@@ -436,10 +445,16 @@ impl Workspace {
 
 /// SMs on the target GPU; skinny GEMMs aim for at least two CTAs per SM.
 const TARGET_CTAS: usize = 2 * 188;
-const PARTIAL_FLOATS: usize = 1 << 22;
+pub(crate) const PARTIAL_FLOATS: usize = 1 << 22;
 
 /// y[t, n] = x[t, k] · Wᵀ with row strides `ldx`/`ldy`: skinny GEMM for decode-sized `t`, tensor-core
 /// GEMM otherwise.
+/// [`linear_ld`] for other modules' projections (BF16 activations, FP32 output).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn linear_rows(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, ldy: usize, t: usize) -> Result<()> {
+    linear_ld(s, partial, x, ldx, w, y, ldy, t)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn linear_ld(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, ldy: usize, t: usize) -> Result<()> {
     // A few rows over 16 (MTP catch-up projects 4 stream rows per token) stay on the GEMV path in
@@ -846,6 +861,7 @@ pub fn forward_segments(model: &Model, segs: &[Seg], ws: &Workspace, s: &Stream,
         steer,
         batch: Some(segs),
         capture: None,
+        taps: ws.taps,
     };
     let mut carry = Carry::new(ws, from_ple);
     let layers = match part {
@@ -994,7 +1010,7 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
     let steer = model.steering.as_ref().map(|p| (p.directions.addr(), p.ranks.addr(), p.masks.addr(), p.norm_preserve, state.steer_strength.addr()));
     let first = state.len() - t;
     let capture = ws.capture.filter(|c| c.pos >= first && c.pos < first + t).map(|c| (c.buf, c.pos - first));
-    let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr(), spec, steer, batch: None, capture };
+    let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr(), spec, steer, batch: None, capture, taps: ws.taps };
     if !from_ple {
         op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, ctx.pos3, ctx.start, t));
         op!(prof, "embed", s, k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h));
@@ -1101,6 +1117,8 @@ struct LayerCtx<'a> {
     batch: Option<&'a [Seg<'a>]>,
     /// Activation capture: (record buffer, row of this step).
     capture: Option<(u64, usize)>,
+    /// DFlash feature capture.
+    taps: Option<crate::dflash::Taps>,
 }
 
 /// Residual bookkeeping carried from layer to layer. Small batches defer each block's residual update to
@@ -1147,6 +1165,16 @@ fn final_mixer(hc: &Hc, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut
 fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnState>, gdn_rec: Option<u64>, qsa: Option<&QsaCache>, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>) -> Result<()> {
     let (ws, s, t, start, pos3) = (ctx.ws, ctx.s, ctx.t, ctx.start, ctx.pos3);
     let small = t <= k::gemv_max_m();
+    // DFlash features: the completed output of a tapped layer is this layer's residual input.
+    if let Some(tp) = ctx.taps.filter(|tp| tp.rows > 0)
+        && let Some(j) = crate::dflash::TAPS.iter().position(|&l| l + 1 == index)
+    {
+        carry.materialize(s, ws, t)?;
+        if let Some(y) = carry.pending.take() {
+            op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, carry.inj, t));
+        }
+        op!(prof, "dflash_tap", s, k::dflash_tap(s, ws.h + (tp.first * H * 4) as u64, tp.rows, tp.buf, j));
+    }
     if let Some(ple) = &layer.ple {
         carry.materialize(s, ws, t)?;
         if let Some(y) = carry.pending.take() {
@@ -1486,7 +1514,7 @@ pub fn forward_mtp_staged(model: &Model, state: &SequenceState, ws: &Workspace, 
     // fc_hidden maps each of the 4 streams: rows of the [t, 4, 2560] input are the 4t stream slices.
     op!(prof, "mtp fc_h", s, linear_ws(s, ws, ws.n, D, &mtp.fc_hidden, ws.h, D, S * t));
     op!(prof, "mtp combine", s, k::hc_combine(s, ws.h, ws.y, ws.ones, t));
-    let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0, spec: None, steer: None, batch: None, capture: None };
+    let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0, spec: None, steer: None, batch: None, capture: None, taps: None };
     let mut carry = Carry::new(ws, false);
     layer_forward(LAYERS, &mtp.layer, None, None, Some(cache), &ctx, &mut carry, prof.as_deref_mut())?;
     final_mixer(&mtp.final_hc, &ctx, &mut carry, prof)

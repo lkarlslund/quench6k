@@ -99,6 +99,15 @@ Two concurrent requests decode speculatively together: both drafters run, then o
 verification step covers both requests' drafts, and each request accepts and samples on its own.
 If one of them uses plain decoding (`"mtp": false`, capture), both continue with batched plain steps.
 
+`--dflash DIR` (any command that decodes speculatively) drafts with the
+[DFlash 2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) block drafter instead of the MTP
+head: five dense layers draft 7 tokens in one pass, conditioned on the outputs of target layers 5, 15,
+25, 35 and 45 (captured during verification) through a 2048-position K/V window, and a candidate
+selector picks one path through each position's top 16 tokens. Verification is unchanged, so the
+output is too; `--drafts` may then be up to 7. The drafter was trained on Qwen's model: on Swift it
+accepts 8–10% more tokens per round than MTP on chat prompts, but a round costs more (drafting about
+1.4 ms), so it is about 8% slower, and the service keeps MTP.
+
 ## Tool calls
 
 Every `<tool_call>` in a response is checked: it parses, is closed, names a declared function, has the

@@ -316,7 +316,7 @@ fn run_mtp(model_dir: &Path, precision: Precision, contexts: &[usize], generate:
         }
         let gpu = gpu_window(&mon);
         if let Some(j) = json {
-            j.record("mtp", drafts, adaptive, ctx, produced, prefill, decode, Some(per_round), gpu.as_ref())?;
+            j.record(if model.dflash.is_some() { "dflash" } else { "mtp" }, drafts, adaptive, ctx, produced, prefill, decode, Some(per_round), gpu.as_ref())?;
         }
     }
     Ok(())
