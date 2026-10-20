@@ -5,3 +5,13 @@
 
 // The value of `key`, or `fallback` when it is not set.
 int sq_variant(const char* key, int fallback);
+
+// Row instance for a small batch of T rows: T itself when bit T of variant `key` is set, else the next
+// power of two (a launcher without an instance for T rounds up to the next instance it has).
+inline int sq_rows(int T, const char* key, int exact_default) {
+    if (T >= 1 && T <= 8 && (sq_variant(key, exact_default) >> T & 1)) return T;
+    int r = 1;
+    while (r < T) r <<= 1;
+    return r;
+}
+

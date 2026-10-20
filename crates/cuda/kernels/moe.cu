@@ -1051,10 +1051,13 @@ extern "C" cudaError_t quench6k_moe_gate_up_small(const void* m, const int* row_
     const bool chain = sq_variant("moe.chain", 1) != 0;
     const bool nl1 = sq_variant("moe.nl1", 1) != 0;
 #define SQ_GU(R) SQ_CHECK_LAUNCH(sq_launch(chain ? (nl1 ? gate_up_pair_kernel<R, true, true> : gate_up_pair_kernel<R, true, false>) : (nl1 ? gate_up_pair_kernel<R, false, true> : gate_up_pair_kernel<R, false, false>), grid, EW * 32, 0, st, x, row_token, gw, gs, g2, uw, us, u2, offsets, active, num_active, a))
-    if (T <= 1) SQ_GU(1);
-    else if (T <= 2) SQ_GU(2);
-    else if (T <= 4) SQ_GU(4);
-    else if (T <= 8) SQ_GU(8);
+    // A 5-row instance (kbench rows.gu, full model: -3.5% per 5-row step); exact 3 and 7 measured slower, 6 no faster.
+    const int R = sq_rows(T, "rows.gu", 1 << 5);
+    if (R <= 1) SQ_GU(1);
+    else if (R <= 2) SQ_GU(2);
+    else if (R <= 4) SQ_GU(4);
+    else if (R <= 5) SQ_GU(5);
+    else if (R <= 8) SQ_GU(8);
     else SQ_GU(16);
 #undef SQ_GU
     SQ_RETURN_LAUNCH();

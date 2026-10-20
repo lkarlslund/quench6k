@@ -280,20 +280,32 @@ pub struct DraftPolicy {
     times: Vec<Option<f64>>,
     /// Relative cost of one more draft for unmeasured lengths.
     pub r: f64,
+    decay: f64,
+    prior: f64,
+    /// Always this draft length (`QUENCH6K_POLICY=fixed=N`, for comparisons).
+    fixed: Option<usize>,
 }
 
 impl DraftPolicy {
-    const DECAY: f64 = 0.9;
-
     pub fn new(lengths: Vec<usize>) -> Self {
         let max = lengths.iter().copied().max().unwrap_or(1);
-        Self { lengths, counts: vec![(0.0, 0.0); max], times: vec![None; max + 1], r: 0.19 }
+        let mut p = Self { lengths, counts: vec![(0.0, 0.0); max], times: vec![None; max + 1], r: 0.19, decay: 0.9, prior: 0.8, fixed: None };
+        // Experiments: QUENCH6K_POLICY=decay=0.95,prior=0.6,fixed=3
+        for kv in std::env::var("QUENCH6K_POLICY").unwrap_or_default().split(',').filter(|kv| !kv.is_empty()) {
+            match kv.split_once('=') {
+                Some(("decay", v)) => p.decay = v.parse().expect("decay"),
+                Some(("prior", v)) => p.prior = v.parse().expect("prior"),
+                Some(("fixed", v)) => p.fixed = Some(v.parse::<usize>().expect("fixed")).filter(|n| p.lengths.contains(n)),
+                _ => panic!("QUENCH6K_POLICY: unknown setting {kv}"),
+            }
+        }
+        p
     }
 
-    /// Estimated acceptance of draft position i (0-based), with a weak prior of 0.8.
+    /// Estimated acceptance of draft position i (0-based), with a weak prior (0.8).
     fn q(&self, i: usize) -> f64 {
         let (a, t) = self.counts[i];
-        (a + 0.8) / (t + 1.0)
+        (a + self.prior) / (t + 1.0)
     }
 
     /// Round time of draft length n (relative units when nothing is measured yet).
@@ -309,6 +321,9 @@ impl DraftPolicy {
     }
 
     pub fn choose(&self) -> usize {
+        if let Some(n) = self.fixed {
+            return n;
+        }
         let value = |n: usize| {
             let (mut tokens, mut reach) = (1.0, 1.0);
             for i in 0..n {
@@ -327,8 +342,8 @@ impl DraftPolicy {
             None => secs,
         });
         for (i, c) in self.counts.iter_mut().enumerate() {
-            c.0 *= Self::DECAY;
-            c.1 *= Self::DECAY;
+            c.0 *= self.decay;
+            c.1 *= self.decay;
             if i < n && i <= a {
                 c.1 += 1.0;
                 if i < a {

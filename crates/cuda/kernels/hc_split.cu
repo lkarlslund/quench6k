@@ -274,10 +274,15 @@ cudaError_t dispatch_t(float* h, int T, const float* y, const float* inj_prev, c
                        const uint8_t* wi, const float* si, const uint8_t* wu, const float* su, const __nv_bfloat16* g,
                        float* scratch, __nv_bfloat16* z, float* r, float* inj, __nv_bfloat16* m, cudaStream_t st) {
 #define SQ_ARGS h, T, y, inj_prev, wd, sd, wi, si, wu, su, g, scratch, z, r, inj, m, st
-    if (T <= 1) return launch<F, 1>(SQ_ARGS);
-    if (T <= 2) return launch<F, 2>(SQ_ARGS);
-    if (T <= 4) return launch<F, 4>(SQ_ARGS);
-    if (T <= 8) return launch<F, 8>(SQ_ARGS);
+    // 5- and 6-row instances (kbench rows.hc, full model: -2.2% and -1.1% per step); 7 measured slower.
+    // No 3-row instance: token groups of 3 break warp_sum_slots (power-of-two slot counts).
+    const int R = sq_rows(T == 3 ? 4 : T, "rows.hc", 1 << 5 | 1 << 6);
+    if (R <= 1) return launch<F, 1>(SQ_ARGS);
+    if (R <= 2) return launch<F, 2>(SQ_ARGS);
+    if (R <= 4) return launch<F, 4>(SQ_ARGS);
+    if (R <= 5) return launch<F, 5>(SQ_ARGS);
+    if (R <= 6) return launch<F, 6>(SQ_ARGS);
+    if (R <= 8) return launch<F, 8>(SQ_ARGS);
     return launch<F, 16>(SQ_ARGS);
 #undef SQ_ARGS
 }

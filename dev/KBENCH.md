@@ -238,3 +238,25 @@ cost matches ~60 unique experts per layer at 8 rows). The remainder grows with r
 / 138 us per layer at 1 / 4 / 8 rows against ~48 us of static weights, in the HC kernels, the GDN
 recurrence and attention. The generic GEMV holds 1.4-1.6 TB/s up to 8 rows and drops to 0.85 TB/s at
 16 rows (pair rounds).
+
+## 2026-10-20: verify row counts and the draft policy
+
+Sampled serving traffic (8 coding and prose prompts, temperature 0.6 and 1.0, 2 seeds, 600 tokens,
+`--kv fp8`, steering, 600 W): rounds commit ~2.4 tokens, and a round with 4 drafts (5 verified rows)
+cost 1.6 ms more than one with 3, against ~0.8 ms for the neighbouring steps.
+
+- The small-batch launchers instantiated 1, 2, 4, 8 and 16 rows, so 5-7 rows ran the 8-row
+  instances. Exact instances per launcher (kbench `rows.gu`, `rows.dn`, `rows.sc`, `rows.hc`: bit T
+  set = exact instance for T rows), full model, 8K, fp8:
+  - experts gate/up: 5 rows -3.5%; 3 rows +2.1%, 6 rows +-0, 7 rows +0.5%.
+  - HC: 5 rows -2.2%, 6 rows -1.1%, 7 rows +0.2%. No 3-row instance: groups of 3 tokens give 6 / 12
+    reduction slots and `warp_sum_slots` needs a power of two (spec-check failed at token 4).
+  - experts down, shared expert combine: no gain at any count.
+  - Kept gate/up 5 and HC 5, 6 (defaults of `rows.gu` / `rows.hc`): -5.6% per 5-row step, -1.2% per
+    6-row step; exact.
+- Beyond that, each row from the fifth on adds ~0.3 ms of gate/up and ~0.15 ms of down: about five
+  newly routed experts per layer per token, real traffic.
+- Draft policy (`QUENCH6K_POLICY`): decay 0.8 / 0.95, prior 0.6 and draft temperature 70% / 85% are
+  all within the run-to-run spread of the adaptive baseline (279-294 tok/s); fixed 3 drafts 292-296.
+  The first configuration after a build or a long idle measured 4-8% low on every request; compare
+  configurations only after a warm-up run. The policy stays as it is.

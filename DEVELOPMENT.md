@@ -86,6 +86,7 @@ commits on `main`. The CUDA runtime is linked statically.
 | `QUENCH6K_KBENCH_PROFILE=N` | kbench: N eager steps timed per op before benchmarking |
 | `QUENCH6K_DFLASH_BF16=1` | DFlash drafter projections in BF16 instead of INT8 |
 | `QUENCH6K_DFLASH_PROFILE=N` | Times round N's DFlash drafting per op (eagerly, 10 times) |
+| `QUENCH6K_POLICY=decay=..,prior=..,fixed=N` | Adaptive draft length policy settings; `fixed=N` always drafts N |
 
 ## History
 
