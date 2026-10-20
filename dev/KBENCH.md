@@ -260,3 +260,9 @@ cost 1.6 ms more than one with 3, against ~0.8 ms for the neighbouring steps.
   all within the run-to-run spread of the adaptive baseline (279-294 tok/s); fixed 3 drafts 292-296.
   The first configuration after a build or a long idle measured 4-8% low on every request; compare
   configurations only after a warm-up run. The policy stays as it is.
+- DFlash on the same sampled traffic: 2.49 tokens per round, the same as MTP (2.44-2.49), at 258 tok/s
+  against 285-293 (drafting 1.4 ms per round against MTP's ~0.6). Its acceptance lead on the earlier
+  single chat prompt (3.50 vs 3.18) does not carry over, so cheaper drafting could at best tie MTP.
+  The MTP drafter's sketch head for DFlash's 7 rows (sketch shortlist, NVFP4 rescoring, top 16):
+  0.27 ms against 0.46 ms for the LM head and top-k, but 2.34 tokens per round and 250-257 tok/s:
+  dropped, as is a 4-bit drafter.
