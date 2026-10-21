@@ -245,6 +245,11 @@ pub struct Workspace {
     fork: Event,
     join: Event,
     prefetch: Vec<(u64, Vec<u64>)>,
+    /// Small batches run the shared expert's SwiGLU and down projection on this stream, beside the
+    /// routing and the routed experts (kbench variant `moe.shared_side`, default 1).
+    moe_side: Stream,
+    moe_fork: Event,
+    moe_join: Event,
     /// Static weight bytes per layer (the sums of the prefetch lists).
     pub layer_weight_bytes: Vec<u64>,
     bufs: Vec<DeviceBuffer>,
@@ -433,6 +438,9 @@ impl Workspace {
             fork: Event::new()?,
             join: Event::new()?,
             prefetch: Vec::new(),
+            moe_side: Stream::new()?,
+            moe_fork: Event::new()?,
+            moe_join: Event::new()?,
             layer_weight_bytes: Vec::new(),
             bufs,
         }
@@ -1381,12 +1389,23 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
     let col = |j: usize| x + (moe.proj.col(j) * 4) as u64;
     op!(prof, "moe proj", s, project(s, ws, ws.m, &moe.proj, x, t));
     let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
+    // Small batches: the shared expert's SwiGLU and down projection depend only on the projection, so
+    // they run on a side stream while the routing (one block) and the routed experts run.
+    let side = t > 1 && t <= k::moe_small_tokens() && quench6k_cuda::variants::get("moe.shared_side", 1) != 0;
     // FP4 prefill: the routed experts' down projection is written in BF16 (QUENCH6K_YD_BF16=0: FP32).
     let yd_bf16 = t > k::moe_small_tokens() && matches!(fp4_mode(), 1 | 3) && std::env::var("QUENCH6K_YD_BF16").map_or(true, |v| v != "0");
     if t == 1 {
         op!(prof, "experts t1", s, k::moe_experts_t1(s, ws.m, col(0), tables(&moe.gate), tables(&moe.up), tables(&moe.down), ws.top_i, ws.top_w, ws.pair_row, ws.act, ws.yd));
     } else if t <= k::moe_small_tokens() {
         let max_active = (t * TOP_K).min(EXPERTS);
+        if side {
+            ws.moe_fork.record(s)?;
+            ws.moe_side.wait(&ws.moe_fork)?;
+            let ss = &ws.moe_side;
+            op!(prof, "shared swiglu", ss, k::swiglu(ss, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
+            op!(prof, "shared down", ss, linear(ss, ws, ws.sact, &moe.shared_down, ws.sh, t));
+            ws.moe_join.record(ss)?;
+        }
         op!(prof, "moe_route_small", s, k::moe_route_small(s, col(0), ld, t, ws.top_i, ws.top_w, ws.offsets, ws.pair_row, ws.row_token, ws.active, ws.num_active));
         op!(prof, "experts gate_up", s, k::moe_gate_up_small(s, ws.m, ws.row_token, tables(&moe.gate), tables(&moe.up), ws.offsets, ws.active, ws.num_active, max_active, t, ws.act));
         op!(prof, "experts down", s, k::moe_down_small(s, ws.act, tables(&moe.down), ws.offsets, ws.active, ws.num_active, max_active, t, ws.yd));
@@ -1457,8 +1476,12 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
         let down = (moe.shared_down.fmt, moe.shared_down.addr, moe.shared_down.scale);
         op!(prof, "moe_shared_combine", s, k::moe_shared_combine(s, x, ld, t, down, ws.yd, ws.pair_row, ws.top_w, ws.y));
     } else {
-        op!(prof, "shared swiglu", s, k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
-        op!(prof, "shared down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
+        if side {
+            s.wait(&ws.moe_join)?;
+        } else {
+            op!(prof, "shared swiglu", s, k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
+            op!(prof, "shared down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
+        }
         if yd_bf16 && rec.is_none() {
             // Combined by the next HyperConnection's norm kernel (or materialized by another reader).
             carry.moe = Some((col(3), ld));

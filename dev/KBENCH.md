@@ -286,3 +286,28 @@ drafter's candidates). MTP 3 drafts, `--kv fp8`, greedy corpus, 600 W:
   (+0.6% average on Qwen3.6-35B-A3B, -5% on long agent turns). Trees stay off for this model.
 - What does grow with context is the target's own QSA selection: 12 layers x ~22 us more at 256K
   than at 8K (~0.26 ms of the 0.6 ms verify growth); qsa_select alone is 20 us per call at 65K groups.
+
+## 2026-10-21: launch gaps (nsys) and the shared expert on a side stream
+
+Nsight Systems ships inside Nsight Compute here (`/usr/lib/nsight-compute/host/target-linux-x64/nsys`):
+`nsys profile -t cuda --cuda-graph-trace=node --capture-range=cudaProfilerApi` around `bench
+--ncu-steps N`, then `nsys stats -r cuda_gpu_trace -f csv` gives every graph node's start and duration.
+
+- MTP 3, 20 rounds, fp8: the GPU is idle 0.9% of the time at 8K and 1.2% at 256K (union of kernel
+  intervals). Of that, ~50-70 us per round are host round trips between the draft and verify graphs
+  (inflated by nsys's API tracing). Launch gaps are not worth a persistent kernel; per-kernel durations
+  are mostly PDL overlap (their sum is ~1.9x the busy time).
+- The shared expert's SwiGLU and down projection (small batches) ran after the routed experts' down
+  kernel, adding ~4 us per MoE layer to the critical path, while the routing kernel (one block)
+  left the GPU idle. They depend only on the MoE projection, so they now run on a side stream forked
+  before the routing and joined before the combine (`moe.shared_side`, default 1; same kernels, so the
+  output is bit-identical: spec-check bf16/fp8 x code/multiturn x 3/6 drafts and eager, batch-check).
+  MTP 3, fp8, 600 W, alternating: verify 8.00 -> 7.88 ms at 8K, 8.60 -> 8.48 at 256K; 455 -> 462 and
+  424 -> 429 tok/s (+1.4%).
+- Still on the 4-row critical path per layer: routed experts ~56 us (at their bandwidth floor), each
+  HyperConnection ~14 us (3 dependent kernels, ~6.6 MB of weights), combine ~2 us, routing ~4 us after
+  the projection. QSA attention (split + merge) costs 25 us per QSA layer in-graph (kbench
+  `QUENCH6K_DUP=qsa_attention_split`, 4 rows: 662 -> 687 us per 4-layer step), ~3.7% of a verify step,
+  for ~2 MB of FP8 K/V; selection and index scores ~1-1.5 us each. The split kernel's 65 chunks of 32
+  keys write 12 x 256 partial floats each (6.4 MB per layer at 4 rows) and the merge reads them back in a
+  65-step serial loop. A faster attention changes the summation order: a numeric change (score + gate).
