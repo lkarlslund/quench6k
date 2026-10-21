@@ -266,3 +266,23 @@ cost 1.6 ms more than one with 3, against ~0.8 ms for the neighbouring steps.
   The MTP drafter's sketch head for DFlash's 7 rows (sketch shortlist, NVFP4 rescoring, top 16):
   0.27 ms against 0.46 ms for the LM head and top-k, but 2.34 tokens per round and 250-257 tok/s:
   dropped, as is a 4-bit drafter.
+
+## 2026-10-21: windowed draft attention and draft trees (both dropped on measurement)
+
+Prompted by EAGLE-4 (sliding-window draft layer) and Kapitsa's KFlash (best-first trees over a block
+drafter's candidates). MTP 3 drafts, `--kv fp8`, greedy corpus, 600 W:
+
+- Draft per round is 0.745 ms at 8K, 0.773 at 64K, 0.836 at 256K (verify 8.00 / 8.31 / 8.60). The
+  0.58 -> 1.6 ms growth measured on 2026-10-15 predates the sketch head. In the eager profile the
+  indexer scores + top-512 select of one QSA layer cost 14 us at 8K and 36 us at 256K, so a window
+  in the MTP layer would save at most ~0.09 ms of a 9.4 ms round (~1%), at some acceptance risk.
+- Verify per round by rows (8K): 3 rows 7.29 ms, 4 rows 8.00, 5 rows 9.00, 6 rows 9.99: each extra
+  row costs 0.7-1.0 ms (~10% of a round), the weights of the experts it newly routes to. A tree row
+  costs the same. On sampled traffic the first draft is rejected in ~27% of rounds (fixed 1 draft:
+  1.73 tokens per round); even if the MTP's second candidate matched half of those, a sibling row
+  adds <= 0.14 tokens per round (~5.5%) for ~10% more verify time, and it is worth less than the
+  third chain draft it would replace (fixed 2 -> 3: +0.33 tokens). Exact-match acceptance for tree
+  rows would also be stricter than the ratio test. KFlash measured the same shape on a MoE target
+  (+0.6% average on Qwen3.6-35B-A3B, -5% on long agent turns). Trees stay off for this model.
+- What does grow with context is the target's own QSA selection: 12 layers x ~22 us more at 256K
+  than at 8K (~0.26 ms of the 0.6 ms verify growth); qsa_select alone is 20 us per call at 65K groups.
