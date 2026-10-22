@@ -344,10 +344,14 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
             }
             Work::Generate(job) => job,
         };
+        if job.ids.len() >= context {
+            // Rejected before touching the cached sequence.
+            let _ = job.tx.send(Msg::Error(format!("prompt of {} tokens exceeds the context of {context}", job.ids.len())));
+            continue;
+        }
         let t0 = std::time::Instant::now();
         let result = (|| -> Result<(Finish, usize, usize)> {
             let p = &job.params;
-            anyhow::ensure!(job.ids.len() < context, "prompt of {} tokens exceeds the context of {context}", job.ids.len());
             let reused = seq.rewind(&job.ids, s)?;
             let mut at = reused;
             while at < job.ids.len() {
