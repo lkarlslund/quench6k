@@ -30,7 +30,15 @@ pub const MAX_CHUNK: usize = 4096;
 /// Most tokens of one graph step (a speculative verification).
 pub const MAX_STEP: usize = SMALL;
 const EPS: f32 = 1e-6;
-const MAX_SPLITS: usize = 64;
+/// Buffer bound on attention splits; steps of few tokens use `decode_splits()` (<= this).
+const MAX_SPLITS: usize = 128;
+
+/// Key splits of steps of few tokens (variant flint.splits; 94 = two waves of the 188 SMs over the four
+/// KV heads when the context is long enough).
+fn decode_splits() -> usize {
+    static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *S.get_or_init(|| (quench6k_cuda::variants::get("flint.splits", 94).max(1) as usize).min(MAX_SPLITS))
+}
 
 pub struct Layer {
     pub attn_norm: u64,
@@ -524,7 +532,7 @@ impl Workspace {
 
 /// Splits the attention of a step of `t` tokens may use (bounded by the partial buffers).
 fn splits_for(t: usize, start: usize, window: usize) -> usize {
-    let s = fk::attn_splits(t, start, window).min(MAX_SPLITS);
+    let s = fk::attn_splits(t, start, window).min(64);
     if t > SMALL { s.min(8.max(1)).min((MAX_CHUNK * 8) / t.max(1)).max(1) } else { s }
 }
 
@@ -621,7 +629,7 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
         // sum in the same order (empty splits exit at once).
         let splits = match start {
             Some(start) if !small => splits_for(t, start, window),
-            _ => MAX_SPLITS,
+            _ => decode_splits(),
         };
         fk::attention(s, ws.qb, seq.k[li].addr(), seq.v[li].addr(), t, ws.start, window, mask, splits, layer.sinks, ws.part_o, ws.part_ml, ws.attn_tickets, ws.attn, f8_rows)?;
         checkpoint(s, "attention")?;

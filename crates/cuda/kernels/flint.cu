@@ -230,9 +230,11 @@ __global__ void __launch_bounds__(W * 32) attn_kernel(const __nv_bfloat16* q, co
     const int k_begin_all = window > 0 ? max(0, p_lo - window + 1) : 0;
     const int k_end_all = p_hi + 1;
     const int tiles_all = (k_end_all - k_begin_all + KEYS - 1) / KEYS;
-    const int se = max(1, min(splits, tiles_all / min_tiles));
+    // Splits of `per` tiles; recounting from `per` drops splits that would be empty.
+    const int want = max(1, min(splits, tiles_all / min_tiles));
+    const int per = (tiles_all + want - 1) / want;
+    const int se = max(1, (tiles_all + per - 1) / per);
     if (split >= se) return;
-    const int per = (tiles_all + se - 1) / se;
     const int t_begin = split * per, t_end = min(tiles_all, t_begin + per);
 
     // Q rows -> shared.
@@ -539,7 +541,9 @@ __global__ void __launch_bounds__(128) attn_merge_kernel(const float* part_o, co
     const int p_lo = *start_p + tok0, p_hi = p_lo + ntok - 1;
     const int k_begin_all = window > 0 ? max(0, p_lo - window + 1) : 0;
     const int tiles_all = (p_hi + 1 - k_begin_all + keys - 1) / keys;
-    const int se = max(1, min(splits, tiles_all / min_tiles));
+    const int want = max(1, min(splits, tiles_all / min_tiles));
+    const int per = (tiles_all + want - 1) / want;
+    const int se = max(1, (tiles_all + per - 1) / per);
     const float* ml = part_ml + (size_t)row * splits * 2;
     const float* po = part_o + (size_t)row * splits * HD;
     const float sink = sinks[h] * 1.4426950408889634f;

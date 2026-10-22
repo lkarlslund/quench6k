@@ -395,3 +395,7 @@ Later the same day:
   `cp.async.bulk.prefetch.L2` for the 8 slots' gate/up/down weights (216 pieces of 64 KiB) made decode
   45% slower (276 vs 501 tok/s at 512): issuing them serializes the router's tail, which the expert
   kernels wait for.
+- **Decode splits.** An FP8 decode-attention CTA takes ~85 KB of shared memory (one per SM), so 64
+  splits x 4 KV heads = 256 CTAs leave a partial second wave on 188 SMs. A cap of 94 (two full waves)
+  with the split count recounted from the tiles per split (empty splits dropped; 8K keeps 64 x 2 tiles):
+  FP8 decode at 64K 340 -> 357 tok/s, 8K unchanged (`flint.splits`).
