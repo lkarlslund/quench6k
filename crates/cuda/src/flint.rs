@@ -16,7 +16,7 @@ mod ffi {
         pub fn quench6k_flint_rmsnorm(x: *const f32, w: *const f32, eps: f32, out: *mut c_void, t: c_int, st: Stream) -> Error;
         pub fn quench6k_flint_qk_prep(qi: *const f32, ldq: c_int, ki: *const f32, ldk: c_int, vi: *const f32, ldv: c_int, q_norm: *const f32, k_norm: *const f32, rope: c_int, start: *const i32, mask: c_int, t: c_int, q: *mut c_void, kc: *mut c_void, vc: *mut c_void, st: Stream) -> Error;
         pub fn quench6k_flint_attn_splits(t: c_int, start: c_int, window: c_int) -> c_int;
-        pub fn quench6k_flint_attention(q: *const c_void, kc: *const c_void, vc: *const c_void, t: c_int, start: *const i32, window: c_int, mask: c_int, splits: c_int, sinks: *const f32, part_o: *mut f32, part_ml: *mut f32, out: *mut c_void, st: Stream) -> Error;
+        pub fn quench6k_flint_attention(q: *const c_void, kc: *const c_void, vc: *const c_void, t: c_int, start: *const i32, window: c_int, mask: c_int, splits: c_int, sinks: *const f32, part_o: *mut f32, part_ml: *mut f32, tickets: *mut i32, out: *mut c_void, st: Stream) -> Error;
         pub fn quench6k_flint_gemv_max_m() -> c_int;
         pub fn quench6k_flint_gemv(x: *const c_void, norm_w: *const f32, m: c_int, k: c_int, codes: *const *const u8, scales: *const *const u8, s2: *const *const f32, n: *const c_int, y: *mut f32, ldy: c_int, accumulate: c_int, st: Stream) -> Error;
         pub fn quench6k_flint_router(h: *const f32, norm_w: *const f32, w: *const c_void, t: c_int, logits: *mut f32, xn: *mut c_void, ticket: *mut i32, sel_e: *mut i32, sel_w: *mut f32, st: Stream) -> Error;
@@ -77,9 +77,9 @@ pub fn attn_splits(t: usize, start: usize, window: usize) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn attention(s: &Stream, q: u64, kc: u64, vc: u64, t: usize, start: u64, window: usize, mask: i32, splits: usize, sinks: u64, part_o: u64, part_ml: u64, out: u64) -> Result<()> {
+pub fn attention(s: &Stream, q: u64, kc: u64, vc: u64, t: usize, start: u64, window: usize, mask: i32, splits: usize, sinks: u64, part_o: u64, part_ml: u64, tickets: u64, out: u64) -> Result<()> {
     check(
-        unsafe { ffi::quench6k_flint_attention(p(q), p(kc), p(vc), t as c_int, p(start), window as c_int, mask, splits as c_int, p(sinks), pm(part_o), pm(part_ml), pm(out), s.raw()) },
+        unsafe { ffi::quench6k_flint_attention(p(q), p(kc), p(vc), t as c_int, p(start), window as c_int, mask, splits as c_int, p(sinks), pm(part_o), pm(part_ml), pm(tickets), pm(out), s.raw()) },
         "flint_attention",
     )
 }

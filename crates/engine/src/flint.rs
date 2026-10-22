@@ -371,6 +371,8 @@ pub struct Workspace {
     argmax_scratch: u64,
     pub argmax_out: u64,
     ticket: u64,
+    /// Attention merge tickets, one per (64-row tile, KV head).
+    attn_tickets: u64,
     /// Host staging of a decode step's token and position.
     io: PinnedBuffer,
 }
@@ -431,6 +433,12 @@ impl Workspace {
             argmax_out: a(logit_rows * 4)?,
             ticket: {
                 let b = DeviceBuffer::zeroed(16)?;
+                let addr = b.addr();
+                bufs.push(b);
+                addr
+            },
+            attn_tickets: {
+                let b = DeviceBuffer::zeroed((t / 8 + 1) * HKV * 4)?;
                 let addr = b.addr();
                 bufs.push(b);
                 addr
@@ -505,9 +513,16 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
         k::moe_nvfp4_gemm(s, x, tb.0, tb.1, tb.2, ws.d_offsets, ws.d_tile_expert, ws.d_tile_row, ws.d_num_tiles, t.div_ceil(bm), y, n, kdim)
     };
     for (li, layer) in model.layers.iter().enumerate() {
-        fk::rmsnorm(s, ws.h, layer.attn_norm, EPS, ws.xn, t)?;
+        let fuse = t == 1 && quench6k_cuda::variants::get("flint.fuse_norm", 1) != 0;
+        if !fuse {
+            fk::rmsnorm(s, ws.h, layer.attn_norm, EPS, ws.xn, t)?;
+        }
         let (qi, ki, vi) = if small {
-            fk::gemv(s, ws.xn, None, t, &[layer.q, layer.k, layer.v], ws.qkv, QKV, false)?;
+            if fuse {
+                fk::gemv(s, ws.h, Some(layer.attn_norm), 1, &[layer.q, layer.k, layer.v], ws.qkv, QKV, false)?;
+            } else {
+                fk::gemv(s, ws.xn, None, t, &[layer.q, layer.k, layer.v], ws.qkv, QKV, false)?;
+            }
             ((ws.qkv, QKV), (ws.qkv + (HQ * HD * 4) as u64, QKV), (ws.qkv + ((HQ + HKV) * HD * 4) as u64, QKV))
         } else {
             dense_gemm(layer.q_t, ws.xn, ws.qf, HQ * HD, D)?;
@@ -525,7 +540,7 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
             Some(start) if !small => splits_for(t, start, window),
             _ => MAX_SPLITS,
         };
-        fk::attention(s, ws.qb, seq.k[li].addr(), seq.v[li].addr(), t, ws.start, window, mask, splits, layer.sinks, ws.part_o, ws.part_ml, ws.attn)?;
+        fk::attention(s, ws.qb, seq.k[li].addr(), seq.v[li].addr(), t, ws.start, window, mask, splits, layer.sinks, ws.part_o, ws.part_ml, ws.attn_tickets, ws.attn)?;
         checkpoint(s, "attention")?;
         if small {
             fk::gemv(s, ws.attn, None, t, &[layer.o], ws.h, D, true)?;
@@ -579,8 +594,12 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
     while done < rows {
         let m = (rows - done).min(fk::gemv_max_m());
         let h = ws.h + ((first + done) * D * 4) as u64;
-        fk::rmsnorm(s, h, model.out_norm, EPS, ws.xn, m)?;
-        fk::gemv(s, ws.xn, None, m, &[model.lm_head], ws.logits + (done * VOCAB * 4) as u64, VOCAB, false)?;
+        if m == 1 && quench6k_cuda::variants::get("flint.fuse_norm", 1) != 0 {
+            fk::gemv(s, h, Some(model.out_norm), 1, &[model.lm_head], ws.logits + (done * VOCAB * 4) as u64, VOCAB, false)?;
+        } else {
+            fk::rmsnorm(s, h, model.out_norm, EPS, ws.xn, m)?;
+            fk::gemv(s, ws.xn, None, m, &[model.lm_head], ws.logits + (done * VOCAB * 4) as u64, VOCAB, false)?;
+        }
         done += m;
     }
     Ok(())

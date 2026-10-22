@@ -156,9 +156,14 @@ struct __align__(16) AttnSmem {
     __nv_bfloat16 v[2][AT_KEYS * AT_LD];
 };
 
+// At least this many key tiles per split: splits beyond tiles / AT_MIN_TILES exit at once, so the split
+// count follows the position (read on the device: graph steps stay valid).
+constexpr int AT_MIN_TILES = 4;
+
 __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const __nv_bfloat16* kc,
                                                    const __nv_bfloat16* vc, int T, const int* start_p, int window,
-                                                   int mask, int splits, float* part_o, float* part_ml) {
+                                                   int mask, int splits, float* part_o, float* part_ml, const float* sinks,
+                                                   int* tickets, __nv_bfloat16* out) {
     pdl_launch_dependents();
     pdl_wait();
     const int start = *start_p;
@@ -173,7 +178,9 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
     const int k_begin_all = window > 0 ? max(0, p_lo - window + 1) : 0;
     const int k_end_all = p_hi + 1;
     const int tiles_all = (k_end_all - k_begin_all + AT_KEYS - 1) / AT_KEYS;
-    const int per = (tiles_all + splits - 1) / splits;
+    const int se = max(1, min(splits, tiles_all / AT_MIN_TILES));
+    if (split >= se) return;
+    const int per = (tiles_all + se - 1) / se;
     const int t_begin = split * per, t_end = min(tiles_all, t_begin + per);
 
     // Q rows -> shared.
@@ -309,25 +316,71 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
             part_ml[(row * splits + split) * 2 + 1] = l[hrow];
         }
     }
+    // The last split to finish merges the tile's rows: out = sum_s 2^(m_s - M) o_s /
+    // (sum_s 2^(m_s - M) l_s + 2^(sink log2 e - M)), in split order.
+    if (!tickets) return;
+    __shared__ bool last;
+    __threadfence();
+    __syncthreads();
+    int* ticket = tickets + blockIdx.x * HKV + kh;
+    if (tid == 0) last = atomicAdd(ticket, 1) == se - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    // Warps take rows; lanes take splits for the maximum and the denominator, then 4 dimensions each.
+    for (int r = warp; r < ntok * GROUP; r += 4) {
+        const size_t row = (size_t)(tok0 + r / GROUP) * HQ + kh * GROUP + r % GROUP;
+        const float sink = sinks[kh * GROUP + r % GROUP] * 1.4426950408889634f;
+        const float* ml = part_ml + row * splits * 2;
+        float mloc = -INFINITY;
+        for (int sp = lane; sp < se; sp += 32) mloc = fmaxf(mloc, __ldcg(ml + sp * 2));
+        const float M = fmaxf(warp_max(mloc), sink);
+        float dloc = 0.0f;
+        for (int sp = lane; sp < se; sp += 32) {
+            const float ms = __ldcg(ml + sp * 2);
+            if (ms != -INFINITY) dloc = fmaf(exp2f(ms - M), __ldcg(ml + sp * 2 + 1), dloc);
+        }
+        const float den = warp_sum(dloc) + exp2f(sink - M);
+        float4 num = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll 4
+        for (int sp = 0; sp < se; ++sp) {
+            const float ms = __ldcg(ml + sp * 2);
+            const float w = ms == -INFINITY ? 0.0f : exp2f(ms - M);
+            const float4 o4 = __ldcg(reinterpret_cast<const float4*>(part_o + (row * splits + sp) * HD) + lane);
+            num.x = fmaf(w, o4.x, num.x), num.y = fmaf(w, o4.y, num.y), num.z = fmaf(w, o4.z, num.z), num.w = fmaf(w, o4.w, num.w);
+        }
+        const float inv = 1.0f / den;
+        __nv_bfloat162 p2[2] = {__floats2bfloat162_rn(num.x * inv, num.y * inv), __floats2bfloat162_rn(num.z * inv, num.w * inv)};
+        *reinterpret_cast<uint2*>(out + row * HD + 4 * lane) = *reinterpret_cast<uint2*>(p2);
+    }
+    if (tid == 0) *ticket = 0;
 }
 
 // out[t, h * 128 + d] = bf16(sum_s 2^(m_s - M) o_s / (sum_s 2^(m_s - M) l_s + 2^(sink_h log2 e - M))).
 // Grid T * HQ, 128 threads.
-__global__ void __launch_bounds__(128) attn_merge_kernel(const float* part_o, const float* part_ml,
-                                                         int splits, const float* sinks, __nv_bfloat16* out) {
+__global__ void __launch_bounds__(128) attn_merge_kernel(const float* part_o, const float* part_ml, int splits, const float* sinks,
+                                                         int T, const int* start_p, int window, __nv_bfloat16* out) {
     pdl_launch_dependents();
     pdl_wait();
     const int row = blockIdx.x, h = row % HQ, d = threadIdx.x;
+    // The attention CTA's effective split count, derived as attn_kernel does.
+    const int tok0 = (row / HQ) / (AT_ROWS / GROUP) * (AT_ROWS / GROUP), ntok = min(AT_ROWS / GROUP, T - tok0);
+    const int p_lo = *start_p + tok0, p_hi = p_lo + ntok - 1;
+    const int k_begin_all = window > 0 ? max(0, p_lo - window + 1) : 0;
+    const int tiles_all = (p_hi + 1 - k_begin_all + AT_KEYS - 1) / AT_KEYS;
+    const int se = max(1, min(splits, tiles_all / AT_MIN_TILES));
+    const float* ml = part_ml + (size_t)row * splits * 2;
+    const float* po = part_o + (size_t)row * splits * HD;
     const float sink = sinks[h] * 1.4426950408889634f;
     float M = sink;
-    for (int s = 0; s < splits; ++s) M = fmaxf(M, part_ml[((size_t)row * splits + s) * 2]);
+    for (int sp = 0; sp < se; ++sp) M = fmaxf(M, ml[sp * 2]);
     float den = exp2f(sink - M), num = 0.0f;
-    for (int s = 0; s < splits; ++s) {
-        const float ms = part_ml[((size_t)row * splits + s) * 2];
-        if (ms == -INFINITY) continue;
-        const float w = exp2f(ms - M);
-        den = fmaf(w, part_ml[((size_t)row * splits + s) * 2 + 1], den);
-        num = fmaf(w, part_o[((size_t)row * splits + s) * HD + d], num);
+#pragma unroll 4
+    for (int sp = 0; sp < se; ++sp) {
+        const float ms = ml[sp * 2];
+        const float w = ms == -INFINITY ? 0.0f : exp2f(ms - M);
+        den = fmaf(w, ms == -INFINITY ? 0.0f : ml[sp * 2 + 1], den);
+        num = fmaf(w, po[(size_t)sp * HD + d], num);
     }
     out[(size_t)row * HD + d] = f2bf(num / den);
 }
@@ -522,11 +575,14 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv1_kernel(const void* xi
 // computes R rows. STEPS = K / 1024.
 SQ_DEVICE int swz16(int j) { return j ^ ((j >> 3) & 7); }
 
-template <int STEPS, int R>
-__global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv2_kernel(const __nv_bfloat16* x, Mats mats, float* y, int accumulate) {
+// NORM: x is the FP32 residual row; the CTA stages bf16(x * norm_w) and scales the dot products by
+// rsqrt(mean(x^2) + 1e-6) (RMSNorm folded into the output).
+template <int STEPS, int R, bool NORM>
+__global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv2_kernel(const void* xin, const float* norm_w, Mats mats, float* y, int accumulate) {
     pdl_launch_dependents();
     constexpr int K = STEPS * 1024;
     __shared__ __align__(16) uint4 xs[K / 8];
+    __shared__ float red[32];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int n_total = mats.end[2];
     const int row0 = (blockIdx.x * GV_WARPS + warp) * R;
@@ -548,8 +604,23 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv2_kernel(const __nv_bfl
         }
     }
     pdl_wait();
-    for (int j = threadIdx.x; j < K / 8; j += blockDim.x) xs[swz16(j)] = reinterpret_cast<const uint4*>(x)[j];
-    __syncthreads();
+    float rn = 1.0f;
+    if constexpr (NORM) {
+        const float* h = static_cast<const float*>(xin);
+        float ss = 0.0f;
+        for (int j = threadIdx.x; j < K / 8; j += blockDim.x) {
+            const float4 a = *reinterpret_cast<const float4*>(h + 8 * j), b = *reinterpret_cast<const float4*>(h + 8 * j + 4);
+            const float4 wa = *reinterpret_cast<const float4*>(norm_w + 8 * j), wb = *reinterpret_cast<const float4*>(norm_w + 8 * j + 4);
+            ss += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w + b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+            __nv_bfloat162 p[4] = {__floats2bfloat162_rn(a.x * wa.x, a.y * wa.y), __floats2bfloat162_rn(a.z * wa.z, a.w * wa.w),
+                                   __floats2bfloat162_rn(b.x * wb.x, b.y * wb.y), __floats2bfloat162_rn(b.z * wb.z, b.w * wb.w)};
+            xs[swz16(j)] = *reinterpret_cast<uint4*>(p);
+        }
+        rn = rsqrtf(block_sum(ss, red) / K + 1e-6f);
+    } else {
+        for (int j = threadIdx.x; j < K / 8; j += blockDim.x) xs[swz16(j)] = static_cast<const uint4*>(xin)[j];
+        __syncthreads();
+    }
     if (row0 >= n_total) return;
     float acc[R] = {};
 #pragma unroll
@@ -572,7 +643,7 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv2_kernel(const __nv_bfl
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         const int row = row0 + r;
-        const float v = warp_sum(acc[r]) * *mats.s2[mat[r]];
+        const float v = warp_sum(acc[r]) * *mats.s2[mat[r]] * rn;
         if (lane == 0 && row < n_total) y[row] = accumulate ? y[row] + v : v;
     }
 }
@@ -1050,7 +1121,7 @@ int quench6k_flint_attn_splits(int T, int start, int window) {
 }
 
 cudaError_t quench6k_flint_attention(const void* q, const void* kc, const void* vc, int T, const int* start, int window, int mask, int splits,
-                                     const float* sinks, float* part_o, float* part_ml, void* out, cudaStream_t st) {
+                                     const float* sinks, float* part_o, float* part_ml, int* tickets, void* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     constexpr size_t smem = sizeof(AttnSmem);
     static bool configured = false;
@@ -1060,10 +1131,13 @@ cudaError_t quench6k_flint_attention(const void* q, const void* kc, const void* 
         configured = true;
     }
     const dim3 grid((T * GROUP + AT_ROWS - 1) / AT_ROWS, HKV, splits);
+    const bool fused = sq_variant("flint.attn_fused_merge", 0) != 0;
     SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel, grid, 128, smem, st, static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(kc),
-                              static_cast<const __nv_bfloat16*>(vc), T, start, window, mask, splits, part_o, part_ml));
-    SQ_CHECK_LAUNCH(fl_launch(8, attn_merge_kernel, T * HQ, 128, 0, st, (const float*)part_o, (const float*)part_ml, splits, sinks,
-                              static_cast<__nv_bfloat16*>(out)));
+                              static_cast<const __nv_bfloat16*>(vc), T, start, window, mask, splits, part_o, part_ml, sinks,
+                              fused ? tickets : nullptr, static_cast<__nv_bfloat16*>(out)));
+    if (!fused)
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_merge_kernel, T * HQ, 128, 0, st, (const float*)part_o, (const float*)part_ml, splits, sinks, T, start,
+                                  window, static_cast<__nv_bfloat16*>(out)));
     SQ_RETURN_LAUNCH();
 }
 
@@ -1096,21 +1170,24 @@ cudaError_t gemv1_launch(const void* x, const float* norm_w, int K, const Mats& 
 }
 
 template <int STEPS, int R>
-cudaError_t gemv2_launch(const void* x, const Mats& mats, int total, float* y, int accumulate, cudaStream_t st) {
+cudaError_t gemv2_launch(const void* x, const float* norm_w, const Mats& mats, int total, float* y, int accumulate, cudaStream_t st) {
     const unsigned grid = (total + GV_WARPS * R - 1) / (GV_WARPS * R);
-    SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemv2_kernel<STEPS, R>, grid, GV_WARPS * 32, 0, st, static_cast<const __nv_bfloat16*>(x), mats, y, accumulate));
+    if (norm_w)
+        SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemv2_kernel<STEPS, R, true>, grid, GV_WARPS * 32, 0, st, x, norm_w, mats, y, accumulate));
+    else
+        SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemv2_kernel<STEPS, R, false>, grid, GV_WARPS * 32, 0, st, x, norm_w, mats, y, accumulate));
     SQ_RETURN_LAUNCH();
 }
 
 template <int M>
 cudaError_t gemv_m(const void* x, const float* norm_w, int K, const Mats& mats, int total, float* y, int ldy, int accumulate, cudaStream_t st) {
     const int g = sq_variant("flint.gemv", 2);
-    if (M == 1 && !norm_w && g == 2 && (K == 2048 || K == 4096)) {
+    if (M == 1 && g == 2 && (K == 2048 || (K == 4096 && !norm_w))) {
         const int R = sq_variant("flint.gemv_r", 0);
-        if (K == 2048) return (R == 2 || (R == 0 && total < 4 * 188 * GV_WARPS * 4)) ? gemv2_launch<2, 2>(x, mats, total, y, accumulate, st)
-                                                                                     : gemv2_launch<2, 4>(x, mats, total, y, accumulate, st);
-        return (R == 1 || (R == 0 && total < 4 * 188 * GV_WARPS * 2)) ? gemv2_launch<4, 1>(x, mats, total, y, accumulate, st)
-                                                                      : gemv2_launch<4, 2>(x, mats, total, y, accumulate, st);
+        if (K == 2048) return (R == 2 || (R == 0 && total < 4 * 188 * GV_WARPS * 4)) ? gemv2_launch<2, 2>(x, norm_w, mats, total, y, accumulate, st)
+                                                                                     : gemv2_launch<2, 4>(x, norm_w, mats, total, y, accumulate, st);
+        return (R == 1 || (R == 0 && total < 4 * 188 * GV_WARPS * 2)) ? gemv2_launch<4, 1>(x, nullptr, mats, total, y, accumulate, st)
+                                                                      : gemv2_launch<4, 2>(x, nullptr, mats, total, y, accumulate, st);
     }
     if (M == 1 && g == 1) {
         const bool r2 = total >= 2 * 188 * GV_WARPS * 2;
