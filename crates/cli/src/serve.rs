@@ -328,7 +328,7 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
 /// sampling on the host from the top candidates.
 fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda::Stream, context: usize, jobs: &mpsc::Receiver<Work>) {
     use quench6k_engine::flint as fl;
-    let setup = || -> Result<_> { Ok((fl::Workspace::new(1)?, fl::FlintSeq::new(model, context)?, crate::flint::Sampler::new()?)) };
+    let setup = || -> Result<_> { Ok((fl::Workspace::new(fl::MAX_STEP)?, fl::FlintSeq::new(model, context)?, crate::flint::Sampler::new()?)) };
     let (mut ws, mut seq, mut sampler) = match setup() {
         Ok(v) => v,
         Err(e) => {
@@ -362,24 +362,57 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
             }
             let prefill = t0.elapsed().as_secs_f64();
             let budget = p.max_tokens.min(context - job.ids.len()).max(1);
+            // Speculation with prompt-lookup drafts (request field "mtp", default on): the tokens that
+            // followed the latest earlier occurrence of the last few tokens are verified in one step.
+            let lookup = job.mtp && quench6k_cuda::variants::get("flint.lookup", 1) != 0;
+            let mut hist = job.ids.clone();
             let mut generated = Vec::new();
+            let (mut drafted, mut accepted, mut steps) = (0usize, 0usize, 0usize);
             let t1 = std::time::Instant::now();
-            let finish = loop {
-                let tok = sampler.sample(s, ws.logits, fl::VOCAB, p, &generated)?;
+            // Emits a token; Some when the run ends.
+            let emit = |tok: i32, generated: &mut Vec<i32>, hist: &mut Vec<i32>| -> Option<Finish> {
                 generated.push(tok);
+                hist.push(tok);
                 if job.tx.send(Msg::Token(tok)).is_err() {
-                    break Finish::Cancelled;
+                    return Some(Finish::Cancelled);
                 }
                 if p.stop_tokens.contains(&tok) {
-                    break Finish::Stop;
+                    return Some(Finish::Stop);
                 }
-                if generated.len() >= budget {
-                    break Finish::Length;
-                }
-                fl::decode(model, &mut ws, &mut seq, tok, s)?;
+                (generated.len() >= budget).then_some(Finish::Length)
             };
+            let first = sampler.sample(s, ws.logits, fl::VOCAB, p, &generated)?;
+            let mut done = emit(first, &mut generated, &mut hist);
+            let mut pending = first;
+            while done.is_none() {
+                let room = (fl::MAX_STEP - 1).min(budget - generated.len());
+                let draft = if lookup { crate::flint::lookup_draft(&hist, room) } else { Vec::new() };
+                let mut toks = Vec::with_capacity(draft.len() + 1);
+                toks.push(pending);
+                toks.extend_from_slice(&draft);
+                let before = seq.tokens.len();
+                fl::step(model, &mut ws, &mut seq, &toks, s)?;
+                steps += 1;
+                drafted += draft.len();
+                let mut j = 0;
+                loop {
+                    let tok = sampler.sample(s, ws.logits + (j * fl::VOCAB * 4) as u64, fl::VOCAB, p, &generated)?;
+                    done = emit(tok, &mut generated, &mut hist);
+                    if done.is_none() && j < draft.len() && tok == draft[j] {
+                        j += 1;
+                        continue;
+                    }
+                    pending = tok;
+                    break;
+                }
+                accepted += j;
+                // Keep the fed tokens that were accepted; the caches of the rest are overwritten later.
+                seq.tokens.truncate(before + 1 + j);
+            }
+            let finish = done.unwrap();
+            let spec_note = if lookup && steps > 0 { format!(", lookup {accepted}/{drafted} drafts accepted, {:.2} tokens/step", generated.len().saturating_sub(1) as f64 / steps as f64) } else { String::new() };
             let secs = t1.elapsed().as_secs_f64();
-            eprintln!("done: prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s), {:?}",
+            eprintln!("done: prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s){spec_note}, {:?}",
                       job.ids.len(), reused, prefill, (job.ids.len() - reused) as f64 / prefill.max(1e-9), generated.len(), secs,
                       generated.len().saturating_sub(1) as f64 / secs.max(1e-9), finish);
             Ok((finish, reused, generated.len()))

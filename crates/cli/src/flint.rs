@@ -281,3 +281,31 @@ impl Sampler {
         Ok(ids[order[cut - 1]])
     }
 }
+
+/// A prompt-lookup draft: up to `k` tokens that followed the latest earlier occurrence of the last 4,
+/// 3 or 2 tokens of `hist` (searched within the last 128K positions).
+pub fn lookup_draft(hist: &[i32], k: usize) -> Vec<i32> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let len = hist.len();
+    for n in [4usize, 3, 2] {
+        if len <= n {
+            continue;
+        }
+        let pat = &hist[len - n..];
+        let lo = len.saturating_sub(1 << 17);
+        let mut i = len - n;
+        while i > lo {
+            i -= 1;
+            if hist[i] == pat[0] && &hist[i..i + n] == pat {
+                let start = i + n;
+                let end = (start + k).min(len);
+                if end > start {
+                    return hist[start..end].to_vec();
+                }
+            }
+        }
+    }
+    Vec::new()
+}

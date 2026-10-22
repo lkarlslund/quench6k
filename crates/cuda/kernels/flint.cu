@@ -94,18 +94,23 @@ __global__ void embed_kernel(const int* tokens, const __nv_bfloat16* table, floa
     for (int i = threadIdx.x; i < D; i += blockDim.x) h[(size_t)t * D + i] = bf2f(row[i]);
 }
 
-// out[t] = bf16(x[t] * rsqrt(mean(x[t]^2) + eps) * w), D = 2048, 256 threads.
-__global__ void __launch_bounds__(256) rmsnorm_kernel(const float* x, const float* w, float eps,
+// out[t] = bf16(x[t] * rsqrt(mean(x[t]^2) + eps) * w), D = 2048, 256 threads. With `add`, x[t] += add[t]
+// first (written back).
+__global__ void __launch_bounds__(256) rmsnorm_kernel(float* x, const float* add, const float* w, float eps,
                                                       __nv_bfloat16* out) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float red[32];
     const int t = blockIdx.x;
-    const float* xr = x + (size_t)t * D;
+    float* xr = x + (size_t)t * D;
     float v[8], ss = 0.0f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         v[i] = xr[threadIdx.x + 256 * i];
+        if (add) {
+            v[i] += add[(size_t)t * D + threadIdx.x + 256 * i];
+            xr[threadIdx.x + 256 * i] = v[i];
+        }
         ss = fmaf(v[i], v[i], ss);
     }
     ss = block_sum(ss, red);
@@ -1253,9 +1258,9 @@ cudaError_t quench6k_flint_embed(const int* tokens, int T, const void* table, fl
     SQ_RETURN_LAUNCH();
 }
 
-cudaError_t quench6k_flint_rmsnorm(const float* x, const float* w, float eps, void* out, int T, cudaStream_t st) {
+cudaError_t quench6k_flint_rmsnorm(float* x, const float* add, const float* w, float eps, void* out, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(fl_launch(2, rmsnorm_kernel, T, 256, 0, st, x, w, eps, static_cast<__nv_bfloat16*>(out)));
+    SQ_CHECK_LAUNCH(fl_launch(2, rmsnorm_kernel, T, 256, 0, st, x, add, w, eps, static_cast<__nv_bfloat16*>(out)));
     SQ_RETURN_LAUNCH();
 }
 

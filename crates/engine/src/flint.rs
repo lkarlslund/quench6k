@@ -27,6 +27,8 @@ pub const WINDOW: usize = 513;
 /// Sliding layers keep the last SWA_RING positions (power of two; at least WINDOW + the largest chunk).
 pub const SWA_RING: usize = 4096;
 pub const MAX_CHUNK: usize = 2048;
+/// Most tokens of one graph step (a speculative verification).
+pub const MAX_STEP: usize = SMALL;
 const EPS: f32 = 1e-6;
 const MAX_SPLITS: usize = 64;
 
@@ -307,8 +309,8 @@ pub struct FlintSeq {
     pub tokens: Vec<i32>,
     pub k: Vec<DeviceBuffer>,
     pub v: Vec<DeviceBuffer>,
-    /// The captured one-token decode step of this sequence (its caches are baked in).
-    graph: Option<quench6k_cuda::Graph>,
+    /// Captured steps of this sequence (its caches are baked in), by token count 1..=SMALL.
+    graphs: Vec<Option<quench6k_cuda::Graph>>,
 }
 
 impl FlintSeq {
@@ -327,7 +329,7 @@ impl FlintSeq {
             k.push(DeviceBuffer::new(bytes)?);
             v.push(DeviceBuffer::new(bytes)?);
         }
-        Ok(Self { capacity, fp8, tokens: Vec::new(), k, v, graph: None })
+        Ok(Self { capacity, fp8, tokens: Vec::new(), k, v, graphs: (0..=SMALL).map(|_| None).collect() })
     }
 
     /// Positions of `prompt` whose state can be kept: the common prefix with the cached tokens, provided
@@ -375,6 +377,9 @@ pub struct Workspace {
     yu: u64,
     actb: u64,
     yd: u64,
+    /// NVFP4-quantized rows for the W4A4 expert path (flint.prefill_fp4): token rows, then activations.
+    q4: u64,
+    q4b: u64,
     pub logits: u64,
     logit_rows: usize,
     argmax_scratch: u64,
@@ -436,6 +441,8 @@ impl Workspace {
             yu: a(pairs * EW * 4)?,
             actb: a(pairs * EW * 2)?,
             yd: a(pairs * D * 4)?,
+            q4: a(k::fp4_rows_bytes(pairs, D))?,
+            q4b: a(k::fp4_rows_bytes(pairs, EW))?,
             logits: a(logit_rows * VOCAB * 4)?,
             logit_rows,
             argmax_scratch: a(k::argmax_scratch(logit_rows, VOCAB))?,
@@ -452,7 +459,7 @@ impl Workspace {
                 bufs.push(b);
                 addr
             },
-            io: PinnedBuffer::new(16)?,
+            io: PinnedBuffer::new(64)?,
             _bufs: Vec::new(),
         };
         Ok(Self { _bufs: bufs, ..ws })
@@ -491,21 +498,31 @@ pub fn forward(model: &FlintModel, ws: &Workspace, seq: &mut FlintSeq, tokens: &
 
 /// One decode token through the sequence's CUDA graph (captured on first use); logits in `ws.logits`.
 pub fn decode(model: &FlintModel, ws: &mut Workspace, seq: &mut FlintSeq, token: i32, s: &Stream) -> Result<()> {
+    step(model, ws, seq, &[token], s)
+}
+
+/// 1..=SMALL tokens (a speculative verification) through the sequence's CUDA graph for that count;
+/// logits of every token in `ws.logits` (the workspace must hold that many rows).
+pub fn step(model: &FlintModel, ws: &mut Workspace, seq: &mut FlintSeq, tokens: &[i32], s: &Stream) -> Result<()> {
+    let t = tokens.len();
+    ensure!((1..=SMALL).contains(&t) && t <= ws.logit_rows, "step of {t} tokens");
     let start = seq.tokens.len();
-    ensure!(start < seq.capacity, "sequence capacity {} exceeded", seq.capacity);
+    ensure!(start + t <= seq.capacity, "sequence capacity {} exceeded", seq.capacity);
     let io = ws.io.as_mut_slice();
-    io[..4].copy_from_slice(&token.to_le_bytes());
-    io[4..8].copy_from_slice(&(start as i32).to_le_bytes());
+    for (i, tok) in tokens.iter().enumerate() {
+        io[4 * i..4 * i + 4].copy_from_slice(&tok.to_le_bytes());
+    }
+    io[48..52].copy_from_slice(&(start as i32).to_le_bytes());
     unsafe {
-        s.copy_h2d(ws.tok, ws.io.as_ptr(), 4)?;
-        s.copy_h2d(ws.start, ws.io.as_ptr().add(4), 4)?;
+        s.copy_h2d(ws.tok, ws.io.as_ptr(), 4 * t)?;
+        s.copy_h2d(ws.start, ws.io.as_ptr().add(48), 4)?;
     }
-    if seq.graph.is_none() {
-        let g = quench6k_cuda::Graph::capture(s, |s| body(model, ws, seq, 1, None, false, s))?;
-        seq.graph = Some(g);
+    if seq.graphs[t].is_none() {
+        let g = quench6k_cuda::Graph::capture(s, |s| body(model, ws, seq, t, None, true, s))?;
+        seq.graphs[t] = Some(g);
     }
-    seq.graph.as_ref().unwrap().launch(s)?;
-    seq.tokens.push(token);
+    seq.graphs[t].as_ref().unwrap().launch(s)?;
+    seq.tokens.extend_from_slice(tokens);
     Ok(())
 }
 
@@ -555,15 +572,16 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
         if small {
             fk::gemv(s, ws.attn, None, t, &[layer.o], ws.h, D, true)?;
         } else {
+            // The residual add happens in the FFN norm below.
             dense_gemm(layer.o_t, ws.attn, ws.of, D, HQ * HD)?;
-            k::add_f32(s, ws.h, ws.of, t * D)?;
         }
+        let o_add = if small { 0 } else { ws.of };
 
         checkpoint(s, "o")?;
         match layer.router {
             Some(router) if small => fk::router(s, ws.h, layer.ffn_norm, router, t, ws.rlogits, ws.xn, ws.ticket, ws.sel_e, ws.sel_w)?,
             Some(router) => {
-                fk::rmsnorm(s, ws.h, layer.ffn_norm, EPS, ws.xn, t)?;
+                fk::rmsnorm_add(s, ws.h, o_add, layer.ffn_norm, EPS, ws.xn, t)?;
                 if t <= k::gemv_max_m() {
                     k::gemv(s, t, ws.xn, D, WeightFormat::Bf16, router, 0, ws.rlogits, EXPERTS, 0, EXPERTS, D, 1, 1.0, false)?;
                 } else {
@@ -572,7 +590,7 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
                 fk::route(s, ws.rlogits, t, ws.sel_e, ws.sel_w)?;
             }
             None => {
-                fk::rmsnorm(s, ws.h, layer.ffn_norm, EPS, ws.xn, t)?;
+                fk::rmsnorm_add(s, ws.h, o_add, layer.ffn_norm, EPS, ws.xn, t)?;
                 fk::dense_slots(s, t, layer.slots, ws.sel_e, ws.sel_w)?
             }
         }
@@ -581,6 +599,18 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
         if small {
             fk::moe_small(s, ws.xn, t, slots, ws.sel_e, ws.sel_w, layer.gate, layer.up, layer.down, ws.act, ws.h)?;
             checkpoint(s, "moe_small")?;
+        } else if quench6k_cuda::variants::get("flint.prefill_fp4", 0) != 0 {
+            // W4A4: activations quantized to NVFP4 per row, FP4 tensor cores (as the Qwen prefill).
+            let pairs = t * slots;
+            let bm4 = k::fp4_tile_rows();
+            let max_tiles = pairs.div_ceil(bm4) + layer.entries;
+            fk::moe_plan(s, ws.sel_e, pairs, layer.entries, bm4, ws.counts, ws.cursor, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
+            fk::gather(s, ws.xn, ws.pair_row, pairs, slots, ws.xs)?;
+            k::fp4_quant_rows(s, ws.xs, pairs, D, ws.q4)?;
+            k::moe_fp4_gate_up(s, ws.q4, pairs, layer.gate, layer.up, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, max_tiles, ws.actb, EW, D)?;
+            k::fp4_quant_rows(s, ws.actb, pairs, EW, ws.q4b)?;
+            k::moe_fp4_gemm(s, ws.q4b, pairs, layer.down.0, layer.down.1, layer.down.2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, max_tiles, ws.yd, D, EW)?;
+            fk::combine(s, ws.yd, ws.pair_row, ws.sel_w, t, slots, ws.h)?;
         } else {
             let pairs = t * slots;
             let max_tiles = pairs.div_ceil(bm) + layer.entries;

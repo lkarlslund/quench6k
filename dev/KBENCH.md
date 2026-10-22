@@ -354,3 +354,19 @@ inflated by PDL waits):
 Not done: prefill attention at long context is compute-bound at ~136 TFLOPS effective (260K prompt in
 49 s at 600 W); larger tiles or FP8 MMAs would help. Single-token GEMVs (QKV 6.6 us, O 6.3 us) are at
 their latency floor; fusing more of the per-layer chain (9 kernels) is the remaining decode lever.
+
+Later the same day:
+
+- **Prefill.** At 64K, prefill time splits into the grouped W4A16 GEMMs (45%), attention (41%) and a
+  standalone residual add (5%, now folded into the FFN RMSNorm). Attention runs at ~170 TFLOPS
+  effective, near what BF16 MMAs with FP32 accumulation give. The engine's W4A4 expert path (the Qwen
+  prefill's FP4 tensor-core kernels; activation rows quantized after gathering since the FP4 gather is
+  fixed to 10 slots) gives +21% at 8K and +13% at 64K, but PPL 15.61 vs 14.95 at 16K, worse than
+  llama.cpp's 14.71: kept off (`flint.prefill_fp4`). W4A8 would be the accurate way.
+- **Prompt-lookup speculation** (server). Drafts are the tokens after the latest earlier occurrence of
+  the last 4, 3 or 2 tokens; [pending, drafts] (<= 8 tokens) run as one graph step (graphs per token
+  count), each row is sampled and accepted while it equals the draft (exact for deterministic drafts),
+  and the sequence is truncated to the accepted tokens (all caches are position-indexed). A
+  26K-token agent edit request: 376 -> 713 tok/s sampled (3.88 tokens/step). The batched verification
+  kernels (M-row GEMV, non-decode attention) round differently from the single-token ones, so greedy
+  output diverges from plain greedy at near-ties (after ~40 tokens on one prompt).
