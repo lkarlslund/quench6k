@@ -387,3 +387,7 @@ Later the same day:
   shared row scale, summed in one W4A4 GEMM over repeated weight k-tiles (K = 2 kw). PPL 25.18 / 15.18
   vs 24.83 / 15.03 (W4A16), but prefill 17.1K vs 17.9K tok/s at 8K: with ~64 rows per expert per
   2048-token chunk the FP4 kernel's 128-row tiles run half empty.
+- **Prefill chunk.** 4096-token chunks (sliding ring 8192 so a chunk plus the window fits) instead of
+  2048: more rows per expert per GEMM. Prefill 17.9K -> 21.3K tok/s at 8K, +8% at 64K, +23% at 131K;
+  decode unchanged; the reuse reach grows to 7679 positions. 8192-token chunks (ring 16384) add only
+  2-3% for ~1.5 GB more workspace.

@@ -25,8 +25,8 @@ pub const EW: usize = 512;
 pub const EXPERTS: usize = 256;
 pub const WINDOW: usize = 513;
 /// Sliding layers keep the last SWA_RING positions (power of two; at least WINDOW + the largest chunk).
-pub const SWA_RING: usize = 4096;
-pub const MAX_CHUNK: usize = 2048;
+pub const SWA_RING: usize = 8192;
+pub const MAX_CHUNK: usize = 4096;
 /// Most tokens of one graph step (a speculative verification).
 pub const MAX_STEP: usize = SMALL;
 const EPS: f32 = 1e-6;
