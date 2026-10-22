@@ -311,3 +311,46 @@ Nsight Systems ships inside Nsight Compute here (`/usr/lib/nsight-compute/host/t
   for ~2 MB of FP8 K/V; selection and index scores ~1-1.5 us each. The split kernel's 65 chunks of 32
   keys write 12 x 256 partial floats each (6.4 MB per layer at 4 rows) and the merge reads them back in a
   65-step serial loop. A faster attention changes the summation order: a numeric change (score + gate).
+
+## 2026-10-22: Recursive Flint decode
+
+Flint (40B-A2.5B, vendor NVFP4 GGUF) shares no kernels with the Qwen path except the grouped W4A16
+expert GEMM (prefill). Decode at 8K went 317 -> 443 tok/s (450 W, BF16 KV) through these steps, each
+measured with nsys per-kernel traces (`QUENCH6K_VARIANTS=flint.pdl=0` so that durations are not
+inflated by PDL waits):
+
+- **PDL and `__restrict__`.** With PDL, the first version crashed (illegal address) only without
+  compute-sanitizer: a dense layer's expert kernel read the slot table that the preceding kernel writes
+  through a `const __restrict__` pointer, and read-only loads may be hoisted above `griddepcontrol.wait`
+  (it read the previous step's MoE slot ids against a 12-entry dense table). Kernels that read what the
+  previous kernel wrote must not mark those pointers `__restrict__`; `flint.cu` uses none. Bisected
+  with the `flint.pdl` bitmask (PDL per kernel) and `QUENCH6K_FLINT_SYNC=op`.
+- **GEMV shape.** A warp per row with 4-byte code loads reached ~0.5 TB/s. Keeping x in registers per
+  lane (no shared memory) was worse: every warp re-reads the whole x row, 20 MB of L2 traffic for 6 MB of
+  QKV weights. What works: x staged once per CTA in shared memory with 16-byte chunks XOR-swizzled
+  (`j ^ ((j >> 3) & 7)`, conflict-free for lanes reading 32 consecutive values), 16-byte code loads (32
+  weights and two scale bytes per lane), 2-4 rows per warp. The LM head runs at 1.58 TB/s.
+- **RMSNorm.** Normalizing per CTA in the GEMV prologue (global -> shared -> block sum -> sync) cost
+  ~4 us per call and lost; folding it into the output instead (stage bf16(h * w), sum of squares in the
+  same pass, scale the dot products by rsqrt at the end) gains ~2% over a separate RMSNorm kernel. The
+  router does the same per warp (each warp reads the whole row anyway) and routes in its last CTA.
+- **Experts.** Six routed experts plus the shared expert as two 512-wide halves are 8 slots per token
+  (dense layers: 12 slices of the 6144-wide MLP). The down projection with a warp per slot and
+  `warp_sum_slots` over 8 rows per CTA (256 CTAs at T = 1) halved its time; 32 rows per CTA (64 CTAs)
+  was slower than the original.
+- **Attention merge.** Merging in the last split's CTA (ticket) was slower than a separate merge kernel,
+  even with the merge spread over warps and lanes: one CTA per (row tile, KV head) is too little
+  parallelism. Kept separate (`flint.attn_fused_merge=1` selects the fused one). The split count is
+  derived on the device from the position (>= 4 key tiles per split), so CUDA graphs stay valid.
+- **Decode attention.** At T = 1 only 8 of a CTA's 64 query rows are real. `flint.attn_dec` (default)
+  lets the four warps share 16 rows and split each 64-key tile instead: identical greedy output, +3% at
+  8K, more with FP8 KV.
+- **FP8 KV.** Converting E4M3 tiles to BF16 with their scales in shared memory made decode slower (255
+  vs 289 tok/s at 64K). Converting to FP16 unscaled (one cvt per two values; E4M3 is exact in FP16),
+  FP16 MMAs, the key scale applied to the score columns and the value scale folded into P: 333 vs 300
+  tok/s at 64K, 188 vs 146 at 260K (with decode-mode attention). PPL 24.98 vs 24.93 (2K), 15.20 vs
+  14.95 (16K). Prefill is 5-20% slower with FP8 (the conversion is not hidden there).
+
+Not done: prefill attention at long context is compute-bound at ~136 TFLOPS effective (260K prompt in
+49 s at 600 W); larger tiles or FP8 MMAs would help. Single-token GEMVs (QKV 6.6 us, O 6.3 us) are at
+their latency floor; fusing more of the per-layer chain (9 kernels) is the remaining decode lever.

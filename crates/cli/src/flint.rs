@@ -105,7 +105,7 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, json: Option<
         );
         if let Some(path) = json {
             use std::io::Write;
-            let rec = serde_json::json!({"engine": "quench6k", "model": "flint-nvfp4", "mode": "plain", "kv": "bf16", "ctx": ctx, "generate": generate,
+            let rec = serde_json::json!({"engine": "quench6k", "model": "flint-nvfp4", "mode": "plain", "kv": if seq.fp8 { "fp8" } else { "bf16" }, "ctx": ctx, "generate": generate,
                 "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0, "copied": copied});
             writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path)?, "{rec}")?;
         }

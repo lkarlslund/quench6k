@@ -8,6 +8,12 @@
 - `results.jsonl`: quench6k measurements, written by `quench6k bench --json`.
 - `radixark.jsonl`: quench6k on the RadixArk/Qwen3.8-Flash-Next-NVFP4 checkpoint (not in the chart).
 - `ninfer-6000.jsonl`: NInfer 6000 measurements on the same machine (8-bit variant, BF16 KV, 600 W).
+- `flint.jsonl`: quench6k on Recursive Flint (vendor NVFP4 GGUF), written by `quench6k flint bench
+  --json`, 600 W. The corpus is the text of `context.ids` tokenized with Flint's tokenizer (280,513
+  tokens); `copied` counts greedy tokens equal to the corpus continuation (the text is tiled, so it is
+  128 of 128 once the prompt has repeated).
+- `flint-llamacpp.jsonl`: llama.cpp (c7fc50941, `llama-bench -fa 1 -ub 2048`, F16 KV) on the same
+  file and machine: `pp<ctx>` for prefill and `tg128 @ d<ctx>` for decode.
 - `results.svg`: rendered from both by `crates/benchplot` (see [DEVELOPMENT.md](../DEVELOPMENT.md)).
 
 One JSON object per line:

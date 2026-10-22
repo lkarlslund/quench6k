@@ -64,6 +64,22 @@ cargo run --release -p quench6k-benchplot -- bench/ninfer-6000.jsonl bench/resul
 tokens of the benchmarked path against the code fixture's reference sequence, or, for a checkpoint
 other than the oracle's, against eager decoding of the same checkpoint.
 
+## Recursive Flint
+
+`crates/engine/src/flint.rs` (model and forward pass), `crates/engine/src/gguf.rs` (GGUF reader) and
+`crates/cuda/kernels/flint.cu`. The reference is llama.cpp's Flint implementation with the same GGUF:
+
+```
+F=/path/to/flint-nvfp4-gguf
+quench6k flint generate --model $F --raw --prompt 'def fibonacci(n):' --n 48   # vs llama-completion --temp 0
+quench6k flint ppl --model $F --file text.txt --ctx 2048 --chunks 6           # vs llama-perplexity -c 2048
+quench6k [--kv fp8] flint bench --model $F --text corpus.txt --ctx 512 8192 65536 131072 260000
+```
+
+`ppl` scores like llama-perplexity (second half of each chunk), so the numbers compare directly; `bench`
+checks graph against eager decoding and reports how much of the corpus continuation greedy decoding
+reproduces.
+
 ## Releases
 
 `.github/workflows/release.yml` runs daily and on demand. When `main` has commits that are not
@@ -87,6 +103,8 @@ commits on `main`. The CUDA runtime is linked statically.
 | `QUENCH6K_DFLASH_BF16=1` | DFlash drafter projections in BF16 instead of INT8 |
 | `QUENCH6K_DFLASH_PROFILE=N` | Times round N's DFlash drafting per op (eagerly, 10 times) |
 | `QUENCH6K_POLICY=decay=..,prior=..,fixed=N` | Adaptive draft length policy settings; `fixed=N` always drafts N |
+| `QUENCH6K_FLINT_SYNC=1` or `=op` | Flint: synchronize after every op (or one named op) and report the failing one |
+| Variants `flint.pdl` (bitmask), `flint.fuse_norm`, `flint.attn_dec`, `flint.attn_fused_merge`, `flint.gemv`, `flint.gemv_r`, `flint.moe_v1` | Flint kernel choices (see dev/KBENCH.md) |
 
 ## History
 

@@ -43,6 +43,33 @@ curl http://localhost:8003/v1/chat/completions -H 'content-type: application/jso
     -d '{"messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+## Recursive Flint
+
+quench6k also runs [Recursive Flint](https://huggingface.co/RecursiveSI/flint) (40B-A2.5B MoE) from
+the vendor's [NVFP4 GGUF](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf). Point `--model` at a
+directory holding `flint-nvfp4.gguf` together with `tokenizer.json`, `chat_template.jinja`,
+`config.json` and `generation_config.json` from the BF16 repository:
+
+```
+quench6k serve --model /path/to/flint-nvfp4-gguf --listen 0.0.0.0:8013 --context 262144 --kv fp8
+```
+
+The server serves one request at a time, reuses the prompt prefix across requests, and handles the
+model's own `<think>` reasoning and its tool-call format. Throughput on the same machine at 600 W, with
+greedy decoding of 128 tokens and FP8 KV from 64K up (BF16 KV below that):
+
+| Context | Prefill (tok/s) | | Decode (tok/s) | |
+|---:|---:|---:|---:|---:|
+| | quench6k | llama.cpp | quench6k | llama.cpp |
+| 512 | 7,818 | 5,691 | 479 | 252 |
+| 8,192 | 20,029 | 11,515 | 440 | 228 |
+| 65,536 | 12,413 | 7,991 | 330 | 188 |
+| 131,072 | 8,587 | 5,591 | 260 | 151 |
+| 260,000 | 5,261 | 3,462 | 187 | 110 |
+
+llama.cpp at c7fc50941 (`llama-bench -fa 1 -ub 2048`, F16 KV). Prefill is the BF16 KV run (FP8 is
+5–20% slower there). Records: `bench/flint.jsonl`, `bench/flint-llamacpp.jsonl`.
+
 ## Documentation
 
 - [DOCS.md](DOCS.md): commands, server options, API, sampling, caching, steering.
