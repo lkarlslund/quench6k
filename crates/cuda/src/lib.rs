@@ -172,6 +172,7 @@ pub mod ffi {
 }
 
 pub mod bf16;
+pub mod flint;
 pub mod kernels;
 
 /// Runtime kernel variants (dev/KBENCH.md): tuning keys that kernel launchers read when they launch

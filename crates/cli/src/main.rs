@@ -2,6 +2,7 @@ mod gpumon;
 mod bench;
 mod kbench;
 mod chat;
+mod flint;
 mod mtp;
 mod serve;
 
@@ -367,6 +368,9 @@ enum Command {
         profile_rounds: usize,
     },
     /// Apply the correctness gate (dev/GOAL.md §1) to teacher-forced candidate distributions.
+    /// Recursive Flint (NVFP4 GGUF) commands.
+    #[command(subcommand)]
+    Flint(flint::FlintCmd),
     Gate {
         /// Fixture root containing one directory per fixture.
         #[arg(long, default_value = "oracle/fixtures")]
@@ -445,6 +449,7 @@ fn main() -> Result<()> {
             let sweep = sweep.iter().map(|v| kbench::parse_sweep(v)).collect::<Result<_>>()?;
             kbench::run(&model, &kbench::Options { layers, ctx, rows, steps, pairs, chunk, fixed, sweep })?
         }
+        Command::Flint(cmd) => flint::run(cmd)?,
         Command::Gate { fixtures, candidates, suffix } => {
             let mut all = true;
             let mut any = false;
