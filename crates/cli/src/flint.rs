@@ -37,13 +37,80 @@ pub enum FlintCmd {
         #[arg(long, default_value_t = 8)]
         chunks: usize,
     },
+    /// Prefill and greedy decode throughput at each context length, on a text corpus tokenized with
+    /// Flint's tokenizer (the first `ctx` tokens). Checks graph decoding against eager decoding at the
+    /// first context and reports how often greedy decoding reproduces the corpus continuation.
+    Bench {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, num_args = 1.., default_values_t = [512usize, 8192, 65536, 131072, 260000])]
+        ctx: Vec<usize>,
+        #[arg(long, default_value_t = 128)]
+        generate: usize,
+        /// Append one JSON record per context to this file.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
 }
 
 pub fn run(cmd: FlintCmd) -> Result<()> {
     match cmd {
         FlintCmd::Generate { model, prompt, raw, n, context } => generate(&model, &prompt, raw, n, context),
         FlintCmd::Ppl { model, file, ctx, chunks } => ppl(&model, &file, ctx, chunks),
+        FlintCmd::Bench { model, text, ctx, generate, json } => bench(&model, &text, &ctx, generate, json.as_deref()),
     }
+}
+
+fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, json: Option<&Path>) -> Result<()> {
+    let chat = Chat::load(dir, None)?;
+    let ids = chat.encode(&std::fs::read_to_string(text)?)?;
+    let (model, s) = load(dir)?;
+    let mut ws = Workspace::new(1)?;
+    for (i, &ctx) in ctxs.iter().enumerate() {
+        anyhow::ensure!(ctx + generate <= ids.len(), "corpus has {} tokens, {} needed", ids.len(), ctx + generate);
+        let mut seq = FlintSeq::new(&model, ctx + generate + 8)?;
+        s.synchronize()?;
+        let t0 = Instant::now();
+        fl::prefill(&model, &ws, &mut seq, &ids[..ctx], &s)?;
+        let mut next = fl::argmax(&ws, 1, &s)?[0];
+        let prefill = t0.elapsed().as_secs_f64();
+        let mut out = vec![next];
+        let t1 = Instant::now();
+        for _ in 1..generate {
+            fl::decode(&model, &mut ws, &mut seq, next, &s)?;
+            next = fl::argmax(&ws, 1, &s)?[0];
+            out.push(next);
+        }
+        let decode = t1.elapsed().as_secs_f64();
+        let copied = out.iter().zip(&ids[ctx..]).filter(|(a, b)| a == b).count();
+        if i == 0 {
+            // Eager decoding of the same prompt must give the same tokens.
+            let mut eager = FlintSeq::new(&model, ctx + generate + 8)?;
+            fl::prefill(&model, &ws, &mut eager, &ids[..ctx], &s)?;
+            let mut e = vec![fl::argmax(&ws, 1, &s)?[0]];
+            while e.len() < out.len().min(64) {
+                fl::forward(&model, &ws, &mut eager, &[*e.last().unwrap()], false, &s)?;
+                e.push(fl::argmax(&ws, 1, &s)?[0]);
+            }
+            anyhow::ensure!(e[..] == out[..e.len()], "graph decoding differs from eager decoding: {e:?} vs {:?}", &out[..e.len()]);
+            println!("graph decoding matches eager decoding ({} tokens)", e.len());
+        }
+        let pf = ctx as f64 / prefill;
+        let tg = (generate - 1) as f64 / decode;
+        println!(
+            "ctx {ctx:>6}: prefill {pf:>7.0} tok/s ({prefill:.2}s), decode {tg:>6.1} tok/s; corpus continuation {copied}/{generate}; {:?}",
+            chat.decode(&out[..out.len().min(24)], false)?
+        );
+        if let Some(path) = json {
+            use std::io::Write;
+            let rec = serde_json::json!({"engine": "quench6k", "model": "flint-nvfp4", "mode": "plain", "kv": "bf16", "ctx": ctx, "generate": generate,
+                "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0, "copied": copied});
+            writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path)?, "{rec}")?;
+        }
+    }
+    Ok(())
 }
 
 fn ppl(dir: &Path, file: &Path, ctx: usize, chunks: usize) -> Result<()> {

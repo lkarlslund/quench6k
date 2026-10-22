@@ -18,7 +18,8 @@ mod ffi {
         pub fn quench6k_flint_attn_splits(t: c_int, start: c_int, window: c_int) -> c_int;
         pub fn quench6k_flint_attention(q: *const c_void, kc: *const c_void, vc: *const c_void, t: c_int, start: *const i32, window: c_int, mask: c_int, splits: c_int, sinks: *const f32, part_o: *mut f32, part_ml: *mut f32, out: *mut c_void, st: Stream) -> Error;
         pub fn quench6k_flint_gemv_max_m() -> c_int;
-        pub fn quench6k_flint_gemv(x: *const c_void, m: c_int, k: c_int, codes: *const *const u8, scales: *const *const u8, s2: *const *const f32, n: *const c_int, y: *mut f32, ldy: c_int, accumulate: c_int, st: Stream) -> Error;
+        pub fn quench6k_flint_gemv(x: *const c_void, norm_w: *const f32, m: c_int, k: c_int, codes: *const *const u8, scales: *const *const u8, s2: *const *const f32, n: *const c_int, y: *mut f32, ldy: c_int, accumulate: c_int, st: Stream) -> Error;
+        pub fn quench6k_flint_router(h: *const f32, norm_w: *const f32, w: *const c_void, t: c_int, logits: *mut f32, xn: *mut c_void, ticket: *mut i32, sel_e: *mut i32, sel_w: *mut f32, st: Stream) -> Error;
         pub fn quench6k_flint_route(logits: *const f32, t: c_int, sel_e: *mut i32, sel_w: *mut f32, st: Stream) -> Error;
         pub fn quench6k_flint_dense_slots(t: c_int, s: c_int, sel_e: *mut i32, sel_w: *mut f32, st: Stream) -> Error;
         pub fn quench6k_flint_moe_small(xn: *const c_void, t: c_int, s: c_int, sel_e: *const i32, sel_w: *const f32, gw: *const u64, gs: *const u64, g2: *const f32, uw: *const u64, us: *const u64, u2: *const f32, dw: *const u64, ds: *const u64, d2: *const f32, act: *mut f32, h: *mut f32, st: Stream) -> Error;
@@ -87,8 +88,10 @@ pub fn gemv_max_m() -> usize {
     unsafe { ffi::quench6k_flint_gemv_max_m() as usize }
 }
 
-/// y[m, c] (+)= x[m] . W_i[n] for up to three matrices with concatenated output columns.
-pub fn gemv(s: &Stream, x: u64, m: usize, mats: &[Fp4], y: u64, ldy: usize, accumulate: bool) -> Result<()> {
+/// y[m, c] (+)= x[m] . W_i[n] for up to three matrices with concatenated output columns. With `norm`
+/// (an RMSNorm weight), x is FP32 [m, k] and is normalized first; otherwise BF16.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv(s: &Stream, x: u64, norm: Option<u64>, m: usize, mats: &[Fp4], y: u64, ldy: usize, accumulate: bool) -> Result<()> {
     assert!(!mats.is_empty() && mats.len() <= 3);
     let k = mats[0].k;
     let mut codes = [std::ptr::null::<u8>(); 3];
@@ -103,9 +106,15 @@ pub fn gemv(s: &Stream, x: u64, m: usize, mats: &[Fp4], y: u64, ldy: usize, accu
         n[i] = w.n as c_int;
     }
     check(
-        unsafe { ffi::quench6k_flint_gemv(p(x), m as c_int, k as c_int, codes.as_ptr(), scales.as_ptr(), s2.as_ptr(), n.as_ptr(), pm(y), ldy as c_int, accumulate as c_int, s.raw()) },
+        unsafe { ffi::quench6k_flint_gemv(p(x), norm.map_or(std::ptr::null(), p), m as c_int, k as c_int, codes.as_ptr(), scales.as_ptr(), s2.as_ptr(), n.as_ptr(), pm(y), ldy as c_int, accumulate as c_int, s.raw()) },
         "flint_gemv",
     )
+}
+
+/// Router of a few tokens: RMSNorm(h) -> xn (BF16), logits, top-6 routing into sel_e/sel_w (8 slots).
+#[allow(clippy::too_many_arguments)]
+pub fn router(s: &Stream, h: u64, norm: u64, w: u64, t: usize, logits: u64, xn: u64, ticket: u64, sel_e: u64, sel_w: u64) -> Result<()> {
+    check(unsafe { ffi::quench6k_flint_router(p(h), p(norm), p(w), t as c_int, pm(logits), pm(xn), pm(ticket), pm(sel_e), pm(sel_w), s.raw()) }, "flint_router")
 }
 
 pub fn route(s: &Stream, logits: u64, t: usize, sel_e: u64, sel_w: u64) -> Result<()> {

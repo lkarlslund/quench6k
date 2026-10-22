@@ -353,67 +353,227 @@ SQ_DEVICE void fp4x8(uint32_t c, float sc, float* w) {
     }
 }
 
-constexpr int GV_WARPS = 8;
+constexpr int GV_WARPS = 8, GV_KMAX = 4096;
 
-template <int M>
-__global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv_kernel(const __nv_bfloat16* x, int K, Mats mats, float* y,
+// x: BF16 [M, K], or with NORM the FP32 residual rows [M, K] normalized here (RMSNorm, weight norm_w,
+// eps 1e-6) into the BF16 copy every CTA keeps in shared memory. A warp computes R rows; all of a row's
+// weight codes and scales are loaded before the PDL wait.
+template <int M, bool NORM, int R>
+__global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv_kernel(const void* xin, const float* norm_w, int K, Mats mats, float* y,
                                                                  int ldy, int accumulate) {
     pdl_launch_dependents();
     extern __shared__ __align__(16) __nv_bfloat16 gv_x[];
+    __shared__ float red[32];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int n_total = mats.end[2];
-    const int row = blockIdx.x * GV_WARPS + warp;
-    // Weight loads do not depend on the predecessor: issue the first step's before waiting.
-    int mat = 0, n = row;
-    if (row < n_total) {
-        mat = row < mats.end[0] ? 0 : (row < mats.end[1] ? 1 : 2);
-        n = row - (mat == 0 ? 0 : mats.end[mat - 1]);
+    const int row0 = (blockIdx.x * GV_WARPS + warp) * R;
+    const int steps = K / 256;
+    uint32_t c[R][GV_KMAX / 256];
+    uint8_t sb[R][GV_KMAX / 256];
+    int mat[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = min(row0 + r, n_total - 1);
+        mat[r] = row < mats.end[0] ? 0 : (row < mats.end[1] ? 1 : 2);
+        const int n = row - (mat[r] == 0 ? 0 : mats.end[mat[r] - 1]);
+        const uint8_t* wc = mats.codes[mat[r]] + (size_t)n * (K / 2);
+        const uint8_t* ws = mats.scales[mat[r]] + (size_t)n * (K / 16);
+#pragma unroll
+        for (int u = 0; u < GV_KMAX / 256; ++u) {
+            if (u < steps) {
+                const int k = u * 256 + lane * 8;
+                c[r][u] = ld_stream_u32(wc + k / 2);
+                sb[r][u] = ws[k / 16];
+            }
+        }
     }
-    const uint8_t* wc = mats.codes[mat] + (size_t)n * (K / 2);
-    const uint8_t* ws = mats.scales[mat] + (size_t)n * (K / 16);
     pdl_wait();
-    for (int i = threadIdx.x; i < M * K / 8; i += blockDim.x)
-        reinterpret_cast<uint4*>(gv_x)[i] = reinterpret_cast<const uint4*>(x)[i];
-    __syncthreads();
-    if (row >= n_total) return;
-    float acc[M] = {};
-    constexpr int U = 4;
-    for (int k0 = 0; k0 < K; k0 += 256 * U) {
-        uint32_t c[U];
-        uint8_t sb[U];
-#pragma unroll
-        for (int u = 0; u < U; ++u) {
-            const int k = k0 + u * 256 + lane * 8;
-            if (k < K) {
-                c[u] = ld_stream_u32(wc + k / 2);
-                sb[u] = ws[k / 16];
-            } else {
-                c[u] = 0, sb[u] = 0;
-            }
+    if constexpr (NORM) {
+        const float* h = static_cast<const float*>(xin);
+        for (int mm = 0; mm < M; ++mm) {
+            float ss = 0.0f;
+            for (int i = threadIdx.x; i < K; i += blockDim.x) ss = fmaf(h[(size_t)mm * K + i], h[(size_t)mm * K + i], ss);
+            ss = block_sum(ss, red);
+            const float rn = rsqrtf(ss / K + 1e-6f);
+            for (int i = threadIdx.x; i < K; i += blockDim.x) gv_x[(size_t)mm * K + i] = f2bf(h[(size_t)mm * K + i] * rn * norm_w[i]);
         }
+    } else {
+        const uint4* x = static_cast<const uint4*>(xin);
+        for (int i = threadIdx.x; i < M * K / 8; i += blockDim.x) reinterpret_cast<uint4*>(gv_x)[i] = x[i];
+    }
+    __syncthreads();
+    if (row0 >= n_total) return;
+    float acc[R][M] = {};
 #pragma unroll
-        for (int u = 0; u < U; ++u) {
-            const int k = k0 + u * 256 + lane * 8;
-            if (k >= K) break;
+    for (int u = 0; u < GV_KMAX / 256; ++u) {
+        if (u >= steps) break;
+        const int k = u * 256 + lane * 8;
+        float xv[M][8];
+#pragma unroll
+        for (int mm = 0; mm < M; ++mm) load_bf16x8(gv_x + (size_t)mm * K + k, xv[mm]);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
             float w[8];
-            fp4x8(c[u], e4m3f(sb[u]), w);
+            fp4x8(c[r][u], e4m3f(sb[r][u]), w);
 #pragma unroll
-            for (int mm = 0; mm < M; ++mm) {
-                float xv[8];
-                load_bf16x8(gv_x + (size_t)mm * K + k, xv);
+            for (int mm = 0; mm < M; ++mm)
 #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[mm] = fmaf(w[i], xv[i], acc[mm]);
+                for (int i = 0; i < 8; ++i) acc[r][mm] = fmaf(w[i], xv[mm][i], acc[r][mm]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = row0 + r;
+        const float s2 = *mats.s2[mat[r]];
+#pragma unroll
+        for (int mm = 0; mm < M; ++mm) {
+            const float v = warp_sum(acc[r][mm]) * s2;
+            if (lane == 0 && row < n_total) {
+                float* dst = y + (size_t)mm * ldy + row;
+                *dst = accumulate ? *dst + v : v;
             }
         }
     }
-    const float s2 = *mats.s2[mat];
+}
+
+// One token: each lane holds the 8-value slices k = u * 256 + 8 lane of x in registers (BF16; with NORM
+// computed from the FP32 residual row by the warp itself), so there is no shared memory or block sync.
+template <bool NORM, int R>
+__global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv1_kernel(const void* xin, const float* norm_w, int K, Mats mats, float* y,
+                                                                  int accumulate) {
+    pdl_launch_dependents();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n_total = mats.end[2];
+    const int row0 = (blockIdx.x * GV_WARPS + warp) * R;
+    const int steps = K / 256;
+    uint32_t c[R][GV_KMAX / 256];
+    uint8_t sb[R][GV_KMAX / 256];
+    int mat[R];
 #pragma unroll
-    for (int mm = 0; mm < M; ++mm) {
-        const float v = warp_sum(acc[mm]) * s2;
-        if (lane == 0) {
-            float* dst = y + (size_t)mm * ldy + row;
-            *dst = accumulate ? *dst + v : v;
+    for (int r = 0; r < R; ++r) {
+        const int row = min(row0 + r, n_total - 1);
+        mat[r] = row < mats.end[0] ? 0 : (row < mats.end[1] ? 1 : 2);
+        const int n = row - (mat[r] == 0 ? 0 : mats.end[mat[r] - 1]);
+        const uint8_t* wc = mats.codes[mat[r]] + (size_t)n * (K / 2);
+        const uint8_t* ws = mats.scales[mat[r]] + (size_t)n * (K / 16);
+#pragma unroll
+        for (int u = 0; u < GV_KMAX / 256; ++u)
+            if (u < steps) {
+                const int k = u * 256 + lane * 8;
+                c[r][u] = ld_stream_u32(wc + k / 2);
+                sb[r][u] = ws[k / 16];
+            }
+    }
+    pdl_wait();
+    uint4 xr[GV_KMAX / 256];
+    if constexpr (NORM) {
+        const float* h = static_cast<const float*>(xin);
+        float ss = 0.0f;
+#pragma unroll
+        for (int u = 0; u < GV_KMAX / 256; ++u)
+            if (u < steps) {
+                const float4 a = *reinterpret_cast<const float4*>(h + u * 256 + lane * 8);
+                const float4 b = *reinterpret_cast<const float4*>(h + u * 256 + lane * 8 + 4);
+                ss += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w + b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+            }
+        const float rn = rsqrtf(warp_sum(ss) / K + 1e-6f);
+#pragma unroll
+        for (int u = 0; u < GV_KMAX / 256; ++u)
+            if (u < steps) {
+                const int k = u * 256 + lane * 8;
+                const float4 a = *reinterpret_cast<const float4*>(h + k), b = *reinterpret_cast<const float4*>(h + k + 4);
+                const float4 wa = *reinterpret_cast<const float4*>(norm_w + k), wb = *reinterpret_cast<const float4*>(norm_w + k + 4);
+                __nv_bfloat162 p[4] = {__floats2bfloat162_rn(a.x * rn * wa.x, a.y * rn * wa.y), __floats2bfloat162_rn(a.z * rn * wa.z, a.w * rn * wa.w),
+                                       __floats2bfloat162_rn(b.x * rn * wb.x, b.y * rn * wb.y), __floats2bfloat162_rn(b.z * rn * wb.z, b.w * rn * wb.w)};
+                xr[u] = *reinterpret_cast<uint4*>(p);
+            }
+    } else {
+        const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(xin);
+#pragma unroll
+        for (int u = 0; u < GV_KMAX / 256; ++u)
+            if (u < steps) xr[u] = *reinterpret_cast<const uint4*>(x + u * 256 + lane * 8);
+    }
+    if (row0 >= n_total) return;
+    float acc[R] = {};
+#pragma unroll
+    for (int u = 0; u < GV_KMAX / 256; ++u) {
+        if (u >= steps) break;
+        float xv[8];
+        load_bf16x8(reinterpret_cast<const __nv_bfloat16*>(&xr[u]), xv);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float w[8];
+            fp4x8(c[r][u], e4m3f(sb[r][u]), w);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[r] = fmaf(w[i], xv[i], acc[r]);
         }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = row0 + r;
+        const float v = warp_sum(acc[r]) * *mats.s2[mat[r]];
+        if (lane == 0 && row < n_total) y[row] = accumulate ? y[row] + v : v;
+    }
+}
+
+// One token, x BF16 [K] staged per CTA in shared memory with its 16-byte chunks XOR-swizzled
+// (chunk j at j ^ ((j >> 3) & 7)), so that lanes reading 32 consecutive values each hit distinct banks.
+// Each lane takes 32 consecutive weights per 1024-wide step (16 code bytes, two scale bytes); a warp
+// computes R rows. STEPS = K / 1024.
+SQ_DEVICE int swz16(int j) { return j ^ ((j >> 3) & 7); }
+
+template <int STEPS, int R>
+__global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv2_kernel(const __nv_bfloat16* x, Mats mats, float* y, int accumulate) {
+    pdl_launch_dependents();
+    constexpr int K = STEPS * 1024;
+    __shared__ __align__(16) uint4 xs[K / 8];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n_total = mats.end[2];
+    const int row0 = (blockIdx.x * GV_WARPS + warp) * R;
+    uint4 c[R][STEPS];
+    uint16_t sb[R][STEPS];
+    int mat[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = min(row0 + r, n_total - 1);
+        mat[r] = row < mats.end[0] ? 0 : (row < mats.end[1] ? 1 : 2);
+        const int n = row - (mat[r] == 0 ? 0 : mats.end[mat[r] - 1]);
+        const uint8_t* wc = mats.codes[mat[r]] + (size_t)n * (K / 2);
+        const uint8_t* ws = mats.scales[mat[r]] + (size_t)n * (K / 16);
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) {
+            const int k = u * 1024 + lane * 32;
+            c[r][u] = ld_stream(wc + k / 2);
+            sb[r][u] = *reinterpret_cast<const uint16_t*>(ws + k / 16);
+        }
+    }
+    pdl_wait();
+    for (int j = threadIdx.x; j < K / 8; j += blockDim.x) xs[swz16(j)] = reinterpret_cast<const uint4*>(x)[j];
+    __syncthreads();
+    if (row0 >= n_total) return;
+    float acc[R] = {};
+#pragma unroll
+    for (int u = 0; u < STEPS; ++u) {
+        float xv[32];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) load_bf16x8(reinterpret_cast<const __nv_bfloat16*>(&xs[swz16(u * 128 + lane * 4 + q)]), xv + 8 * q);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float s0 = e4m3f(sb[r][u] & 0xff), s1 = e4m3f(sb[r][u] >> 8);
+            float w[32];
+            fp4x8(c[r][u].x, s0, w);
+            fp4x8(c[r][u].y, s0, w + 8);
+            fp4x8(c[r][u].z, s1, w + 16);
+            fp4x8(c[r][u].w, s1, w + 24);
+#pragma unroll
+            for (int i = 0; i < 32; ++i) acc[r] = fmaf(w[i], xv[i], acc[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = row0 + r;
+        const float v = warp_sum(acc[r]) * *mats.s2[mat[r]];
+        if (lane == 0 && row < n_total) y[row] = accumulate ? y[row] + v : v;
     }
 }
 
@@ -548,6 +708,208 @@ __global__ void __launch_bounds__(GV_WARPS * 32) moe_down_kernel(const float* ac
         total = fmaf(sel_w[t * S + s], acc * d2[e], total);
     }
     if (lane == 0) h[(size_t)t * D + n] += total;
+}
+
+// ---- Router, few tokens ----------------------------------------------------------------------------
+// logits[t, e] = xn[t] . Wr[e] (BF16 [256, 2048]) with xn = RMSNorm(h[t]) computed per CTA (CTA 0 also
+// writes it for the experts); the last CTA to finish (ticket) routes every token as route_kernel and
+// resets the ticket. Grid E / GV_WARPS, a warp per expert row.
+constexpr int RT_TMAX = 8;
+
+SQ_DEVICE void route_token(const float* logits, int t, int lane, int* sel_e, float* sel_w) {
+    float v[E / 32];
+#pragma unroll
+    for (int j = 0; j < E / 32; ++j) {
+        const float z = __ldcg(logits + (size_t)t * E + j * 32 + lane);
+        v[j] = 1.0f / (1.0f + expf(-z));
+        if (!(v[j] >= 0.0f)) v[j] = 0.0f;
+    }
+    float chosen[TOPK], sum = 0.0f;
+    int chosen_i[TOPK];
+    for (int r = 0; r < TOPK; ++r) {
+        float best = -1.0f;
+        int best_i = 0x7fffffff;
+#pragma unroll
+        for (int j = 0; j < E / 32; ++j)
+            if (v[j] > best) best = v[j], best_i = j * 32 + lane;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ob = __shfl_xor_sync(0xffffffff, best, o);
+            const int oi = __shfl_xor_sync(0xffffffff, best_i, o);
+            if (ob > best || (ob == best && oi < best_i)) best = ob, best_i = oi;
+        }
+        chosen[r] = best;
+        chosen_i[r] = best_i;
+        sum += best;
+        if ((best_i & 31) == lane) v[best_i / 32] = -2.0f;
+    }
+    if (lane == 0) {
+        for (int r = 0; r < TOPK; ++r) {
+            sel_e[t * 8 + r] = chosen_i[r];
+            sel_w[t * 8 + r] = chosen[r] / (sum + 1e-20f);
+        }
+        sel_e[t * 8 + 6] = E, sel_w[t * 8 + 6] = 1.0f;
+        sel_e[t * 8 + 7] = E + 1, sel_w[t * 8 + 7] = 1.0f;
+    }
+}
+
+__global__ void __launch_bounds__(128) router_kernel(const float* h, const float* norm_w, const __nv_bfloat16* W, int T, float* logits,
+                                                    __nv_bfloat16* xn, int* ticket, int* sel_e, float* sel_w) {
+    pdl_launch_dependents();
+    __shared__ bool last;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 4 + warp;
+    uint4 w[D / 256];
+#pragma unroll
+    for (int u = 0; u < D / 256; ++u) w[u] = ld_stream(W + (size_t)row * D + u * 256 + lane * 8);
+    pdl_wait();
+    // logit = rsqrt(mean(h^2) + eps) * (Wr . (h * norm_w)); the warp reads the whole row, so it also
+    // has the sum of squares. Warp 0 of CTA 0 writes the normalized row for the experts.
+    for (int t = 0; t < T; ++t) {
+        const float* hr = h + (size_t)t * D;
+        float acc = 0.0f, ss = 0.0f;
+        float hv[D / 256][8];
+#pragma unroll
+        for (int u = 0; u < D / 256; ++u) {
+            const int k = u * 256 + lane * 8;
+            const float4 a = *reinterpret_cast<const float4*>(hr + k), b = *reinterpret_cast<const float4*>(hr + k + 4);
+            const float4 na = *reinterpret_cast<const float4*>(norm_w + k), nb = *reinterpret_cast<const float4*>(norm_w + k + 4);
+            const float x[8] = {a.x * na.x, a.y * na.y, a.z * na.z, a.w * na.w, b.x * nb.x, b.y * nb.y, b.z * nb.z, b.w * nb.w};
+            const float hh[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+            float wv[8];
+            load_bf16x8(reinterpret_cast<const __nv_bfloat16*>(&w[u]), wv);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                acc = fmaf(wv[i], x[i], acc);
+                ss = fmaf(hh[i], hh[i], ss);
+                hv[u][i] = x[i];
+            }
+        }
+        const float rn = rsqrtf(warp_sum(ss) / D + 1e-6f);
+        acc = warp_sum(acc) * rn;
+        if (lane == 0) logits[(size_t)t * E + row] = acc;
+        if (blockIdx.x == 0 && warp == 0) {
+#pragma unroll
+            for (int u = 0; u < D / 256; ++u) {
+                __nv_bfloat162 p[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) p[i] = __floats2bfloat162_rn(hv[u][2 * i] * rn, hv[u][2 * i + 1] * rn);
+                *reinterpret_cast<uint4*>(xn + (size_t)t * D + u * 256 + lane * 8) = *reinterpret_cast<uint4*>(p);
+            }
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(ticket, 1) == (int)gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    for (int t = warp; t < T; t += 4) route_token(logits, t, lane, sel_e, sel_w);
+    if (threadIdx.x == 0) *ticket = 0;
+}
+
+// ---- MoE, few tokens (v2) -------------------------------------------------------------------------------
+// act[p, n] = silu(xn[t] . G[n]) * (xn[t] . U[n]) for pair p = t * S + s. Grid (T * S, EW / 16): a warp
+// computes two gate and two up rows, each lane 16 consecutive weights per 512-wide step.
+__global__ void __launch_bounds__(GV_WARPS * 32) moe_gate_up2_kernel(const __nv_bfloat16* xn, int S, const int* sel_e,
+                                                                     const uint64_t* gw, const uint64_t* gs, const float* g2,
+                                                                     const uint64_t* uw, const uint64_t* us, const float* u2, float* act) {
+    pdl_launch_dependents();
+    __shared__ __align__(16) __nv_bfloat16 xs[D];
+    pdl_wait();
+    const int pair = blockIdx.x, t = pair / S, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int i = threadIdx.x; i < D / 8; i += blockDim.x) reinterpret_cast<uint4*>(xs)[i] = reinterpret_cast<const uint4*>(xn + (size_t)t * D)[i];
+    const int e = sel_e[pair];
+    const int n0 = blockIdx.y * 16 + warp * 2;
+    const uint8_t* mc[2] = {reinterpret_cast<const uint8_t*>(gw[e]), reinterpret_cast<const uint8_t*>(uw[e])};
+    const uint8_t* ms[2] = {reinterpret_cast<const uint8_t*>(gs[e]), reinterpret_cast<const uint8_t*>(us[e])};
+    uint2 c[2][2][D / 512];
+    uint8_t sc[2][2][D / 512];
+#pragma unroll
+    for (int m = 0; m < 2; ++m)
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+#pragma unroll
+            for (int u = 0; u < D / 512; ++u) {
+                const int k = u * 512 + lane * 16;
+                c[m][r][u] = ld_stream_u2(mc[m] + (size_t)(n0 + r) * (D / 2) + k / 2);
+                sc[m][r][u] = ms[m][(size_t)(n0 + r) * (D / 16) + k / 16];
+            }
+    __syncthreads();
+    float v[4] = {};  // slot m * 2 + r
+#pragma unroll
+    for (int u = 0; u < D / 512; ++u) {
+        const int k = u * 512 + lane * 16;
+        float xv[16];
+        load_bf16x8(xs + k, xv);
+        load_bf16x8(xs + k + 8, xv + 8);
+#pragma unroll
+        for (int m = 0; m < 2; ++m)
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                float w[16];
+                const float scl = e4m3f(sc[m][r][u]);
+                fp4x8(c[m][r][u].x, scl, w);
+                fp4x8(c[m][r][u].y, scl, w + 8);
+#pragma unroll
+                for (int i = 0; i < 16; ++i) v[m * 2 + r] = fmaf(w[i], xv[i], v[m * 2 + r]);
+            }
+    }
+    const float sum = warp_sum_slots<4>(v);  // lane holds slot lane >> 3
+    const int slot = lane >> 3;
+    const float gsum = __shfl_sync(0xffffffff, sum, (slot & 1) * 8) * g2[e];       // gate row (slot & 1)
+    const float usum = __shfl_sync(0xffffffff, sum, 16 + (slot & 1) * 8) * u2[e];  // up row (slot & 1)
+    if (lane == 0 || lane == 8) act[(size_t)pair * EW + n0 + (lane >> 3)] = silu(gsum) * usum;
+}
+
+// h[t, n] += sum_s w[t, s] d2[e_s] act[t * S + s] . Wd_{e_s}[n]. Grid (T, D / DN_ROWS): warp w takes
+// slots w, w + 8, .. for DN_ROWS rows (each lane 16 of the 512 inputs), slot sums combined in slot order.
+constexpr int DN_ROWS = 8;
+__global__ void __launch_bounds__(GV_WARPS * 32) moe_down2_kernel(const float* act, int S, const int* sel_e, const float* sel_w,
+                                                                  const uint64_t* dw, const uint64_t* ds, const float* d2, float* h) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ float part[SLOTS_MAX][DN_ROWS];
+    const int t = blockIdx.x, n0 = blockIdx.y * DN_ROWS, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int s = warp; s < S; s += GV_WARPS) {
+        const int e = sel_e[t * S + s];
+        const uint8_t* c = reinterpret_cast<const uint8_t*>(dw[e]);
+        const uint8_t* sc = reinterpret_cast<const uint8_t*>(ds[e]);
+        uint2 cw[DN_ROWS];
+        uint8_t sw[DN_ROWS];
+#pragma unroll
+        for (int r = 0; r < DN_ROWS; ++r) {
+            cw[r] = ld_stream_u2(c + (size_t)(n0 + r) * (EW / 2) + lane * 8);
+            sw[r] = sc[(size_t)(n0 + r) * (EW / 16) + lane];
+        }
+        float a[16];
+        const float4* ap = reinterpret_cast<const float4*>(act + (size_t)(t * S + s) * EW + lane * 16);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float4 q = ap[i];
+            a[4 * i] = q.x, a[4 * i + 1] = q.y, a[4 * i + 2] = q.z, a[4 * i + 3] = q.w;
+        }
+        float v[DN_ROWS];
+#pragma unroll
+        for (int r = 0; r < DN_ROWS; ++r) {
+            float w[16];
+            const float scl = e4m3f(sw[r]);
+            fp4x8(cw[r].x, scl, w);
+            fp4x8(cw[r].y, scl, w + 8);
+            float acc = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) acc = fmaf(w[i], a[i], acc);
+            v[r] = acc;
+        }
+        const float sum = warp_sum_slots<DN_ROWS>(v);  // lane holds row lane / (32 / DN_ROWS)
+        if (lane % (32 / DN_ROWS) == 0) part[s][lane / (32 / DN_ROWS)] = sum * d2[e] * sel_w[t * S + s];
+    }
+    __syncthreads();
+    if (threadIdx.x < DN_ROWS) {
+        float total = 0.0f;
+        for (int s = 0; s < S; ++s) total += part[s][threadIdx.x];
+        h[(size_t)t * D + n0 + threadIdx.x] += total;
+    }
 }
 
 // ---- MoE, many tokens (grouped GEMM tables as moe.cu) -------------------------------------------------
@@ -707,11 +1069,74 @@ cudaError_t quench6k_flint_attention(const void* q, const void* kc, const void* 
 
 int quench6k_flint_gemv_max_m() { return 8; }
 
+}  // extern "C"
+
+namespace {
+
+template <int M, bool NORM, int R>
+cudaError_t gemv_launch(const void* x, const float* norm_w, int K, const Mats& mats, int total, float* y, int ldy, int accumulate,
+                        cudaStream_t st) {
+    const size_t smem = (size_t)M * K * 2;
+    static bool configured = false;
+    if (!configured) {
+        const cudaError_t err = cudaFuncSetAttribute(fp4_gemv_kernel<M, NORM, R>, cudaFuncAttributeMaxDynamicSharedMemorySize, M * GV_KMAX * 2);
+        if (err != cudaSuccess) return err;
+        configured = true;
+    }
+    const unsigned grid = (total + GV_WARPS * R - 1) / (GV_WARPS * R);
+    SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemv_kernel<M, NORM, R>, grid, GV_WARPS * 32, smem, st, x, norm_w, K, mats, y, ldy, accumulate));
+    SQ_RETURN_LAUNCH();
+}
+
+template <bool NORM, int R>
+cudaError_t gemv1_launch(const void* x, const float* norm_w, int K, const Mats& mats, int total, float* y, int accumulate, cudaStream_t st) {
+    const unsigned grid = (total + GV_WARPS * R - 1) / (GV_WARPS * R);
+    SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemv1_kernel<NORM, R>, grid, GV_WARPS * 32, 0, st, x, norm_w, K, mats, y, accumulate));
+    SQ_RETURN_LAUNCH();
+}
+
+template <int STEPS, int R>
+cudaError_t gemv2_launch(const void* x, const Mats& mats, int total, float* y, int accumulate, cudaStream_t st) {
+    const unsigned grid = (total + GV_WARPS * R - 1) / (GV_WARPS * R);
+    SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemv2_kernel<STEPS, R>, grid, GV_WARPS * 32, 0, st, static_cast<const __nv_bfloat16*>(x), mats, y, accumulate));
+    SQ_RETURN_LAUNCH();
+}
+
+template <int M>
+cudaError_t gemv_m(const void* x, const float* norm_w, int K, const Mats& mats, int total, float* y, int ldy, int accumulate, cudaStream_t st) {
+    const int g = sq_variant("flint.gemv", 2);
+    if (M == 1 && !norm_w && g == 2 && (K == 2048 || K == 4096)) {
+        const int R = sq_variant("flint.gemv_r", 0);
+        if (K == 2048) return (R == 2 || (R == 0 && total < 4 * 188 * GV_WARPS * 4)) ? gemv2_launch<2, 2>(x, mats, total, y, accumulate, st)
+                                                                                     : gemv2_launch<2, 4>(x, mats, total, y, accumulate, st);
+        return (R == 1 || (R == 0 && total < 4 * 188 * GV_WARPS * 2)) ? gemv2_launch<4, 1>(x, mats, total, y, accumulate, st)
+                                                                      : gemv2_launch<4, 2>(x, mats, total, y, accumulate, st);
+    }
+    if (M == 1 && g == 1) {
+        const bool r2 = total >= 2 * 188 * GV_WARPS * 2;
+        if (norm_w) return r2 ? gemv1_launch<true, 2>(x, norm_w, K, mats, total, y, accumulate, st)
+                              : gemv1_launch<true, 1>(x, norm_w, K, mats, total, y, accumulate, st);
+        return r2 ? gemv1_launch<false, 2>(x, norm_w, K, mats, total, y, accumulate, st)
+                  : gemv1_launch<false, 1>(x, norm_w, K, mats, total, y, accumulate, st);
+    }
+    // Two rows per warp unless that leaves fewer than ~2 CTAs per SM.
+    const bool r2 = total >= 2 * 188 * GV_WARPS * 2;
+    if (norm_w) return r2 ? gemv_launch<M, true, 2>(x, norm_w, K, mats, total, y, ldy, accumulate, st)
+                          : gemv_launch<M, true, 1>(x, norm_w, K, mats, total, y, ldy, accumulate, st);
+    return r2 ? gemv_launch<M, false, 2>(x, norm_w, K, mats, total, y, ldy, accumulate, st)
+              : gemv_launch<M, false, 1>(x, norm_w, K, mats, total, y, ldy, accumulate, st);
+}
+
+}  // namespace
+
+extern "C" {
+
 // Up to three NVFP4 matrices (n_i rows each, null codes for unused) with concatenated output columns.
-cudaError_t quench6k_flint_gemv(const void* x, int M, int K, const uint8_t* const* codes, const uint8_t* const* scales,
+// norm_w non-null: x is FP32 [M, K] and is RMS-normalized with weight norm_w first.
+cudaError_t quench6k_flint_gemv(const void* x, const float* norm_w, int M, int K, const uint8_t* const* codes, const uint8_t* const* scales,
                                 const float* const* s2, const int* n, float* y, int ldy, int accumulate, cudaStream_t st) {
     if (M == 0) return cudaSuccess;
-    if (K % 256 != 0 || M > 8 || K > 4096) return cudaErrorInvalidValue;
+    if (K % 256 != 0 || M > 8 || K > GV_KMAX) return cudaErrorInvalidValue;
     Mats mats{};
     int total = 0;
     for (int i = 0; i < 3; ++i) {
@@ -721,29 +1146,24 @@ cudaError_t quench6k_flint_gemv(const void* x, int M, int K, const uint8_t* cons
         total += codes[i] ? n[i] : 0;
         mats.end[i] = total;
     }
-    const size_t smem = (size_t)M * K * 2;
-    if (smem > 48 * 1024) {
-        static bool configured[9] = {};
-        if (!configured[M]) {
-            cudaError_t err = cudaSuccess;
-            switch (M) {
-#define SQ_CFG(m) \
-    case m: err = cudaFuncSetAttribute(fp4_gemv_kernel<m>, cudaFuncAttributeMaxDynamicSharedMemorySize, m * 4096 * 2); break;
-                SQ_CFG(1) SQ_CFG(2) SQ_CFG(3) SQ_CFG(4) SQ_CFG(5) SQ_CFG(6) SQ_CFG(7) SQ_CFG(8)
-#undef SQ_CFG
-            }
-            if (err != cudaSuccess) return err;
-            configured[M] = true;
-        }
-    }
-    const unsigned grid = (total + GV_WARPS - 1) / GV_WARPS;
-    const __nv_bfloat16* xb = static_cast<const __nv_bfloat16*>(x);
     switch (M) {
-#define SQ_GV(m) \
-    case m: SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemv_kernel<m>, grid, GV_WARPS * 32, smem, st, xb, K, mats, y, ldy, accumulate)); break;
-        SQ_GV(1) SQ_GV(2) SQ_GV(3) SQ_GV(4) SQ_GV(5) SQ_GV(6) SQ_GV(7) SQ_GV(8)
-#undef SQ_GV
+        case 1: return gemv_m<1>(x, norm_w, K, mats, total, y, ldy, accumulate, st);
+        case 2: return gemv_m<2>(x, norm_w, K, mats, total, y, ldy, accumulate, st);
+        case 3: return gemv_m<3>(x, norm_w, K, mats, total, y, ldy, accumulate, st);
+        case 4: return gemv_m<4>(x, norm_w, K, mats, total, y, ldy, accumulate, st);
+        case 5: return gemv_m<5>(x, norm_w, K, mats, total, y, ldy, accumulate, st);
+        case 6: return gemv_m<6>(x, norm_w, K, mats, total, y, ldy, accumulate, st);
+        case 7: return gemv_m<7>(x, norm_w, K, mats, total, y, ldy, accumulate, st);
+        default: return gemv_m<8>(x, norm_w, K, mats, total, y, ldy, accumulate, st);
     }
+}
+
+cudaError_t quench6k_flint_router(const float* h, const float* norm_w, const void* w, int T, float* logits, void* xn, int* ticket, int* sel_e,
+                                  float* sel_w, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    if (T > RT_TMAX) return cudaErrorInvalidValue;
+    SQ_CHECK_LAUNCH(fl_launch(32, router_kernel, E / 4, 128, 0, st, h, norm_w, static_cast<const __nv_bfloat16*>(w), T, logits,
+                              static_cast<__nv_bfloat16*>(xn), ticket, sel_e, sel_w));
     SQ_RETURN_LAUNCH();
 }
 
@@ -763,10 +1183,16 @@ cudaError_t quench6k_flint_moe_small(const void* xn, int T, int S, const int* se
                                      const uint64_t* gs, const float* g2, const uint64_t* uw, const uint64_t* us, const float* u2,
                                      const uint64_t* dw, const uint64_t* ds, const float* d2, float* act, float* h, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(fl_launch(128, moe_gate_up_kernel, dim3(T * S, EW / GV_WARPS), GV_WARPS * 32, 0, st, static_cast<const __nv_bfloat16*>(xn),
-                              S, sel_e, gw, gs, g2, uw, us, u2, act));
-    SQ_CHECK_LAUNCH(fl_launch(256, moe_down_kernel, dim3(T, D / GV_WARPS), GV_WARPS * 32, 0, st, (const float*)act, S, sel_e, sel_w, dw, ds,
-                              d2, h));
+    if (sq_variant("flint.moe_v1", 0)) {
+        SQ_CHECK_LAUNCH(fl_launch(128, moe_gate_up_kernel, dim3(T * S, EW / GV_WARPS), GV_WARPS * 32, 0, st, static_cast<const __nv_bfloat16*>(xn),
+                                  S, sel_e, gw, gs, g2, uw, us, u2, act));
+        SQ_CHECK_LAUNCH(fl_launch(256, moe_down_kernel, dim3(T, D / GV_WARPS), GV_WARPS * 32, 0, st, (const float*)act, S, sel_e, sel_w, dw, ds,
+                                  d2, h));
+    } else {
+        SQ_CHECK_LAUNCH(fl_launch(128, moe_gate_up2_kernel, dim3(T * S, EW / 16), GV_WARPS * 32, 0, st, static_cast<const __nv_bfloat16*>(xn), S,
+                                  sel_e, gw, gs, g2, uw, us, u2, act));
+        SQ_CHECK_LAUNCH(fl_launch(256, moe_down2_kernel, dim3(T, D / DN_ROWS), GV_WARPS * 32, 0, st, (const float*)act, S, sel_e, sel_w, dw, ds, d2, h));
+    }
     SQ_RETURN_LAUNCH();
 }
 

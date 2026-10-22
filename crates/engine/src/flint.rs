@@ -305,6 +305,8 @@ pub struct FlintSeq {
     pub tokens: Vec<i32>,
     pub k: Vec<DeviceBuffer>,
     pub v: Vec<DeviceBuffer>,
+    /// The captured one-token decode step of this sequence (its caches are baked in).
+    graph: Option<quench6k_cuda::Graph>,
 }
 
 impl FlintSeq {
@@ -316,7 +318,7 @@ impl FlintSeq {
             k.push(DeviceBuffer::new(rows * HKV * HD * 2)?);
             v.push(DeviceBuffer::new(rows * HKV * HD * 2)?);
         }
-        Ok(Self { capacity, tokens: Vec::new(), k, v })
+        Ok(Self { capacity, tokens: Vec::new(), k, v, graph: None })
     }
 
     /// Positions of `prompt` whose state can be kept: the common prefix with the cached tokens, provided
@@ -368,6 +370,9 @@ pub struct Workspace {
     logit_rows: usize,
     argmax_scratch: u64,
     pub argmax_out: u64,
+    ticket: u64,
+    /// Host staging of a decode step's token and position.
+    io: PinnedBuffer,
 }
 
 const SMALL: usize = 8;
@@ -424,6 +429,13 @@ impl Workspace {
             logit_rows,
             argmax_scratch: a(k::argmax_scratch(logit_rows, VOCAB))?,
             argmax_out: a(logit_rows * 4)?,
+            ticket: {
+                let b = DeviceBuffer::zeroed(16)?;
+                let addr = b.addr();
+                bufs.push(b);
+                addr
+            },
+            io: PinnedBuffer::new(16)?,
             _bufs: Vec::new(),
         };
         Ok(Self { _bufs: bufs, ..ws })
@@ -455,6 +467,34 @@ pub fn forward(model: &FlintModel, ws: &Workspace, seq: &mut FlintSeq, tokens: &
     ensure!(start + t <= seq.capacity, "sequence capacity {} exceeded", seq.capacity);
     s.upload_to(ws.tok, tokens)?;
     s.upload_to(ws.start, &[start as i32])?;
+    body(model, ws, seq, t, Some(start), all_logits, s)?;
+    seq.tokens.extend_from_slice(tokens);
+    Ok(())
+}
+
+/// One decode token through the sequence's CUDA graph (captured on first use); logits in `ws.logits`.
+pub fn decode(model: &FlintModel, ws: &mut Workspace, seq: &mut FlintSeq, token: i32, s: &Stream) -> Result<()> {
+    let start = seq.tokens.len();
+    ensure!(start < seq.capacity, "sequence capacity {} exceeded", seq.capacity);
+    let io = ws.io.as_mut_slice();
+    io[..4].copy_from_slice(&token.to_le_bytes());
+    io[4..8].copy_from_slice(&(start as i32).to_le_bytes());
+    unsafe {
+        s.copy_h2d(ws.tok, ws.io.as_ptr(), 4)?;
+        s.copy_h2d(ws.start, ws.io.as_ptr().add(4), 4)?;
+    }
+    if seq.graph.is_none() {
+        let g = quench6k_cuda::Graph::capture(s, |s| body(model, ws, seq, 1, None, false, s))?;
+        seq.graph = Some(g);
+    }
+    seq.graph.as_ref().unwrap().launch(s)?;
+    seq.tokens.push(token);
+    Ok(())
+}
+
+/// The step's kernels for `t` tokens whose ids and start position are already on the device. `start`:
+/// the host position for choosing attention splits, or None for a position-independent (graph) step.
+fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Option<usize>, all_logits: bool, s: &Stream) -> Result<()> {
     fk::embed(s, ws.tok, t, model.embed, ws.h)?;
     let bm = k::moe_tile_rows();
     let small = t <= SMALL;
@@ -467,7 +507,7 @@ pub fn forward(model: &FlintModel, ws: &Workspace, seq: &mut FlintSeq, tokens: &
     for (li, layer) in model.layers.iter().enumerate() {
         fk::rmsnorm(s, ws.h, layer.attn_norm, EPS, ws.xn, t)?;
         let (qi, ki, vi) = if small {
-            fk::gemv(s, ws.xn, t, &[layer.q, layer.k, layer.v], ws.qkv, QKV, false)?;
+            fk::gemv(s, ws.xn, None, t, &[layer.q, layer.k, layer.v], ws.qkv, QKV, false)?;
             ((ws.qkv, QKV), (ws.qkv + (HQ * HD * 4) as u64, QKV), (ws.qkv + ((HQ + HKV) * HD * 4) as u64, QKV))
         } else {
             dense_gemm(layer.q_t, ws.xn, ws.qf, HQ * HD, D)?;
@@ -479,20 +519,26 @@ pub fn forward(model: &FlintModel, ws: &Workspace, seq: &mut FlintSeq, tokens: &
         checkpoint(s, "qkv")?;
         fk::qk_prep(s, qi, ki, vi, layer.q_norm, layer.k_norm, layer.rope, ws.start, mask, t, ws.qb, seq.k[li].addr(), seq.v[li].addr())?;
         checkpoint(s, "qk_prep")?;
-        let splits = splits_for(t, start, window);
+        // Steps of few tokens always split the keys MAX_SPLITS ways, so that eager and graph steps
+        // sum in the same order (empty splits exit at once).
+        let splits = match start {
+            Some(start) if !small => splits_for(t, start, window),
+            _ => MAX_SPLITS,
+        };
         fk::attention(s, ws.qb, seq.k[li].addr(), seq.v[li].addr(), t, ws.start, window, mask, splits, layer.sinks, ws.part_o, ws.part_ml, ws.attn)?;
         checkpoint(s, "attention")?;
         if small {
-            fk::gemv(s, ws.attn, t, &[layer.o], ws.h, D, true)?;
+            fk::gemv(s, ws.attn, None, t, &[layer.o], ws.h, D, true)?;
         } else {
             dense_gemm(layer.o_t, ws.attn, ws.of, D, HQ * HD)?;
             k::add_f32(s, ws.h, ws.of, t * D)?;
         }
 
         checkpoint(s, "o")?;
-        fk::rmsnorm(s, ws.h, layer.ffn_norm, EPS, ws.xn, t)?;
         match layer.router {
+            Some(router) if small => fk::router(s, ws.h, layer.ffn_norm, router, t, ws.rlogits, ws.xn, ws.ticket, ws.sel_e, ws.sel_w)?,
             Some(router) => {
+                fk::rmsnorm(s, ws.h, layer.ffn_norm, EPS, ws.xn, t)?;
                 if t <= k::gemv_max_m() {
                     k::gemv(s, t, ws.xn, D, WeightFormat::Bf16, router, 0, ws.rlogits, EXPERTS, 0, EXPERTS, D, 1, 1.0, false)?;
                 } else {
@@ -500,7 +546,10 @@ pub fn forward(model: &FlintModel, ws: &Workspace, seq: &mut FlintSeq, tokens: &
                 }
                 fk::route(s, ws.rlogits, t, ws.sel_e, ws.sel_w)?;
             }
-            None => fk::dense_slots(s, t, layer.slots, ws.sel_e, ws.sel_w)?,
+            None => {
+                fk::rmsnorm(s, ws.h, layer.ffn_norm, EPS, ws.xn, t)?;
+                fk::dense_slots(s, t, layer.slots, ws.sel_e, ws.sel_w)?
+            }
         }
         checkpoint(s, "route")?;
         let slots = layer.slots;
@@ -526,14 +575,14 @@ pub fn forward(model: &FlintModel, ws: &Workspace, seq: &mut FlintSeq, tokens: &
     let rows = if all_logits { t } else { 1 };
     ensure!(rows <= ws.logit_rows, "{rows} logit rows requested, workspace holds {}", ws.logit_rows);
     let first = t - rows;
-    fk::rmsnorm(s, ws.h + (first * D * 4) as u64, model.out_norm, EPS, ws.xn, rows)?;
     let mut done = 0;
     while done < rows {
         let m = (rows - done).min(fk::gemv_max_m());
-        fk::gemv(s, ws.xn + (done * D * 2) as u64, m, &[model.lm_head], ws.logits + (done * VOCAB * 4) as u64, VOCAB, false)?;
+        let h = ws.h + ((first + done) * D * 4) as u64;
+        fk::rmsnorm(s, h, model.out_norm, EPS, ws.xn, m)?;
+        fk::gemv(s, ws.xn, None, m, &[model.lm_head], ws.logits + (done * VOCAB * 4) as u64, VOCAB, false)?;
         done += m;
     }
-    seq.tokens.extend_from_slice(tokens);
     Ok(())
 }
 
