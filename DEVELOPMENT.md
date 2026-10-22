@@ -104,7 +104,7 @@ commits on `main`. The CUDA runtime is linked statically.
 | `QUENCH6K_DFLASH_PROFILE=N` | Times round N's DFlash drafting per op (eagerly, 10 times) |
 | `QUENCH6K_POLICY=decay=..,prior=..,fixed=N` | Adaptive draft length policy settings; `fixed=N` always drafts N |
 | `QUENCH6K_FLINT_SYNC=1` or `=op` | Flint: synchronize after every op (or one named op) and report the failing one |
-| Variants `flint.pdl` (bitmask), `flint.fuse_norm`, `flint.attn_dec`, `flint.attn_fused_merge`, `flint.attn_min_tiles`, `flint.gemv`, `flint.gemv_r`, `flint.moe_v1` | Flint kernel choices (see dev/KBENCH.md) |
+| Variants `flint.pdl` (bitmask), `flint.fuse_norm`, `flint.attn_dec`, `flint.attn_fused_merge`, `flint.attn_min_tiles`, `flint.attn_wide`, `flint.gemv`, `flint.gemv_r`, `flint.moe_v1` | Flint kernel choices (see dev/KBENCH.md) |
 | Variant `flint.prefill_fp4=1` | Flint prefill experts in W4A4 (FP4 activations): +13-21% prefill, PPL 15.61 vs 14.95 at 16K, so off |
 | Variant `flint.lookup=0` | Flint server: no prompt-lookup speculation |
 

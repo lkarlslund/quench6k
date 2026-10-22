@@ -179,22 +179,28 @@ __global__ void __launch_bounds__(128) qk_prep_kernel(const float* qi, int ldq, 
 // unnormalized output and (max, sum) in base 2; attn_merge adds the sinks and normalizes.
 constexpr int AT_ROWS = 64, AT_KEYS = 64, AT_LD = HD + 8;
 
-struct __align__(16) AttnSmem {
-    __nv_bfloat16 q[AT_ROWS * AT_LD];
-    __nv_bfloat16 k[2][AT_KEYS * AT_LD];
-    __nv_bfloat16 v[2][AT_KEYS * AT_LD];
+template <int ROWS, int KEYS>
+struct __align__(16) AttnSmemT {
+    __nv_bfloat16 q[ROWS * AT_LD];
+    __nv_bfloat16 k[2][KEYS * AT_LD];
+    __nv_bfloat16 v[2][KEYS * AT_LD];
 };
 
-// FP8 caches: tiles arrive as E4M3 codes in a double-buffered staging area and are converted (with
-// their per-row scales) into a single BF16 tile before the MMAs.
-struct __align__(16) AttnSmem8 {
-    __nv_bfloat16 q[AT_ROWS * AT_LD];
-    __nv_bfloat16 k[1][AT_KEYS * AT_LD];
-    __nv_bfloat16 v[1][AT_KEYS * AT_LD];
-    uint8_t k8[2][AT_KEYS * HD];
-    uint8_t v8[2][AT_KEYS * HD];
-    float ks[AT_KEYS], vs[AT_KEYS];
+// FP8 caches: tiles arrive as E4M3 codes in a double-buffered staging area and are converted into a
+// single FP16 tile (codes unscaled; the rows' scales apply to the scores and to P) before the MMAs.
+template <int ROWS, int KEYS>
+struct __align__(16) AttnSmem8T {
+    __nv_bfloat16 q[ROWS * AT_LD];
+    __nv_bfloat16 k[1][KEYS * AT_LD];
+    __nv_bfloat16 v[1][KEYS * AT_LD];
+    uint8_t k8[2][KEYS * HD];
+    uint8_t v8[2][KEYS * HD];
+    float ks[KEYS], vs[KEYS];
 };
+using AttnSmem = AttnSmemT<AT_ROWS, AT_KEYS>;
+using AttnSmem8 = AttnSmem8T<AT_ROWS, AT_KEYS>;
+// Wide tiles for steps of many tokens: 8 warps, 128 rows (16 tokens), 32-key tiles.
+constexpr int AT_WIDE_ROWS = 128, AT_WIDE_KEYS = 32;
 
 // At least this many key tiles per split (variant flint.attn_min_tiles): splits beyond tiles / min exit at once, so the split
 // count follows the position (read on the device: graph steps stay valid).
@@ -202,8 +208,8 @@ constexpr int AT_MIN_TILES_DEFAULT = 1;
 
 // DEC (steps of at most 2 tokens, 16 rows): the four warps share rows 0..15 and each takes 16 keys of
 // every tile; their states combine through shared memory at the end.
-template <bool F8, bool DEC>
-__global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const __nv_bfloat16* kc,
+template <bool F8, bool DEC, int W = 4>
+__global__ void __launch_bounds__(W * 32) attn_kernel(const __nv_bfloat16* q, const __nv_bfloat16* kc,
                                                    const __nv_bfloat16* vc, int T, const int* start_p, int window,
                                                    int mask, int splits, float* part_o, float* part_ml, const float* sinks,
                                                    int* tickets, __nv_bfloat16* out, int f8_rows, int min_tiles) {
@@ -211,24 +217,26 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
     pdl_wait();
     const int start = *start_p;
     extern __shared__ __align__(16) uint8_t at_smem[];
-    using Smem = std::conditional_t<F8, AttnSmem8, AttnSmem>;
+    constexpr int ROWS = W * 16, KEYS = W == 8 ? AT_WIDE_KEYS : AT_KEYS, NT = W * 32;
+    static_assert(!DEC || W == 4, "decode mode uses 4 warps");
+    using Smem = std::conditional_t<F8, AttnSmem8T<ROWS, KEYS>, AttnSmemT<ROWS, KEYS>>;
     Smem& sm = *reinterpret_cast<Smem*>(at_smem);
     const int kh = blockIdx.y, split = blockIdx.z;
-    const int tok0 = blockIdx.x * (AT_ROWS / GROUP);
+    const int tok0 = blockIdx.x * (ROWS / GROUP);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int ntok = min(AT_ROWS / GROUP, T - tok0);
+    const int ntok = min(ROWS / GROUP, T - tok0);
     // Key range of the whole tile, split in key-tile units.
     const int p_lo = start + tok0, p_hi = start + tok0 + ntok - 1;
     const int k_begin_all = window > 0 ? max(0, p_lo - window + 1) : 0;
     const int k_end_all = p_hi + 1;
-    const int tiles_all = (k_end_all - k_begin_all + AT_KEYS - 1) / AT_KEYS;
+    const int tiles_all = (k_end_all - k_begin_all + KEYS - 1) / KEYS;
     const int se = max(1, min(splits, tiles_all / min_tiles));
     if (split >= se) return;
     const int per = (tiles_all + se - 1) / se;
     const int t_begin = split * per, t_end = min(tiles_all, t_begin + per);
 
     // Q rows -> shared.
-    for (int i = tid; i < AT_ROWS * (HD / 8); i += 128) {
+    for (int i = tid; i < ROWS * (HD / 8); i += NT) {
         const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
         const int tt = r / GROUP, hh = r % GROUP;
         uint4 val = make_uint4(0, 0, 0, 0);
@@ -244,11 +252,11 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
         *reinterpret_cast<uint4*>(&sm.q[r * AT_LD + c]) = val;
     }
     auto load_kv = [&](int buf, int tile) {
-        const int j0 = k_begin_all + tile * AT_KEYS;
+        const int j0 = k_begin_all + tile * KEYS;
         if constexpr (F8) {
             const uint8_t* k8 = reinterpret_cast<const uint8_t*>(kc);
             const uint8_t* v8 = reinterpret_cast<const uint8_t*>(vc);
-            for (int i = tid; i < AT_KEYS * (HD / 16); i += 128) {
+            for (int i = tid; i < KEYS * (HD / 16); i += NT) {
                 const int r = i / (HD / 16), c = (i % (HD / 16)) * 16;
                 const int j = j0 + r;
                 const bool ok = j < k_end_all;
@@ -257,7 +265,7 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
                 cp_async16(&sm.v8[buf][r * HD + c], v8 + off, ok);
             }
         } else {
-            for (int i = tid; i < AT_KEYS * (HD / 8); i += 128) {
+            for (int i = tid; i < KEYS * (HD / 8); i += NT) {
                 const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
                 const int j = j0 + r;
                 const bool ok = j < k_end_all;
@@ -272,14 +280,14 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
         if constexpr (F8) {
             const float* ksc = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(kc) + (size_t)f8_rows * HKV * HD);
             const float* vsc = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(vc) + (size_t)f8_rows * HKV * HD);
-            if (tid < AT_KEYS) {
+            if (tid < KEYS) {
                 const int j = j0 + tid;
                 const bool ok = j < k_end_all;
                 const size_t srow = (size_t)((ok ? j : 0) & mask) * HKV + kh;
                 sm.ks[tid] = ok ? ksc[srow] : 0.0f;
                 sm.vs[tid] = ok ? vsc[srow] : 0.0f;
             }
-            for (int i = tid; i < AT_KEYS * (HD / 16); i += 128) {
+            for (int i = tid; i < KEYS * (HD / 16); i += NT) {
                 const int r = i / (HD / 16), c = (i % (HD / 16)) * 16;
                 const uint4 kq = *reinterpret_cast<const uint4*>(&sm.k8[buf][r * HD + c]);
                 const uint4 vq = *reinterpret_cast<const uint4*>(&sm.v8[buf][r * HD + c]);
@@ -299,7 +307,7 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
         }
     };
     const int g8 = lane >> 2, t4 = lane & 3;
-    constexpr int KW = DEC ? 16 : AT_KEYS;  // keys of a tile this warp handles
+    constexpr int KW = DEC ? 16 : KEYS;  // keys of a tile this warp handles
     const int rbase = DEC ? 0 : warp * 16, koff = DEC ? warp * 16 : 0;
     // This thread's two rows (g8 and g8 + 8 of the warp's 16) and their limits.
     int lim_hi[2], lim_lo[2];
@@ -328,7 +336,7 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
         cp_async_commit();
         cp_async_wait<1>();
         __syncthreads();
-        const int j0 = k_begin_all + tile * AT_KEYS;
+        const int j0 = k_begin_all + tile * KEYS;
         if constexpr (F8) {
             convert(sbuf, j0);
             __syncthreads();
@@ -490,7 +498,7 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
     if (!last) return;
     __threadfence();
     // Warps take rows; lanes take splits for the maximum and the denominator, then 4 dimensions each.
-    for (int r = warp; r < ntok * GROUP; r += 4) {
+    for (int r = warp; r < ntok * GROUP; r += W) {
         const size_t row = (size_t)(tok0 + r / GROUP) * HQ + kh * GROUP + r % GROUP;
         const float sink = sinks[kh * GROUP + r % GROUP] * 1.4426950408889634f;
         const float* ml = part_ml + row * splits * 2;
@@ -521,15 +529,16 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
 // out[t, h * 128 + d] = bf16(sum_s 2^(m_s - M) o_s / (sum_s 2^(m_s - M) l_s + 2^(sink_h log2 e - M))).
 // Grid T * HQ, 128 threads.
 __global__ void __launch_bounds__(128) attn_merge_kernel(const float* part_o, const float* part_ml, int splits, const float* sinks,
-                                                         int T, const int* start_p, int window, __nv_bfloat16* out, int min_tiles) {
+                                                         int T, const int* start_p, int window, __nv_bfloat16* out, int min_tiles,
+                                                         int tile_tok, int keys) {
     pdl_launch_dependents();
     pdl_wait();
     const int row = blockIdx.x, h = row % HQ, d = threadIdx.x;
     // The attention CTA's effective split count, derived as attn_kernel does.
-    const int tok0 = (row / HQ) / (AT_ROWS / GROUP) * (AT_ROWS / GROUP), ntok = min(AT_ROWS / GROUP, T - tok0);
+    const int tok0 = (row / HQ) / tile_tok * tile_tok, ntok = min(tile_tok, T - tok0);
     const int p_lo = *start_p + tok0, p_hi = p_lo + ntok - 1;
     const int k_begin_all = window > 0 ? max(0, p_lo - window + 1) : 0;
-    const int tiles_all = (p_hi + 1 - k_begin_all + AT_KEYS - 1) / AT_KEYS;
+    const int tiles_all = (p_hi + 1 - k_begin_all + keys - 1) / keys;
     const int se = max(1, min(splits, tiles_all / min_tiles));
     const float* ml = part_ml + (size_t)row * splits * 2;
     const float* po = part_o + (size_t)row * splits * HD;
@@ -1292,17 +1301,27 @@ cudaError_t quench6k_flint_attention(const void* q, const void* kc, const void* 
         if (err == cudaSuccess) err = cudaFuncSetAttribute(attn_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(AttnSmem8));
         if (err == cudaSuccess) err = cudaFuncSetAttribute(attn_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(AttnSmem));
         if (err == cudaSuccess) err = cudaFuncSetAttribute(attn_kernel<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(AttnSmem8));
+        if (err == cudaSuccess)
+            err = cudaFuncSetAttribute(attn_kernel<false, false, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(AttnSmemT<AT_WIDE_ROWS, AT_WIDE_KEYS>));
+        if (err == cudaSuccess)
+            err = cudaFuncSetAttribute(attn_kernel<true, false, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(AttnSmem8T<AT_WIDE_ROWS, AT_WIDE_KEYS>));
         if (err != cudaSuccess) return err;
         configured = true;
     }
-    const dim3 grid((T * GROUP + AT_ROWS - 1) / AT_ROWS, HKV, splits);
     const bool fused = sq_variant("flint.attn_fused_merge", 0) != 0;
     const bool dec = T <= 2 && sq_variant("flint.attn_dec", 1) != 0;
+    const bool wide = T > 2 && !fused && sq_variant("flint.attn_wide", 1) != 0;
     const int min_tiles = max(1, sq_variant("flint.attn_min_tiles", AT_MIN_TILES_DEFAULT));
+    const int rows = wide ? AT_WIDE_ROWS : AT_ROWS, keys = wide ? AT_WIDE_KEYS : AT_KEYS;
+    const dim3 grid((T * GROUP + rows - 1) / rows, HKV, splits);
     const __nv_bfloat16 *qb = static_cast<const __nv_bfloat16*>(q), *kb = static_cast<const __nv_bfloat16*>(kc), *vb = static_cast<const __nv_bfloat16*>(vc);
     int* tk = fused && !dec ? tickets : nullptr;
     __nv_bfloat16* ob = static_cast<__nv_bfloat16*>(out);
-    if (f8_rows && dec)
+    if (wide && f8_rows)
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, false, 8>, grid, 256, sizeof(AttnSmem8T<AT_WIDE_ROWS, AT_WIDE_KEYS>), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, f8_rows, min_tiles));
+    else if (wide)
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, false, 8>, grid, 256, sizeof(AttnSmemT<AT_WIDE_ROWS, AT_WIDE_KEYS>), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, 0, min_tiles));
+    else if (f8_rows && dec)
         SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, true>, grid, 128, sizeof(AttnSmem8), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, f8_rows, min_tiles));
     else if (f8_rows)
         SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, false>, grid, 128, sizeof(AttnSmem8), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, f8_rows, min_tiles));
@@ -1312,7 +1331,7 @@ cudaError_t quench6k_flint_attention(const void* q, const void* kc, const void* 
         SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, false>, grid, 128, sizeof(AttnSmem), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, 0, min_tiles));
     if (!fused || dec)
         SQ_CHECK_LAUNCH(fl_launch(8, attn_merge_kernel, T * HQ, 128, 0, st, (const float*)part_o, (const float*)part_ml, splits, sinks, T, start,
-                                  window, static_cast<__nv_bfloat16*>(out), min_tiles));
+                                  window, static_cast<__nv_bfloat16*>(out), min_tiles, rows / GROUP, keys));
     SQ_RETURN_LAUNCH();
 }
 

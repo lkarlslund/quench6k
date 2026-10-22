@@ -379,3 +379,7 @@ Later the same day:
   layers, 287 MB, a device copy): a follow-up that diverges anywhere after that point (reasoning dropped
   from the history, re-rendered whitespace) restores them and keeps the whole earlier prompt (26,085 of
   26,107 tokens reused after 3,000 generated, instead of a full prefill).
+- **Wide prefill attention.** Steps of more than 2 tokens use 128-row tiles (8 warps, 16 tokens x 8
+  heads) with 32-key tiles (`flint.attn_wide`, default on; 70 KB of shared memory): K/V tile traffic
+  and FP8 conversion per FLOP halve. Prefill at 64K +6.5% (BF16 KV) / +6% (FP8). PPL moves by rounding
+  only (2K chunks within 0.5% either way: 24.83 vs 24.93 overall; tiled corpus 1.0390 vs 1.0391).
