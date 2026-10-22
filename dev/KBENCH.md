@@ -370,3 +370,12 @@ Later the same day:
   26K-token agent edit request: 376 -> 713 tok/s sampled (3.88 tokens/step). The batched verification
   kernels (M-row GEMV, non-decode attention) round differently from the single-token ones, so greedy
   output diverges from plain greedy at near-ties (after ~40 tokens on one prompt).
+- **Adaptive drafts.** With matches of 2 tokens and fixed 7-token drafts, free-form text lost 14%
+  (drafts rejected, larger steps). Matches of at least 3 tokens and a draft cap from the request's
+  acceptance rate (EMA; caps 1/2/4/7): free-form 491 vs 494 tok/s, the agent edit 738 vs 382.
+- **Prefix reuse.** Reusing a prefix of length p only needs the sliding rings to hold [p - 512, p)
+  (a rewritten chunk of <= 2048 positions never overwrites a key its own queries need), so the limit is
+  p >= cached - 3583, not the 1535 first used. The rings are also copied at every prompt's end (35
+  layers, 287 MB, a device copy): a follow-up that diverges anywhere after that point (reasoning dropped
+  from the history, re-rendered whitespace) restores them and keeps the whole earlier prompt (26,085 of
+  26,107 tokens reused after 3,000 generated, instead of a full prefill).

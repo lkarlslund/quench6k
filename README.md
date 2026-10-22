@@ -57,8 +57,9 @@ quench6k serve --model /path/to/flint-nvfp4-gguf --listen 0.0.0.0:8013 --context
 The server serves one request at a time, reuses the prompt prefix across requests, and handles the
 model's own `<think>` reasoning and its tool-call format. Flint has no MTP head; the server speculates
 with prompt-lookup drafts instead (the tokens that followed the latest earlier occurrence of the last
-few tokens, up to 7, verified in one step). On a 26K-token coding-agent edit request (sampled,
-temperature 1) that took decoding from 376 to 713 tok/s at 3.9 tokens per step. Verification steps run
+3 or 4 tokens, up to 7 as the request's acceptance rate allows, verified in one step). On a 26K-token
+coding-agent edit request (sampled, temperature 1) that takes decoding from 382 to 738 tok/s (3.8
+tokens per step); on free-form text it costs under 1%. Verification steps run
 batched kernels, so speculative greedy output is not bit-identical to plain greedy output (it differs
 by rounding); `"mtp": false` in a request turns it off. Throughput on the same machine at 600 W, with
 greedy decoding of 128 tokens and FP8 KV from 64K up (BF16 KV below that):

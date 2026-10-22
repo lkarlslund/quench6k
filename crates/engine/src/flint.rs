@@ -311,6 +311,10 @@ pub struct FlintSeq {
     pub v: Vec<DeviceBuffer>,
     /// Captured steps of this sequence (its caches are baked in), by token count 1..=SMALL.
     graphs: Vec<Option<quench6k_cuda::Graph>>,
+    /// The sliding layers' rings as they were after the first `pos` tokens (taken at a prompt's end),
+    /// so that a follow-up prompt diverging anywhere after it needs no full prefill.
+    snap: Option<(usize, DeviceBuffer)>,
+    sliding: Vec<bool>,
 }
 
 impl FlintSeq {
@@ -329,15 +333,67 @@ impl FlintSeq {
             k.push(DeviceBuffer::new(bytes)?);
             v.push(DeviceBuffer::new(bytes)?);
         }
-        Ok(Self { capacity, fp8, tokens: Vec::new(), k, v, graphs: (0..=SMALL).map(|_| None).collect() })
+        Ok(Self { capacity, fp8, tokens: Vec::new(), k, v, graphs: (0..=SMALL).map(|_| None).collect(), snap: None, sliding: model.layers.iter().map(|l| l.sliding).collect() })
     }
 
-    /// Positions of `prompt` whose state can be kept: the common prefix with the cached tokens, provided
-    /// the sliding rings still hold the window before it.
-    pub fn reusable(&self, prompt: &[i32]) -> usize {
+    /// Keeps the longest prefix of `prompt` whose state is available and drops the rest of the cached
+    /// tokens; returns its length. The common prefix with the cached tokens is usable while the rings
+    /// still hold the WINDOW positions before it (rewriting a chunk of <= MAX_CHUNK positions never
+    /// overwrites a key its queries need); otherwise the ring snapshot is restored when it covers it.
+    pub fn rewind(&mut self, prompt: &[i32], s: &Stream) -> Result<usize> {
+        const REACH: usize = SWA_RING - WINDOW;
         let common = self.tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
         let p = common.min(prompt.len().saturating_sub(1));
-        if self.tokens.len() > p + SWA_RING - WINDOW - MAX_CHUNK { 0 } else { p }
+        let live = if self.tokens.len() <= p + REACH { p } else { 0 };
+        let snap = match &self.snap {
+            Some((e, _)) if *e <= self.tokens.len() && p + REACH >= *e => p.min(*e),
+            _ => 0,
+        };
+        let keep = if snap > live {
+            self.restore(s)?;
+            snap
+        } else {
+            live
+        };
+        if self.snap.as_ref().is_some_and(|(e, _)| keep < *e) {
+            self.snap = None;
+        }
+        self.tokens.truncate(keep);
+        Ok(keep)
+    }
+
+    /// Remembers the rings at the current position (after a prompt).
+    pub fn snapshot(&mut self, model: &FlintModel, s: &Stream) -> Result<()> {
+        let ring = SWA_RING * HKV * HD * 2;
+        let n = model.layers.iter().filter(|l| l.sliding).count();
+        let buf = match self.snap.take() {
+            Some((_, b)) => b,
+            None => DeviceBuffer::new(2 * n * ring)?,
+        };
+        let mut at = 0;
+        for (i, layer) in model.layers.iter().enumerate() {
+            if layer.sliding {
+                s.copy_d2d(buf.addr() + at as u64, self.k[i].addr(), ring)?;
+                s.copy_d2d(buf.addr() + (at + ring) as u64, self.v[i].addr(), ring)?;
+                at += 2 * ring;
+            }
+        }
+        self.snap = Some((self.tokens.len(), buf));
+        Ok(())
+    }
+
+    fn restore(&mut self, s: &Stream) -> Result<()> {
+        let Some((_, buf)) = &self.snap else { return Ok(()) };
+        let ring = SWA_RING * HKV * HD * 2;
+        let mut at = 0;
+        for i in 0..self.k.len() {
+            if self.sliding[i] {
+                s.copy_d2d(self.k[i].addr(), buf.addr() + at as u64, ring)?;
+                s.copy_d2d(self.v[i].addr(), buf.addr() + (at + ring) as u64, ring)?;
+                at += 2 * ring;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -653,8 +709,7 @@ pub fn argmax(ws: &Workspace, rows: usize, s: &Stream) -> Result<Vec<i32>> {
 
 /// Prefills `prompt` beyond the reusable prefix in chunks; logits of the last token are left in `ws`.
 pub fn prefill(model: &FlintModel, ws: &Workspace, seq: &mut FlintSeq, prompt: &[i32], s: &Stream) -> Result<usize> {
-    let keep = seq.reusable(prompt);
-    seq.tokens.truncate(keep);
+    let keep = seq.rewind(prompt, s)?;
     let mut at = keep;
     while at < prompt.len() {
         let end = (at + MAX_CHUNK).min(prompt.len());

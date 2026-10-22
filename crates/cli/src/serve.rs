@@ -348,8 +348,7 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
         let result = (|| -> Result<(Finish, usize, usize)> {
             let p = &job.params;
             anyhow::ensure!(job.ids.len() < context, "prompt of {} tokens exceeds the context of {context}", job.ids.len());
-            let reused = seq.reusable(&job.ids);
-            seq.tokens.truncate(reused);
+            let reused = seq.rewind(&job.ids, s)?;
             let mut at = reused;
             while at < job.ids.len() {
                 let end = (at + fl::MAX_CHUNK).min(job.ids.len());
@@ -360,6 +359,7 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
                     (cb.0)(at, reused);
                 }
             }
+            seq.snapshot(model, s)?;
             let prefill = t0.elapsed().as_secs_f64();
             let budget = p.max_tokens.min(context - job.ids.len()).max(1);
             // Speculation with prompt-lookup drafts (request field "mtp", default on): the tokens that
@@ -384,8 +384,11 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
             let first = sampler.sample(s, ws.logits, fl::VOCAB, p, &generated)?;
             let mut done = emit(first, &mut generated, &mut hist);
             let mut pending = first;
+            // Draft length follows the request's recent acceptance rate (drafts that fail cost a larger step).
+            let mut rate = 0.5f64;
             while done.is_none() {
-                let room = (fl::MAX_STEP - 1).min(budget - generated.len());
+                let cap = if rate < 0.15 { 1 } else if rate < 0.35 { 2 } else if rate < 0.6 { 4 } else { fl::MAX_STEP - 1 };
+                let room = cap.min(budget - generated.len());
                 let draft = if lookup { crate::flint::lookup_draft(&hist, room) } else { Vec::new() };
                 let mut toks = Vec::with_capacity(draft.len() + 1);
                 toks.push(pending);
@@ -406,6 +409,9 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
                     break;
                 }
                 accepted += j;
+                if !draft.is_empty() {
+                    rate = 0.8 * rate + 0.2 * (j as f64 / draft.len() as f64);
+                }
                 // Keep the fed tokens that were accepted; the caches of the rest are overwritten later.
                 seq.tokens.truncate(before + 1 + j);
             }

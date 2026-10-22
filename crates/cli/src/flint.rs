@@ -289,7 +289,7 @@ pub fn lookup_draft(hist: &[i32], k: usize) -> Vec<i32> {
         return Vec::new();
     }
     let len = hist.len();
-    for n in [4usize, 3, 2] {
+    for n in [4usize, 3] {
         if len <= n {
             continue;
         }
