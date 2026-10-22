@@ -171,6 +171,13 @@ fn generate(dir: &Path, prompt: &str, raw: bool, n: usize, context: usize) -> Re
     fl::prefill(&model, &ws, &mut seq, &ids, &s)?;
     let mut next = fl::argmax(&ws, 1, &s)?[0];
     let prefill = t0.elapsed().as_secs_f64();
+    {
+        let (idx, val) = (quench6k_cuda::DeviceBuffer::new(32)?, quench6k_cuda::DeviceBuffer::new(32)?);
+        quench6k_cuda::kernels::topk(&s, ws.logits, 1, fl::VOCAB, fl::VOCAB, 5, false, idx.addr(), val.addr())?;
+        let (i, v) = (s.download::<i32>(idx.addr(), 5)?, s.download::<f32>(val.addr(), 5)?);
+        let top: Vec<String> = i.iter().zip(&v).map(|(t, l)| format!("{:?} {l:.3}", chat.decode(&[*t], false).unwrap_or_default())).collect();
+        println!("first-token top 5: {}", top.join(", "));
+    }
     let mut out = vec![next];
     let t1 = Instant::now();
     for _ in 1..n {
