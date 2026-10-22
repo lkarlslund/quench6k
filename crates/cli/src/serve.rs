@@ -1247,6 +1247,32 @@ mod tests {
         assert!(validate_calls(json_style, &tools()).is_ok(), "{:?}", validate_calls(json_style, &tools()));
     }
 
+    /// Flint: GLM-style calls and reasoning the model opens itself.
+    #[test]
+    fn flint_output() {
+        let call = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>";
+        assert!(validate_calls(call, &tools()).is_ok());
+        let (reasoning, content, calls) = parse_output(&format!("<think>Need the tool.</think>Checking.{call}"), false, Some(&tools()));
+        assert_eq!(reasoning.as_deref(), Some("Need the tool."));
+        assert_eq!(content, "Checking.");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"Oslo\",\"days\":3}");
+        assert!(validate_calls("<tool_call>get_weather<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>", &tools()).is_err());
+        // Streaming: the <think> opening is held until known, then reasoning and content separate.
+        let mut seg = Segmenter::new(false);
+        let mut out = String::new();
+        for piece in ["<th", "ink>", "plan", "</think>", "\n\nThe answer is forty-two."] {
+            for s in seg.feed(piece, &[]) {
+                match s {
+                    Seg::Reasoning(r) => out += &format!("R[{r}]"),
+                    Seg::Content(c) => out += &format!("C[{c}]"),
+                    _ => {}
+                }
+            }
+        }
+        // The last bytes of content wait for the end (a possible <tool_call>; see Segmenter::tail).
+        assert!(out.starts_with("R[plan]C[The answer"), "{out}");
+    }
+
     #[test]
     fn python_style_literals() {
         let tools = json!([{"type": "function", "function": {"name": "exec_command", "parameters": {"type": "object",
