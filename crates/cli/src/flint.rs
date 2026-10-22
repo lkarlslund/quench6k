@@ -203,20 +203,25 @@ fn generate(dir: &Path, prompt: &str, raw: bool, n: usize, context: usize) -> Re
     Ok(())
 }
 
-/// Host-side sampling from a logits row: the top candidates come from the device; penalties,
-/// temperature, top-k, min-p and top-p apply to them.
+/// Host-side sampling: the top candidates of up to MAX_ROWS logits rows come from the device in one
+/// kernel and one download ([`Sampler::fetch`]); penalties, temperature, top-k, min-p and top-p apply to
+/// them per row ([`Sampler::pick`]).
 pub struct Sampler {
-    idx: quench6k_cuda::DeviceBuffer,
-    val: quench6k_cuda::DeviceBuffer,
+    /// Candidate ids [rows, pool] (i32) followed by their logits [rows, pool] (f32).
+    buf: quench6k_cuda::DeviceBuffer,
+    ids: Vec<i32>,
+    vals: Vec<f32>,
+    pool: usize,
     state: u64,
     seed: Option<u64>,
 }
 
 const POOL: usize = 256;
+const MAX_ROWS: usize = 8;
 
 impl Sampler {
     pub fn new() -> Result<Self> {
-        Ok(Self { idx: quench6k_cuda::DeviceBuffer::new(POOL * 4)?, val: quench6k_cuda::DeviceBuffer::new(POOL * 4)?, state: 0, seed: None })
+        Ok(Self { buf: quench6k_cuda::DeviceBuffer::new(MAX_ROWS * POOL * 8)?, ids: Vec::new(), vals: Vec::new(), pool: 1, state: 0, seed: None })
     }
 
     fn uniform(&mut self) -> f64 {
@@ -228,21 +233,33 @@ impl Sampler {
         (z >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    /// The next token for logits row `logits` (n columns); `generated`: this request's output so far.
-    pub fn sample(&mut self, s: &quench6k_cuda::Stream, logits: u64, n: usize, p: &quench6k_engine::session::GenParams, generated: &[i32]) -> Result<i32> {
-        use quench6k_cuda::kernels as k;
+    /// The candidates of `rows` consecutive logits rows at `logits` (n columns each).
+    pub fn fetch(&mut self, s: &quench6k_cuda::Stream, logits: u64, rows: usize, n: usize, p: &quench6k_engine::session::GenParams) -> Result<()> {
+        anyhow::ensure!(rows <= MAX_ROWS, "{rows} rows to sample");
+        let penalized = p.presence_penalty != 0.0 || p.repetition_penalty != 1.0;
+        let greedy = p.temperature <= 0.0 || p.top_k == 1;
+        let pool = if greedy && !penalized { 1 } else if p.top_k == 0 { POOL } else { p.top_k.max(if penalized { 64 } else { 1 }).min(POOL) };
+        let (idx, val) = (self.buf.addr(), self.buf.addr() + (rows * pool * 4) as u64);
+        quench6k_cuda::kernels::topk(s, logits, rows, n, n, pool, false, idx, val)?;
+        let raw = s.download::<u32>(idx, 2 * rows * pool)?;
+        self.ids = raw[..rows * pool].iter().map(|&v| v as i32).collect();
+        self.vals = raw[rows * pool..].iter().map(|&v| f32::from_bits(v)).collect();
+        self.pool = pool;
+        Ok(())
+    }
+
+    /// The next token from fetched row `row`; `generated`: this request's output so far.
+    pub fn pick(&mut self, row: usize, p: &quench6k_engine::session::GenParams, generated: &[i32]) -> i32 {
         if generated.is_empty() || self.seed != Some(p.seed) {
             self.seed = Some(p.seed);
             self.state = p.seed;
         }
+        let pool = self.pool;
+        let ids = &self.ids[row * pool..(row + 1) * pool];
+        let mut vals = self.vals[row * pool..(row + 1) * pool].to_vec();
         let penalized = p.presence_penalty != 0.0 || p.repetition_penalty != 1.0;
-        let greedy = p.temperature <= 0.0 || p.top_k == 1;
-        let pool = if greedy && !penalized { 1 } else if p.top_k == 0 { POOL } else { p.top_k.max(if penalized { 64 } else { 1 }).min(POOL) };
-        k::topk(s, logits, 1, n, n, pool, false, self.idx.addr(), self.val.addr())?;
-        let ids = s.download::<i32>(self.idx.addr(), pool)?;
-        let mut vals = s.download::<f32>(self.val.addr(), pool)?;
         if penalized {
-            for (v, id) in vals.iter_mut().zip(&ids) {
+            for (v, id) in vals.iter_mut().zip(ids) {
                 if generated.contains(id) {
                     *v -= p.presence_penalty;
                     *v = if *v > 0.0 { *v / p.repetition_penalty } else { *v * p.repetition_penalty };
@@ -251,8 +268,8 @@ impl Sampler {
         }
         let mut order: Vec<usize> = (0..pool).collect();
         order.sort_by(|&a, &b| vals[b].total_cmp(&vals[a]).then(ids[a].cmp(&ids[b])));
-        if greedy {
-            return Ok(ids[order[0]]);
+        if p.temperature <= 0.0 || p.top_k == 1 {
+            return ids[order[0]];
         }
         let keep = if p.top_k == 0 { pool } else { p.top_k.min(pool) };
         let order = &order[..keep];
@@ -278,14 +295,15 @@ impl Sampler {
             }
         }
         let total: f64 = probs[..cut].iter().sum();
+        let ids: Vec<i32> = order.iter().map(|&i| ids[i]).collect();
         let mut r = self.uniform() * total;
         for (i, q) in probs[..cut].iter().enumerate() {
             r -= q;
             if r <= 0.0 {
-                return Ok(ids[order[i]]);
+                return ids[i];
             }
         }
-        Ok(ids[order[cut - 1]])
+        ids[cut - 1]
     }
 }
 

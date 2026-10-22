@@ -385,7 +385,8 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
                 }
                 (generated.len() >= budget).then_some(Finish::Length)
             };
-            let first = sampler.sample(s, ws.logits, fl::VOCAB, p, &generated)?;
+            sampler.fetch(s, ws.logits, 1, fl::VOCAB, p)?;
+            let first = sampler.pick(0, p, &generated);
             let mut done = emit(first, &mut generated, &mut hist);
             let mut pending = first;
             // Draft length follows the request's recent acceptance rate (drafts that fail cost a larger step).
@@ -401,9 +402,10 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
                 fl::step(model, &mut ws, &mut seq, &toks, s)?;
                 steps += 1;
                 drafted += draft.len();
+                sampler.fetch(s, ws.logits, toks.len(), fl::VOCAB, p)?;
                 let mut j = 0;
                 loop {
-                    let tok = sampler.sample(s, ws.logits + (j * fl::VOCAB * 4) as u64, fl::VOCAB, p, &generated)?;
+                    let tok = sampler.pick(j, p, &generated);
                     done = emit(tok, &mut generated, &mut hist);
                     if done.is_none() && j < draft.len() && tok == draft[j] {
                         j += 1;
