@@ -191,9 +191,9 @@ struct __align__(16) AttnSmem8 {
     float ks[AT_KEYS], vs[AT_KEYS];
 };
 
-// At least this many key tiles per split: splits beyond tiles / AT_MIN_TILES exit at once, so the split
+// At least this many key tiles per split (variant flint.attn_min_tiles): splits beyond tiles / min exit at once, so the split
 // count follows the position (read on the device: graph steps stay valid).
-constexpr int AT_MIN_TILES = 4;
+constexpr int AT_MIN_TILES_DEFAULT = 1;
 
 // DEC (steps of at most 2 tokens, 16 rows): the four warps share rows 0..15 and each takes 16 keys of
 // every tile; their states combine through shared memory at the end.
@@ -201,7 +201,7 @@ template <bool F8, bool DEC>
 __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const __nv_bfloat16* kc,
                                                    const __nv_bfloat16* vc, int T, const int* start_p, int window,
                                                    int mask, int splits, float* part_o, float* part_ml, const float* sinks,
-                                                   int* tickets, __nv_bfloat16* out, int f8_rows) {
+                                                   int* tickets, __nv_bfloat16* out, int f8_rows, int min_tiles) {
     pdl_launch_dependents();
     pdl_wait();
     const int start = *start_p;
@@ -217,7 +217,7 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
     const int k_begin_all = window > 0 ? max(0, p_lo - window + 1) : 0;
     const int k_end_all = p_hi + 1;
     const int tiles_all = (k_end_all - k_begin_all + AT_KEYS - 1) / AT_KEYS;
-    const int se = max(1, min(splits, tiles_all / AT_MIN_TILES));
+    const int se = max(1, min(splits, tiles_all / min_tiles));
     if (split >= se) return;
     const int per = (tiles_all + se - 1) / se;
     const int t_begin = split * per, t_end = min(tiles_all, t_begin + per);
@@ -516,7 +516,7 @@ __global__ void __launch_bounds__(128) attn_kernel(const __nv_bfloat16* q, const
 // out[t, h * 128 + d] = bf16(sum_s 2^(m_s - M) o_s / (sum_s 2^(m_s - M) l_s + 2^(sink_h log2 e - M))).
 // Grid T * HQ, 128 threads.
 __global__ void __launch_bounds__(128) attn_merge_kernel(const float* part_o, const float* part_ml, int splits, const float* sinks,
-                                                         int T, const int* start_p, int window, __nv_bfloat16* out) {
+                                                         int T, const int* start_p, int window, __nv_bfloat16* out, int min_tiles) {
     pdl_launch_dependents();
     pdl_wait();
     const int row = blockIdx.x, h = row % HQ, d = threadIdx.x;
@@ -525,7 +525,7 @@ __global__ void __launch_bounds__(128) attn_merge_kernel(const float* part_o, co
     const int p_lo = *start_p + tok0, p_hi = p_lo + ntok - 1;
     const int k_begin_all = window > 0 ? max(0, p_lo - window + 1) : 0;
     const int tiles_all = (p_hi + 1 - k_begin_all + AT_KEYS - 1) / AT_KEYS;
-    const int se = max(1, min(splits, tiles_all / AT_MIN_TILES));
+    const int se = max(1, min(splits, tiles_all / min_tiles));
     const float* ml = part_ml + (size_t)row * splits * 2;
     const float* po = part_o + (size_t)row * splits * HD;
     const float sink = sinks[h] * 1.4426950408889634f;
@@ -1046,7 +1046,6 @@ __global__ void __launch_bounds__(GV_WARPS * 32) moe_gate_up2_kernel(const __nv_
     __shared__ __align__(16) __nv_bfloat16 xs[D];
     pdl_wait();
     const int pair = blockIdx.x, t = pair / S, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int i = threadIdx.x; i < D / 8; i += blockDim.x) reinterpret_cast<uint4*>(xs)[i] = reinterpret_cast<const uint4*>(xn + (size_t)t * D)[i];
     const int e = sel_e[pair];
     const int n0 = blockIdx.y * 16 + warp * 2;
     const uint8_t* mc[2] = {reinterpret_cast<const uint8_t*>(gw[e]), reinterpret_cast<const uint8_t*>(uw[e])};
@@ -1063,6 +1062,8 @@ __global__ void __launch_bounds__(GV_WARPS * 32) moe_gate_up2_kernel(const __nv_
                 c[m][r][u] = ld_stream_u2(mc[m] + (size_t)(n0 + r) * (D / 2) + k / 2);
                 sc[m][r][u] = ms[m][(size_t)(n0 + r) * (D / 16) + k / 16];
             }
+    // Stage the token's row while the weights are in flight.
+    for (int i = threadIdx.x; i < D / 8; i += blockDim.x) reinterpret_cast<uint4*>(xs)[i] = reinterpret_cast<const uint4*>(xn + (size_t)t * D)[i];
     __syncthreads();
     float v[4] = {};  // slot m * 2 + r
 #pragma unroll
@@ -1292,20 +1293,21 @@ cudaError_t quench6k_flint_attention(const void* q, const void* kc, const void* 
     const dim3 grid((T * GROUP + AT_ROWS - 1) / AT_ROWS, HKV, splits);
     const bool fused = sq_variant("flint.attn_fused_merge", 0) != 0;
     const bool dec = T <= 2 && sq_variant("flint.attn_dec", 1) != 0;
+    const int min_tiles = max(1, sq_variant("flint.attn_min_tiles", AT_MIN_TILES_DEFAULT));
     const __nv_bfloat16 *qb = static_cast<const __nv_bfloat16*>(q), *kb = static_cast<const __nv_bfloat16*>(kc), *vb = static_cast<const __nv_bfloat16*>(vc);
     int* tk = fused && !dec ? tickets : nullptr;
     __nv_bfloat16* ob = static_cast<__nv_bfloat16*>(out);
     if (f8_rows && dec)
-        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, true>, grid, 128, sizeof(AttnSmem8), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, f8_rows));
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, true>, grid, 128, sizeof(AttnSmem8), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, f8_rows, min_tiles));
     else if (f8_rows)
-        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, false>, grid, 128, sizeof(AttnSmem8), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, f8_rows));
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, false>, grid, 128, sizeof(AttnSmem8), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, f8_rows, min_tiles));
     else if (dec)
-        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, true>, grid, 128, sizeof(AttnSmem), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, 0));
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, true>, grid, 128, sizeof(AttnSmem), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, 0, min_tiles));
     else
-        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, false>, grid, 128, sizeof(AttnSmem), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, 0));
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, false>, grid, 128, sizeof(AttnSmem), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, 0, min_tiles));
     if (!fused || dec)
         SQ_CHECK_LAUNCH(fl_launch(8, attn_merge_kernel, T * HQ, 128, 0, st, (const float*)part_o, (const float*)part_ml, splits, sinks, T, start,
-                                  window, static_cast<__nv_bfloat16*>(out)));
+                                  window, static_cast<__nv_bfloat16*>(out), min_tiles));
     SQ_RETURN_LAUNCH();
 }
 
