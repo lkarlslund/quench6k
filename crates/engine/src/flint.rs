@@ -302,6 +302,8 @@ impl FlintModel {
 /// A sequence's KV caches: full layers [capacity, 4, 128] BF16, sliding layers a ring of SWA_RING rows.
 pub struct FlintSeq {
     pub capacity: usize,
+    /// Full-attention caches are FP8 (E4M3 with a scale per position and head) instead of BF16.
+    pub fp8: bool,
     pub tokens: Vec<i32>,
     pub k: Vec<DeviceBuffer>,
     pub v: Vec<DeviceBuffer>,
@@ -311,14 +313,21 @@ pub struct FlintSeq {
 
 impl FlintSeq {
     pub fn new(model: &FlintModel, capacity: usize) -> Result<Self> {
+        let fp8 = crate::forward::KV_FP8.load(std::sync::atomic::Ordering::Relaxed);
         let mut k = Vec::with_capacity(LAYERS);
         let mut v = Vec::with_capacity(LAYERS);
         for layer in &model.layers {
-            let rows = if layer.sliding { SWA_RING } else { capacity };
-            k.push(DeviceBuffer::new(rows * HKV * HD * 2)?);
-            v.push(DeviceBuffer::new(rows * HKV * HD * 2)?);
+            let bytes = if layer.sliding {
+                SWA_RING * HKV * HD * 2
+            } else if fp8 {
+                capacity * HKV * (HD + 4)
+            } else {
+                capacity * HKV * HD * 2
+            };
+            k.push(DeviceBuffer::new(bytes)?);
+            v.push(DeviceBuffer::new(bytes)?);
         }
-        Ok(Self { capacity, tokens: Vec::new(), k, v, graph: None })
+        Ok(Self { capacity, fp8, tokens: Vec::new(), k, v, graph: None })
     }
 
     /// Positions of `prompt` whose state can be kept: the common prefix with the cached tokens, provided
@@ -531,8 +540,9 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
             ((ws.qf, HQ * HD), (ws.kf, HKV * HD), (ws.vf, HKV * HD))
         };
         let (mask, window) = if layer.sliding { ((SWA_RING - 1) as i32, WINDOW) } else { (i32::MAX, 0) };
+        let f8_rows = if seq.fp8 && !layer.sliding { seq.capacity } else { 0 };
         checkpoint(s, "qkv")?;
-        fk::qk_prep(s, qi, ki, vi, layer.q_norm, layer.k_norm, layer.rope, ws.start, mask, t, ws.qb, seq.k[li].addr(), seq.v[li].addr())?;
+        fk::qk_prep(s, qi, ki, vi, layer.q_norm, layer.k_norm, layer.rope, ws.start, mask, f8_rows, t, ws.qb, seq.k[li].addr(), seq.v[li].addr())?;
         checkpoint(s, "qk_prep")?;
         // Steps of few tokens always split the keys MAX_SPLITS ways, so that eager and graph steps
         // sum in the same order (empty splits exit at once).
@@ -540,7 +550,7 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
             Some(start) if !small => splits_for(t, start, window),
             _ => MAX_SPLITS,
         };
-        fk::attention(s, ws.qb, seq.k[li].addr(), seq.v[li].addr(), t, ws.start, window, mask, splits, layer.sinks, ws.part_o, ws.part_ml, ws.attn_tickets, ws.attn)?;
+        fk::attention(s, ws.qb, seq.k[li].addr(), seq.v[li].addr(), t, ws.start, window, mask, splits, layer.sinks, ws.part_o, ws.part_ml, ws.attn_tickets, ws.attn, f8_rows)?;
         checkpoint(s, "attention")?;
         if small {
             fk::gemv(s, ws.attn, None, t, &[layer.o], ws.h, D, true)?;
