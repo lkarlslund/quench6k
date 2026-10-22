@@ -31,6 +31,16 @@ impl Chat {
         env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
             Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
         });
+        if source.contains("ensure_ascii") {
+            // Templates written for Python's json.dumps (Flint's): ", " and ": " separators, non-ASCII
+            // kept, keyword arguments accepted.
+            env.add_filter("tojson", |v: minijinja::Value, kwargs: minijinja::value::Kwargs| -> Result<minijinja::Value, minijinja::Error> {
+                let _: Option<minijinja::Value> = kwargs.get("ensure_ascii")?;
+                kwargs.assert_all_used()?;
+                let json = serde_json::to_value(&v).map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))?;
+                Ok(minijinja::Value::from_safe_string(py_json(&json)))
+            });
+        }
         env.add_template_owned("chat", source)?;
         let mut stop_tokens = Vec::new();
         if let Ok(text) = std::fs::read_to_string(model_dir.join("generation_config.json")) {
@@ -87,6 +97,9 @@ impl Chat {
     /// Qwen3-VL processor's expansion).
     pub fn expand_media(&self, ids: &[i32], images: Vec<quench6k_engine::vision::VisionInput>, videos: Vec<quench6k_engine::vision::VideoClip>) -> Result<(Vec<i32>, Vec<std::sync::Arc<quench6k_engine::session::ImageInput>>)> {
         use quench6k_engine::session::ImageInput;
+        if images.is_empty() && videos.is_empty() {
+            return Ok((ids.to_vec(), Vec::new()));
+        }
         let token = |t: &str| self.token_id(t).ok_or_else(|| anyhow::anyhow!("tokenizer has no {t}"));
         let (pad, vpad, vstart, vend) = (token("<|image_pad|>")?, token("<|video_pad|>")?, token("<|vision_start|>")?, token("<|vision_end|>")?);
         let found = ids.iter().filter(|&&t| t == pad).count();
@@ -172,6 +185,15 @@ impl Chat {
     pub fn decode(&self, ids: &[i32], skip_special: bool) -> Result<String> {
         let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
         self.tokenizer.decode(&ids, skip_special).map_err(|e| anyhow!("detokenize: {e}"))
+    }
+}
+
+/// JSON as Python's `json.dumps(v, ensure_ascii=False)` writes it.
+fn py_json(v: &Value) -> String {
+    match v {
+        Value::Array(a) => format!("[{}]", a.iter().map(py_json).collect::<Vec<_>>().join(", ")),
+        Value::Object(o) => format!("{{{}}}", o.iter().map(|(k, v)| format!("{}: {}", Value::String(k.clone()), py_json(v))).collect::<Vec<_>>().join(", ")),
+        other => other.to_string(),
     }
 }
 

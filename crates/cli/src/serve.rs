@@ -114,8 +114,22 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         model_id: model_id(&opts.model),
     };
     let steering = steer.steering.is_some();
-    let vision = opts.vision;
+    let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model);
+    anyhow::ensure!(!(flint && steering), "steering packs are not supported for Flint");
+    let vision = opts.vision && !flint;
     std::thread::spawn(move || {
+        if flint {
+            match crate::flint::load(&model_dir) {
+                Ok((model, stream)) => {
+                    let _ = ready_tx.send(Ok(0.0));
+                    schedule_flint(&model, &stream, context, &jobs_rx);
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                }
+            }
+            return;
+        }
         let setup = (|| -> Result<_> {
             let (mut model, stream) = crate::load(&model_dir, Precision::Int8Group, true)?;
             let strength = steer.attach(&mut model, &stream)?;
@@ -310,6 +324,79 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
     }
 }
 
+/// The GPU worker for Flint checkpoints: one sequence, requests in turn (prefix reuse across requests),
+/// sampling on the host from the top candidates.
+fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda::Stream, context: usize, jobs: &mpsc::Receiver<Work>) {
+    use quench6k_engine::flint as fl;
+    let setup = || -> Result<_> { Ok((fl::Workspace::new(1)?, fl::FlintSeq::new(model, context)?, crate::flint::Sampler::new()?)) };
+    let (mut ws, mut seq, mut sampler) = match setup() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("flint worker: {e:#}");
+            return;
+        }
+    };
+    while let Ok(w) = jobs.recv() {
+        let job = match w {
+            Work::Persist(ack) => {
+                let _ = ack.send(());
+                continue;
+            }
+            Work::Generate(job) => job,
+        };
+        let t0 = std::time::Instant::now();
+        let result = (|| -> Result<(Finish, usize, usize)> {
+            let p = &job.params;
+            anyhow::ensure!(job.ids.len() < context, "prompt of {} tokens exceeds the context of {context}", job.ids.len());
+            let reused = seq.reusable(&job.ids);
+            seq.tokens.truncate(reused);
+            let mut at = reused;
+            while at < job.ids.len() {
+                let end = (at + fl::MAX_CHUNK).min(job.ids.len());
+                fl::forward(model, &ws, &mut seq, &job.ids[at..end], false, s)?;
+                at = end;
+                if let Some(cb) = &p.progress {
+                    s.synchronize()?;
+                    (cb.0)(at, reused);
+                }
+            }
+            let prefill = t0.elapsed().as_secs_f64();
+            let budget = p.max_tokens.min(context - job.ids.len()).max(1);
+            let mut generated = Vec::new();
+            let t1 = std::time::Instant::now();
+            let finish = loop {
+                let tok = sampler.sample(s, ws.logits, fl::VOCAB, p, &generated)?;
+                generated.push(tok);
+                if job.tx.send(Msg::Token(tok)).is_err() {
+                    break Finish::Cancelled;
+                }
+                if p.stop_tokens.contains(&tok) {
+                    break Finish::Stop;
+                }
+                if generated.len() >= budget {
+                    break Finish::Length;
+                }
+                fl::decode(model, &mut ws, &mut seq, tok, s)?;
+            };
+            let secs = t1.elapsed().as_secs_f64();
+            eprintln!("done: prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s), {:?}",
+                      job.ids.len(), reused, prefill, (job.ids.len() - reused) as f64 / prefill.max(1e-9), generated.len(), secs,
+                      generated.len().saturating_sub(1) as f64 / secs.max(1e-9), finish);
+            Ok((finish, reused, generated.len()))
+        })();
+        match result {
+            Ok((finish, reused, _)) => {
+                let _ = job.tx.send(Msg::Done(finish, reused));
+            }
+            Err(e) => {
+                // The sequence state may be partial: start over next time.
+                seq.tokens.clear();
+                let _ = job.tx.send(Msg::Error(format!("{e:#}")));
+            }
+        }
+    }
+}
+
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
     let mut data = vec![json!({"id": app.name, "object": "model", "owned_by": "quench6k"})];
     if let Some((name, _)) = &app.steered {
@@ -452,6 +539,11 @@ fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<quench6k_en
 }
 
 fn parse_output(text: &str, thinking: bool, tools: Option<&Value>) -> (Option<String>, String, Vec<Value>) {
+    // Models that decide per turn whether to reason (Flint) open their output with <think>.
+    let (thinking, text) = match text.trim_start().strip_prefix("<think>") {
+        Some(rest) if !thinking => (true, rest),
+        _ => (thinking, text),
+    };
     let (reasoning, rest) = if thinking {
         match think_end(text) {
             Some((i, j)) => (Some(text[..i].trim().to_string()), text[j..].trim_start()),
@@ -492,6 +584,29 @@ fn parse_tool_call(body: &str, tools: Option<&Value>) -> Option<Value> {
             _ => return None,
         };
         return Some(json!({"name": name, "arguments": args.to_string()}));
+    }
+    // Flint (GLM style): NAME<arg_key>ARG</arg_key><arg_value>value</arg_value>...
+    if body.contains("<arg_key>") || (!body.contains("<function=") && !body.contains('<')) {
+        let name = body[..body.find('<').unwrap_or(body.len())].trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let schema = tools.and_then(|t| t.as_array()).and_then(|a| {
+            a.iter().find(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) == Some(name.as_str()))
+        });
+        let mut args = serde_json::Map::new();
+        let mut cursor = 0;
+        while let Some(k) = body[cursor..].find("<arg_key>") {
+            let ks = cursor + k + "<arg_key>".len();
+            let ke = body[ks..].find("</arg_key>")? + ks;
+            let vs = body[ke..].find("<arg_value>")? + ke + "<arg_value>".len();
+            let ve = body[vs..].find("</arg_value>")? + vs;
+            let arg = body[ks..ke].trim().to_string();
+            let ty = schema.and_then(|s| s.pointer(&format!("/function/parameters/properties/{arg}/type"))).and_then(Value::as_str);
+            args.insert(arg, param_value(&body[vs..ve], ty));
+            cursor = ve + "</arg_value>".len();
+        }
+        return Some(json!({"name": name, "arguments": Value::Object(args).to_string()}));
     }
     let f = body.find("<function=")? + "<function=".len();
     let name_end = body[f..].find('>')? + f;
@@ -634,6 +749,18 @@ impl Segmenter {
         if apply_stops(&mut self.text, stops) {
             self.stopped = true;
         }
+        // A turn the model may open with <think>: hold the start until it is known.
+        if !self.thinking && !self.content_started && self.sent == 0 {
+            let lead = self.text.len() - self.text.trim_start().len();
+            let body = &self.text[lead..];
+            if body.starts_with("<think>") {
+                self.thinking = true;
+                self.in_reasoning = true;
+                self.sent = lead + "<think>".len();
+            } else if "<think>".starts_with(body) && !self.stopped {
+                return out;
+            }
+        }
         let (text, mut sent) = (&self.text, self.sent);
         loop {
             if self.in_reasoning {
@@ -743,7 +870,7 @@ async fn generate(app: &App, p: &Prepared, mut on_seg: impl FnMut(Seg)) -> Resul
         total += n;
         cached_first.get_or_insert(cached);
         let (Some(tools), Some(tc)) = (p.tools.as_ref(), app.tool_call_token) else { return Ok((seg, total, finish, cached_first.unwrap_or(0))) };
-        let body = if p.thinking { think_end(&seg.text).map(|(_, j)| &seg.text[j..]).unwrap_or("") } else { seg.text.as_str() };
+        let body = if seg.thinking { think_end(&seg.text).map(|(_, j)| &seg.text[j..]).unwrap_or("") } else { seg.text.as_str() };
         let problem = match validate_calls(body, tools) {
             // QUENCH6K_TEST_TOOL_RETRY: treat the first attempt's tool calls as invalid (exercises retries).
             Ok(()) if attempt == 0 && body.contains("<tool_call>") && std::env::var_os("QUENCH6K_TEST_TOOL_RETRY").is_some() => Some("forced by QUENCH6K_TEST_TOOL_RETRY".to_string()),
@@ -782,7 +909,7 @@ fn validate_calls(body: &str, tools: &Value) -> Result<(), String> {
         let end = body[b0..].find("</tool_call>").ok_or("unterminated <tool_call>")?;
         let block = &body[b0..b0 + end];
         let call = parse_tool_call(block, Some(tools)).ok_or("unparsable tool call")?;
-        if !block.contains("</function>") && !block.trim_start().starts_with('{') {
+        if block.contains("<function=") && !block.contains("</function>") {
             return Err("missing </function>".into());
         }
         let name = call["name"].as_str().unwrap_or("");

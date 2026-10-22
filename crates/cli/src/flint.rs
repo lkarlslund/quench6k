@@ -195,3 +195,89 @@ fn generate(dir: &Path, prompt: &str, raw: bool, n: usize, context: usize) -> Re
     );
     Ok(())
 }
+
+/// Host-side sampling from a logits row: the top candidates come from the device; penalties,
+/// temperature, top-k, min-p and top-p apply to them.
+pub struct Sampler {
+    idx: quench6k_cuda::DeviceBuffer,
+    val: quench6k_cuda::DeviceBuffer,
+    state: u64,
+    seed: Option<u64>,
+}
+
+const POOL: usize = 256;
+
+impl Sampler {
+    pub fn new() -> Result<Self> {
+        Ok(Self { idx: quench6k_cuda::DeviceBuffer::new(POOL * 4)?, val: quench6k_cuda::DeviceBuffer::new(POOL * 4)?, state: 0, seed: None })
+    }
+
+    fn uniform(&mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// The next token for logits row `logits` (n columns); `generated`: this request's output so far.
+    pub fn sample(&mut self, s: &quench6k_cuda::Stream, logits: u64, n: usize, p: &quench6k_engine::session::GenParams, generated: &[i32]) -> Result<i32> {
+        use quench6k_cuda::kernels as k;
+        if generated.is_empty() || self.seed != Some(p.seed) {
+            self.seed = Some(p.seed);
+            self.state = p.seed;
+        }
+        let penalized = p.presence_penalty != 0.0 || p.repetition_penalty != 1.0;
+        let greedy = p.temperature <= 0.0 || p.top_k == 1;
+        let pool = if greedy && !penalized { 1 } else if p.top_k == 0 { POOL } else { p.top_k.max(if penalized { 64 } else { 1 }).min(POOL) };
+        k::topk(s, logits, 1, n, n, pool, false, self.idx.addr(), self.val.addr())?;
+        let ids = s.download::<i32>(self.idx.addr(), pool)?;
+        let mut vals = s.download::<f32>(self.val.addr(), pool)?;
+        if penalized {
+            for (v, id) in vals.iter_mut().zip(&ids) {
+                if generated.contains(id) {
+                    *v -= p.presence_penalty;
+                    *v = if *v > 0.0 { *v / p.repetition_penalty } else { *v * p.repetition_penalty };
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..pool).collect();
+        order.sort_by(|&a, &b| vals[b].total_cmp(&vals[a]).then(ids[a].cmp(&ids[b])));
+        if greedy {
+            return Ok(ids[order[0]]);
+        }
+        let keep = if p.top_k == 0 { pool } else { p.top_k.min(pool) };
+        let order = &order[..keep];
+        let top = vals[order[0]];
+        let mut probs: Vec<f64> = order.iter().map(|&i| (((vals[i] - top) / p.temperature) as f64).exp()).collect();
+        if p.min_p > 0.0 {
+            for q in probs.iter_mut() {
+                if *q < p.min_p as f64 {
+                    *q = 0.0;
+                }
+            }
+        }
+        let total: f64 = probs.iter().sum();
+        let mut cut = probs.len();
+        if p.top_p < 1.0 {
+            let mut acc = 0.0;
+            for (i, q) in probs.iter().enumerate() {
+                acc += q / total;
+                if acc >= p.top_p as f64 {
+                    cut = i + 1;
+                    break;
+                }
+            }
+        }
+        let total: f64 = probs[..cut].iter().sum();
+        let mut r = self.uniform() * total;
+        for (i, q) in probs[..cut].iter().enumerate() {
+            r -= q;
+            if r <= 0.0 {
+                return Ok(ids[order[i]]);
+            }
+        }
+        Ok(ids[order[cut - 1]])
+    }
+}
