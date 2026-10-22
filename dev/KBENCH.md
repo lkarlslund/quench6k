@@ -391,3 +391,7 @@ Later the same day:
   2048: more rows per expert per GEMM. Prefill 17.9K -> 21.3K tok/s at 8K, +8% at 64K, +23% at 131K;
   decode unchanged; the reuse reach grows to 7679 positions. 8192-token chunks (ring 16384) add only
   2-3% for ~1.5 GB more workspace.
+- **L2 prefetch of the chosen experts** (tried, reverted): the router's last CTA issuing
+  `cp.async.bulk.prefetch.L2` for the 8 slots' gate/up/down weights (216 pieces of 64 KiB) made decode
+  45% slower (276 vs 501 tok/s at 512): issuing them serializes the router's tail, which the expert
+  kernels wait for.
