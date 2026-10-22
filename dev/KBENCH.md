@@ -383,3 +383,7 @@ Later the same day:
   heads) with 32-key tiles (`flint.attn_wide`, default on; 70 KB of shared memory): K/V tile traffic
   and FP8 conversion per FLOP halve. Prefill at 64K +6.5% (BF16 KV) / +6% (FP8). PPL moves by rounding
   only (2K chunks within 0.5% either way: 24.83 vs 24.93 overall; tiled corpus 1.0390 vs 1.0391).
+- **Two-term FP4 activations** (tried, reverted): NVFP4 of x plus NVFP4 of its residual under a
+  shared row scale, summed in one W4A4 GEMM over repeated weight k-tiles (K = 2 kw). PPL 25.18 / 15.18
+  vs 24.83 / 15.03 (W4A16), but prefill 17.1K vs 17.9K tok/s at 8K: with ~64 rows per expert per
+  2048-token chunk the FP4 kernel's 128-row tiles run half empty.
