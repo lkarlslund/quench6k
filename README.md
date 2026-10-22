@@ -61,14 +61,14 @@ greedy decoding of 128 tokens and FP8 KV from 64K up (BF16 KV below that):
 | Context | Prefill (tok/s) | | Decode (tok/s) | |
 |---:|---:|---:|---:|---:|
 | | quench6k | llama.cpp | quench6k | llama.cpp |
-| 512 | 7,818 | 5,691 | 479 | 252 |
-| 8,192 | 20,029 | 11,515 | 440 | 228 |
-| 65,536 | 12,413 | 7,991 | 330 | 188 |
-| 131,072 | 8,587 | 5,591 | 260 | 151 |
-| 260,000 | 5,261 | 3,462 | 187 | 110 |
+| 512 | 7,862 | 5,691 | 499 | 252 |
+| 8,192 | 20,377 | 11,515 | 452 | 228 |
+| 65,536 | 12,886 | 7,991 | 337 | 188 |
+| 131,072 | 8,982 | 5,591 | 264 | 151 |
+| 260,000 | 5,488 | 3,462 | 189 | 110 |
 
 llama.cpp at c7fc50941 (`llama-bench -fa 1 -ub 2048`, F16 KV). Prefill is the BF16 KV run (FP8 is
-5–20% slower there). Records: `bench/flint.jsonl`, `bench/flint-llamacpp.jsonl`.
+4–16% slower there). Records: `bench/flint.jsonl`, `bench/flint-llamacpp.jsonl`.
 
 ## Documentation
 
