@@ -52,12 +52,28 @@ Not supported: quantized attention or shared experts, compressed-tensors exports
 
 ## HTTP API
 
-- `GET /v1/models`
+- `GET /health`: `{"status": "ok"}` once the model is loaded.
+- `GET /v1/models`, `GET /v1/models/{id}`: the served model names, each with its context limit in
+  `max_model_len` (as vLLM) and `context_length` (as OpenRouter): `--context`.
 - `POST /v1/chat/completions`: OpenAI chat completions, streaming with `"stream": true`. Reasoning is
   returned in `reasoning_content`, tool calls in `tool_calls`; `usage.prompt_tokens_details.cached_tokens`
   counts prompt tokens served from the context cache.
 - `POST /v1/messages`: Anthropic messages (system, content blocks, `thinking`, `tool_use` /
   `tool_result`, `stop_sequences`), streaming with the Anthropic event types.
+- `POST /v1/messages/count_tokens`: `{"input_tokens": n}`, the prompt's tokens after the chat template
+  and image and video expansion.
+
+- `POST /v1/completions`: OpenAI (legacy) completions of a raw `prompt` (a string, special tokens
+  written as text, or a list of token ids), streaming with `"stream": true`. No chat template and no
+  reasoning or tool-call parsing; `logprobs`, `echo` and `n` > 1 are rejected.
+- `POST /tokenize`: `{"tokens": [...], "count": n, "max_model_len": c}` for `messages` (through the
+  chat template, as a chat request would be prompted) or a raw `prompt` / `content` string.
+- `POST /detokenize`: `{"tokens": [...]}` to text, returned as `prompt` (vLLM) and `content` (llama.cpp).
+- `GET /metrics`: Prometheus counters per slot (generations, prompt tokens, prompt tokens served from
+  the cache, generated tokens, prefill and decode seconds), failed generations, and the waiting and
+  running requests.
+
+A prompt of `--context` tokens or more is rejected with HTTP 400 and code `context_length_exceeded`.
 
 ### Request fields
 
@@ -121,6 +137,8 @@ the text before it is kept. While a tool call is being generated, streaming clie
 - The GPU holds the current conversation of each slot plus recurrent-state snapshots at turn
   boundaries and at intervals inside long prompts, so a follow-up turn or an edited prompt reuses
   the longest cached prefix.
+- A request starts on the free slot that holds the most of its prompt, or else on the one holding the
+  shorter conversation, so two conversations running side by side each keep their own slot.
 - When a request would overwrite a different conversation, that conversation's state is moved to
   pinned host memory (`--cache-host-gib`) and, with `--cache-dir`, to disk.
 - Stored contexts are keyed by their tokens (images by content) and are valid only for the model

@@ -129,49 +129,134 @@ pub enum Finish {
 
 pub struct Session {
     ws: Workspace,
-    state: SequenceState,
     hw: HeadWorkspace,
-    graph: DecodeGraph,
-    dec: SpecDecoder,
-    spec: SpecGraphs,
-    /// Slot 0's penalty history (the speculative graphs read it).
-    pen: Penalties,
+    /// The slots' sequences: the main slot, and the second slot for a concurrent request.
+    lanes: Vec<Lane>,
+    /// Graphs that step both slots together (with the second slot).
+    pair: Option<Pair>,
     chunk: usize,
     capacity: usize,
     top_idx: DeviceBuffer,
     top_val: DeviceBuffer,
-    /// Tokens whose attention K/V are cached at their positions (the committed sequence).
-    kv_tokens: Vec<i32>,
-    /// Recurrent-state snapshots at prompt positions, oldest first.
-    snapshots: Vec<Snapshot>,
-    /// Prompt tokens served from a snapshot in the last request.
-    pub reused: usize,
-    /// Steering strength the cached state was computed with (reuse needs the same strength).
-    kv_strength: f32,
-    /// Host and disk tiers of stored contexts.
+    /// Host and disk tiers of stored contexts, shared by the slots.
     store: ContextStore,
-    /// The second slot for a concurrent request (speculative or plain, without the prefix cache).
-    aux: Option<Aux>,
     /// Activation capture records (two sites x 48 layers), and the prompt_last site of the current run.
     capture_buf: Option<DeviceBuffer>,
     prompt_site: Option<CaptureSite>,
     vision: Option<crate::vision::VisionModel>,
-    /// Prompt positions whose `kv_tokens` entry is an image's content key instead of its placeholder
-    /// ID (the first placeholder of each image), so the cache matches images by content.
-    kv_marks: Vec<(usize, i32)>,
 }
 
-struct Aux {
+/// One slot's sequence: its state, decoder, graphs and penalty history, and its prefix cache (the
+/// tokens its attention caches hold and recurrent-state snapshots along them).
+struct Lane {
     state: SequenceState,
     graph: DecodeGraph,
     dec: SpecDecoder,
     spec: SpecGraphs,
+    /// The penalty history (the speculative graphs read it).
+    pen: Penalties,
+    /// Tokens whose attention K/V are cached at their positions (the committed sequence).
+    kv_tokens: Vec<i32>,
+    /// Prompt positions whose `kv_tokens` entry is an image's content key instead of its placeholder
+    /// ID (the first placeholder of each image), so the cache matches images by content.
+    kv_marks: Vec<(usize, i32)>,
+    /// Recurrent-state snapshots at prompt positions, oldest first.
+    snapshots: Vec<Snapshot>,
+    /// Steering strength the cached state was computed with (reuse needs the same strength).
+    kv_strength: f32,
+    /// Prompt tokens served from the cache in the slot's last request.
+    reused: usize,
+}
+
+/// Rounds and steps of both slots together.
+struct Pair {
     /// Speculative rounds of both slots together.
     pair: crate::spec::PairGraphs,
     batch: BatchGraph,
     hw2: HeadWorkspace,
     _out2: DeviceBuffer,
-    pen: Penalties,
+}
+
+impl Lane {
+    #[allow(clippy::too_many_arguments)]
+    fn new(model: &Model, ws: &mut Workspace, hw: &HeadWorkspace, s: &Stream, capacity: usize, max_drafts: usize, chunk: usize, slot: usize) -> Result<Self> {
+        let mut state = SequenceState::with_mtp(capacity, true)?;
+        // A one-token prompt to bring the sequence into a valid state for capture.
+        let dec = SpecDecoder::prefill(model, &mut state, ws, s, &[0], max_drafts, chunk)?;
+        let graph = DecodeGraph::capture(model, &state, ws, hw, s)?;
+        let pen = Penalties::new()?;
+        let spec = SpecGraphs::capture(model, &state, ws, &dec, s, true, Some(pen.addrs()), Some(slot))?;
+        Ok(Self { state, graph, dec, spec, pen, kv_tokens: Vec::new(), kv_marks: Vec::new(), snapshots: Vec::new(), kv_strength: 0.0, reused: 0 })
+    }
+
+    /// `kv_tokens` for the sequence: its tokens with image placeholders keyed by content.
+    fn sync_kv_tokens(&mut self) {
+        self.kv_tokens = keyed(&self.state.tokens, &self.kv_marks);
+    }
+
+    fn pieces(&self) -> Vec<(u64, usize)> {
+        recurrent_pieces(&self.state, self.dec.pending_addr())
+    }
+
+    /// The live cache pieces holding positions [0, len): position table, then per attention cache (the
+    /// target's QSA layers, then the drafter's) K, V, index keys and pooled index groups.
+    fn kv_pieces(&self, len: usize) -> Vec<(u64, usize)> {
+        use crate::forward::QsaCache;
+        let mut v = vec![(self.state.pos3.addr(), len * 3 * 4)];
+        let caches: Vec<&QsaCache> = self.state.qsa.iter().flatten().chain(self.state.mtp_qsa.iter()).collect();
+        for c in caches {
+            let per = |b: &DeviceBuffer, rows: usize, total_rows: usize| (b.addr(), b.bytes() / total_rows * rows);
+            let cap = self.state.capacity;
+            v.push(per(&c.k, len, cap));
+            v.push(per(&c.v, len, cap));
+            v.push(per(&c.raw, len, cap));
+            v.push(per(&c.pooled, len / 4, cap / 4));
+        }
+        v
+    }
+
+    fn restore_snapshot(&self, s: &Stream, snap: &Snapshot) -> Result<()> {
+        let mut off = 0u64;
+        for (addr, bytes) in self.pieces() {
+            s.copy_d2d(addr, snap.buf.addr() + off, bytes)?;
+            off += bytes as u64;
+        }
+        Ok(())
+    }
+
+    /// The largest snapshot position within the cached prefix shared with `key` (and short of its end).
+    fn cached_prefix(&self, key: &[i32]) -> usize {
+        let lcp = self.kv_tokens.iter().zip(key).take_while(|(a, b)| a == b).count();
+        self.snapshots.iter().filter(|sn| sn.pos <= lcp && sn.pos < key.len()).map(|sn| sn.pos).max().unwrap_or(0)
+    }
+}
+
+/// The pieces of the recurrent state, as (device address, bytes); `pending` is the speculative
+/// decoder's pending row.
+fn recurrent_pieces(state: &SequenceState, pending: u64) -> Vec<(u64, usize)> {
+    let mut v: Vec<(u64, usize)> = state.gdn.iter().flatten().flat_map(|g| [(g.conv.addr(), g.conv.bytes()), (g.recurrent.addr(), g.recurrent.bytes())]).collect();
+    v.push((state.ple_conv.addr(), state.ple_conv.bytes()));
+    v.push((pending, crate::model::H * 4));
+    v
+}
+
+fn snapshot_bytes(state: &SequenceState, pending: u64) -> usize {
+    recurrent_pieces(state, pending).iter().map(|p| p.1).sum()
+}
+
+fn save_snapshot(state: &SequenceState, pending: u64, s: &Stream, pos: usize, recycled: Option<DeviceBuffer>) -> Result<Snapshot> {
+    let pieces = recurrent_pieces(state, pending);
+    let total: usize = pieces.iter().map(|p| p.1).sum();
+    let buf = match recycled {
+        Some(b) if b.bytes() >= total => b,
+        _ => DeviceBuffer::new(total)?,
+    };
+    let mut off = 0u64;
+    for (addr, bytes) in pieces {
+        s.copy_d2d(buf.addr() + off, addr, bytes)?;
+        off += bytes as u64;
+    }
+    Ok(Snapshot { pos, buf, periodic: false })
 }
 
 /// A slot's repetition/presence penalty history on the device: the request's parameters, flags per
@@ -242,12 +327,12 @@ impl Penalties {
 
 const CAPTURE_LAYER_BYTES: usize = forward::CaptureLayout::BYTES;
 
-/// A request in progress on a slot (0: the main slot with MTP and the prefix cache; 1: the plain slot).
+/// A request in progress on a slot (0: the main slot; 1: the second slot).
 pub struct Run {
     pub slot: usize,
     pub params: GenParams,
     pub produced: usize,
-    /// Speculative (slot 0, greedy, alone) or plain one-token steps.
+    /// Speculative rounds or plain one-token steps.
     spec: bool,
     /// Plain mode: the token to feed next (already emitted).
     pending: i32,
@@ -299,35 +384,21 @@ impl Session {
     pub fn new(model: &Model, s: &Stream, capacity: usize, chunk: usize, max_drafts: usize, store: StoreOptions) -> Result<Self> {
         let slack = 2 * (max_drafts + 2) + 16;
         let mut ws = Workspace::for_model(&model, chunk, capacity + slack)?;
-        let mut state = SequenceState::with_mtp(capacity + slack, true)?;
         let hw = HeadWorkspace::new(1, MAX_TOP_K)?;
-        // A one-token prompt to bring the sequence into a valid state for capture.
-        let dec = SpecDecoder::prefill(model, &mut state, &mut ws, s, &[0], max_drafts, chunk)?;
-        let graph = DecodeGraph::capture(model, &state, &ws, &hw, s)?;
-        let pen = Penalties::new()?;
-        let spec = SpecGraphs::capture(model, &state, &mut ws, &dec, s, true, Some(pen.addrs()), Some(0))?;
+        let lane = Lane::new(model, &mut ws, &hw, s, capacity + slack, max_drafts, chunk, 0)?;
         Ok(Self {
             ws,
-            state,
             hw,
-            graph,
-            dec,
-            spec,
-            pen,
+            lanes: vec![lane],
+            pair: None,
             chunk,
             capacity,
             top_idx: DeviceBuffer::new(MAX_TOP_K * 4)?,
             top_val: DeviceBuffer::new(MAX_TOP_K * 4)?,
-            kv_tokens: Vec::new(),
-            snapshots: Vec::new(),
-            reused: 0,
-            kv_strength: 0.0,
             store: ContextStore::open(store)?,
-            aux: None,
             capture_buf: None,
             prompt_site: None,
             vision: None,
-            kv_marks: Vec::new(),
         })
     }
 
@@ -353,33 +424,29 @@ impl Session {
             return Ok(None);
         }
         let buf = self.capture_buf()? + (crate::model::LAYERS * CAPTURE_LAYER_BYTES) as u64;
-        let state = if run.slot == 0 { &mut self.state } else { &mut self.aux.as_mut().expect("second slot").state };
-        let pos = state.len();
+        let lane = &mut self.lanes[run.slot];
+        let pos = lane.state.len();
         self.ws.capture = Some(forward::CaptureTarget { pos, buf });
-        let r = forward::forward(model, state, &mut self.ws, s, &[run.pending]);
+        let r = forward::forward(model, &mut lane.state, &mut self.ws, s, &[run.pending]);
         self.ws.capture = None;
         r?;
         forward::head_logits(model, &self.hw, s, self.ws.out)?;
-        if run.slot == 0 {
-            self.sync_kv_tokens();
-        }
+        lane.sync_kv_tokens();
         let site = self.read_site(s, "completion_last", buf, pos, run.pending, self.hw.logits_addr())?;
         Ok(Some(CaptureResult { sites: vec![prompt_site, site] }))
     }
 
-    /// Adds the second slot: speculative decoding of its own, pair rounds with the main slot when both
-    /// decode speculatively, batched plain steps otherwise.
+    /// Adds the second slot: speculative decoding and a prefix cache of its own, pair rounds with the
+    /// main slot when both decode speculatively, batched plain steps otherwise.
     pub fn enable_second_slot(&mut self, model: &Model, s: &Stream) -> Result<()> {
-        let mut state = SequenceState::with_mtp(self.state.capacity, true)?;
-        let dec = SpecDecoder::prefill(model, &mut state, &mut self.ws, s, &[0], self.dec.drafts, self.chunk)?;
-        let graph = DecodeGraph::capture(model, &state, &self.ws, &self.hw, s)?;
-        let pen = Penalties::new()?;
-        let spec = SpecGraphs::capture(model, &state, &mut self.ws, &dec, s, true, Some(pen.addrs()), Some(1))?;
-        let pair = crate::spec::PairGraphs::capture(model, [&self.state, &state], &mut self.ws, s, self.dec.drafts)?;
+        let (capacity, drafts) = (self.lanes[0].state.capacity, self.lanes[0].dec.drafts);
+        let lane = Lane::new(model, &mut self.ws, &self.hw, s, capacity, drafts, self.chunk, 1)?;
+        let pair = crate::spec::PairGraphs::capture(model, [&self.lanes[0].state, &lane.state], &mut self.ws, s, drafts)?;
         let hw2 = HeadWorkspace::new(2, MAX_TOP_K)?;
         let out2 = DeviceBuffer::new(8)?;
-        let batch = BatchGraph::capture(model, &[&self.state, &state], &self.ws, &hw2, s, out2.addr())?;
-        self.aux = Some(Aux { state, graph, dec, spec, pair, batch, hw2, _out2: out2, pen });
+        let batch = BatchGraph::capture(model, &[&self.lanes[0].state, &lane.state], &self.ws, &hw2, s, out2.addr())?;
+        self.lanes.push(lane);
+        self.pair = Some(Pair { pair, batch, hw2, _out2: out2 });
         Ok(())
     }
 
@@ -398,14 +465,17 @@ impl Session {
     fn encode_images(&mut self, s: &Stream, images: &[std::sync::Arc<ImageInput>], from: usize) -> Result<Vec<std::sync::Arc<forward::MmSpan>>> {
         loop {
             match self.encode_images_once(s, images, from) {
-                Err(e) if format!("{e:#}").contains("out of memory") && !self.snapshots.is_empty() => {
-                    let i = self.snapshots.iter().position(|sn| sn.periodic).unwrap_or(0);
-                    let pos = self.snapshots[i].pos;
-                    if !self.snapshots[i].periodic {
-                        self.stash(pos)?;
+                Err(e) if format!("{e:#}").contains("out of memory") && self.lanes.iter().any(|l| !l.snapshots.is_empty()) => {
+                    // A periodic snapshot of any slot, else the oldest of the slot holding the most.
+                    let periodic = self.lanes.iter().enumerate().find_map(|(k, l)| l.snapshots.iter().position(|sn| sn.periodic).map(|i| (k, i)));
+                    let (slot, i) = periodic.unwrap_or_else(|| (self.lanes.iter().enumerate().max_by_key(|(_, l)| l.snapshots.len()).unwrap().0, 0));
+                    let snap = &self.lanes[slot].snapshots[i];
+                    let (pos, periodic) = (snap.pos, snap.periodic);
+                    if !periodic {
+                        self.stash(slot, pos)?;
                     }
-                    self.snapshots.remove(i);
-                    eprintln!("image encoder out of memory: freed the snapshot at {pos}, retrying");
+                    self.lanes[slot].snapshots.remove(i);
+                    eprintln!("image encoder out of memory: freed the snapshot at {pos} of slot {slot}, retrying");
                 }
                 r => return r,
             }
@@ -427,106 +497,66 @@ impl Session {
 
     /// Speculative rounds and accepted drafts of a slot's run since its prefill.
     pub fn spec_stats(&self, slot: usize) -> (usize, usize) {
-        let dec = if slot == 0 { &self.dec } else { &self.aux.as_ref().expect("second slot").dec };
+        let dec = &self.lanes[slot].dec;
         (dec.rounds, dec.accepted)
     }
 
     pub fn has_second_slot(&self) -> bool {
-        self.aux.is_some()
+        self.lanes.len() > 1
+    }
+
+    /// Prompt tokens served from the cache in the last request on `slot`.
+    pub fn reused(&self, slot: usize) -> usize {
+        self.lanes[slot].reused
+    }
+
+    /// Prompt tokens of a request that `slot` holds on the GPU (its attention caches and a snapshot),
+    /// and the length of the context it holds: a scheduler admits to the free slot with the most of
+    /// the prompt, and otherwise overwrites the shortest context.
+    pub fn cached_prefix(&self, slot: usize, prompt: &[i32], p: &GenParams) -> (usize, usize) {
+        let lane = &self.lanes[slot];
+        let reusable = if lane.kv_strength == p.steering_strength { lane.cached_prefix(&keyed(prompt, &image_marks(&p.images))) } else { 0 };
+        (reusable, lane.kv_tokens.len())
     }
 
     /// Starts a request on `slot`: prefills and returns the run with the tokens to emit now (none for a
     /// speculative run, whose first round emits).
     pub fn begin(&mut self, model: &Model, s: &Stream, slot: usize, prompt: &[i32], p: &GenParams, speculate: bool) -> Result<(Run, Vec<i32>)> {
         ensure!(!prompt.is_empty(), "empty prompt");
+        ensure!(slot < self.lanes.len(), "no slot {slot}");
         ensure!(prompt.len() < self.capacity, "prompt of {} tokens exceeds the context of {}", prompt.len(), self.capacity);
         let budget = p.max_tokens.min(self.capacity - prompt.len());
         let mut run = Run { slot, params: p.clone(), produced: 0, spec: false, pending: 0, rng: Rng::new(p.seed), budget };
         let speculate = speculate && !p.capture;
         self.prompt_site = None;
         let capture = if p.capture { Some(forward::CaptureTarget { pos: prompt.len() - 1, buf: self.capture_buf()? }) } else { None };
-        if slot == 0 {
-            self.state.reset(s)?;
-            self.state.set_steering_strength(s, p.steering_strength)?;
-            self.pen.reset(s, p, prompt)?;
-            self.ws.capture = capture;
-            let r = self.prefill(model, s, prompt, &p.images, &p.boundaries, p.steering_strength, p.progress.as_ref());
-            self.ws.capture = None;
-            r?;
-            if let Some(c) = capture {
-                self.prompt_site = Some(self.read_site(s, "prompt_last", c.buf, c.pos, prompt[c.pos], self.dec.last_logits_addr())?);
-            }
-            if speculate {
-                // Sampled (or penalized) runs draw the first token here; the first round commits it.
-                if p.temperature > 0.0 || self.pen.active {
-                    self.dec.next = self.sample(s, self.dec.last_logits_addr(), p, &self.pen, &mut run.rng)?;
-                }
-                self.spec.set_sampling(s, sampling(p, self.pen.active))?;
-                self.spec.penalized = self.pen.active;
-                self.spec.restart(&self.state, &self.dec, s)?;
-                run.spec = true;
-                return Ok((run, Vec::new()));
-            }
-            let tok = if p.temperature <= 0.0 && !self.pen.active { self.dec.next } else { self.sample(s, self.dec.last_logits_addr(), p, &self.pen, &mut run.rng)? };
-            run.pending = tok;
-            return Ok((run, vec![tok]));
-        }
-        let spans = self.encode_images(s, &p.images, 0)?;
-        let aux = self.aux.as_mut().expect("second slot");
-        aux.state.reset(s)?;
-        aux.state.mm = spans;
-        aux.state.set_steering_strength(s, p.steering_strength)?;
-        aux.pen.reset(s, p, prompt)?;
+        let lane = &mut self.lanes[slot];
+        lane.state.reset(s)?;
+        lane.state.set_steering_strength(s, p.steering_strength)?;
+        lane.pen.reset(s, p, prompt)?;
         self.ws.capture = capture;
-        // The same step boundaries as a fresh slot-0 prefill (chunks, cut at turn boundaries), so
-        // both slots compute identical results for the same prompt.
-        let (ws, chunk) = (&mut self.ws, self.chunk);
+        let r = self.prefill(model, s, slot, prompt, &p.images, &p.boundaries, p.steering_strength, p.progress.as_ref());
+        self.ws.capture = None;
+        r?;
+        let logits = self.lanes[slot].dec.last_logits_addr();
+        if let Some(c) = capture {
+            self.prompt_site = Some(self.read_site(s, "prompt_last", c.buf, c.pos, prompt[c.pos], logits)?);
+        }
+        let sampled = p.temperature > 0.0 || self.lanes[slot].pen.active;
         if speculate {
-            let progress = p.progress.as_ref().map(|f| move |pos: usize| (f.0)(pos, 0));
-            let progress = progress.as_ref().map(|f| f as &(dyn Fn(usize) + Send + Sync));
-            let r = with_ple_warm(model, prompt, 0, || aux.dec.prefill_new(model, &mut aux.state, ws, s, prompt, chunk, &p.boundaries, progress));
-            self.ws.capture = None;
-            r?;
-            let aux = self.aux.as_mut().expect("second slot");
-            if p.temperature > 0.0 || aux.pen.active {
-                let logits = aux.dec.last_logits_addr();
-                let aux = self.aux.as_ref().unwrap();
-                let tok = self.sample(s, logits, p, &aux.pen, &mut run.rng)?;
-                self.aux.as_mut().unwrap().dec.next = tok;
+            // Sampled (or penalized) runs draw the first token here; the first round commits it.
+            if sampled {
+                let tok = self.sample(s, logits, p, &self.lanes[slot].pen, &mut run.rng)?;
+                self.lanes[slot].dec.next = tok;
             }
-            let aux = self.aux.as_mut().expect("second slot");
-            aux.spec.set_sampling(s, sampling(p, aux.pen.active))?;
-            aux.spec.penalized = aux.pen.active;
-            aux.spec.restart(&aux.state, &aux.dec, s)?;
+            let lane = &mut self.lanes[slot];
+            lane.spec.set_sampling(s, sampling(p, lane.pen.active))?;
+            lane.spec.penalized = lane.pen.active;
+            lane.spec.restart(&lane.state, &lane.dec, s)?;
             run.spec = true;
             return Ok((run, Vec::new()));
         }
-        let r = with_ple_warm(model, prompt, 0, || -> Result<usize> {
-            let mut c0 = 0;
-            let mut last_rows = 0;
-            while c0 < prompt.len() {
-                let mut end = (c0 + chunk).min(prompt.len());
-                if let Some(&b) = p.boundaries.iter().filter(|&&b| b > c0 && b < prompt.len()).min() {
-                    end = end.min(b);
-                }
-                forward::forward(model, &mut aux.state, ws, s, &prompt[c0..end])?;
-                last_rows = end - c0;
-                c0 = end;
-                if let Some(f) = &p.progress {
-                    s.synchronize()?;
-                    (f.0)(end, 0);
-                }
-            }
-            Ok(last_rows)
-        });
-        self.ws.capture = None;
-        let last_rows = r?;
-        let last = self.ws.out + ((last_rows - 1) * crate::model::D * 2) as u64;
-        forward::head_logits(model, &self.hw, s, last)?;
-        if let Some(c) = capture {
-            self.prompt_site = Some(self.read_site(s, "prompt_last", c.buf, c.pos, prompt[c.pos], self.hw.logits_addr())?);
-        }
-        let tok = self.sample(s, self.hw.logits_addr(), p, &self.aux.as_ref().unwrap().pen, &mut run.rng)?;
+        let tok = if sampled { self.sample(s, logits, p, &self.lanes[slot].pen, &mut run.rng)? } else { self.lanes[slot].dec.next };
         run.pending = tok;
         Ok((run, vec![tok]))
     }
@@ -537,35 +567,29 @@ impl Session {
         if !run.spec {
             return Ok(Vec::new());
         }
-        let (state, next) = if run.slot == 0 {
-            (&mut self.state, self.dec.next)
-        } else {
-            let aux = self.aux.as_mut().expect("second slot");
-            (&mut aux.state, aux.dec.next)
-        };
-        forward::flush_spec(model, state, &self.ws, s)?;
+        let lane = &mut self.lanes[run.slot];
+        forward::flush_spec(model, &mut lane.state, &self.ws, s)?;
         run.spec = false;
-        run.pending = next;
-        Ok(vec![next])
+        run.pending = lane.dec.next;
+        Ok(vec![lane.dec.next])
     }
 
     /// One step of the given runs (one, or one per slot, both plain); returns each run's new tokens.
     pub fn step(&mut self, model: &Model, s: &Stream, runs: &mut [&mut Run]) -> Result<Vec<Vec<i32>>> {
         match runs {
-            [run] if run.spec && run.slot == 0 => {
-                let committed = self.spec.round(model, &mut self.state, &mut self.ws, &mut self.dec, s)?;
-                self.sync_kv_tokens();
-                Ok(vec![committed])
-            }
             [run] if run.spec => {
-                let aux = self.aux.as_mut().expect("second slot");
-                Ok(vec![aux.spec.round(model, &mut aux.state, &mut self.ws, &mut aux.dec, s)?])
+                let lane = &mut self.lanes[run.slot];
+                let committed = lane.spec.round(model, &mut lane.state, &mut self.ws, &mut lane.dec, s)?;
+                lane.sync_kv_tokens();
+                Ok(vec![committed])
             }
             [a, b] if a.spec && b.spec => {
                 ensure!(a.slot == 0 && b.slot == 1, "pair rounds take slot 0, then slot 1");
-                let aux = self.aux.as_mut().expect("second slot");
-                let [ca, cb] = aux.pair.round(model, &mut self.ws, s, (&mut self.spec, &mut self.state, &mut self.dec), (&mut aux.spec, &mut aux.state, &mut aux.dec))?;
-                self.sync_kv_tokens();
+                let pair = self.pair.as_mut().expect("second slot");
+                let [l0, l1] = &mut self.lanes[..] else { anyhow::bail!("pair rounds need two slots") };
+                let [ca, cb] = pair.pair.round(model, &mut self.ws, s, (&mut l0.spec, &mut l0.state, &mut l0.dec), (&mut l1.spec, &mut l1.state, &mut l1.dec))?;
+                l0.sync_kv_tokens();
+                l1.sync_kv_tokens();
                 Ok(vec![ca, cb])
             }
             [a, b] if a.spec || b.spec => {
@@ -576,31 +600,27 @@ impl Session {
                 Ok(vec![ta, tb])
             }
             [run] => {
-                if run.slot == 0 {
-                    self.pen.generated(s, run.pending)?;
-                    self.graph.step(model, &mut self.state, &mut self.ws, &self.hw, s, run.pending)?;
-                    self.sync_kv_tokens();
-                } else {
-                    let aux = self.aux.as_mut().expect("second slot");
-                    aux.pen.generated(s, run.pending)?;
-                    aux.graph.step(model, &mut aux.state, &mut self.ws, &self.hw, s, run.pending)?;
-                }
-                let pen = if run.slot == 0 { &self.pen } else { &self.aux.as_ref().unwrap().pen };
-                let tok = self.sample(s, self.hw.logits_addr(), &run.params.clone(), pen, &mut run.rng)?;
+                let lane = &mut self.lanes[run.slot];
+                lane.pen.generated(s, run.pending)?;
+                lane.graph.step(model, &mut lane.state, &mut self.ws, &self.hw, s, run.pending)?;
+                lane.sync_kv_tokens();
+                let tok = self.sample(s, self.hw.logits_addr(), &run.params.clone(), &self.lanes[run.slot].pen, &mut run.rng)?;
                 run.pending = tok;
                 Ok(vec![vec![tok]])
             }
             [a, b] => {
                 ensure!(!a.spec && !b.spec && a.slot == 0 && b.slot == 1, "batched steps need both slots in plain mode");
-                let aux = self.aux.as_mut().expect("second slot");
-                self.pen.generated(s, a.pending)?;
-                aux.pen.generated(s, b.pending)?;
-                aux.batch.step(model, &mut [&mut self.state, &mut aux.state], &mut self.ws, s, &[a.pending, b.pending])?;
+                let pair = self.pair.as_mut().expect("second slot");
+                let [l0, l1] = &mut self.lanes[..] else { anyhow::bail!("batched steps need two slots") };
+                l0.pen.generated(s, a.pending)?;
+                l1.pen.generated(s, b.pending)?;
+                pair.batch.step(model, &mut [&mut l0.state, &mut l1.state], &mut self.ws, s, &[a.pending, b.pending])?;
                 s.synchronize()?;
-                self.sync_kv_tokens();
-                let logits = self.aux.as_ref().unwrap().hw2.logits_addr();
-                let ta = self.sample(s, logits, &a.params.clone(), &self.pen, &mut a.rng)?;
-                let tb = self.sample(s, logits + (VOCAB * 4) as u64, &b.params.clone(), &self.aux.as_ref().unwrap().pen, &mut b.rng)?;
+                l0.sync_kv_tokens();
+                l1.sync_kv_tokens();
+                let logits = self.pair.as_ref().unwrap().hw2.logits_addr();
+                let ta = self.sample(s, logits, &a.params.clone(), &self.lanes[0].pen, &mut a.rng)?;
+                let tb = self.sample(s, logits + (VOCAB * 4) as u64, &b.params.clone(), &self.lanes[1].pen, &mut b.rng)?;
                 a.pending = ta;
                 b.pending = tb;
                 Ok(vec![vec![ta], vec![tb]])
@@ -616,42 +636,28 @@ impl Session {
 
     /// Writes host-tier contexts to the disk tier (persistence).
     pub fn persist(&mut self) -> Result<()> {
-        if self.kv_strength == 0.0 {
-            self.stash(usize::MAX)?;
+        for slot in 0..self.lanes.len() {
+            if self.lanes[slot].kv_strength == 0.0 {
+                self.stash(slot, usize::MAX)?;
+            }
         }
         self.store.persist()
     }
 
-    /// The live cache pieces holding positions [0, len): position table, then per attention cache (the
-    /// target's QSA layers, then the drafter's) K, V, index keys and pooled index groups.
-    fn kv_pieces(&self, len: usize) -> Vec<(u64, usize)> {
-        use crate::forward::QsaCache;
-        let mut v = vec![(self.state.pos3.addr(), len * 3 * 4)];
-        let caches: Vec<&QsaCache> = self.state.qsa.iter().flatten().chain(self.state.mtp_qsa.iter()).collect();
-        for c in caches {
-            let per = |b: &DeviceBuffer, rows: usize, total_rows: usize| (b.addr(), b.bytes() / total_rows * rows);
-            let cap = self.state.capacity;
-            v.push(per(&c.k, len, cap));
-            v.push(per(&c.v, len, cap));
-            v.push(per(&c.raw, len, cap));
-            v.push(per(&c.pooled, len / 4, cap / 4));
-        }
-        v
-    }
-
-    /// Saves the GPU context at the largest snapshot position (at most `limit`) to the store unless it
-    /// is stored already.
-    fn stash(&mut self, limit: usize) -> Result<()> {
+    /// Saves the GPU context of `slot` at its largest snapshot position (at most `limit`) to the store
+    /// unless it is stored already.
+    fn stash(&mut self, slot: usize, limit: usize) -> Result<()> {
         if !self.store.enabled() {
             return Ok(());
         }
-        let Some(snap) = self.snapshots.iter().filter(|sn| sn.pos <= limit && sn.pos <= self.kv_tokens.len()).max_by_key(|sn| sn.pos) else { return Ok(()) };
-        let tokens = self.kv_tokens[..snap.pos].to_vec();
+        let lane = &self.lanes[slot];
+        let Some(snap) = lane.snapshots.iter().filter(|sn| sn.pos <= limit && sn.pos <= lane.kv_tokens.len()).max_by_key(|sn| sn.pos) else { return Ok(()) };
+        let tokens = lane.kv_tokens[..snap.pos].to_vec();
         if self.store.contains(&tokens) {
             return Ok(());
         }
-        let rec: usize = Self::pieces(&self.state, self.dec.pending_addr()).iter().map(|p| p.1).sum();
-        let kv = self.kv_pieces(snap.pos);
+        let rec: usize = lane.pieces().iter().map(|p| p.1).sum();
+        let kv = lane.kv_pieces(snap.pos);
         let total = rec + kv.iter().map(|p| p.1).sum::<usize>();
         let t0 = std::time::Instant::now();
         let buf = quench6k_cuda::PinnedBuffer::new(total)?;
@@ -667,26 +673,28 @@ impl Session {
         }
         s.synchronize()?;
         let t2 = std::time::Instant::now();
+        let pos = snap.pos;
         self.store.insert(tokens, buf)?;
         if std::env::var_os("QUENCH6K_TIMING").is_some() {
-            eprintln!("stash {} tokens, {} MiB: alloc {:.3}s copy {:.3}s insert {:.3}s", snap.pos, total >> 20, (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64());
+            eprintln!("stash slot {slot}, {pos} tokens, {} MiB: alloc {:.3}s copy {:.3}s insert {:.3}s", total >> 20, (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64());
         }
         Ok(())
     }
 
-    /// Loads stored entry `i` into the live caches and makes it the GPU context (one snapshot at its
-    /// end).
-    fn load_entry(&mut self, s: &Stream, i: usize) -> Result<()> {
+    /// Loads stored entry `i` into the live caches of `slot` and makes it the slot's GPU context (one
+    /// snapshot at its end).
+    fn load_entry(&mut self, s: &Stream, slot: usize, i: usize) -> Result<()> {
         let t0 = std::time::Instant::now();
-        let rec: usize = Self::pieces(&self.state, self.dec.pending_addr()).iter().map(|p| p.1).sum();
-        let (tokens, _) = self.store.get(i)?;
-        let kv = self.kv_pieces(tokens.len());
-        let snap_buf = match self.snapshots.pop() {
-            Some(sn) if sn.buf.bytes() >= rec => sn.buf,
+        let lane = &mut self.lanes[slot];
+        let rec: usize = lane.pieces().iter().map(|p| p.1).sum();
+        // The snapshot buffer first: without one the slot's context stays as it is.
+        let snap_buf = match lane.snapshots.last() {
+            Some(sn) if sn.buf.bytes() >= rec => lane.snapshots.pop().unwrap().buf,
             _ => DeviceBuffer::new(rec)?,
         };
-        self.snapshots.clear();
-        let (_, data) = self.store.get(i)?;
+        lane.snapshots.clear();
+        let (tokens, data) = self.store.get(i)?;
+        let kv = lane.kv_pieces(tokens.len());
         unsafe {
             s.copy_h2d(snap_buf.addr(), data.as_ptr(), rec)?;
             let mut off = rec;
@@ -697,120 +705,86 @@ impl Session {
         }
         s.synchronize()?;
         if std::env::var_os("QUENCH6K_TIMING").is_some() {
-            eprintln!("load {} tokens from the store: {:.3}s", tokens.len(), t0.elapsed().as_secs_f64());
+            eprintln!("load {} tokens from the store into slot {slot}: {:.3}s", tokens.len(), t0.elapsed().as_secs_f64());
         }
-        self.snapshots.push(Snapshot { pos: tokens.len(), buf: snap_buf, periodic: false });
-        self.kv_tokens = tokens;
+        lane.snapshots.push(Snapshot { pos: tokens.len(), buf: snap_buf, periodic: false });
+        lane.kv_tokens = tokens;
         Ok(())
-    }
-
-    /// `kv_tokens` for the slot-0 sequence: its tokens with image placeholders keyed by content.
-    fn sync_kv_tokens(&mut self) {
-        self.kv_tokens = keyed(&self.state.tokens, &self.kv_marks);
     }
 
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// The pieces of the recurrent state, as (device address, bytes); `pending` is the speculative
-    /// decoder's pending row.
-    fn pieces(state: &SequenceState, pending: u64) -> Vec<(u64, usize)> {
-        let mut v: Vec<(u64, usize)> = state.gdn.iter().flatten().flat_map(|g| [(g.conv.addr(), g.conv.bytes()), (g.recurrent.addr(), g.recurrent.bytes())]).collect();
-        v.push((state.ple_conv.addr(), state.ple_conv.bytes()));
-        v.push((pending, crate::model::H * 4));
-        v
-    }
-
-    fn snapshot_bytes(state: &SequenceState, pending: u64) -> usize {
-        Self::pieces(state, pending).iter().map(|p| p.1).sum()
-    }
-
-    fn save_snapshot(state: &SequenceState, pending: u64, s: &Stream, pos: usize, recycled: Option<DeviceBuffer>) -> Result<Snapshot> {
-        let pieces = Self::pieces(state, pending);
-        let total: usize = pieces.iter().map(|p| p.1).sum();
-        let buf = match recycled {
-            Some(b) if b.bytes() >= total => b,
-            _ => DeviceBuffer::new(total)?,
-        };
-        let mut off = 0u64;
-        for (addr, bytes) in pieces {
-            s.copy_d2d(buf.addr() + off, addr, bytes)?;
-            off += bytes as u64;
-        }
-        Ok(Snapshot { pos, buf, periodic: false })
-    }
-
-    fn restore_snapshot(&self, s: &Stream, snap: &Snapshot) -> Result<()> {
-        let mut off = 0u64;
-        for (addr, bytes) in Self::pieces(&self.state, self.dec.pending_addr()) {
-            s.copy_d2d(addr, snap.buf.addr() + off, bytes)?;
-            off += bytes as u64;
-        }
-        Ok(())
-    }
-
-    /// Positions the state, target and MTP caches on the longest snapshot whose prefix the caches still
-    /// hold, prefills the rest of `prompt`, and takes new snapshots at `boundaries`.
-    fn prefill(&mut self, model: &Model, s: &Stream, prompt: &[i32], images: &[std::sync::Arc<ImageInput>], boundaries: &[usize], strength: f32, progress: Option<&Progress>) -> Result<()> {
+    /// Positions the state, target and MTP caches of `slot` on the longest snapshot whose prefix the
+    /// slot's caches (or the store) hold, prefills the rest of `prompt`, and takes new snapshots at
+    /// `boundaries`.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill(&mut self, model: &Model, s: &Stream, slot: usize, prompt: &[i32], images: &[std::sync::Arc<ImageInput>], boundaries: &[usize], strength: f32, progress: Option<&Progress>) -> Result<()> {
+        let lane = &mut self.lanes[slot];
         // Steered state is never reused across strengths, and the store holds unsteered state only.
-        if self.kv_strength != strength {
-            self.kv_tokens.clear();
-            self.snapshots.clear();
+        if lane.kv_strength != strength {
+            lane.kv_tokens.clear();
+            lane.snapshots.clear();
         }
         let marks = image_marks(images);
         let key = keyed(prompt, &marks);
-        let mut lcp = self.kv_tokens.iter().zip(&key).take_while(|(a, b)| a == b).count();
+        let mut lcp = lane.kv_tokens.iter().zip(&key).take_while(|(a, b)| a == b).count();
         if strength == 0.0 && self.store.enabled() {
             // The new prompt overwrites the cached conversation past `lcp`: keep its boundary state.
-            if self.snapshots.iter().any(|sn| sn.pos > lcp) {
-                self.stash(usize::MAX)?;
+            if lane.snapshots.iter().any(|sn| sn.pos > lcp) {
+                self.stash(slot, usize::MAX)?;
             }
-            let gpu_best = self.snapshots.iter().filter(|sn| sn.pos <= lcp && sn.pos < prompt.len()).map(|sn| sn.pos).max().unwrap_or(0);
+            let gpu_best = self.lanes[slot].cached_prefix(&key);
             if let Some((i, len)) = self.store.best(&key) {
                 if len > gpu_best {
-                    self.load_entry(s, i)?;
-                    lcp = len;
+                    match self.load_entry(s, slot, i) {
+                        Ok(()) => lcp = len,
+                        Err(e) => eprintln!("loading a stored context into slot {slot}: {e:#}"),
+                    }
                 }
             }
         }
-        self.kv_strength = strength;
+        let lane = &mut self.lanes[slot];
+        lane.kv_strength = strength;
         // Snapshots past the common prefix describe tokens the new prompt overwrites.
-        self.snapshots.retain(|sn| sn.pos <= lcp);
-        self.state.reset(s)?;
-        self.kv_marks = marks;
-        let best = self.snapshots.iter().enumerate().filter(|(_, sn)| sn.pos < prompt.len()).max_by_key(|(_, sn)| sn.pos).map(|(i, _)| i);
+        lane.snapshots.retain(|sn| sn.pos <= lcp);
+        lane.state.reset(s)?;
+        lane.kv_marks = marks;
+        let best = lane.snapshots.iter().enumerate().filter(|(_, sn)| sn.pos < prompt.len()).max_by_key(|(_, sn)| sn.pos).map(|(i, _)| i);
         let start = match best {
             Some(i) => {
-                let snap = self.snapshots.remove(i);
-                self.restore_snapshot(s, &snap)?;
+                let snap = lane.snapshots.remove(i);
+                lane.restore_snapshot(s, &snap)?;
                 let pos = snap.pos;
-                self.snapshots.push(snap); // most recently used last
-                self.state.tokens = prompt[..pos].to_vec();
+                lane.snapshots.push(snap); // most recently used last
+                lane.state.tokens = prompt[..pos].to_vec();
                 pos
             }
             None => {
-                s.memset(self.dec.pending_addr(), 0, crate::model::H * 4)?;
+                s.memset(lane.dec.pending_addr(), 0, crate::model::H * 4)?;
                 0
             }
         };
-        self.reused = start;
+        lane.reused = start;
         // Images are encoded only from the restored position on.
-        self.state.mm = self.encode_images(s, images, start)?;
+        let mm = self.encode_images(s, images, start)?;
+        let lane = &mut self.lanes[slot];
+        lane.state.mm = mm;
         if let Some(f) = progress {
             (f.0)(start, start);
         }
         let report = progress.map(|f| move |pos: usize| (f.0)(pos, start));
-        let mut pauses: Vec<usize> = boundaries.iter().copied().filter(|&b| b > start && b < prompt.len() && !self.snapshots.iter().any(|sn| sn.pos == b)).collect();
+        let mut pauses: Vec<usize> = boundaries.iter().copied().filter(|&b| b > start && b < prompt.len() && !lane.snapshots.iter().any(|sn| sn.pos == b)).collect();
         // Periodic snapshots on chunk boundaries (no extra prefill steps), at most PERIODIC_SNAPSHOTS
         // per prompt, so a prefix shared up to any point is reusable to within one interval of it.
         let interval = self.chunk * prompt.len().div_ceil(self.chunk * PERIODIC_SNAPSHOTS).max(1);
-        let periodic: Vec<usize> = (1..).map(|k| k * interval).take_while(|&p| p < prompt.len()).filter(|&p| p > start && !pauses.contains(&p) && !self.snapshots.iter().any(|sn| sn.pos == p)).collect();
+        let periodic: Vec<usize> = (1..).map(|k| k * interval).take_while(|&p| p < prompt.len()).filter(|&p| p > start && !pauses.contains(&p) && !lane.snapshots.iter().any(|sn| sn.pos == p)).collect();
         pauses.extend(&periodic);
         pauses.sort_unstable();
         pauses.dedup();
-        let snapshots = &mut self.snapshots;
-        let (dec, state, ws, chunk) = (&mut self.dec, &mut self.state, &mut self.ws, self.chunk);
+        let snapshots = &mut lane.snapshots;
+        let (dec, state, ws, chunk) = (&mut lane.dec, &mut lane.state, &mut self.ws, self.chunk);
         with_ple_warm(model, prompt, start, || dec.prefill_from(model, state, ws, s, prompt, start, chunk, &pauses, |state, pos, pending| {
             // Recycle the oldest periodic snapshot first, then the oldest. Snapshots only speed up later
             // prompts: when device memory is short, an older one is recycled, or none is taken.
@@ -822,7 +796,7 @@ impl Session {
                 Some(oldest(snapshots))
             } else {
                 // Leave headroom for per-request buffers (vision encoder, sampling).
-                let bytes = Self::snapshot_bytes(state, pending);
+                let bytes = snapshot_bytes(state, pending);
                 let room = quench6k_cuda::mem_info().map_or(false, |(free, _)| free >= bytes + SNAPSHOT_HEADROOM);
                 match if room { DeviceBuffer::new(bytes) } else { Err(anyhow::anyhow!("under {} MiB free", SNAPSHOT_HEADROOM >> 20)) } {
                     Ok(b) => Some(b),
@@ -834,25 +808,27 @@ impl Session {
                 }
             };
             if let Some(buf) = buf {
-                let mut snap = Self::save_snapshot(state, pending, s, pos, Some(buf))?;
+                let mut snap = save_snapshot(state, pending, s, pos, Some(buf))?;
                 snap.periodic = periodic.contains(&pos);
                 snapshots.push(snap);
             }
             Ok(())
         }, report.as_ref().map(|f| f as &(dyn Fn(usize) + Send + Sync))))?;
-        self.kv_tokens = key;
+        self.lanes[slot].kv_tokens = key;
         Ok(())
     }
 
-    /// Generates from `prompt`, calling `on_token` for every generated token (return false to stop).
+    /// Generates from `prompt` on the main slot, calling `on_token` for every generated token (return
+    /// false to stop).
     pub fn generate(&mut self, model: &Model, s: &Stream, prompt: &[i32], p: &GenParams, mut on_token: impl FnMut(i32) -> bool) -> Result<(Finish, usize)> {
         ensure!(!prompt.is_empty(), "empty prompt");
         ensure!(prompt.len() < self.capacity, "prompt of {} tokens exceeds the context of {}", prompt.len(), self.capacity);
         ensure!(p.presence_penalty == 0.0 && p.repetition_penalty == 1.0, "penalties need begin/step");
-        self.state.reset(s)?;
-        self.state.set_steering_strength(s, p.steering_strength)?;
-        self.pen.active = false;
-        self.spec.penalized = false;
+        let lane = &mut self.lanes[0];
+        lane.state.reset(s)?;
+        lane.state.set_steering_strength(s, p.steering_strength)?;
+        lane.pen.active = false;
+        lane.spec.penalized = false;
         let budget = p.max_tokens.min(self.capacity - prompt.len());
         let mut produced = 0usize;
         let mut emit = |tok: i32, produced: &mut usize| -> Option<Finish> {
@@ -871,40 +847,44 @@ impl Session {
         if budget == 0 {
             return Ok((Finish::Length, 0));
         }
-        self.prefill(model, s, prompt, &p.images, &p.boundaries, p.steering_strength, p.progress.as_ref())?;
+        self.prefill(model, s, 0, prompt, &p.images, &p.boundaries, p.steering_strength, p.progress.as_ref())?;
+        let logits = self.lanes[0].dec.last_logits_addr();
         if p.temperature <= 0.0 || !p.capture {
             if p.temperature > 0.0 {
                 let mut rng = Rng::new(p.seed);
-                self.dec.next = self.sample(s, self.dec.last_logits_addr(), p, &self.pen, &mut rng)?;
+                let tok = self.sample(s, logits, p, &self.lanes[0].pen, &mut rng)?;
+                self.lanes[0].dec.next = tok;
             }
-            self.spec.set_sampling(s, sampling(p, false))?;
-            self.spec.restart(&self.state, &self.dec, s)?;
+            let lane = &mut self.lanes[0];
+            lane.spec.set_sampling(s, sampling(p, false))?;
+            lane.spec.restart(&lane.state, &lane.dec, s)?;
             // The target's first token, then speculative rounds (each commits the previous `next`
             // and the accepted drafts; the round's own `next` is emitted by the following round).
             loop {
-                let committed = self.spec.round(model, &mut self.state, &mut self.ws, &mut self.dec, s)?;
+                let committed = lane.spec.round(model, &mut lane.state, &mut self.ws, &mut lane.dec, s)?;
                 for &tok in &committed {
                     if let Some(f) = emit(tok, &mut produced) {
-                        self.sync_kv_tokens();
+                        lane.sync_kv_tokens();
                         return Ok((f, produced));
                     }
                 }
-                if self.state.len() + 2 * (self.dec.drafts + 2) >= self.state.capacity {
-                    self.sync_kv_tokens();
+                if lane.state.len() + 2 * (lane.dec.drafts + 2) >= lane.state.capacity {
+                    lane.sync_kv_tokens();
                     return Ok((Finish::Length, produced));
                 }
             }
         }
         // Sampled: the first token from the last prompt row's logits, then one token per step.
         let mut rng = Rng::new(p.seed);
-        let mut tok = self.sample(s, self.dec.last_logits_addr(), p, &self.pen, &mut rng)?;
+        let mut tok = self.sample(s, logits, p, &self.lanes[0].pen, &mut rng)?;
         loop {
             if let Some(f) = emit(tok, &mut produced) {
-                self.sync_kv_tokens();
+                self.lanes[0].sync_kv_tokens();
                 return Ok((f, produced));
             }
-            self.graph.step(model, &mut self.state, &mut self.ws, &self.hw, s, tok)?;
-            tok = self.sample(s, self.hw.logits_addr(), p, &self.pen, &mut rng)?;
+            let lane = &mut self.lanes[0];
+            lane.graph.step(model, &mut lane.state, &mut self.ws, &self.hw, s, tok)?;
+            tok = self.sample(s, self.hw.logits_addr(), p, &self.lanes[0].pen, &mut rng)?;
         }
     }
 

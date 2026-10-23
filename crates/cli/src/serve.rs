@@ -1,14 +1,15 @@
 //! OpenAI-compatible HTTP serving (`quench6k serve`): `/v1/models` and `/v1/chat/completions` with
-//! streaming, reasoning (`reasoning_content`) and tool calls. One GPU worker thread owns the model and
+//! streaming, reasoning (`reasoning_content`) and tool calls, and Anthropic `/v1/messages`. One GPU worker thread owns the model and
 //! the generation session; requests queue for it.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -83,8 +84,60 @@ enum Msg {
     Error(String),
 }
 
+/// Counters and gauges for `/metrics`, per slot where it matters.
+#[derive(Default)]
+struct Metrics {
+    generations: [AtomicU64; 2],
+    prompt_tokens: [AtomicU64; 2],
+    cached_tokens: [AtomicU64; 2],
+    generated_tokens: [AtomicU64; 2],
+    prefill_micros: [AtomicU64; 2],
+    decode_micros: [AtomicU64; 2],
+    errors: AtomicU64,
+    /// Requests waiting for a slot, and requests running.
+    queued: AtomicU64,
+    running: AtomicU64,
+}
+
+impl Metrics {
+    fn done(&self, slot: usize, prompt: usize, cached: usize, generated: usize, prefill: f64, decode: f64) {
+        let add = |c: &[AtomicU64; 2], v: u64| c[slot.min(1)].fetch_add(v, Ordering::Relaxed);
+        add(&self.generations, 1);
+        add(&self.prompt_tokens, prompt as u64);
+        add(&self.cached_tokens, cached as u64);
+        add(&self.generated_tokens, generated as u64);
+        add(&self.prefill_micros, (prefill * 1e6) as u64);
+        add(&self.decode_micros, (decode * 1e6) as u64);
+    }
+
+    /// The Prometheus text exposition.
+    fn render(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let per_slot: [(&str, &str, &[AtomicU64; 2], f64); 6] = [
+            ("generations_total", "Finished generations (a tool-call retry counts again)", &self.generations, 1.0),
+            ("prompt_tokens_total", "Prompt tokens", &self.prompt_tokens, 1.0),
+            ("prompt_tokens_cached_total", "Prompt tokens served from the context cache", &self.cached_tokens, 1.0),
+            ("generation_tokens_total", "Generated tokens", &self.generated_tokens, 1.0),
+            ("prefill_seconds_total", "Time in prefill", &self.prefill_micros, 1e-6),
+            ("decode_seconds_total", "Time decoding", &self.decode_micros, 1e-6),
+        ];
+        for (name, help, c, scale) in per_slot {
+            let _ = writeln!(out, "# HELP quench6k_{name} {help}.\n# TYPE quench6k_{name} counter");
+            for (slot, v) in c.iter().enumerate() {
+                let _ = writeln!(out, "quench6k_{name}{{slot=\"{slot}\"}} {}", v.load(Ordering::Relaxed) as f64 * scale);
+            }
+        }
+        let _ = writeln!(out, "# HELP quench6k_errors_total Generations that failed.\n# TYPE quench6k_errors_total counter\nquench6k_errors_total {}", self.errors.load(Ordering::Relaxed));
+        let _ = writeln!(out, "# HELP quench6k_requests_waiting Requests waiting for a slot.\n# TYPE quench6k_requests_waiting gauge\nquench6k_requests_waiting {}", self.queued.load(Ordering::Relaxed));
+        let _ = writeln!(out, "# HELP quench6k_requests_running Requests prefilling or decoding.\n# TYPE quench6k_requests_running gauge\nquench6k_requests_running {}", self.running.load(Ordering::Relaxed));
+        out
+    }
+}
+
 struct App {
     chat: Chat,
+    metrics: Arc<Metrics>,
     jobs: mpsc::Sender<Work>,
     name: String,
     /// Steering strength used when a request carries none (the loaded pack's, or 0).
@@ -97,6 +150,10 @@ struct App {
     tool_call_token: Option<i32>,
     capture_dir: Option<PathBuf>,
     model_id: String,
+    /// Longest prompt + completion in tokens (per slot), reported as `max_model_len`.
+    context: usize,
+    /// Server start (the `created` time of the models).
+    started: u64,
     vision: bool,
     image_max_pixels: usize,
     video_max_frames: usize,
@@ -117,12 +174,15 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model);
     anyhow::ensure!(!(flint && steering), "steering packs are not supported for Flint");
     let vision = opts.vision && !flint;
+    let metrics = Arc::new(Metrics::default());
+    let worker_metrics = metrics.clone();
     std::thread::spawn(move || {
+        let metrics = worker_metrics;
         if flint {
             match crate::flint::load(&model_dir) {
                 Ok((model, stream)) => {
                     let _ = ready_tx.send(Ok(0.0));
-                    schedule_flint(&model, &stream, context, &jobs_rx);
+                    schedule_flint(&model, &stream, context, &jobs_rx, &metrics);
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -156,7 +216,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                 eprintln!("second slot unavailable: {e:#}");
             }
         }
-        schedule(&model, &stream, &mut session, &jobs_rx);
+        schedule(&model, &stream, &mut session, &jobs_rx, &metrics);
     });
     let _ = ready_rx.recv().context("worker thread")??;
     // With a pack, the base name runs unsteered and the steered name applies --strength (default 1).
@@ -165,11 +225,18 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     if let Some((name, strength)) = &steered {
         println!("models: {} (unsteered), {name} (steering strength {strength})", opts.name);
     }
-    let app = Arc::new(App { chat, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, steered, tool_retries: opts.tool_retries, default_max_tokens: opts.default_max_tokens, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model), vision, image_max_pixels: opts.image_max_pixels, video_max_frames: opts.video_max_frames });
+    let app = Arc::new(App { chat, metrics, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, steered, tool_retries: opts.tool_retries, default_max_tokens: opts.default_max_tokens, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model), context: opts.context, started: now(), vision, image_max_pixels: opts.image_max_pixels, video_max_frames: opts.video_max_frames });
     let router = Router::new()
+        .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/v1/models/{id}", get(model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/completions", post(completions))
+        .route("/tokenize", post(tokenize))
+        .route("/detokenize", post(detokenize))
+        .route("/metrics", get(metrics_text))
         .with_state(app);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -192,7 +259,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
 
 /// The GPU worker: admits queued requests into free slots and steps the running ones, one alone
 /// (speculatively when it started alone) or both batched.
-fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, session: &mut Session, jobs: &mpsc::Receiver<Work>) {
+fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, session: &mut Session, jobs: &mpsc::Receiver<Work>, metrics: &Metrics) {
     use quench6k_engine::session::Run;
     struct Active {
         run: Run,
@@ -232,6 +299,7 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
         }
         let secs = a.decode_start.elapsed().as_secs_f64();
         let n = a.generated.len();
+        metrics.done(a.run.slot, a.prompt, a.reused, n, a.prefill, secs);
         let (rounds, accepted) = session.spec_stats(a.run.slot);
         let mtp = if a.run.is_spec() && rounds > 0 { format!(", MTP {:.2} tokens/round", (rounds + accepted) as f64 / rounds as f64) } else { String::new() };
         eprintln!("done: slot {}, prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s){mtp}, {:?}",
@@ -258,6 +326,8 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
         }
     };
     loop {
+        metrics.queued.store(queue.len() as u64, Ordering::Relaxed);
+        metrics.running.store(slots.iter().flatten().count() as u64, Ordering::Relaxed);
         if slots.iter().all(Option::is_none) && queue.is_empty() {
             match jobs.recv() {
                 Ok(w) => take(w, &mut queue, session),
@@ -267,16 +337,22 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
         while let Ok(w) = jobs.try_recv() {
             take(w, &mut queue, session);
         }
-        // Admit queued requests into free slots (the main slot first: MTP and the prefix cache).
-        while let Some(free) = (0..nslots).find(|&i| slots[i].is_none()) {
-            let Some(job) = queue.pop_front() else { break };
+        // Admit queued requests into free slots: the one whose GPU cache holds the most of the prompt,
+        // else the one holding the shortest context (the cheapest to stash and overwrite).
+        while let Some(job) = queue.front() {
+            let free = (0..nslots).filter(|&i| slots[i].is_none()).map(|i| {
+                let (reusable, held) = session.cached_prefix(i, &job.ids, &job.params);
+                (reusable, std::cmp::Reverse(held), std::cmp::Reverse(i))
+            }).max();
+            let Some((_, _, std::cmp::Reverse(free))) = free else { break };
+            let job = queue.pop_front().unwrap();
             // Both slots decode speculatively, together in pair rounds when both are busy (a request
             // with plain decoding makes the other switch to batched plain steps; see Session::step).
             let speculate = job.mtp;
             let t0 = std::time::Instant::now();
             match session.begin(model, s, free, &job.ids, &job.params, speculate) {
                 Ok((run, toks)) => {
-                    let mut a = Active { run, tx: job.tx, reused: if free == 0 { session.reused } else { 0 }, capture: job.capture, generated: Vec::new(),
+                    let mut a = Active { run, tx: job.tx, reused: session.reused(free), capture: job.capture, generated: Vec::new(),
                                          prompt: job.ids.len(), prefill: t0.elapsed().as_secs_f64(), decode_start: std::time::Instant::now() };
                     if let Some(path) = std::env::var_os("QUENCH6K_TRACE") {
                         use std::io::Write;
@@ -294,6 +370,8 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
                 }
             }
         }
+        metrics.queued.store(queue.len() as u64, Ordering::Relaxed);
+        metrics.running.store(slots.iter().flatten().count() as u64, Ordering::Relaxed);
         // Step the running requests.
         let result = match &mut slots {
             [Some(a), Some(b)] => session.step(model, s, &mut [&mut a.run, &mut b.run]),
@@ -326,7 +404,7 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
 
 /// The GPU worker for Flint checkpoints: one sequence, requests in turn (prefix reuse across requests),
 /// sampling on the host from the top candidates.
-fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda::Stream, context: usize, jobs: &mpsc::Receiver<Work>) {
+fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda::Stream, context: usize, jobs: &mpsc::Receiver<Work>, metrics: &Metrics) {
     use quench6k_engine::flint as fl;
     let setup = || -> Result<_> { Ok((fl::Workspace::new(fl::MAX_STEP)?, fl::FlintSeq::new(model, context)?, crate::flint::Sampler::new()?)) };
     let (mut ws, mut seq, mut sampler) = match setup() {
@@ -350,7 +428,8 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
             continue;
         }
         let t0 = std::time::Instant::now();
-        let result = (|| -> Result<(Finish, usize, usize)> {
+        metrics.running.store(1, Ordering::Relaxed);
+        let result = (|| -> Result<(Finish, usize, usize, f64, f64)> {
             let p = &job.params;
             let reused = seq.rewind(&job.ids, s)?;
             let mut at = reused;
@@ -427,10 +506,12 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
             eprintln!("done: prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s){spec_note}, {:?}",
                       job.ids.len(), reused, prefill, (job.ids.len() - reused) as f64 / prefill.max(1e-9), generated.len(), secs,
                       generated.len().saturating_sub(1) as f64 / secs.max(1e-9), finish);
-            Ok((finish, reused, generated.len()))
+            Ok((finish, reused, generated.len(), prefill, secs))
         })();
+        metrics.running.store(0, Ordering::Relaxed);
         match result {
-            Ok((finish, reused, _)) => {
+            Ok((finish, reused, generated, prefill, decode)) => {
+                metrics.done(0, job.ids.len(), reused, generated, prefill, decode);
                 let _ = job.tx.send(Msg::Done(finish, reused));
             }
             Err(e) => {
@@ -442,16 +523,70 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
     }
 }
 
+async fn health() -> Json<Value> {
+    Json(json!({"status": "ok"}))
+}
+
+/// The served model names: the base model, and the steered one with a pack loaded.
+fn model_names(app: &App) -> impl Iterator<Item = &str> {
+    std::iter::once(app.name.as_str()).chain(app.steered.as_ref().map(|(name, _)| name.as_str()))
+}
+
+/// A model object with its context limit under vLLM's (`max_model_len`) and OpenRouter's
+/// (`context_length`) names.
+fn model_object(app: &App, name: &str) -> Value {
+    json!({"id": name, "object": "model", "created": app.started, "owned_by": "quench6k",
+           "max_model_len": app.context, "context_length": app.context})
+}
+
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
-    let mut data = vec![json!({"id": app.name, "object": "model", "owned_by": "quench6k"})];
-    if let Some((name, _)) = &app.steered {
-        data.push(json!({"id": name, "object": "model", "owned_by": "quench6k"}));
-    }
+    let data: Vec<Value> = model_names(&app).map(|name| model_object(&app, name)).collect();
     Json(json!({"object": "list", "data": data}))
 }
 
-fn error(status: StatusCode, msg: impl Into<String>) -> Response {
-    (status, Json(json!({"error": {"message": msg.into(), "type": "invalid_request_error"}}))).into_response()
+async fn model(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+    match model_names(&app).find(|&name| name == id) {
+        Some(name) => Json(model_object(&app, name)).into_response(),
+        None => ApiError { code: Some("model_not_found"), ..error(StatusCode::NOT_FOUND, format!("model '{id}' not found")) }.into_response(),
+    }
+}
+
+/// A rejected request: OpenAI-style as a response, Anthropic-style through `anthropic`.
+struct ApiError {
+    status: StatusCode,
+    code: Option<&'static str>,
+    message: String,
+}
+
+fn error(status: StatusCode, msg: impl Into<String>) -> ApiError {
+    ApiError { status, code: None, message: msg.into() }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let kind = if self.status.is_server_error() { "server_error" } else { "invalid_request_error" };
+        (self.status, Json(json!({"error": {"message": self.message, "type": kind, "code": self.code}}))).into_response()
+    }
+}
+
+impl ApiError {
+    fn anthropic(self) -> Response {
+        let kind = match self.status {
+            StatusCode::NOT_FOUND => "not_found_error",
+            s if s.is_server_error() => "api_error",
+            _ => "invalid_request_error",
+        };
+        (self.status, Json(json!({"type": "error", "error": {"type": kind, "message": self.message}}))).into_response()
+    }
+}
+
+/// Rejects a prompt that leaves no room for a completion in the context.
+fn check_context(app: &App, p: &Prepared) -> Result<(), ApiError> {
+    if p.ids.len() < app.context {
+        return Ok(());
+    }
+    let msg = format!("prompt of {} tokens exceeds the context of {} tokens", p.ids.len(), app.context);
+    Err(ApiError { code: Some("context_length_exceeded"), ..error(StatusCode::BAD_REQUEST, msg) })
 }
 
 fn now() -> u64 {
@@ -474,28 +609,58 @@ struct Prepared {
     model: String,
 }
 
-fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
+fn prepare(app: &App, req: &Value) -> Result<Prepared, ApiError> {
+    let tools = req.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty())).cloned();
+    let (mut ids, images, mut thinking) = render_chat(app, req, tools.as_ref())?;
+    // Debugging: "prompt_ids" replays a traced prompt (text-only) in place of the rendered messages.
+    if let Some(raw) = req.get("prompt_ids").and_then(Value::as_array) {
+        ids = raw.iter().filter_map(Value::as_i64).map(|v| v as i32).collect();
+        let tail = app.chat.decode(&ids[ids.len().saturating_sub(4)..], false).unwrap_or_default();
+        thinking = tail.ends_with("<think>\n");
+    }
+    prepare_ids(app, req, ids, images, thinking, tools)
+}
+
+type Media = Vec<std::sync::Arc<quench6k_engine::session::ImageInput>>;
+
+/// `messages` through the chat template: the prompt's tokens (media expanded), its media, and whether
+/// the prompt opens a reasoning block.
+fn render_chat(app: &App, req: &Value, tools: Option<&Value>) -> Result<(Vec<i32>, Media, bool), ApiError> {
     let messages = req.get("messages").filter(|m| m.is_array()).ok_or_else(|| error(StatusCode::BAD_REQUEST, "messages must be an array"))?;
     let kwargs = req.get("chat_template_kwargs").cloned().unwrap_or(Value::Null);
     let enable_thinking = kwargs.get("enable_thinking").and_then(Value::as_bool);
     let effort = kwargs.get("reasoning_effort").or_else(|| req.get("reasoning_effort")).and_then(Value::as_str);
-    let tools = req.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty())).cloned();
     let t0 = std::time::Instant::now();
     let (messages, images, videos) = extract_images(app, messages)?;
-    let text = app.chat.render(&messages, tools.as_ref(), enable_thinking, effort).map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
+    let text = app.chat.render(&messages, tools, enable_thinking, effort).map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
     let thinking = text.ends_with("<think>\n");
     let t1 = std::time::Instant::now();
     let ids = app.chat.encode(&text).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if std::env::var_os("QUENCH6K_TIMING").is_some() {
         eprintln!("prepare: render {:.1} ms, encode {:.1} ms ({} tokens)", (t1 - t0).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3, ids.len());
     }
-    let (mut ids, images) = app.chat.expand_media(&ids, images, videos).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let mut thinking = thinking;
-    // Debugging: "prompt_ids" replays a traced prompt (text-only) in place of the rendered messages.
-    if let Some(raw) = req.get("prompt_ids").and_then(Value::as_array) {
-        ids = raw.iter().filter_map(Value::as_i64).map(|v| v as i32).collect();
-        let tail = app.chat.decode(&ids[ids.len().saturating_sub(4)..], false).unwrap_or_default();
-        thinking = tail.ends_with("<think>\n");
+    let (ids, images) = app.chat.expand_media(&ids, images, videos).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok((ids, images, thinking))
+}
+
+/// A raw prompt's tokens: a string (special tokens included as text) or a list of token ids.
+fn raw_ids(app: &App, prompt: Option<&Value>) -> Result<Vec<i32>, ApiError> {
+    match prompt {
+        Some(Value::String(text)) => app.chat.encode(text).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}"))),
+        Some(Value::Array(a)) if a.len() == 1 && a[0].is_string() => raw_ids(app, a.first()),
+        Some(Value::Array(a)) if a.iter().all(Value::is_i64) => Ok(a.iter().filter_map(Value::as_i64).map(|v| v as i32).collect()),
+        Some(Value::Array(a)) if a.len() == 1 && a[0].is_array() => raw_ids(app, a.first()),
+        _ => Err(error(StatusCode::BAD_REQUEST, "prompt must be a string or a list of token ids (one prompt per request)")),
+    }
+}
+
+/// Sampling and request options common to the chat and raw completion endpoints.
+fn prepare_ids(app: &App, req: &Value, ids: Vec<i32>, images: Media, thinking: bool, tools: Option<Value>) -> Result<Prepared, ApiError> {
+    if ids.is_empty() {
+        return Err(error(StatusCode::BAD_REQUEST, "empty prompt"));
+    }
+    if req.get("n").and_then(Value::as_u64).is_some_and(|n| n != 1) {
+        return Err(error(StatusCode::BAD_REQUEST, "n must be 1"));
     }
     let max_tokens = req.get("max_completion_tokens").or_else(|| req.get("max_tokens")).and_then(Value::as_u64).map_or(app.default_max_tokens, |n| n as usize);
     let temperature = req.get("temperature").and_then(Value::as_f64).unwrap_or(1.0) as f32;
@@ -545,7 +710,7 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, Response> {
 /// Replaces image and video parts of message contents (OpenAI-style `image_url` / `video_url` with
 /// a data URL) by template placeholders and preprocesses them, in order.
 #[allow(clippy::type_complexity)]
-fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<quench6k_engine::vision::VisionInput>, Vec<quench6k_engine::vision::VideoClip>), Response> {
+fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<quench6k_engine::vision::VisionInput>, Vec<quench6k_engine::vision::VideoClip>), ApiError> {
     use base64::Engine;
     let mut out = messages.clone();
     let (mut images, mut videos) = (Vec::new(), Vec::new());
@@ -700,9 +865,9 @@ fn finish_reason(finish: Finish, tool_calls: bool) -> &'static str {
 }
 
 async fn chat_completions(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
-    let p = match prepare(&app, &req) {
+    let p = match prepare(&app, &req).and_then(|p| check_context(&app, &p).map(|()| p)) {
         Ok(p) => p,
-        Err(r) => return r,
+        Err(e) => return e.into_response(),
     };
     let id = format!("chatcmpl-{}", now());
     if p.stream { stream_response(app, p, id).await } else { full_response(app, p, id).await }
@@ -722,7 +887,7 @@ fn apply_stops(text: &mut String, stops: &[String]) -> bool {
 async fn full_response(app: Arc<App>, p: Prepared, id: String) -> Response {
     let (seg, n, finish, cached) = match generate(&app, &p, |_| {}).await {
         Ok(r) => r,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
     let prompt_tokens = p.ids.len();
     let (reasoning, content, calls) = parse_output(&seg.text, p.thinking, p.tools.as_ref());
@@ -911,7 +1076,9 @@ async fn generate(app: &App, p: &Prepared, mut on_seg: impl FnMut(Seg)) -> Resul
             })));
         }
         app.jobs.send(Work::Generate(Job { ids: ids.clone(), params: params.clone(), mtp: p.mtp, tx, capture: p.capture.clone() })).map_err(|_| "generation worker stopped".to_string())?;
-        let (n, finish, cached) = drive(app, &mut rx, ids.len(), &p.stops, &mut seg, &mut stream, &mut on_seg).await?;
+        let (n, finish, cached) = drive(app, &mut rx, ids.len(), &p.stops, &mut seg, &mut stream, &mut on_seg).await.inspect_err(|_| {
+            app.metrics.errors.fetch_add(1, Ordering::Relaxed);
+        })?;
         total += n;
         cached_first.get_or_insert(cached);
         let (Some(tools), Some(tc)) = (p.tools.as_ref(), app.tool_call_token) else { return Ok((seg, total, finish, cached_first.unwrap_or(0))) };
@@ -1159,9 +1326,9 @@ fn tool_use_blocks(calls: &[Value]) -> Vec<Value> {
 
 async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
     let converted = from_anthropic(&req);
-    let p = match prepare(&app, &converted) {
+    let p = match prepare(&app, &converted).and_then(|p| check_context(&app, &p).map(|()| p)) {
         Ok(p) => p,
-        Err(r) => return r,
+        Err(e) => return e.anthropic(),
     };
     let prompt_tokens = p.ids.len();
     let id = format!("msg_{}", now());
@@ -1169,7 +1336,7 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
     if !p.stream {
         let (seg, n, finish, cached) = match generate(&app, &p, |_| {}).await {
             Ok(r) => r,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e).anthropic(),
         };
         let (reasoning, content, calls) = parse_output(&seg.text, thinking, tools.as_ref());
         let mut blocks = Vec::new();
@@ -1242,6 +1409,139 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
         let _ = out_tx.send(ev("message_stop", json!({"type": "message_stop"})));
     });
     Sse::new(UnboundedReceiverStream::new(out_rx)).keep_alive(KeepAlive::default()).into_response()
+}
+
+async fn metrics_text(State(app): State<Arc<App>>) -> Response {
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], app.metrics.render()).into_response()
+}
+
+/// `/tokenize` (vLLM and llama.cpp): the tokens of `messages` through the chat template (media
+/// expanded), or of a raw `prompt` / `content` string.
+async fn tokenize(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
+    let ids = if req.get("messages").is_some() {
+        let tools = req.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty()));
+        render_chat(&app, &req, tools).map(|(ids, _, _)| ids)
+    } else {
+        raw_ids(&app, req.get("prompt").or_else(|| req.get("content")))
+    };
+    match ids {
+        Ok(ids) => Json(json!({"tokens": ids, "count": ids.len(), "max_model_len": app.context})).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `/detokenize`: the text of `tokens` (special tokens included), as vLLM's `prompt` and llama.cpp's
+/// `content`.
+async fn detokenize(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
+    let Some(ids) = req.get("tokens").and_then(Value::as_array).and_then(|a| a.iter().map(|v| v.as_i64().map(|v| v as i32)).collect::<Option<Vec<i32>>>()) else {
+        return error(StatusCode::BAD_REQUEST, "tokens must be a list of token ids").into_response();
+    };
+    match app.chat.decode(&ids, false) {
+        Ok(text) => Json(json!({"prompt": text, "content": text})).into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+/// `/v1/completions`: a raw prompt (no chat template, no reasoning or tool-call parsing).
+async fn completions(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
+    if req.get("logprobs").is_some_and(|v| !v.is_null() && v != &json!(false)) || req.get("echo").and_then(Value::as_bool) == Some(true) {
+        return error(StatusCode::BAD_REQUEST, "logprobs and echo are not supported").into_response();
+    }
+    let p = match raw_ids(&app, req.get("prompt")).and_then(|ids| prepare_ids(&app, &req, ids, Vec::new(), false, None)).and_then(|p| check_context(&app, &p).map(|()| p)) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (id, created, model, prompt_tokens) = (format!("cmpl-{}", now()), now(), p.model.clone(), p.ids.len());
+    let body = move |text: &str, finish: Option<&str>| json!({"id": id, "object": "text_completion", "created": created, "model": model,
+                                                             "choices": [{"index": 0, "text": text, "logprobs": Value::Null, "finish_reason": finish}]});
+    let usage = move |n: usize, cached: usize| json!({"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n,
+                                                       "prompt_tokens_details": {"cached_tokens": cached}});
+    let reason = |finish: Finish, stopped: bool| if stopped { "stop" } else { finish_reason(finish, false) };
+    if !p.stream {
+        return match generate_raw(&app, &p, |_| {}).await {
+            Ok((text, n, finish, cached, stopped)) => {
+                let mut out = body(&text, Some(reason(finish, stopped)));
+                out["usage"] = usage(n, cached);
+                Json(out).into_response()
+            }
+            Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+    }
+    let (out_tx, out_rx) = tmpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
+    tokio::spawn(async move {
+        let send = |v: Value| out_tx.send(Ok(Event::default().data(v.to_string())));
+        match generate_raw(&app, &p, |t| {
+            let _ = send(body(&t, None));
+        })
+        .await
+        {
+            Ok((_, n, finish, cached, stopped)) => {
+                let mut last = body("", Some(reason(finish, stopped)));
+                last["usage"] = usage(n, cached);
+                let _ = send(last);
+                let _ = out_tx.send(Ok(Event::default().data("[DONE]")));
+            }
+            Err(e) => {
+                let _ = send(json!({"error": {"message": e}}));
+            }
+        }
+    });
+    Sse::new(UnboundedReceiverStream::new(out_rx)).keep_alive(KeepAlive::default()).into_response()
+}
+
+/// Runs a prepared request without chat parsing, passing decoded text to `on_text` as it is final
+/// (text that may begin a stop string waits). Returns (text cut at a stop string, generated tokens,
+/// finish, cached prompt tokens, whether a stop string ended it).
+async fn generate_raw(app: &App, p: &Prepared, mut on_text: impl FnMut(String)) -> Result<(String, usize, Finish, usize, bool), String> {
+    let (tx, mut rx) = tmpsc::unbounded_channel();
+    app.jobs.send(Work::Generate(Job { ids: p.ids.clone(), params: p.params.clone(), mtp: p.mtp, tx, capture: p.capture.clone() })).map_err(|_| "generation worker stopped".to_string())?;
+    let hold = p.stops.iter().map(|s| s.len().saturating_sub(1)).max().unwrap_or(0);
+    let mut stream = TextStream::default();
+    let (mut text, mut sent, mut n, mut stopped) = (String::new(), 0usize, 0usize, false);
+    let (mut finish, mut cached) = (Finish::Cancelled, 0);
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            Msg::Token(t) => {
+                n += 1;
+                if stopped {
+                    continue;
+                }
+                let piece = stream.push(&app.chat, t).map_err(|e| format!("{e:#}"))?;
+                text.push_str(&piece);
+                if apply_stops(&mut text, &p.stops) {
+                    stopped = true;
+                    rx.close();
+                }
+                let end = if stopped { text.len() } else { text.len().saturating_sub(hold) };
+                let end = (sent..=end.max(sent)).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(sent);
+                if end > sent {
+                    on_text(text[sent..end].to_string());
+                    sent = end;
+                }
+            }
+            Msg::Progress(..) => {}
+            Msg::Done(f, c) => {
+                (finish, cached) = (f, c);
+                break;
+            }
+            Msg::Error(e) => {
+                app.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                return Err(e);
+            }
+        }
+    }
+    if sent < text.len() {
+        on_text(text[sent..].to_string());
+    }
+    Ok((text, n, finish, cached, stopped))
+}
+
+/// `/v1/messages/count_tokens`: the prompt's tokens after rendering and media expansion.
+async fn count_tokens(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
+    match prepare(&app, &from_anthropic(&req)) {
+        Ok(p) => Json(json!({"input_tokens": p.ids.len()})).into_response(),
+        Err(e) => e.anthropic(),
+    }
 }
 
 #[cfg(test)]
