@@ -237,6 +237,8 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
         .route("/metrics", get(metrics_text))
+        // axum's default of 2 MB is less than a long conversation with tool output or an image or video data URL.
+        .layer(axum::extract::DefaultBodyLimit::max(512 << 20))
         .with_state(app);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
