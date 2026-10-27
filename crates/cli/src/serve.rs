@@ -34,6 +34,8 @@ pub struct ServeOptions {
     pub steered_name: Option<String>,
     pub cache_host_gib: f64,
     pub cache_dir: Option<PathBuf>,
+    pub cache_disk_gib: f64,
+    pub cache_max_age_days: Option<f64>,
     pub chat_template: Option<PathBuf>,
     pub tool_retries: usize,
     pub default_max_tokens: usize,
@@ -168,6 +170,8 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     let store = quench6k_engine::context_store::StoreOptions {
         host_bytes: (opts.cache_host_gib * 1073741824.0) as usize,
         dir: opts.cache_dir.clone(),
+        disk_bytes: (opts.cache_disk_gib * 1073741824.0) as usize,
+        max_age: opts.cache_max_age_days.map(|d| std::time::Duration::from_secs_f64(d * 86400.0)),
         model_id: model_id(&opts.model),
     };
     let steering = steer.steering.is_some();

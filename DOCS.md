@@ -39,6 +39,8 @@ Not supported: quantized attention or shared experts, compressed-tensors exports
 | `--tool-retries N` | 2 | Regenerations of a malformed tool call |
 | `--cache-host-gib N` | 16 | Pinned host memory for stored contexts |
 | `--cache-dir DIR` | | Disk tier for stored contexts, kept across restarts |
+| `--cache-disk-gib N` | 200 | Most disk space for the disk tier (0: no limit) |
+| `--cache-max-age-days N` | | Deletes stored contexts unused for N days |
 | `--chat-template FILE` | | Overrides the checkpoint's `chat_template.jinja` |
 | `--steering FILE` | | Steering pack to load |
 | `--strength X` | pack default | Strength of the steered model |
@@ -141,6 +143,9 @@ the text before it is kept. While a tool call is being generated, streaming clie
   shorter conversation, so two conversations running side by side each keep their own slot.
 - When a request would overwrite a different conversation, that conversation's state is moved to
   pinned host memory (`--cache-host-gib`) and, with `--cache-dir`, to disk.
+- The disk tier keeps within `--cache-disk-gib` and `--cache-max-age-days` by deleting the least
+  recently used contexts first (a file's modification time is its last use; reusing a context renews
+  it). Files written for another model configuration count toward the limit and go first.
 - Stored contexts are keyed by their tokens (images by content) and are valid only for the model
   configuration (checkpoint, KV format) that wrote them.
 

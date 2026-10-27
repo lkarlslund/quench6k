@@ -216,6 +216,13 @@ enum Command {
         /// Directory for the disk tier of stored contexts, kept across restarts.
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+        /// Most disk space for stored contexts in --cache-dir, in GiB; the least recently used are
+        /// deleted first (0: no limit).
+        #[arg(long, default_value_t = 200.0)]
+        cache_disk_gib: f64,
+        /// Deletes stored contexts in --cache-dir unused for this many days.
+        #[arg(long)]
+        cache_max_age_days: Option<f64>,
         /// Chat template file overriding the model's chat_template.jinja.
         #[arg(long)]
         chat_template: Option<PathBuf>,
@@ -430,8 +437,8 @@ fn main() -> Result<()> {
         }
         Command::VisionCheck { model, reference, max_pixels } => vision_check(&model, &reference, max_pixels)?,
         Command::Score { model, precision, fixture, out, suffix, chunk, decode, batch2, steer } => score(&model, precision.into(), &fixture, &out, &suffix, chunk, decode, batch2, &steer)?,
-        Command::Serve { model, listen, context, drafts, name, steer, steered_name, cache_host_gib, cache_dir, chat_template, tool_retries, default_max_tokens, slots, capture_dir, no_vision, image_max_pixels, video_max_frames } => {
-            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, steered_name, cache_host_gib, cache_dir, chat_template, tool_retries, default_max_tokens, slots, capture_dir, vision: !no_vision, image_max_pixels, video_max_frames })?
+        Command::Serve { model, listen, context, drafts, name, steer, steered_name, cache_host_gib, cache_dir, cache_disk_gib, cache_max_age_days, chat_template, tool_retries, default_max_tokens, slots, capture_dir, no_vision, image_max_pixels, video_max_frames } => {
+            serve::run(serve::ServeOptions { model, listen, context, drafts, name, steer, steered_name, cache_host_gib, cache_dir, cache_disk_gib, cache_max_age_days, chat_template, tool_retries, default_max_tokens, slots, capture_dir, vision: !no_vision, image_max_pixels, video_max_frames })?
         }
         Command::BatchCheck { model, fixture, n } => batch_check(&model, &fixture, n)?,
         Command::Chat { model, prompt, max_tokens, temperature, top_p, top_k, seed, think, context, image, video, steer } => {
