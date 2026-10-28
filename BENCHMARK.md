@@ -3,7 +3,8 @@
 ![Decode and prefill throughput by context length](bench/results.svg)
 
 One request on an RTX PRO 6000 Blackwell at 600 W, compared with NInfer 6000 measured on the same
-machine. Tokens per second.
+machine. Tokens per second. Dotted lines with open markers are the FP8 KV cache (`--kv fp8`, the
+serving configuration), solid lines BF16.
 
 **Greedy and sampled.** Greedy decoding takes the most likely token; normal requests sample at
 temperature 1.0 (top_p 0.95, top_k 20). Sampled text is less predictable, so the MTP head's drafts are

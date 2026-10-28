@@ -98,8 +98,10 @@ fn num(v: f64) -> String {
 /// One chart panel: tok/s against context (log scale) for `series`.
 fn panel(svg: &mut String, recs: &[Rec], ctxs: &[u64], series: &[Series], value: fn(&Rec) -> Option<f64>, x0: f64, title: &str) {
     let (w, h, top, left, bottom) = (430.0, 300.0, 40.0, 58.0, 36.0);
-    let pts = |s: &Series| -> Vec<(u64, f64)> { ctxs.iter().filter_map(|&c| find(recs, s, s.kv, c).and_then(value).map(|v| (c, v))).collect() };
-    let vmax = series.iter().flat_map(|s| pts(s)).map(|p| p.1).fold(0.0, f64::max);
+    let pts = |s: &Series, kv: &str| -> Vec<(u64, f64)> { ctxs.iter().filter_map(|&c| find(recs, s, kv, c).and_then(value).map(|v| (c, v))).collect() };
+    // Each quench6k series is drawn twice: BF16 KV as listed, FP8 KV dotted with open markers.
+    let lines: Vec<(&Series, &str)> = series.iter().flat_map(|s| if s.engine == "quench6k" { vec![(s, s.kv), (s, "fp8")] } else { vec![(s, s.kv)] }).collect();
+    let vmax = lines.iter().flat_map(|&(s, kv)| pts(s, kv)).map(|p| p.1).fold(0.0, f64::max);
     // A round axis maximum with 4-6 gridlines.
     let step = (0..7).flat_map(|e| [1.0, 2.0, 2.5, 5.0].map(|m| m * 10f64.powi(e))).find(|st| vmax / st <= 5.0).unwrap_or(1.0);
     let ymax = (vmax / step).ceil() * step;
@@ -119,13 +121,14 @@ fn panel(svg: &mut String, recs: &[Rec], ctxs: &[u64], series: &[Series], value:
         let _ = writeln!(svg, r#"<text x="{:.1}" y="{:.1}" class="xtick">{}</text>"#, px(c), ly + ph + 18.0, ctx_label(c));
     }
     let _ = writeln!(svg, r#"<text x="{:.1}" y="{:.1}" class="axis">context (tokens)</text>"#, lx + pw / 2.0, ly + ph + 33.0);
-    for s in series {
-        let p = pts(s);
+    for &(s, kv) in &lines {
+        let p = pts(s, kv);
         if p.is_empty() {
             continue;
         }
         // One polyline per run of consecutive contexts: no line across a context without data.
-        let dash = if s.dashed { r#" stroke-dasharray="5 4""# } else { "" };
+        let fp8 = kv == "fp8";
+        let dash = if fp8 { r#" stroke-dasharray="0.1 4.5" stroke-linecap="round""# } else if s.dashed { r#" stroke-dasharray="5 4""# } else { "" };
         let mut runs: Vec<Vec<(u64, f64)>> = Vec::new();
         for &(c, v) in &p {
             let i = ctxs.iter().position(|&x| x == c).unwrap();
@@ -139,7 +142,8 @@ fn panel(svg: &mut String, recs: &[Rec], ctxs: &[u64], series: &[Series], value:
             let _ = writeln!(svg, r#"<polyline points="{}" fill="none" stroke="{}" stroke-width="2.2"{dash}/>"#, path.join(" "), s.color);
         }
         for &(c, v) in &p {
-            let _ = writeln!(svg, r#"<circle cx="{:.1}" cy="{:.1}" r="3" fill="{}"/>"#, px(c), py(v), s.color);
+            let fill = if fp8 { "#ffffff" } else { s.color };
+            let _ = writeln!(svg, r#"<circle cx="{:.1}" cy="{:.1}" r="3" fill="{fill}" stroke="{}" stroke-width="1.5"/>"#, px(c), py(v), s.color);
         }
     }
 }
@@ -162,6 +166,10 @@ fn svg(recs: &[Rec], ctxs: &[u64]) -> String {
     panel(&mut s, recs, ctxs, PREFILL, |r| r.prefill, 440.0, "Prefill, tokens/s");
     legend(&mut s, DECODE, 60.0, 318.0);
     legend(&mut s, PREFILL, 500.0, 318.0);
+    let (x, y) = (500.0, 318.0 + (PREFILL.len() as f64 + 0.6) * 18.0);
+    let _ = writeln!(s, r##"<line x1="{x}" y1="{y}" x2="{}" y2="{y}" stroke="#495057" stroke-width="2.2"/><circle cx="{}" cy="{y}" r="3" fill="#495057"/><text x="{}" y="{}" class="legend">quench6k with BF16 KV cache</text>"##, x + 22.0, x + 11.0, x + 28.0, y + 4.0);
+    let y = y + 18.0;
+    let _ = writeln!(s, r##"<line x1="{x}" y1="{y}" x2="{}" y2="{y}" stroke="#495057" stroke-width="2.2" stroke-dasharray="0.1 4.5" stroke-linecap="round"/><circle cx="{}" cy="{y}" r="3" fill="#ffffff" stroke="#495057" stroke-width="1.5"/><text x="{}" y="{}" class="legend">quench6k with FP8 KV cache (--kv fp8)</text>"##, x + 22.0, x + 11.0, x + 28.0, y + 4.0);
     s.push_str("</svg>\n");
     s
 }
