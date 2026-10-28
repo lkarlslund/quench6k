@@ -1399,7 +1399,7 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
             Seg::Prompt(..) | Seg::ToolBytes(_) => {}
         })
         .await;
-        let (seg, n, finish, _) = match result {
+        let (seg, n, finish, cached) = match result {
             Ok(r) => r,
             Err(e) => {
                 let _ = out_tx.send(ev("error", json!({"type": "error", "error": {"type": "api_error", "message": e}})));
@@ -1423,7 +1423,7 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
             let _ = out_tx.send(ev("content_block_stop", json!({"type": "content_block_stop", "index": i})));
         }
         let _ = out_tx.send(ev("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": stop_reason(finish, seg.stopped, !calls.is_empty()), "stop_sequence": Value::Null},
-                                                        "usage": {"output_tokens": n}})));
+                                                        "usage": {"input_tokens": prompt_tokens - cached, "cache_read_input_tokens": cached, "output_tokens": n}})));
         let _ = out_tx.send(ev("message_stop", json!({"type": "message_stop"})));
     });
     Sse::new(UnboundedReceiverStream::new(out_rx)).keep_alive(KeepAlive::default()).into_response()
