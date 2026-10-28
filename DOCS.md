@@ -92,7 +92,7 @@ A prompt of `--context` tokens or more is rejected with HTTP 400 and code `conte
 | `stop` | | String or list of strings |
 | `tools` | | OpenAI function tools |
 | `chat_template_kwargs.enable_thinking` | template default | Anthropic: `"thinking": {"type": "enabled"}` |
-| `reasoning_effort` | | Passed to the chat template |
+| `reasoning_effort` | template default (`xhigh`) | `low`, `medium`, `high` (as `xhigh`) or `xhigh`; `none` and `minimal` turn thinking off |
 
 Extensions:
 

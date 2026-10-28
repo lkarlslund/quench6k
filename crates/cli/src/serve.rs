@@ -629,13 +629,25 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, ApiError> {
 
 type Media = Vec<std::sync::Arc<quench6k_engine::session::ImageInput>>;
 
+/// OpenAI reasoning efforts in the template's terms: the Flash-Next templates take xhigh, medium and
+/// low, so "none" and "minimal" turn thinking off and "high" is xhigh. Other values pass through.
+fn reasoning(enable_thinking: Option<bool>, effort: Option<&str>) -> (Option<bool>, Option<&str>) {
+    match effort {
+        Some("none" | "minimal") => (Some(false), None),
+        Some("high") => (enable_thinking, Some("xhigh")),
+        _ => (enable_thinking, effort),
+    }
+}
+
 /// `messages` through the chat template: the prompt's tokens (media expanded), its media, and whether
 /// the prompt opens a reasoning block.
 fn render_chat(app: &App, req: &Value, tools: Option<&Value>) -> Result<(Vec<i32>, Media, bool), ApiError> {
     let messages = req.get("messages").filter(|m| m.is_array()).ok_or_else(|| error(StatusCode::BAD_REQUEST, "messages must be an array"))?;
     let kwargs = req.get("chat_template_kwargs").cloned().unwrap_or(Value::Null);
-    let enable_thinking = kwargs.get("enable_thinking").and_then(Value::as_bool);
-    let effort = kwargs.get("reasoning_effort").or_else(|| req.get("reasoning_effort")).and_then(Value::as_str);
+    let (enable_thinking, effort) = reasoning(
+        kwargs.get("enable_thinking").and_then(Value::as_bool),
+        kwargs.get("reasoning_effort").or_else(|| req.get("reasoning_effort")).and_then(Value::as_str),
+    );
     let t0 = std::time::Instant::now();
     let (messages, images, videos) = extract_images(app, messages)?;
     let text = app.chat.render(&messages, tools, enable_thinking, effort).map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
@@ -1557,6 +1569,15 @@ mod tests {
     fn tools() -> Value {
         json!([{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object",
             "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}}])
+    }
+
+    #[test]
+    fn openai_reasoning_efforts() {
+        assert_eq!(reasoning(None, Some("none")), (Some(false), None));
+        assert_eq!(reasoning(Some(true), Some("minimal")), (Some(false), None));
+        assert_eq!(reasoning(None, Some("high")), (None, Some("xhigh")));
+        assert_eq!(reasoning(Some(true), Some("low")), (Some(true), Some("low")));
+        assert_eq!(reasoning(Some(false), None), (Some(false), None));
     }
 
     #[test]
