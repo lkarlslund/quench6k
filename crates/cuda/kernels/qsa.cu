@@ -12,6 +12,7 @@
 #include <cuda_fp8.h>
 
 #include "mma.cuh"
+#include "variants.cuh"
 
 namespace {
 
@@ -428,6 +429,145 @@ __global__ void __launch_bounds__(ATT_THREADS) attention_split_kernel(const floa
     if (tid < QPG) {
         out[tid] = smax[tid];
         out[QPG + tid] = ssum[tid];
+    }
+#pragma unroll
+    for (int h = 0; h < QPG; ++h) out[2 * QPG + h * HD + tid] = acc[h];
+}
+
+// attention_split_kernel<true> with fewer instructions per block (the kernel is issue-bound, not memory-
+// bound): the chunk's FP8 K/V rows stay raw in shared memory and are dequantized where they are used (to
+// the same BF16 values; ~30 KB, three blocks per SM); each warp scores its four keys together, so q is read
+// from shared memory once per column instead of once per key, and reduces the 48 dot products with two
+// slot reductions; the PV loop reads probabilities four keys at a time. Every sum keeps its operands and
+// order, so outputs are bitwise identical.
+__global__ void __launch_bounds__(ATT_THREADS, 3) attention_split_raw8_kernel(const float* __restrict__ q,
+                                                                              const void* __restrict__ kcache,
+                                                                              const void* __restrict__ vcache,
+                                                                              const int* __restrict__ sel,
+                                                                              const int* __restrict__ start_ptr, float* part) {
+    pdl_launch_dependents();
+    pdl_wait();
+    constexpr int KPW = KT / (ATT_THREADS / 32);  // keys per warp
+    __shared__ __align__(16) float sq[QPG][HD];
+    __shared__ __align__(16) unsigned char sk[KT][HD], sv[KT][HD];
+    __shared__ float kscale[KT];
+    __shared__ __align__(16) float vscale[KT];
+    __shared__ __align__(16) float sp[QPG][KT];
+    __shared__ float sscale[QPG];
+    __shared__ int keys[KT];
+
+    const int t = blockIdx.x, kvh = blockIdx.y, split = blockIdx.z;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int p = *start_ptr + t;
+    const int complete = (p + 1) / GROUP;
+    const bool dense = complete <= TOPG;
+    const int tail_begin = complete * GROUP;
+    const int nkeys = dense ? p + 1 : TOPG * GROUP + (p + 1 - tail_begin);
+    const int k_begin = split * CHUNK, k_end = min(nkeys, k_begin + CHUNK);
+    const int* sel_row = sel + (size_t)t * TOPG;
+    float* out = part + (((size_t)t * KVH + kvh) * SPLITS + split) * (2 * QPG + QPG * HD);
+
+    if (k_begin >= k_end) {
+        if (tid < QPG) {
+            out[tid] = -INFINITY;
+            out[QPG + tid] = 0;
+        }
+        return;
+    }
+    // CHUNK == KT: one tile per block.
+    const int nk = k_end - k_begin;
+    if (tid < nk) keys[tid] = key_at(k_begin + tid, dense, sel_row, tail_begin);
+    const float4* q4 = reinterpret_cast<const float4*>(q + (size_t)t * QH * HD + kvh * QPG * HD);
+    for (int i = tid; i < QPG * HD / 4; i += ATT_THREADS) reinterpret_cast<float4*>(&sq[0][0])[i] = q4[i];
+    __syncthreads();
+    for (int i = tid; i < nk * HD / 16; i += ATT_THREADS) {
+        const int r = i / (HD / 16), c = (i % (HD / 16)) * 16;
+        *reinterpret_cast<uint4*>(&sk[r][c]) = *reinterpret_cast<const uint4*>(kv_row<true>(kcache, keys[r], kvh) + c);
+        *reinterpret_cast<uint4*>(&sv[r][c]) = *reinterpret_cast<const uint4*>(kv_row<true>(vcache, keys[r], kvh) + c);
+    }
+    if (tid < KT) kscale[tid] = tid < nk ? *reinterpret_cast<const float*>(kv_row<true>(kcache, keys[tid], kvh) + HD) : 0.0f;
+    else if (tid < 2 * KT) {
+        const int r = tid - KT;
+        vscale[r] = r < nk ? *reinterpret_cast<const float*>(kv_row<true>(vcache, keys[r], kvh) + HD) : 0.0f;
+    }
+    __syncthreads();
+    auto deq = [](unsigned char b, float scale) {
+        __nv_fp8_e4m3 v;
+        v.__x = b;
+        return bf2f(f2bf(float(v) * scale));
+    };
+    {
+        // Warp w scores keys w + 8 i (i < 4); keys past nk compute on stale shared memory and are dropped.
+        float partv[KPW][QPG] = {};
+        float ks[KPW];
+#pragma unroll
+        for (int i = 0; i < KPW; ++i) ks[i] = kscale[warp + 8 * i];
+        for (int d = lane; d < HD; d += 32) {
+            float qd[QPG];
+#pragma unroll
+            for (int h = 0; h < QPG; ++h) qd[h] = sq[h][d];
+#pragma unroll
+            for (int i = 0; i < KPW; ++i) {
+                const float kf = deq(sk[warp + 8 * i][d], ks[i]);
+#pragma unroll
+                for (int h = 0; h < QPG; ++h) partv[i][h] += qd[h] * kf;
+            }
+        }
+        // Slots i * 12 + h: 0..31 in one reduction (lane l holds slot l), 32..47 in another (lane l, slot l / 2).
+        float a[32], b[16];
+#pragma unroll
+        for (int s = 0; s < 32; ++s) a[s] = partv[s / QPG][s % QPG];
+#pragma unroll
+        for (int s = 0; s < 16; ++s) b[s] = partv[(32 + s) / QPG][(32 + s) % QPG];
+        const float sa = warp_sum_slots(a);
+        const float sb = warp_sum_slots(b);
+        {
+            const int r = warp + 8 * (lane / QPG);
+            if (r < nk) sp[lane % QPG][r] = sa * (1.0f / 16.0f);
+        }
+        if ((lane & 1) == 0) {
+            const int s = 32 + lane / 2, r = warp + 8 * (s / QPG);
+            if (r < nk) sp[s % QPG][r] = sb * (1.0f / 16.0f);
+        }
+    }
+    __syncthreads();
+    for (int h = warp; h < QPG; h += ATT_THREADS / 32) {
+        float m = lane < nk ? sp[h][lane] : -INFINITY;
+        m = warp_max(m);
+        // One chunk per block: the running max starts at -inf and the running sum at 0.
+        const float new_max = fmaxf(-INFINITY, m);
+        const float e = lane < nk ? __expf(sp[h][lane] - new_max) : 0.0f;
+        sp[h][lane] = e;
+        const float sum = warp_sum(e);
+        if (lane == 0) {
+            const float scale = __expf(-INFINITY - new_max);
+            sscale[h] = scale;
+            out[h] = new_max;
+            out[QPG + h] = 0.0f * scale + sum;
+        }
+    }
+    __syncthreads();
+    float acc[QPG] = {};
+#pragma unroll
+    for (int h = 0; h < QPG; ++h) acc[h] *= sscale[h];
+    int r = 0;
+    for (; r + 4 <= nk; r += 4) {
+        const float4 vs = *reinterpret_cast<const float4*>(&vscale[r]);
+        const float v0 = deq(sv[r][tid], vs.x), v1 = deq(sv[r + 1][tid], vs.y), v2 = deq(sv[r + 2][tid], vs.z),
+                    v3 = deq(sv[r + 3][tid], vs.w);
+#pragma unroll
+        for (int h = 0; h < QPG; ++h) {
+            const float4 pr = *reinterpret_cast<const float4*>(&sp[h][r]);
+            acc[h] += pr.x * v0;
+            acc[h] += pr.y * v1;
+            acc[h] += pr.z * v2;
+            acc[h] += pr.w * v3;
+        }
+    }
+    for (; r < nk; ++r) {
+        const float vf = deq(sv[r][tid], vscale[r]);
+#pragma unroll
+        for (int h = 0; h < QPG; ++h) acc[h] += sp[h][r] * vf;
     }
 #pragma unroll
     for (int h = 0; h < QPG; ++h) out[2 * QPG + h * HD + tid] = acc[h];
@@ -1113,8 +1253,10 @@ extern "C" cudaError_t quench6k_qsa_attention_split(const float* q, const float*
                                                   const int* sel, const int* start, int T, int fp8, float* part, void* out,
                                                   cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(fp8 ? attention_split_kernel<true> : attention_split_kernel<false>, dim3(T, KVH, SPLITS), ATT_THREADS, 0, st,
-                              q, kcache, vcache, sel, start, part));
+    // qsa.raw8 (kbench): FP8 K/V staged raw, three blocks per SM; 0 = the BF16-staging kernel.
+    const auto split = !fp8 ? attention_split_kernel<false>
+                       : sq_variant("qsa.raw8", 1) ? attention_split_raw8_kernel : attention_split_kernel<true>;
+    SQ_CHECK_LAUNCH(sq_launch(split, dim3(T, KVH, SPLITS), ATT_THREADS, 0, st, q, kcache, vcache, sel, start, part));
     SQ_CHECK_LAUNCH(sq_launch(attention_merge_kernel, dim3(T, QH), HD, 0, st, part, qg, ld, start, static_cast<__nv_bfloat16*>(out)));
     SQ_RETURN_LAUNCH();
 }

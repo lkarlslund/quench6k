@@ -77,6 +77,159 @@ Variant kernels are templates over these keys; new fused kernels are added as fu
 - Prefill kernels need captured 8K-token batches (about 1 GB of activations per layer); the same
   structure applies, with R = chunk rows, but the first version covers decode.
 
+## Measurement (2026-10-27)
+
+### Experiment ledger
+
+`bench/kbench.jsonl`: one JSON record per measured configuration, so that "was this tried?" is a grep,
+not a read through the dated findings below. `kbench --log bench/kbench.jsonl --note "what is tried"`
+appends the baseline and every swept configuration:
+
+| Field | |
+|---|---|
+| `date`, `commit` | UTC date; the checkout's HEAD, `+dirty` when tracked files differ from it |
+| `layers`, `ctx`, `rows`, `steps`, `pairs` | The kbench configuration |
+| `fixed`, `variant` | Keys set for baseline and candidate (`--variant`), and the candidate's own keys (`{}`: the baseline) |
+| `us`, `floor_us` (baseline) | Microseconds per step, and the step's weight-streaming floor |
+| `base_us`, `ratio`, `q25`, `q75`, `exact`, `finite` (candidates) | Median candidate / baseline time over the pairs, its spread, bitwise equality with the baseline, all values finite |
+| `rejected` | The launch error, when a configuration is not compiled in |
+| `gpu` | As in bench/README.md, with `power_limit_w` (600 for comparisons) |
+| `sass` | Results of `--sass` checks |
+| `note` | `--note` |
+| `verdict`, `why` | Filled in by hand after the run: `kept`, `dropped`, `neutral` or `baseline`, and one line of reason |
+
+Records with `"backfill": true` and a `source` are the earlier rounds' experiments, taken from the
+findings below and from ROADMAP.md (no commit or configuration; `ratio` where a number was recorded).
+The ledger holds numbers and settings only: no prompts or outputs.
+
+### SASS check
+
+A hint the compiler ignored changes no output and possibly no timing, so a neutral result does not
+tell "did not help" from "is not there". `quench6k sass --file gemv [--kernel REGEX] [--top N]` lists
+the kernels of `kernels/gemv.cu` in the binary (demangled), their instruction counts and local loads
+and stores (register spills), and optionally the most frequent opcodes. `--check FILE/KERNEL=INSTR`
+(also kbench's `--sass`, recorded in the ledger) requires every kernel matching KERNEL to contain an
+instruction matching INSTR, and prints the first match's position:
+
+    quench6k sass --check 'gemv/gemv_kernel<\(WFmt\)3, \(int\)4, __nv_bfloat16, \(int\)2, \(int\)5, \(int\)8>=LDG\.E\.NA'
+
+A verdict then has three outcomes: effective (present, faster), ineffective (present, within noise),
+not implemented (absent). One file takes ~8 s; all of them ~20 s. ncu cannot attach on this driver
+(see 2026-10-19), so `--clock-control` advice for ncu does not apply here; nsys does.
+
+First use: the GEMV instances the engine runs (INT8G, 5-deep prefetch, 8 warps) spill nothing; 43 of
+the variant-only instances do (BF16 with 16 warps or 8-deep prefetch: up to 944 local loads).
+
+### Which step to rank on
+
+The service runs sampled MTP on one slot at 55K tokens (median) up to 190K: the 4-row verify step at
+long context, not plain decode at 8K. Rank candidates at `--rows 4`, and at `--ctx 65536` and `163840`
+as well as 8192. The verify step barely depends on context (4 layers: 662 / 656 / 677 us at 8K / 64K
+/ 160K; 8 layers: 1232 / 1238 / 1256 us), so the per-layer chain, not attention, is where long-context
+time goes; the full model adds the drafter and LM head (MTP 561 -> 520 tok/s from 8K to 260K).
+
+kbench checks every replay for non-finite values in the final hidden state and the residual; a
+candidate that produces any is marked `NON-FINITE` and never "best".
+
+### Real conversations as benchmark prompts
+
+`bench/context.ids` is tiled text: greedy MTP accepts 6.9 tokens per round on it, real traffic 2.2-3.6,
+so its MTP numbers overstate real speed by ~1.7x and weigh the draft path wrongly. The server's
+context files (`--cache-dir`) hold real conversations:
+
+    quench6k context-ids ~/.cache/quench6k/<id>.ctx --model M --out ~/bench-private/<id>.ids
+    QUENCH6K_BENCH_IDS=~/bench-private/<id>.ids quench6k bench --model M --ctx <its length> --mtp 6 --adaptive --sampled
+
+`context-ids` cuts after the last `<|im_start|>assistant\n`, so `bench` generates a real assistant
+turn. It refuses contexts with images (their spans hold negative content keys and need the pixels)
+and refuses to write inside a git checkout. **These files are private conversation data: keep them
+outside the repository, never commit them or records that quote them, and do not put their names or
+content in the ledger or in any document.** Pick conversations that share only the system prompt.
+
+Measured 2026-10-27 (600 W, three conversations of 20K / 91K / 170K tokens, 512 tokens generated):
+sampled MTP 277 / 368 / 346 tok/s at 2.3 / 3.6 / 3.4 tokens per round, greedy 275 / 488 / 341. The
+service log shows the same range (`quench6k traffic`: 305-336 tok/s at 3.1-3.6 tokens per round).
+Single conversations vary a lot; compare candidates on the same set and alternate.
+
+### Real traffic
+
+`journalctl --user -u quench6k -o short-iso | quench6k traffic [--weekly] [--since YYYY-MM-DD]`
+summarizes the server's per-request log lines per period and context range: requests, generated
+tokens, decode tok/s (generated / decode time), MTP tokens per round, cache reuse, the share of time in
+prefill, and prefill tok/s over requests that prefilled at least 4,096 new tokens. It caught what no
+benchmark did: cold prefill went 3-5K -> 9-10K tok/s and decode ~225 -> 305-336 tok/s when the PLE
+table was stored uncompressed (2026-10-26).
+
+### Census
+
+`tools/census.py` credits each kernel of an nsys trace (the command is in its docstring) with its
+critical-path contribution: its end minus the latest earlier end. Raw durations under PDL include
+the wait on the predecessor and add up to ~2x the busy time; the credits add up to it exactly. Weight
+loads issued before `griddepcontrol.wait` are credited to the predecessor, so a kernel's credit is
+what it costs after its inputs are ready. `--shape` splits by grid and stream (which GEMV is which).
+
+2026-10-27, full model, fp8 KV, 64K context, MTP 3 (4-row verify), 20 rounds, 600 W: 8.87 ms busy
+per round (verify ~8.1, draft ~0.77), 957 kernels, 0.23 ms idle.
+
+| Group | Per round | Share | Per call | Note |
+|---|---|---|---|---|
+| Routed experts (gate/up + down, 49 layers) | 3.17 ms | 36% | 49 + 16 us | ~1.7 TB/s for ~110 MB per layer: at the floor |
+| Dense GEMVs (212) | 2.90 ms | 33% | | |
+| - GDN in-projection (36) | 1.11 ms | 13% | 31.7 us | 1.37 TB/s, the one GEMV below ~1.6 |
+| - output projections (95) | 0.67 ms | 7.5% | 7.0 us | weights mostly preloaded under the predecessor |
+| - LM head (1) | 0.41 ms | 4.6% | 411 us | 1.59 TB/s: at the floor |
+| - attention QKV (12), router + shared gate/up (47) | 0.49 ms | 5.5% | 21 / 4.9 us | the 113-block router GEMV at ~0.9 TB/s |
+| HyperConnection (106 x 3 kernels) | 1.12 ms | 12.6% | 5.0 + 1.7 + 3.9 us | down, finish, up-mix |
+| GDN recurrence (36) | 0.44 ms | 4.9% | 12.2 us | |
+| QSA attention split + merge, select, index (15) | 0.68 ms | 7.7% | 25 + 4.5 + 8 + 8 us | a faster reduction is a numeric change |
+| Routing, combine, SwiGLU, small kernels | ~0.3 ms | ~3% | 0.7-2 us | |
+
+What it says about fusion (the 2026-10-27 kernel survey estimated ~2.5 us of ramp and tail per removed
+kernel, ~480 us per token for fusing the HC chain and the MoE chain):
+
+- The ramp is already hidden: every decode kernel loads its weights before the PDL wait, and the
+  kernels that fusion would remove are credited 0.7-2 us each (finish 1.7, routing 0.7, SwiGLU 0.9,
+  combine 2.0). Removing all of them outright would save ~0.4 ms per round (~4.5%); a fused kernel
+  keeps their work.
+- The HC's cost is not its kernel count: down and up-mix are separated by two grid-wide reductions
+  (sums of squares over 20 splits, dot products over 20 splits), and a fused kernel needs the same
+  barriers in-kernel. Every version measured lost: whole rows per block +6%, finish in up-mix
+  +3-5%, finish by the last block +2-5%, per-row-block tickets +0.6-1.7% (2026-10-16 to 10-19). The
+  most a perfect fusion could take is hc_finish's 1.7 us x 106 = 0.18 ms per round (2%).
+- The real remaining gaps against bandwidth (worked on below): the GDN in-projection (1.37 TB/s;
+  at 1.6 TB/s it would save ~0.16 ms per round), the HC's ~0.6 TB/s for 6.6 MB per call (post-wait
+  latency of three dependent phases, not bandwidth), and the QSA split + merge.
+
+## 2026-10-27: the three census targets
+
+kbench, 4 layers, fp8 KV, 64K, 4 rows, 600 W; each line is in `bench/kbench.jsonl`. ncu attaches on
+this driver now: `ncu --cache-control none --clock-control none -k regex:<kernel> --set full` around
+`kbench --steps 1 --pairs 1` (kernels run alone there, without PDL overlap, so use it for where a
+kernel's time goes, not for its in-graph cost). `gemv.rows/N`, `gemv.warps/N` and `gemv.pre/N` set
+one GEMV shape (N output rows) without touching the others (`sq_variant_shape`).
+
+- **QSA decode split: kept, exact, +1.4% end to end.** ncu: SMs 85% active, ~2,950 instructions per
+  warp, mostly shared-memory loads of q and of the probabilities: issue-bound, not memory- or
+  occupancy-bound (staging the FP8 K/V raw for three blocks per SM, one wave, alone: +-0). The new
+  kernel (`attention_split_raw8_kernel`, `qsa.raw8`, default 1) scores each warp's four keys together
+  (q read once per column instead of once per key), reduces the 48 dot products with two
+  `warp_sum_slots`, and reads probabilities four keys at a time in the PV loop; every sum keeps its
+  operands and order. 23 -> 11 us standalone, -1.27% per kbench step. Full model (MTP 3,
+  alternating): verify 8.20 -> 8.09 ms per round, draft 0.772 -> 0.749 ms, 446 -> 452 tok/s at 64K,
+  437 -> 443 at 160K. `score` byte-identical on all fixtures, spec-check (code, long-context) and
+  batch-check exact. The merge spread over 2 / 4 blocks per head: +-0.
+- **GDN in-projection: unchanged.** ncu: 1.26 TB/s alone, long-scoreboard stalls; every block issues
+  all its weight loads at once, so the 2.7 waves reach DRAM as bursts with gaps between them. Every
+  rows x warps shape for N = 16480 alone is slower (+0.8..+4.2%). A persistent version (two CTAs per
+  SM, each warp loads the next row before computing the current one; exact) is +1.9%: it preloads
+  ~1 MB before the PDL wait instead of the first wave's ~15 MB and keeps too little in flight; with
+  three CTAs per SM it spills (+2.8%).
+- **HyperConnection: unchanged.** ncu (warm L2): down / finish / up-mix 3.7-4.4 / 2.7 / 4.7 us alone,
+  stalls on the loads of z and the residual, SMs ~40% idle within each kernel: latency of dependent
+  round trips. In the trace each HC kernel's credit does not depend on its predecessor (hc_down 5.1
+  us after the combine, 4.7 after a GEMV), so block residency is not the limit; two row tasks per
+  hc_down warp (half the blocks) is +1.3%.
+
 ## Findings (2026-10-16)
 
 - Method check: a sweep over an unread key gives 1.000 +-0.1%; achievable DRAM read rate on this card

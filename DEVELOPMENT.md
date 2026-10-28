@@ -50,6 +50,17 @@ pair rounds (two sequences).
 candidates bit for bit against the baseline and times them in alternating pairs. Kernel variants are
 selected at run time (`--variant key=value`, `--sweep key=v1,v2`). See [dev/KBENCH.md](dev/KBENCH.md).
 
+Every measured candidate goes into the experiment ledger, `bench/kbench.jsonl` (`kbench --log
+bench/kbench.jsonl --note "..."`, then fill in `verdict` and `why`). Grep it before trying an idea:
+it also holds the earlier rounds' kept and dropped experiments. `quench6k sass` (and `kbench --sass
+FILE/KERNEL=INSTR`) checks that an optimization is present in the machine code, and lists register
+spills. Rank candidates on the verify step real traffic runs (`--rows 4`, also at `--ctx 65536` and
+`163840`), not only on plain decode at 8K. See dev/KBENCH.md "Measurement".
+
+`quench6k traffic` summarizes the service's request log (decode and cold prefill rates, MTP tokens per
+round, cache reuse, per day or week and context range): `journalctl --user -u quench6k -o short-iso |
+quench6k traffic --weekly`.
+
 ## Benchmarks
 
 ```

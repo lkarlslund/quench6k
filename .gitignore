@@ -7,3 +7,5 @@
 /out/
 __pycache__/
 /.claude/
+# Server context files hold conversations (quench6k context-ids refuses to write inside a checkout).
+*.ctx

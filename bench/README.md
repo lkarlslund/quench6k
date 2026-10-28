@@ -14,6 +14,9 @@
   128 of 128 once the prompt has repeated).
 - `flint-llamacpp.jsonl`: llama.cpp (c7fc50941, `llama-bench -fa 1 -ub 2048`, F16 KV) on the same
   file and machine: `pp<ctx>` for prefill and `tg128 @ d<ctx>` for decode.
+- `kbench.jsonl`: the experiment ledger, one record per kernel configuration measured by `quench6k
+  kbench --log` (fields in [dev/KBENCH.md](../dev/KBENCH.md) "Experiment ledger"). Numbers and
+  settings only: prompts from real conversations (`quench6k context-ids`) never go in this directory.
 - `results.svg`: rendered from both by `crates/benchplot` (see [DEVELOPMENT.md](../DEVELOPMENT.md)).
 
 One JSON object per line:
@@ -30,7 +33,7 @@ One JSON object per line:
 | `generate` | Tokens generated for the decode measurement |
 | `prefill_tok_s`, `decode_tok_s` | Throughput |
 | `tokens_per_round` | MTP tokens per draft-and-verify round |
-| `gpu` | GPU during the measurement (NVML, every 200 ms): `temp_max_c`, `sm_mhz_min`, `sm_mhz_mean`, `power_w_mean`, `clock_events` (`power_cap` is normal under load; `sw_thermal`, `hw_thermal`, `hw_slowdown`, `hw_power_brake` set `slowed`) |
+| `gpu` | GPU during the measurement (NVML, every 200 ms): `temp_max_c`, `sm_mhz_min`, `sm_mhz_mean`, `power_w_mean`, `power_limit_w` (enforced limit; from 2026-10-27), `clock_events` (`power_cap` is normal under load; `sw_thermal`, `hw_thermal`, `hw_slowdown`, `hw_power_brake` set `slowed`) |
 
 Later records replace earlier ones with the same engine, mode, drafts, adaptive and sampled flags, KV
 format and context.

@@ -921,6 +921,7 @@ dependencies = [
  "minijinja-contrib",
  "quench6k-cuda",
  "quench6k-engine",
+ "regex",
  "serde",
  "serde_json",
  "tokenizers",

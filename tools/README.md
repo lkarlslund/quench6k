@@ -13,3 +13,5 @@ kernels only.
   ```
 
   `--act-quant` emulates NVFP4 W4A4 expert activations; `--fp64` computes in FP64.
+- `census.py`: per-kernel critical-path time of a decode or MTP round from an Nsight Systems trace
+  (dev/KBENCH.md "Census").

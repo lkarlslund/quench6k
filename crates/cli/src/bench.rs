@@ -66,9 +66,12 @@ fn gpu_window(mon: &Option<gpumon::Monitor>) -> Option<gpumon::Window> {
 }
 
 /// Today's UTC date, YYYY-MM-DD.
-fn utc_date() -> String {
-    let days = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() / 86_400) as i64;
-    // Days since 1970-01-01 to a civil date (H. Hinnant's algorithm).
+pub(crate) fn utc_date() -> String {
+    civil_date(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() / 86_400) as i64)
+}
+
+/// Days since 1970-01-01 to a civil date (H. Hinnant's algorithm).
+pub(crate) fn civil_date(days: i64) -> String {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;

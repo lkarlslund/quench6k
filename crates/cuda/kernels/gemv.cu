@@ -189,8 +189,8 @@ cudaError_t launch_m(const __nv_bfloat16* X, int ldx, const uint8_t* W, const fl
     const int k_per_split = ((K + splits - 1) / splits + 511) / 512 * 512;
     splits = (K + k_per_split - 1) / k_per_split;
     const int variant = M == 1 || M == 4;
-    const int pre = variant ? sq_variant("gemv.pre", 5) : 5, nw = variant ? sq_variant("gemv.warps", WARPS) : WARPS;
-    int rows = variant ? sq_variant("gemv.rows", 0) : 0;
+    const int pre = variant ? sq_variant_shape("gemv.pre", N, 5) : 5, nw = variant ? sq_variant_shape("gemv.warps", N, WARPS) : WARPS;
+    int rows = variant ? sq_variant_shape("gemv.rows", N, 0) : 0;
     // Default: two rows per warp when that still gives at least one CTA per SM, otherwise one; four-row
     // steps (MTP verify rounds) always take two (kbench: 1.1% faster per verify step).
     if (rows == 0) rows = M == 4 || (N + 2 * nw - 1) / (2 * nw) * splits >= 188 ? 2 : 1;

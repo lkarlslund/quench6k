@@ -26,6 +26,7 @@ struct Nvml {
     clock: unsafe extern "C" fn(Device, u32, *mut u32) -> i32,
     power: unsafe extern "C" fn(Device, *mut u32) -> i32,
     reasons: unsafe extern "C" fn(Device, *mut u64) -> i32,
+    limit: unsafe extern "C" fn(Device, *mut u32) -> i32,
 }
 
 // The device handle is an opaque NVML pointer, valid on any thread.
@@ -63,6 +64,7 @@ impl Nvml {
                 clock: std::mem::transmute(sym(b"nvmlDeviceGetClockInfo\0")?),
                 power: std::mem::transmute(sym(b"nvmlDeviceGetPowerUsage\0")?),
                 reasons: std::mem::transmute(reasons),
+                limit: std::mem::transmute(sym(b"nvmlDeviceGetEnforcedPowerLimit\0")?),
                 _lib: lib,
             })
         }
@@ -76,7 +78,14 @@ impl Nvml {
             (self.power)(self.device, &mut p);
             (self.reasons)(self.device, &mut r);
         }
-        Sample { temp: t, sm_mhz: c, power_mw: p, reasons: r }
+        Sample { temp: t, sm_mhz: c, power_mw: p, power_limit: self.power_limit(), reasons: r }
+    }
+
+    /// The enforced power limit in watts (what `nvidia-smi -pl` set).
+    fn power_limit(&self) -> u32 {
+        let mut mw = 0u32;
+        unsafe { (self.limit)(self.device, &mut mw) };
+        mw / 1000
     }
 }
 
@@ -85,6 +94,7 @@ struct Sample {
     temp: u32,
     sm_mhz: u32,
     power_mw: u32,
+    power_limit: u32,
     reasons: u64,
 }
 
@@ -96,6 +106,7 @@ pub struct Window {
     pub sm_mhz_min: u32,
     pub sm_mhz_mean: f64,
     pub power_w_mean: f64,
+    pub power_limit_w: u32,
     pub reasons: u64,
 }
 
@@ -110,12 +121,24 @@ impl Window {
     }
 
     pub fn summary(&self) -> String {
-        format!("GPU max {} C, SM {}-{:.0} MHz (min-mean), {:.0} W", self.temp_max, self.sm_mhz_min, self.sm_mhz_mean, self.power_w_mean)
+        format!("GPU max {} C, SM {}-{:.0} MHz (min-mean), {:.0} W of {} W", self.temp_max, self.sm_mhz_min, self.sm_mhz_mean, self.power_w_mean, self.power_limit_w)
     }
 
     pub fn json(&self) -> serde_json::Value {
         serde_json::json!({"samples": self.samples, "temp_max_c": self.temp_max, "sm_mhz_min": self.sm_mhz_min, "sm_mhz_mean": self.sm_mhz_mean.round(),
-                           "power_w_mean": self.power_w_mean.round(), "clock_events": self.reason_names(), "slowed": self.slowed()})
+                           "power_w_mean": self.power_w_mean.round(), "power_limit_w": self.power_limit_w, "clock_events": self.reason_names(), "slowed": self.slowed()})
+    }
+}
+
+impl Acc {
+    fn add(&mut self, x: Sample) {
+        self.sm_min = if self.n == 0 { x.sm_mhz } else { self.sm_min.min(x.sm_mhz) };
+        self.n += 1;
+        self.temp_max = self.temp_max.max(x.temp);
+        self.sm_sum += x.sm_mhz as f64;
+        self.power_sum += x.power_mw as f64 / 1000.0;
+        self.power_limit = x.power_limit;
+        self.reasons |= x.reasons;
     }
 }
 
@@ -126,11 +149,13 @@ struct Acc {
     sm_min: u32,
     sm_sum: f64,
     power_sum: f64,
+    power_limit: u32,
     reasons: u64,
 }
 
 /// A sampling thread; `begin` starts a window and `end` returns it.
 pub struct Monitor {
+    nvml: Arc<Mutex<Nvml>>,
     acc: Arc<Mutex<Acc>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -146,34 +171,32 @@ impl Monitor {
                 return None;
             }
         };
+        let nvml = Arc::new(Mutex::new(nvml));
         let acc = Arc::new(Mutex::new(Acc::default()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (a, s) = (acc.clone(), stop.clone());
+        let (n, a, s) = (nvml.clone(), acc.clone(), stop.clone());
         let thread = std::thread::spawn(move || {
             while !s.load(Ordering::Relaxed) {
-                let x = nvml.sample();
-                let mut g = a.lock().unwrap();
-                g.sm_min = if g.n == 0 { x.sm_mhz } else { g.sm_min.min(x.sm_mhz) };
-                g.n += 1;
-                g.temp_max = g.temp_max.max(x.temp);
-                g.sm_sum += x.sm_mhz as f64;
-                g.power_sum += x.power_mw as f64 / 1000.0;
-                g.reasons |= x.reasons;
-                drop(g);
+                let x = n.lock().unwrap().sample();
+                a.lock().unwrap().add(x);
                 std::thread::sleep(INTERVAL);
             }
         });
-        Some(Self { acc, stop, thread: Some(thread) })
+        Some(Self { nvml, acc, stop, thread: Some(thread) })
     }
 
     pub fn begin(&self) {
         *self.acc.lock().unwrap() = Acc::default();
     }
 
+    /// The window so far; one taken now when it is shorter than the sampling interval.
     pub fn end(&self) -> Window {
-        let g = self.acc.lock().unwrap();
+        let mut g = self.acc.lock().unwrap();
+        if g.n == 0 {
+            g.add(self.nvml.lock().unwrap().sample());
+        }
         let n = g.n.max(1) as f64;
-        Window { samples: g.n, temp_max: g.temp_max, sm_mhz_min: g.sm_min, sm_mhz_mean: g.sm_sum / n, power_w_mean: g.power_sum / n, reasons: g.reasons }
+        Window { samples: g.n, temp_max: g.temp_max, sm_mhz_min: g.sm_min, sm_mhz_mean: g.sm_sum / n, power_w_mean: g.power_sum / n, power_limit_w: g.power_limit, reasons: g.reasons }
     }
 }
 

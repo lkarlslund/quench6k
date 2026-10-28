@@ -42,6 +42,15 @@ int sq_variant(const char* key, int fallback) {
     return it == t.end() ? fallback : it->second;
 }
 
+int sq_variant_shape(const char* key, int n, int fallback) {
+    const std::string shaped = std::string(key) + "/" + std::to_string(n);
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto& t = table();
+    auto it = t.find(shaped);
+    if (it == t.end()) it = t.find(key);
+    return it == t.end() ? fallback : it->second;
+}
+
 extern "C" void quench6k_set_variant(const char* key, int value) {
     std::lock_guard<std::mutex> lock(mutex);
     table()[key] = value;

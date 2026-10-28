@@ -4,11 +4,13 @@ mod kbench;
 mod chat;
 mod flint;
 mod mtp;
+mod sass;
+mod traffic;
 mod serve;
 
 use std::path::PathBuf;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use quench6k_engine::checkpoint::Checkpoint;
 use quench6k_engine::loader::{self, LoadOptions};
@@ -334,6 +336,59 @@ enum Command {
         /// key=v1,v2,...: swept (cartesian product over all --sweep keys).
         #[arg(long)]
         sweep: Vec<String>,
+        /// Append one JSON record per configuration to this experiment ledger (bench/kbench.jsonl).
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// What this run tries, stored in its ledger records.
+        #[arg(long)]
+        note: Option<String>,
+        /// FILE/KERNEL=INSTR: the kernels of kernels/FILE.cu whose demangled name matches the regex
+        /// KERNEL must contain an instruction matching INSTR (see `quench6k sass`).
+        #[arg(long)]
+        sass: Vec<String>,
+    },
+    /// Write the token IDs of a server context file (--cache-dir), cut after its last
+    /// "<|im_start|>assistant\n": a real conversation as a benchmark prompt (QUENCH6K_BENCH_IDS), on
+    /// which `bench` generates a real assistant turn instead of continuing tiled text. The output is
+    /// private conversation data: it is refused inside a git checkout.
+    ContextIds {
+        /// A .ctx file from the server's cache directory.
+        file: PathBuf,
+        /// Model directory (for the tokenizer).
+        #[arg(long)]
+        model: PathBuf,
+        /// Where to write the IDs; must lie outside any git checkout.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Summarize the server's request log per day (or week) and context range: decode and cold-prefill
+    /// rates, MTP tokens per round, cache reuse. Reads `journalctl --user -u quench6k -o short-iso` on stdin.
+    Traffic {
+        /// One row per week (starting Monday) instead of per day.
+        #[arg(long)]
+        weekly: bool,
+        /// Only requests on or after this date (YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Inspect the SASS nvcc emitted for this binary's kernels: instruction counts, register spills
+    /// (local loads and stores), opcode counts, and FILE/KERNEL=INSTR presence checks.
+    Sass {
+        /// Kernel source file name ("gemv" for kernels/gemv.cu); empty reads all of them (slow).
+        #[arg(long, default_value = "")]
+        file: String,
+        /// Only kernels whose demangled name matches this regex.
+        #[arg(long)]
+        kernel: Option<String>,
+        /// Print the N most frequent opcodes over the listed kernels.
+        #[arg(long, default_value_t = 0)]
+        top: usize,
+        /// FILE/KERNEL=INSTR check (repeatable); exits non-zero when a matching kernel lacks INSTR.
+        #[arg(long)]
+        check: Vec<String>,
+        /// Another binary to read instead of this one.
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
     /// Measure MTP draft acceptance on a fixture (drafts are compared with the target's greedy tokens).
     MtpProbe {
@@ -451,10 +506,28 @@ fn main() -> Result<()> {
             let out = json.map(|path| bench::JsonOut { path, kv: cli.kv.clone(), sampled });
             bench::run(&model, precision.into(), &ctx, generate, chunk, profile, ncu_steps, mtp, adaptive, sampled, out.as_ref())?
         }
-        Command::Kbench { model, layers, ctx, rows, steps, pairs, chunk, variant, sweep } => {
+        Command::Kbench { model, layers, ctx, rows, steps, pairs, chunk, variant, sweep, log, note, sass } => {
             let fixed = variant.iter().map(|v| kbench::parse_fixed(v)).collect::<Result<_>>()?;
             let sweep = sweep.iter().map(|v| kbench::parse_sweep(v)).collect::<Result<_>>()?;
-            kbench::run(&model, &kbench::Options { layers, ctx, rows, steps, pairs, chunk, fixed, sweep })?
+            kbench::run(&model, &kbench::Options { layers, ctx, rows, steps, pairs, chunk, fixed, sweep, log, note, sass })?
+        }
+        Command::ContextIds { file, model, out } => {
+            let dir = std::path::absolute(&out)?.parent().map(|p| p.to_path_buf()).context("--out has no directory")?;
+            let in_git = std::process::Command::new("git").args(["rev-parse", "--is-inside-work-tree"]).current_dir(&dir).output()
+                .is_ok_and(|o| o.status.success());
+            ensure!(!in_git, "{} is inside a git checkout; conversation data must not get near a repository", dir.display());
+            let tokenizer = tokenizers::Tokenizer::from_file(model.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer.json: {e}"))?;
+            let turn: Vec<i32> = tokenizer.encode("<|im_start|>assistant\n", false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().iter().map(|&t| t as i32).collect();
+            let ids = quench6k_engine::context_store::file_tokens(&file)?;
+            // Image spans carry negative content keys (session::ImageInput) and need their pixels.
+            ensure!(ids.iter().all(|&t| t >= 0), "this context contains images, which a token file cannot replay");
+            let cut = ids.windows(turn.len()).rposition(|w| w == turn).map(|i| i + turn.len()).context("no assistant turn in this context")?;
+            eprintln!("{} tokens, cut after the last assistant turn start at {cut}", ids.len());
+            std::fs::write(&out, ids[..cut].iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ") + "\n")?;
+        }
+        Command::Traffic { weekly, since } => traffic::run(weekly, since.as_deref())?,
+        Command::Sass { file, kernel, top, check, binary } => {
+            sass::run(binary.as_deref(), &file, kernel.as_deref(), top, &check)?
         }
         Command::Flint(cmd) => flint::run(cmd)?,
         Command::Gate { fixtures, candidates, suffix } => {

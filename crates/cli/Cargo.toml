@@ -23,3 +23,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net",
 tokio-stream = "0.1"
 axum = "0.8"
 base64 = "0.22"
+regex = "1"

@@ -245,6 +245,11 @@ fn write_file(path: &Path, model_id: &str, tokens: &[i32], data: &[u8], used: Sy
     Ok(())
 }
 
+/// The token IDs a context file holds (the conversation, as the model saw it).
+pub fn file_tokens(path: &Path) -> Result<Vec<i32>> {
+    Ok(read_header(path)?.1)
+}
+
 fn read_header(path: &Path) -> Result<(String, Vec<i32>, usize)> {
     let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
     let mut magic = [0u8; 8];
