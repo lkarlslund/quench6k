@@ -599,6 +599,16 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// A suffix for response and tool-call ids that is unique for the server's life: clients
+/// pair tool results with tool calls by id, and ids built from the second they were made
+/// in collided when two responses finished in the same second (Claude Code then marked
+/// one call "[Tool use interrupted]").
+fn unique_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    format!("{nanos:x}{:06x}", NEXT.fetch_add(1, Ordering::Relaxed) & 0xff_ffff)
+}
+
 /// What the request asks for, after rendering and tokenizing.
 struct Prepared {
     capture: Option<(PathBuf, Value)>,
@@ -787,7 +797,7 @@ fn parse_output(text: &str, thinking: bool, tools: Option<&Value>) -> (Option<St
         let body_start = cursor + start + "<tool_call>".len();
         let Some(end) = rest[body_start..].find("</tool_call>") else { break };
         if let Some(call) = parse_tool_call(&rest[body_start..body_start + end], tools) {
-            calls.push(json!({"id": format!("call_{}_{}", now(), calls.len()), "type": "function", "function": call}));
+            calls.push(json!({"id": format!("call_{}_{}", unique_id(), calls.len()), "type": "function", "function": call}));
         }
         cursor = body_start + end + "</tool_call>".len();
     }
@@ -887,7 +897,7 @@ async fn chat_completions(State(app): State<Arc<App>>, Json(req): Json<Value>) -
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let id = format!("chatcmpl-{}", now());
+    let id = format!("chatcmpl-{}", unique_id());
     if p.stream { stream_response(app, p, id).await } else { full_response(app, p, id).await }
 }
 
@@ -1312,9 +1322,16 @@ fn from_anthropic(req: &Value) -> Value {
         .map(|t| json!({"type": "function", "function": {"name": t["name"], "description": t.get("description").cloned().unwrap_or(Value::Null),
                                                          "parameters": t.get("input_schema").cloned().unwrap_or(json!({"type": "object"}))}}))
         .collect();
-    let thinking = req.get("thinking").and_then(|t| t.get("type")).and_then(Value::as_str) == Some("enabled");
+    // Claude Code sends `{"type": "adaptive"}` (newer) or `{"type": "enabled", ...}`; both turn
+    // thinking on. Its effort (`output_config.effort`: low, medium, high, max) becomes the
+    // template's reasoning effort through the same mapping as the OpenAI endpoint.
+    let thinking = matches!(req.get("thinking").and_then(|t| t.get("type")).and_then(Value::as_str), Some("enabled" | "adaptive"));
+    let mut kwargs = json!({"enable_thinking": thinking});
+    if let Some(effort) = req.get("output_config").and_then(|o| o.get("effort")).and_then(Value::as_str) {
+        kwargs["reasoning_effort"] = json!(if effort == "max" { "xhigh" } else { effort });
+    }
     let mut out = json!({"messages": messages, "model": req.get("model").cloned().unwrap_or(Value::Null),
-                         "chat_template_kwargs": {"enable_thinking": thinking}, "stream": req.get("stream").cloned().unwrap_or(json!(false))});
+                         "chat_template_kwargs": kwargs, "stream": req.get("stream").cloned().unwrap_or(json!(false))});
     if !tools.is_empty() {
         out["tools"] = Value::Array(tools);
     }
@@ -1349,7 +1366,7 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
         Err(e) => return e.anthropic(),
     };
     let prompt_tokens = p.ids.len();
-    let id = format!("msg_{}", now());
+    let id = format!("msg_{}", unique_id());
     let (thinking, tools) = (p.thinking, p.tools.clone());
     if !p.stream {
         let (seg, n, finish, cached) = match generate(&app, &p, |_| {}).await {
@@ -1469,7 +1486,7 @@ async fn completions(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Res
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let (id, created, model, prompt_tokens) = (format!("cmpl-{}", now()), now(), p.model.clone(), p.ids.len());
+    let (id, created, model, prompt_tokens) = (format!("cmpl-{}", unique_id()), now(), p.model.clone(), p.ids.len());
     let body = move |text: &str, finish: Option<&str>| json!({"id": id, "object": "text_completion", "created": created, "model": model,
                                                              "choices": [{"index": 0, "text": text, "logprobs": Value::Null, "finish_reason": finish}]});
     let usage = move |n: usize, cached: usize| json!({"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n,
@@ -1578,6 +1595,24 @@ mod tests {
         assert_eq!(reasoning(None, Some("high")), (None, Some("xhigh")));
         assert_eq!(reasoning(Some(true), Some("low")), (Some(true), Some("low")));
         assert_eq!(reasoning(Some(false), None), (Some(false), None));
+    }
+
+    #[test]
+    fn ids_are_unique_within_a_second() {
+        let ids: std::collections::HashSet<String> = (0..1000).map(|_| unique_id()).collect();
+        assert_eq!(ids.len(), 1000);
+    }
+
+    #[test]
+    fn anthropic_adaptive_thinking_and_effort() {
+        let req = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                         "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}});
+        let out = from_anthropic(&req);
+        assert_eq!(out["chat_template_kwargs"]["enable_thinking"], json!(true));
+        assert_eq!(out["chat_template_kwargs"]["reasoning_effort"], json!("high"));
+        let off = from_anthropic(&json!({"model": "m", "messages": []}));
+        assert_eq!(off["chat_template_kwargs"]["enable_thinking"], json!(false));
+        assert!(off["chat_template_kwargs"].get("reasoning_effort").is_none());
     }
 
     #[test]
