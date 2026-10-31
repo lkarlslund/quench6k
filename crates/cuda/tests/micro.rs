@@ -71,7 +71,11 @@ struct Gemv {
 }
 
 fn gemv_weights(s: &Stream, n: usize) -> Gemv {
-    Gemv { w: filled(s, n * D, 3), s: scales(s, n * D / kernels::int8_group()), n }
+    Gemv {
+        w: filled(s, n * D, 3),
+        s: scales(s, n * D / kernels::int8_group()),
+        n,
+    }
 }
 
 #[test]
@@ -113,14 +117,36 @@ fn hc_latency() {
         )
     };
     let gemv = |s: &Stream, w: &Gemv, t: usize, x: u64| {
-        kernels::gemv(s, t, x, D, fmt, w.w.addr(), w.s.addr(), out.addr(), w.n, partial.addr(), w.n, D, 1, 1.0, false)
+        kernels::gemv(
+            s,
+            t,
+            x,
+            D,
+            fmt,
+            w.w.addr(),
+            w.s.addr(),
+            out.addr(),
+            w.n,
+            partial.addr(),
+            w.n,
+            D,
+            1,
+            1.0,
+            false,
+        )
     };
     for t in [1usize, 4] {
         let g = Graph::capture(&s, |s| hcs.iter().try_for_each(|w| hc(s, w, t))).unwrap();
         let hc_only = time_graph(&s, &g, CALLS);
-        let g = Graph::capture(&s, |s| gemvs.iter().try_for_each(|w| gemv(s, w, t, m.addr()))).unwrap();
+        let g = Graph::capture(&s, |s| {
+            gemvs.iter().try_for_each(|w| gemv(s, w, t, m.addr()))
+        })
+        .unwrap();
         let big_only = time_graph(&s, &g, CALLS);
-        let g = Graph::capture(&s, |s| small.iter().try_for_each(|w| gemv(s, w, t, m.addr()))).unwrap();
+        let g = Graph::capture(&s, |s| {
+            small.iter().try_for_each(|w| gemv(s, w, t, m.addr()))
+        })
+        .unwrap();
         let small_only = time_graph(&s, &g, CALLS);
         let g = Graph::capture(&s, |s| {
             hcs.iter().zip(&gemvs).try_for_each(|(a, b)| {
@@ -165,7 +191,8 @@ fn expert_latency() {
     let down_scales: Vec<DeviceBuffer> = (0..E).map(|_| filled(&s, D * W / 16, 0x38)).collect();
     let table = |v: &[DeviceBuffer]| {
         let b = DeviceBuffer::new(E * 8).unwrap();
-        s.upload(&b, &v.iter().map(|x| x.addr()).collect::<Vec<u64>>()).unwrap();
+        s.upload(&b, &v.iter().map(|x| x.addr()).collect::<Vec<u64>>())
+            .unwrap();
         b
     };
     let ones = {
@@ -173,7 +200,14 @@ fn expert_latency() {
         s.upload(&b, &vec![1.0f32; E]).unwrap();
         b
     };
-    let (gc, gs, uc, us, dc, ds) = (table(&gate_codes), table(&gate_scales), table(&up_codes), table(&up_scales), table(&down_codes), table(&down_scales));
+    let (gc, gs, uc, us, dc, ds) = (
+        table(&gate_codes),
+        table(&gate_scales),
+        table(&up_codes),
+        table(&up_scales),
+        table(&down_codes),
+        table(&down_scales),
+    );
     let mut rng = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = || {
         rng ^= rng << 13;
@@ -185,22 +219,69 @@ fn expert_latency() {
     let logits: Vec<DeviceBuffer> = (0..LAYERS)
         .map(|_| {
             let b = DeviceBuffer::new(t_max * E * 4).unwrap();
-            s.upload(&b, &(0..t_max * E).map(|_| next() * 8.0).collect::<Vec<f32>>()).unwrap();
+            s.upload(
+                &b,
+                &(0..t_max * E).map(|_| next() * 8.0).collect::<Vec<f32>>(),
+            )
+            .unwrap();
             b
         })
         .collect();
     let m = filled(&s, t_max * D * 2, 0);
     let pairs = t_max * TOPK;
-    let (top_i, top_w, pair_row, row_token) = (filled(&s, pairs * 4, 0), filled(&s, pairs * 4, 0), filled(&s, pairs * 4, 0), filled(&s, pairs * 4, 0));
-    let (offsets, active, num_active) = (filled(&s, (E + 1) * 4, 0), filled(&s, E * 4, 0), filled(&s, 4, 0));
+    let (top_i, top_w, pair_row, row_token) = (
+        filled(&s, pairs * 4, 0),
+        filled(&s, pairs * 4, 0),
+        filled(&s, pairs * 4, 0),
+        filled(&s, pairs * 4, 0),
+    );
+    let (offsets, active, num_active) = (
+        filled(&s, (E + 1) * 4, 0),
+        filled(&s, E * 4, 0),
+        filled(&s, 4, 0),
+    );
     let act = filled(&s, pairs * W * 2, 0);
     let yd = filled(&s, pairs * D * 4, 0);
     for t in [1usize, 2, 4, 5] {
         let max_active = (t * TOPK).min(E);
         let layer = |s: &Stream, l: usize| -> anyhow::Result<()> {
-            kernels::moe_route_small(s, logits[l].addr(), E, t, top_i.addr(), top_w.addr(), offsets.addr(), pair_row.addr(), row_token.addr(), active.addr(), num_active.addr())?;
-            kernels::moe_gate_up_small(s, m.addr(), row_token.addr(), (gc.addr(), gs.addr(), ones.addr()), (uc.addr(), us.addr(), ones.addr()), offsets.addr(), active.addr(), num_active.addr(), max_active, t, act.addr())?;
-            kernels::moe_down_small(s, act.addr(), (dc.addr(), ds.addr(), ones.addr()), offsets.addr(), active.addr(), num_active.addr(), max_active, t, yd.addr())
+            kernels::moe_route_small(
+                s,
+                logits[l].addr(),
+                E,
+                t,
+                top_i.addr(),
+                top_w.addr(),
+                offsets.addr(),
+                pair_row.addr(),
+                row_token.addr(),
+                active.addr(),
+                num_active.addr(),
+            )?;
+            kernels::moe_gate_up_small(
+                s,
+                m.addr(),
+                row_token.addr(),
+                (gc.addr(), gs.addr(), ones.addr()),
+                (uc.addr(), us.addr(), ones.addr()),
+                offsets.addr(),
+                active.addr(),
+                num_active.addr(),
+                max_active,
+                t,
+                act.addr(),
+            )?;
+            kernels::moe_down_small(
+                s,
+                act.addr(),
+                (dc.addr(), ds.addr(), ones.addr()),
+                offsets.addr(),
+                active.addr(),
+                num_active.addr(),
+                max_active,
+                t,
+                yd.addr(),
+            )
         };
         let mut distinct = 0usize;
         for l in 0..LAYERS {
@@ -210,7 +291,11 @@ fn expert_latency() {
         let g = Graph::capture(&s, |s| (0..LAYERS).try_for_each(|l| layer(s, l))).unwrap();
         let us_layer = time_graph(&s, &g, LAYERS);
         let bytes = distinct as f64 / LAYERS as f64 * (3 * W * D) as f64 * (0.5 + 1.0 / 16.0);
-        println!("T={t}: {us_layer:.2} us per layer, {:.1} experts, {:.2} TB/s", distinct as f64 / LAYERS as f64, bytes / us_layer / 1e6);
+        println!(
+            "T={t}: {us_layer:.2} us per layer, {:.1} experts, {:.2} TB/s",
+            distinct as f64 / LAYERS as f64,
+            bytes / us_layer / 1e6
+        );
     }
 }
 
@@ -225,13 +310,44 @@ fn gemv_latency() {
     let x = filled(&s, 16 * 16480 * 2, 0);
     let out = filled(&s, 16 * 16480 * 4, 0);
     let partial = filled(&s, 1 << 24, 0);
-    for &(n, k, splits) in &[(2560usize, 6144usize, 1usize), (2560, 6144, 2), (2560, 640, 1), (16480, 2560, 1), (13952, 2560, 1), (3600, 2560, 1)] {
-        let ws: Vec<(DeviceBuffer, DeviceBuffer)> =
-            (0..CALLS).map(|_| (filled(&s, n * k, 3), scales(&s, n * k / kernels::int8_group()))).collect();
+    for &(n, k, splits) in &[
+        (2560usize, 6144usize, 1usize),
+        (2560, 6144, 2),
+        (2560, 640, 1),
+        (16480, 2560, 1),
+        (13952, 2560, 1),
+        (3600, 2560, 1),
+    ] {
+        let ws: Vec<(DeviceBuffer, DeviceBuffer)> = (0..CALLS)
+            .map(|_| {
+                (
+                    filled(&s, n * k, 3),
+                    scales(&s, n * k / kernels::int8_group()),
+                )
+            })
+            .collect();
         let mut line = format!("N={n} K={k} splits={splits}:");
         for t in [1usize, 4, 8, 16] {
             let g = Graph::capture(&s, |s| {
-                ws.iter().try_for_each(|(w, sc)| kernels::gemv(s, t, x.addr(), k, fmt, w.addr(), sc.addr(), out.addr(), n, partial.addr(), n, k, splits, 1.0, false))
+                ws.iter().try_for_each(|(w, sc)| {
+                    kernels::gemv(
+                        s,
+                        t,
+                        x.addr(),
+                        k,
+                        fmt,
+                        w.addr(),
+                        sc.addr(),
+                        out.addr(),
+                        n,
+                        partial.addr(),
+                        n,
+                        k,
+                        splits,
+                        1.0,
+                        false,
+                    )
+                })
             })
             .unwrap();
             let us = time_graph(&s, &g, CALLS);
@@ -259,14 +375,30 @@ fn select_latency() {
     for &ctx in &[8192usize, 65536, 131072, 262144] {
         let ld = ctx / 4;
         for coarse in [false, true] {
-            let v: Vec<f32> = (0..t * ld).map(|_| if coarse { (next() * 64.0).round() / 4.0 } else { next() * 3.0 }).collect();
+            let v: Vec<f32> = (0..t * ld)
+                .map(|_| {
+                    if coarse {
+                        (next() * 64.0).round() / 4.0
+                    } else {
+                        next() * 3.0
+                    }
+                })
+                .collect();
             let scores = DeviceBuffer::new(v.len() * 4).unwrap();
             s.upload(&scores, &v).unwrap();
             let start = DeviceBuffer::new(4).unwrap();
             s.upload(&start, &[(ctx - t) as i32]).unwrap();
             let sel = DeviceBuffer::new(t * 512 * 4).unwrap();
-            let g = Graph::capture(&s, |s| (0..CALLS).try_for_each(|_| kernels::qsa_select(s, scores.addr(), t, ld, start.addr(), sel.addr()))).unwrap();
-            println!("ctx {ctx} coarse {coarse}: {:.2} us", time_graph(&s, &g, CALLS));
+            let g = Graph::capture(&s, |s| {
+                (0..CALLS).try_for_each(|_| {
+                    kernels::qsa_select(s, scores.addr(), t, ld, start.addr(), sel.addr())
+                })
+            })
+            .unwrap();
+            println!(
+                "ctx {ctx} coarse {coarse}: {:.2} us",
+                time_graph(&s, &g, CALLS)
+            );
         }
     }
 }
@@ -278,17 +410,49 @@ fn gemm_throughput() {
     quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let m = 4096;
-    for &(n, k) in &[(16480usize, 2560usize), (2560, 6144), (13952, 2560), (324, 10240), (10240, 320)] {
+    for &(n, k) in &[
+        (16480usize, 2560usize),
+        (2560, 6144),
+        (13952, 2560),
+        (324, 10240),
+        (10240, 320),
+    ] {
         let x = filled(&s, m * k * 2, 0);
         let y = filled(&s, m * n * 4, 0);
         let w8 = filled(&s, n * k, 3);
         let sc = scales(&s, n * k / kernels::int8_group());
         let wb = filled(&s, n * k * 2, 0);
         let mut line = format!("M={m} N={n} K={k}:");
-        for (fmt, w, scale, name) in [(WeightFormat::Int8Group, &w8, sc.addr(), "int8g"), (WeightFormat::Bf16, &wb, 0, "bf16")] {
-            let g = Graph::capture(&s, |s| (0..8).try_for_each(|_| kernels::gemm_f32(s, x.addr(), k, fmt, w.addr(), k, scale, y.addr(), n, m, n, k, 1.0, false))).unwrap();
+        for (fmt, w, scale, name) in [
+            (WeightFormat::Int8Group, &w8, sc.addr(), "int8g"),
+            (WeightFormat::Bf16, &wb, 0, "bf16"),
+        ] {
+            let g = Graph::capture(&s, |s| {
+                (0..8).try_for_each(|_| {
+                    kernels::gemm_f32(
+                        s,
+                        x.addr(),
+                        k,
+                        fmt,
+                        w.addr(),
+                        k,
+                        scale,
+                        y.addr(),
+                        n,
+                        m,
+                        n,
+                        k,
+                        1.0,
+                        false,
+                    )
+                })
+            })
+            .unwrap();
             let us = time_graph(&s, &g, 8);
-            line += &format!("  {name} {us:.0} us {:.0} TFLOPS", 2.0 * (m * n * k) as f64 / us / 1e6);
+            line += &format!(
+                "  {name} {us:.0} us {:.0} TFLOPS",
+                2.0 * (m * n * k) as f64 / us / 1e6
+            );
         }
         println!("{line}");
     }
@@ -317,7 +481,18 @@ fn draft_head_latency() {
     let sc = DeviceBuffer::new(V * D / 16).unwrap();
     let s2 = DeviceBuffer::new(4).unwrap();
     let amax = DeviceBuffer::new(4).unwrap();
-    kernels::quantize_nvfp4(&s, wb.addr(), 1, V, D, codes.addr(), sc.addr(), s2.addr(), amax.addr()).unwrap();
+    kernels::quantize_nvfp4(
+        &s,
+        wb.addr(),
+        1,
+        V,
+        D,
+        codes.addr(),
+        sc.addr(),
+        s2.addr(),
+        amax.addr(),
+    )
+    .unwrap();
     let sketch = DeviceBuffer::new(kernels::draft_sketch_bytes(V)).unwrap();
     kernels::build_draft_sketch(&s, wb.addr(), sketch.addr(), V).unwrap();
     s.synchronize().unwrap();
@@ -329,10 +504,26 @@ fn draft_head_latency() {
     let reps = 50;
     let g = Graph::capture(&s, |s| {
         for _ in 0..reps {
-            kernels::draft_head_argmax(s, x.addr(), sketch.addr(), (codes.addr(), sc.addr(), s2.addr()), ys.addr(), pick.addr(), V, out.addr(), 0, 0)?;
+            kernels::draft_head_argmax(
+                s,
+                x.addr(),
+                sketch.addr(),
+                (codes.addr(), sc.addr(), s2.addr()),
+                ys.addr(),
+                pick.addr(),
+                V,
+                out.addr(),
+                0,
+                0,
+            )?;
         }
         Ok(())
     })
     .unwrap();
-    println!("draft head: {:.1} us per call ({} rows, sketch {:.1} MB)", time_graph(&s, &g, reps), V, kernels::draft_sketch_bytes(V) as f64 / 1e6);
+    println!(
+        "draft head: {:.1} us per call ({} rows, sketch {:.1} MB)",
+        time_graph(&s, &g, reps),
+        V,
+        kernels::draft_sketch_bytes(V) as f64 / 1e6
+    );
 }

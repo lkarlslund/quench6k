@@ -31,18 +31,50 @@ fn gemm_matches_cpu() {
     quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x1234_5678_9abc_def1);
-    for &(m, n, k) in &[(1, 320, 10240), (7, 4, 2560), (130, 300, 64), (64, 128, 32), (200, 1000, 2560)] {
-        let x = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
-        let w = rng.vec(n * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
+    for &(m, n, k) in &[
+        (1, 320, 10240),
+        (7, 4, 2560),
+        (130, 300, 64),
+        (64, 128, 32),
+        (200, 1000, 2560),
+    ] {
+        let x = rng
+            .vec(m * k)
+            .iter()
+            .map(|&v| bf16::round(v))
+            .collect::<Vec<_>>();
+        let w = rng
+            .vec(n * k)
+            .iter()
+            .map(|&v| bf16::round(v))
+            .collect::<Vec<_>>();
         let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
         let y0 = rng.vec(m * n);
         let dy = upload(&s, &y0);
-        kernels::gemm_f32(&s, dx.addr(), k, WeightFormat::Bf16, dw.addr(), k, 0, dy.addr(), n, m, n, k, 0.5, true).unwrap();
+        kernels::gemm_f32(
+            &s,
+            dx.addr(),
+            k,
+            WeightFormat::Bf16,
+            dw.addr(),
+            k,
+            0,
+            dy.addr(),
+            n,
+            m,
+            n,
+            k,
+            0.5,
+            true,
+        )
+        .unwrap();
         let y: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
         let mut worst = 0f64;
         for i in 0..m {
             for j in 0..n {
-                let dot: f64 = (0..k).map(|t| x[i * k + t] as f64 * w[j * k + t] as f64).sum();
+                let dot: f64 = (0..k)
+                    .map(|t| x[i * k + t] as f64 * w[j * k + t] as f64)
+                    .sum();
                 let want = y0[i * n + j] as f64 + 0.5 * dot;
                 let scale = (k as f64).sqrt() * 0.5;
                 worst = worst.max((y[i * n + j] as f64 - want).abs() / scale);
@@ -56,14 +88,19 @@ fn cpu_matmul(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f64> {
     let mut y = vec![0f64; m * n];
     for i in 0..m {
         for j in 0..n {
-            y[i * n + j] = (0..k).map(|t| x[i * k + t] as f64 * w[j * k + t] as f64).sum();
+            y[i * n + j] = (0..k)
+                .map(|t| x[i * k + t] as f64 * w[j * k + t] as f64)
+                .sum();
         }
     }
     y
 }
 
 fn max_rel(got: &[f32], want: &[f64], k: usize) -> f64 {
-    got.iter().zip(want).map(|(g, w)| (*g as f64 - w).abs() / (k as f64).sqrt()).fold(0.0, f64::max)
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| (*g as f64 - w).abs() / (k as f64).sqrt())
+        .fold(0.0, f64::max)
 }
 
 #[test]
@@ -71,7 +108,13 @@ fn gemv_and_int8_group_paths_match_cpu() {
     quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    for &(m, n, k, splits) in &[(1, 320, 10240, 16), (3, 10240, 320, 1), (16, 2560, 6144, 3), (2, 33, 2560, 1), (5, 48, 2560, 4)] {
+    for &(m, n, k, splits) in &[
+        (1, 320, 10240, 16),
+        (3, 10240, 320, 1),
+        (16, 2560, 6144, 3),
+        (2, 33, 2560, 1),
+        (5, 48, 2560, 4),
+    ] {
         let x: Vec<f32> = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect();
         let w: Vec<f32> = rng.vec(n * k).iter().map(|&v| bf16::round(v)).collect();
         let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
@@ -79,7 +122,24 @@ fn gemv_and_int8_group_paths_match_cpu() {
         let partial = DeviceBuffer::new(splits * m * n * 4).unwrap();
 
         // BF16 GEMV
-        kernels::gemv(&s, m, dx.addr(), k, WeightFormat::Bf16, dw.addr(), 0, dy.addr(), n, partial.addr(), n, k, splits, 1.0, false).unwrap();
+        kernels::gemv(
+            &s,
+            m,
+            dx.addr(),
+            k,
+            WeightFormat::Bf16,
+            dw.addr(),
+            0,
+            dy.addr(),
+            n,
+            partial.addr(),
+            n,
+            k,
+            splits,
+            1.0,
+            false,
+        )
+        .unwrap();
         let got: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
         let e = max_rel(&got, &cpu_matmul(&x, &w, m, n, k), k);
         assert!(e < 1e-4, "bf16 gemv {m}x{n}x{k}/{splits}: {e}");
@@ -92,13 +152,48 @@ fn gemv_and_int8_group_paths_match_cpu() {
             kernels::quantize_int8_groups(&s, dw.addr(), n, k, dq.addr(), dgs.addr()).unwrap();
             let q: Vec<u8> = s.download(dq.addr(), n * k).unwrap();
             let gs: Vec<f32> = s.download(dgs.addr(), n * (k / g)).unwrap();
-            let wq: Vec<f32> = (0..n * k).map(|i| q[i] as i8 as f32 * gs[(i / k) * (k / g) + (i % k) / g]).collect();
+            let wq: Vec<f32> = (0..n * k)
+                .map(|i| q[i] as i8 as f32 * gs[(i / k) * (k / g) + (i % k) / g])
+                .collect();
             let want = cpu_matmul(&x, &wq, m, n, k);
-            kernels::gemv(&s, m, dx.addr(), k, WeightFormat::Int8Group, dq.addr(), dgs.addr(), dy.addr(), n, partial.addr(), n, k, splits, 1.0, false).unwrap();
+            kernels::gemv(
+                &s,
+                m,
+                dx.addr(),
+                k,
+                WeightFormat::Int8Group,
+                dq.addr(),
+                dgs.addr(),
+                dy.addr(),
+                n,
+                partial.addr(),
+                n,
+                k,
+                splits,
+                1.0,
+                false,
+            )
+            .unwrap();
             let got: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
             let e = max_rel(&got, &want, k);
             assert!(e < 1e-4, "int8g gemv {m}x{n}x{k}/{splits}: {e}");
-            kernels::gemm_f32(&s, dx.addr(), k, WeightFormat::Int8Group, dq.addr(), k, dgs.addr(), dy.addr(), n, m, n, k, 1.0, false).unwrap();
+            kernels::gemm_f32(
+                &s,
+                dx.addr(),
+                k,
+                WeightFormat::Int8Group,
+                dq.addr(),
+                k,
+                dgs.addr(),
+                dy.addr(),
+                n,
+                m,
+                n,
+                k,
+                1.0,
+                false,
+            )
+            .unwrap();
             let got: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
             // The tensor-core path rounds q * scale to BF16 while staging.
             let e = max_rel(&got, &want, k);
@@ -113,7 +208,11 @@ fn fp8_e4m3(b: u8) -> f32 {
     let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
     let e = ((b >> 3) & 0xf) as i32;
     let m = (b & 7) as f32;
-    if e == 0 { sign * m / 8.0 * 2f32.powi(-6) } else { sign * (1.0 + m / 8.0) * 2f32.powi(e - 7) }
+    if e == 0 {
+        sign * m / 8.0 * 2f32.powi(-6)
+    } else {
+        sign * (1.0 + m / 8.0) * 2f32.powi(e - 7)
+    }
 }
 
 #[test]
@@ -122,20 +221,41 @@ fn nvfp4_quantization_round_trips() {
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x0dd_ba11);
     let (count, n, k) = (3, 64, 256);
-    let w: Vec<f32> = rng.vec(count * n * k).iter().enumerate().map(|(i, &v)| bf16::round(v * if i % 97 == 0 { 8.0 } else { 1.0 })).collect();
+    let w: Vec<f32> = rng
+        .vec(count * n * k)
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| bf16::round(v * if i % 97 == 0 { 8.0 } else { 1.0 }))
+        .collect();
     let dw = upload(&s, &to_bf16(&w));
     let codes = DeviceBuffer::new(count * n * k / 2).unwrap();
     let scales = DeviceBuffer::new(count * n * k / 16).unwrap();
     let scale2 = DeviceBuffer::new(count * 4).unwrap();
     let amax = DeviceBuffer::new(count * 4).unwrap();
-    kernels::quantize_nvfp4(&s, dw.addr(), count, n, k, codes.addr(), scales.addr(), scale2.addr(), amax.addr()).unwrap();
+    kernels::quantize_nvfp4(
+        &s,
+        dw.addr(),
+        count,
+        n,
+        k,
+        codes.addr(),
+        scales.addr(),
+        scale2.addr(),
+        amax.addr(),
+    )
+    .unwrap();
     let c: Vec<u8> = s.download(codes.addr(), count * n * k / 2).unwrap();
     let sc: Vec<u8> = s.download(scales.addr(), count * n * k / 16).unwrap();
     let s2: Vec<f32> = s.download(scale2.addr(), count).unwrap();
     for m in 0..count {
         let per = n * k;
-        let amax = w[m * per..(m + 1) * per].iter().fold(0f32, |a, &v| a.max(v.abs()));
-        assert!((s2[m] - amax / (6.0 * 448.0)).abs() <= 1e-6 * s2[m], "scale2 {m}");
+        let amax = w[m * per..(m + 1) * per]
+            .iter()
+            .fold(0f32, |a, &v| a.max(v.abs()));
+        assert!(
+            (s2[m] - amax / (6.0 * 448.0)).abs() <= 1e-6 * s2[m],
+            "scale2 {m}"
+        );
         for b in 0..per / 16 {
             let bs = fp8_e4m3(sc[m * per / 16 + b]) * s2[m];
             for i in 0..16 {
@@ -144,7 +264,12 @@ fn nvfp4_quantization_round_trips() {
                 let code = if idx % 2 == 0 { byte & 15 } else { byte >> 4 };
                 let q = E2M1[(code & 7) as usize] * if code & 8 != 0 { -1.0 } else { 1.0 } * bs;
                 // Nearest grid point: error at most half the largest grid step (1.0) times the scale.
-                assert!((q - w[idx]).abs() <= 1.0 * bs + 1e-6, "value {idx}: {} vs {}", q, w[idx]);
+                assert!(
+                    (q - w[idx]).abs() <= 1.0 * bs + 1e-6,
+                    "value {idx}: {} vs {}",
+                    q,
+                    w[idx]
+                );
             }
         }
     }
@@ -163,60 +288,109 @@ fn expert_gate_up_small_matches_cpu() {
     const E: usize = 512;
     let (n, k) = (640usize, 2560usize);
     for t in [2usize, 4, 8] {
-    let mut rng = Rng(0xfeed_beef + t as u64);
-    // Two experts with random NVFP4 weights for gate and up.
-    let mut make = |rng: &mut Rng| -> (Vec<u8>, Vec<u8>, f32) {
-        let codes: Vec<u8> = (0..n * k / 2).map(|_| ((rng.next() * 127.0 + 128.0) as u32 & 0xff) as u8).collect();
-        let scales: Vec<u8> = (0..n * k / 16).map(|_| 0x30 + ((rng.next().abs() * 8.0) as u8)).collect();
-        (codes, scales, 0.01)
-    };
-    let experts: Vec<[(Vec<u8>, Vec<u8>, f32); 2]> = (0..2).map(|_| [make(&mut rng), make(&mut rng)]).collect();
-    let dev: Vec<[(DeviceBuffer, DeviceBuffer); 2]> = experts.iter().map(|e| [(upload(&s, &e[0].0), upload(&s, &e[0].1)), (upload(&s, &e[1].0), upload(&s, &e[1].1))]).collect();
-    let ids = [7usize, 300];
-    let mut tables = vec![0u64; 4 * E];
-    let mut s2 = vec![0f32; 2 * E];
-    for (i, &e) in ids.iter().enumerate() {
-        for j in 0..2 {
-            tables[2 * j * E + e] = dev[i][j].0.addr();
-            tables[(2 * j + 1) * E + e] = dev[i][j].1.addr();
-            s2[j * E + e] = experts[i][j].2;
+        let mut rng = Rng(0xfeed_beef + t as u64);
+        // Two experts with random NVFP4 weights for gate and up.
+        let mut make = |rng: &mut Rng| -> (Vec<u8>, Vec<u8>, f32) {
+            let codes: Vec<u8> = (0..n * k / 2)
+                .map(|_| ((rng.next() * 127.0 + 128.0) as u32 & 0xff) as u8)
+                .collect();
+            let scales: Vec<u8> = (0..n * k / 16)
+                .map(|_| 0x30 + ((rng.next().abs() * 8.0) as u8))
+                .collect();
+            (codes, scales, 0.01)
+        };
+        let experts: Vec<[(Vec<u8>, Vec<u8>, f32); 2]> =
+            (0..2).map(|_| [make(&mut rng), make(&mut rng)]).collect();
+        let dev: Vec<[(DeviceBuffer, DeviceBuffer); 2]> = experts
+            .iter()
+            .map(|e| {
+                [
+                    (upload(&s, &e[0].0), upload(&s, &e[0].1)),
+                    (upload(&s, &e[1].0), upload(&s, &e[1].1)),
+                ]
+            })
+            .collect();
+        let ids = [7usize, 300];
+        let mut tables = vec![0u64; 4 * E];
+        let mut s2 = vec![0f32; 2 * E];
+        for (i, &e) in ids.iter().enumerate() {
+            for j in 0..2 {
+                tables[2 * j * E + e] = dev[i][j].0.addr();
+                tables[(2 * j + 1) * E + e] = dev[i][j].1.addr();
+                s2[j * E + e] = experts[i][j].2;
+            }
         }
-    }
-    let dt = upload(&s, &tables);
-    let ds2 = upload(&s, &s2);
-    // Token 0 -> experts 7 and 300, token 1 -> expert 300: rows grouped by expert.
-    let x: Vec<f32> = rng.vec(t * k).iter().map(|&v| bf16::round(v)).collect();
-    let dx = upload(&s, &to_bf16(&x));
-    let mut offsets = vec![3i32; E + 1];
-    for (e, o) in offsets.iter_mut().enumerate() {
-        *o = if e <= 7 { 0 } else if e <= 300 { 1 } else { 3 };
-    }
-    let row_token = [0i32, 0, (t - 1) as i32];
-    let active = [7i32, 300];
-    let (d_off, d_rt, d_act, d_na) = (upload(&s, &offsets), upload(&s, &row_token), upload(&s, &active), upload(&s, &[2i32]));
-    let out = DeviceBuffer::new(3 * n * 2).unwrap();
-    let a = |j: usize| (dt.addr() + (2 * j * E * 8) as u64, dt.addr() + ((2 * j + 1) * E * 8) as u64, ds2.addr() + (j * E * 4) as u64);
-    kernels::moe_gate_up_small(&s, dx.addr(), d_rt.addr(), a(0), a(1), d_off.addr(), d_act.addr(), d_na.addr(), 2, t, out.addr()).unwrap();
-    let got: Vec<u16> = s.download(out.addr(), 3 * n).unwrap();
-    let row_expert = [0usize, 1, 1];
-    for r in 0..3 {
-        let xi = &x[row_token[r] as usize * k..][..k];
-        let ex = &experts[row_expert[r]];
-        for f in [0usize, 1, 2, 3, 100, 333, 639] {
-            let dot = |w: &(Vec<u8>, Vec<u8>, f32)| -> f64 {
-                (0..k).map(|c| {
-                    let byte = w.0[f * k / 2 + c / 2];
-                    let code = if c % 2 == 0 { byte & 15 } else { byte >> 4 };
-                    let sc = fp8_e4m3(w.1[f * k / 16 + c / 16]);
-                    (nvfp4_value(code) * sc) as f64 * xi[c] as f64
-                }).sum::<f64>() * w.2 as f64
+        let dt = upload(&s, &tables);
+        let ds2 = upload(&s, &s2);
+        // Token 0 -> experts 7 and 300, token 1 -> expert 300: rows grouped by expert.
+        let x: Vec<f32> = rng.vec(t * k).iter().map(|&v| bf16::round(v)).collect();
+        let dx = upload(&s, &to_bf16(&x));
+        let mut offsets = vec![3i32; E + 1];
+        for (e, o) in offsets.iter_mut().enumerate() {
+            *o = if e <= 7 {
+                0
+            } else if e <= 300 {
+                1
+            } else {
+                3
             };
-            let (g, u) = (dot(&ex[0]), dot(&ex[1]));
-            let want = g / (1.0 + (-g).exp()) * u;
-            let have = bf16::to_f32(got[r * n + f]) as f64;
-            assert!((have - want).abs() <= 1e-2 * want.abs().max(1e-3) + 1e-4, "t {t} row {r} feature {f}: {have} vs {want}");
         }
-    }
+        let row_token = [0i32, 0, (t - 1) as i32];
+        let active = [7i32, 300];
+        let (d_off, d_rt, d_act, d_na) = (
+            upload(&s, &offsets),
+            upload(&s, &row_token),
+            upload(&s, &active),
+            upload(&s, &[2i32]),
+        );
+        let out = DeviceBuffer::new(3 * n * 2).unwrap();
+        let a = |j: usize| {
+            (
+                dt.addr() + (2 * j * E * 8) as u64,
+                dt.addr() + ((2 * j + 1) * E * 8) as u64,
+                ds2.addr() + (j * E * 4) as u64,
+            )
+        };
+        kernels::moe_gate_up_small(
+            &s,
+            dx.addr(),
+            d_rt.addr(),
+            a(0),
+            a(1),
+            d_off.addr(),
+            d_act.addr(),
+            d_na.addr(),
+            2,
+            t,
+            out.addr(),
+        )
+        .unwrap();
+        let got: Vec<u16> = s.download(out.addr(), 3 * n).unwrap();
+        let row_expert = [0usize, 1, 1];
+        for r in 0..3 {
+            let xi = &x[row_token[r] as usize * k..][..k];
+            let ex = &experts[row_expert[r]];
+            for f in [0usize, 1, 2, 3, 100, 333, 639] {
+                let dot = |w: &(Vec<u8>, Vec<u8>, f32)| -> f64 {
+                    (0..k)
+                        .map(|c| {
+                            let byte = w.0[f * k / 2 + c / 2];
+                            let code = if c % 2 == 0 { byte & 15 } else { byte >> 4 };
+                            let sc = fp8_e4m3(w.1[f * k / 16 + c / 16]);
+                            (nvfp4_value(code) * sc) as f64 * xi[c] as f64
+                        })
+                        .sum::<f64>()
+                        * w.2 as f64
+                };
+                let (g, u) = (dot(&ex[0]), dot(&ex[1]));
+                let want = g / (1.0 + (-g).exp()) * u;
+                let have = bf16::to_f32(got[r * n + f]) as f64;
+                assert!(
+                    (have - want).abs() <= 1e-2 * want.abs().max(1e-3) + 1e-4,
+                    "t {t} row {r} feature {f}: {have} vs {want}"
+                );
+            }
+        }
     }
 }
 
@@ -230,43 +404,98 @@ fn hc_small_is_batch_invariant() {
     const H: usize = 4 * D;
     const RANK: usize = 320;
     let gr = kernels::int8_group();
-    let bytes = |n: usize, rng: &mut Rng| -> Vec<i8> { (0..n).map(|_| (rng.next() * 100.0) as i8).collect() };
-    let pos = |n: usize, rng: &mut Rng| -> Vec<f32> { (0..n).map(|_| 0.002 + 0.002 * rng.next().abs()).collect() };
-    let (wd, sd) = (upload(&s, &bytes(RANK * H, &mut rng)), upload(&s, &pos(RANK * H / gr, &mut rng)));
-    let (wi, si) = (upload(&s, &bytes(4 * H, &mut rng)), upload(&s, &pos(4 * H / gr, &mut rng)));
-    let (wu, su) = (upload(&s, &bytes(H * RANK, &mut rng)), upload(&s, &pos(H * RANK / gr, &mut rng)));
-    let g = upload(&s, &to_bf16(&rng.vec(4 * D).iter().map(|v| v * 0.1).collect::<Vec<_>>()));
+    let bytes = |n: usize, rng: &mut Rng| -> Vec<i8> {
+        (0..n).map(|_| (rng.next() * 100.0) as i8).collect()
+    };
+    let pos = |n: usize, rng: &mut Rng| -> Vec<f32> {
+        (0..n).map(|_| 0.002 + 0.002 * rng.next().abs()).collect()
+    };
+    let (wd, sd) = (
+        upload(&s, &bytes(RANK * H, &mut rng)),
+        upload(&s, &pos(RANK * H / gr, &mut rng)),
+    );
+    let (wi, si) = (
+        upload(&s, &bytes(4 * H, &mut rng)),
+        upload(&s, &pos(4 * H / gr, &mut rng)),
+    );
+    let (wu, su) = (
+        upload(&s, &bytes(H * RANK, &mut rng)),
+        upload(&s, &pos(H * RANK / gr, &mut rng)),
+    );
+    let g = upload(
+        &s,
+        &to_bf16(&rng.vec(4 * D).iter().map(|v| v * 0.1).collect::<Vec<_>>()),
+    );
     let fmt = WeightFormat::Int8Group;
     for (with_y, with_inj) in [(true, true), (false, true), (true, false), (false, false)] {
-    let run = |t: usize, h0: &[f32], y0: &[f32], ip: &[f32]| -> (Vec<f32>, Vec<u16>, Vec<f32>) {
-        let h = upload(&s, h0);
-        let y = upload(&s, y0);
-        let inj_prev = upload(&s, ip);
-        let scratch = DeviceBuffer::zeroed(kernels::hc_small_scratch_floats(t) * 4).unwrap();
-        let z = DeviceBuffer::new(t * RANK * 2).unwrap();
-        let r = DeviceBuffer::new(t * 16).unwrap();
-        let inj = DeviceBuffer::new(t * 16).unwrap();
-        let m = DeviceBuffer::new(t * D * 2).unwrap();
-        s.memset(inj.addr(), 0, t * 16).unwrap();
-        let y = if with_y { y.addr() } else { 0 };
-        let inject = with_inj.then(|| (fmt, wi.addr(), si.addr()));
-        kernels::hc_small(&s, h.addr(), t, y, inj_prev.addr(), (fmt, wd.addr(), sd.addr()), inject,
-            (fmt, wu.addr(), su.addr()), g.addr(), scratch.addr(), z.addr(), r.addr(), inj.addr(), m.addr()).unwrap();
-        (s.download(h.addr(), t * H).unwrap(), s.download(m.addr(), t * D).unwrap(), s.download(inj.addr(), t * 4).unwrap())
-    };
-    for &t in &[2usize, 4, 5, 8, 16] {
-        let h0 = rng.vec(t * H);
-        let y0 = rng.vec(t * D);
-        let ip: Vec<f32> = (0..t * 4).map(|_| 1.0 + rng.next() * 0.5).collect();
-        let (hb, mb, ib) = run(t, &h0, &y0, &ip);
-        for i in 0..t {
-            let (h1, m1, i1) = run(1, &h0[i * H..(i + 1) * H], &y0[i * D..(i + 1) * D], &ip[i * 4..(i + 1) * 4]);
-            assert!(h1.iter().zip(&hb[i * H..]).all(|(a, b)| a.to_bits() == b.to_bits()), "T={t} token {i}: residual differs");
-            assert!(i1.iter().zip(&ib[i * 4..]).all(|(a, b)| a.to_bits() == b.to_bits()), "T={t} token {i}: injection differs");
-            let bad = m1.iter().zip(&mb[i * D..]).filter(|(a, b)| a != b).count();
-            assert!(bad == 0, "T={t} token {i} (y {with_y}, inj {with_inj}): {bad} block-input values differ");
+        let run =
+            |t: usize, h0: &[f32], y0: &[f32], ip: &[f32]| -> (Vec<f32>, Vec<u16>, Vec<f32>) {
+                let h = upload(&s, h0);
+                let y = upload(&s, y0);
+                let inj_prev = upload(&s, ip);
+                let scratch =
+                    DeviceBuffer::zeroed(kernels::hc_small_scratch_floats(t) * 4).unwrap();
+                let z = DeviceBuffer::new(t * RANK * 2).unwrap();
+                let r = DeviceBuffer::new(t * 16).unwrap();
+                let inj = DeviceBuffer::new(t * 16).unwrap();
+                let m = DeviceBuffer::new(t * D * 2).unwrap();
+                s.memset(inj.addr(), 0, t * 16).unwrap();
+                let y = if with_y { y.addr() } else { 0 };
+                let inject = with_inj.then(|| (fmt, wi.addr(), si.addr()));
+                kernels::hc_small(
+                    &s,
+                    h.addr(),
+                    t,
+                    y,
+                    inj_prev.addr(),
+                    (fmt, wd.addr(), sd.addr()),
+                    inject,
+                    (fmt, wu.addr(), su.addr()),
+                    g.addr(),
+                    scratch.addr(),
+                    z.addr(),
+                    r.addr(),
+                    inj.addr(),
+                    m.addr(),
+                )
+                .unwrap();
+                (
+                    s.download(h.addr(), t * H).unwrap(),
+                    s.download(m.addr(), t * D).unwrap(),
+                    s.download(inj.addr(), t * 4).unwrap(),
+                )
+            };
+        for &t in &[2usize, 4, 5, 8, 16] {
+            let h0 = rng.vec(t * H);
+            let y0 = rng.vec(t * D);
+            let ip: Vec<f32> = (0..t * 4).map(|_| 1.0 + rng.next() * 0.5).collect();
+            let (hb, mb, ib) = run(t, &h0, &y0, &ip);
+            for i in 0..t {
+                let (h1, m1, i1) = run(
+                    1,
+                    &h0[i * H..(i + 1) * H],
+                    &y0[i * D..(i + 1) * D],
+                    &ip[i * 4..(i + 1) * 4],
+                );
+                assert!(
+                    h1.iter()
+                        .zip(&hb[i * H..])
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "T={t} token {i}: residual differs"
+                );
+                assert!(
+                    i1.iter()
+                        .zip(&ib[i * 4..])
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "T={t} token {i}: injection differs"
+                );
+                let bad = m1.iter().zip(&mb[i * D..]).filter(|(a, b)| a != b).count();
+                assert!(
+                    bad == 0,
+                    "T={t} token {i} (y {with_y}, inj {with_inj}): {bad} block-input values differ"
+                );
+            }
         }
-    }
     }
 }
 
@@ -277,29 +506,50 @@ fn qsa_select_matches_cpu() {
     quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0xa11c_e5e1_ec7);
-    for &(start, ld, coarse) in &[(8_000usize, 2048usize, true), (131_000, 32_768, true), (262_000, 65_536, true), (40_000, 65_536, true), (131_000, 32_768, false), (262_000, 65_536, false), (20_000, 65_536, false), (30_000, 65_536, true)] {
-      // 4 rows take the cluster variant, 300 the one-block-per-row (prefill) kernel.
-      for t in [4usize, 300] {
-        if start + t > 4 * ld {
-            continue;  // rows longer than ld cannot occur (ld covers the context)
+    for &(start, ld, coarse) in &[
+        (8_000usize, 2048usize, true),
+        (131_000, 32_768, true),
+        (262_000, 65_536, true),
+        (40_000, 65_536, true),
+        (131_000, 32_768, false),
+        (262_000, 65_536, false),
+        (20_000, 65_536, false),
+        (30_000, 65_536, true),
+    ] {
+        // 4 rows take the cluster variant, 300 the one-block-per-row (prefill) kernel.
+        for t in [4usize, 300] {
+            if start + t > 4 * ld {
+                continue; // rows longer than ld cannot occur (ld covers the context)
+            }
+            // Coarse values give the threshold many ties; continuous ones usually end the search early.
+            let scores: Vec<f32> = (0..t * ld)
+                .map(|_| {
+                    if coarse {
+                        (rng.next() * 40.0).round() / 8.0
+                    } else {
+                        rng.next() * 3.0
+                    }
+                })
+                .collect();
+            let ds = upload(&s, &scores);
+            let dstart = upload(&s, &[start as i32]);
+            let sel = DeviceBuffer::new(t * 512 * 4).unwrap();
+            kernels::qsa_select(&s, ds.addr(), t, ld, dstart.addr(), sel.addr()).unwrap();
+            let got: Vec<i32> = s.download(sel.addr(), t * 512).unwrap();
+            for r in 0..t {
+                let n = ((start + r + 1) / 4).min(ld);
+                let row = &scores[r * ld..r * ld + n];
+                let mut idx: Vec<usize> = (0..n).collect();
+                idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
+                let mut want: Vec<i32> = idx[..512].iter().map(|&i| i as i32).collect();
+                want.sort();
+                assert_eq!(
+                    &got[r * 512..(r + 1) * 512],
+                    &want[..],
+                    "start {start} ld {ld} t {t} row {r}"
+                );
+            }
         }
-        // Coarse values give the threshold many ties; continuous ones usually end the search early.
-        let scores: Vec<f32> = (0..t * ld).map(|_| if coarse { (rng.next() * 40.0).round() / 8.0 } else { rng.next() * 3.0 }).collect();
-        let ds = upload(&s, &scores);
-        let dstart = upload(&s, &[start as i32]);
-        let sel = DeviceBuffer::new(t * 512 * 4).unwrap();
-        kernels::qsa_select(&s, ds.addr(), t, ld, dstart.addr(), sel.addr()).unwrap();
-        let got: Vec<i32> = s.download(sel.addr(), t * 512).unwrap();
-        for r in 0..t {
-            let n = ((start + r + 1) / 4).min(ld);
-            let row = &scores[r * ld..r * ld + n];
-            let mut idx: Vec<usize> = (0..n).collect();
-            idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
-            let mut want: Vec<i32> = idx[..512].iter().map(|&i| i as i32).collect();
-            want.sort();
-            assert_eq!(&got[r * 512..(r + 1) * 512], &want[..], "start {start} ld {ld} t {t} row {r}");
-        }
-      }
     }
 }
 
@@ -320,7 +570,11 @@ fn gdn_chunked_matches_sequential() {
             for h in 0..2 * KH {
                 let row = &mut qkv[r * C + h * DK..r * C + (h + 1) * DK];
                 let n = row.iter().map(|v| v * v).sum::<f32>().sqrt();
-                let sc = if h < KH { 1.0 / (n * (DK as f32).sqrt()) } else { 1.0 / n };
+                let sc = if h < KH {
+                    1.0 / (n * (DK as f32).sqrt())
+                } else {
+                    1.0 / n
+                };
                 row.iter_mut().for_each(|v| *v *= sc);
             }
         }
@@ -331,26 +585,61 @@ fn gdn_chunked_matches_sequential() {
         let run = |mode: u8| -> (Vec<f32>, Vec<f32>) {
             let st = upload(&s, &state0);
             let out = DeviceBuffer::new(t * VH * DK * 4).unwrap();
-            let scratch = DeviceBuffer::new(kernels::gdn_chunk_scratch_floats(t).max(kernels::gdn_tc_scratch_floats(t)) * 4).unwrap();
+            let scratch = DeviceBuffer::new(
+                kernels::gdn_chunk_scratch_floats(t).max(kernels::gdn_tc_scratch_floats(t)) * 4,
+            )
+            .unwrap();
             if mode == 2 {
-                kernels::gdn_chunked_tc(&s, dq.addr(), db.addr(), dg.addr(), st.addr(), out.addr(), t, scratch.addr()).unwrap();
+                kernels::gdn_chunked_tc(
+                    &s,
+                    dq.addr(),
+                    db.addr(),
+                    dg.addr(),
+                    st.addr(),
+                    out.addr(),
+                    t,
+                    scratch.addr(),
+                )
+                .unwrap();
             } else {
-                kernels::gdn_recurrent(&s, dq.addr(), db.addr(), dg.addr(), st.addr(), out.addr(), t, if mode == 0 { 0 } else { scratch.addr() }).unwrap();
+                kernels::gdn_recurrent(
+                    &s,
+                    dq.addr(),
+                    db.addr(),
+                    dg.addr(),
+                    st.addr(),
+                    out.addr(),
+                    t,
+                    if mode == 0 { 0 } else { scratch.addr() },
+                )
+                .unwrap();
             }
-            (s.download(out.addr(), t * VH * DK).unwrap(), s.download(st.addr(), VH * DK * DK).unwrap())
+            (
+                s.download(out.addr(), t * VH * DK).unwrap(),
+                s.download(st.addr(), VH * DK * DK).unwrap(),
+            )
         };
         let (o0, s0) = run(0);
         let (o1, s1) = run(1);
         let (o2, s2) = run(2);
         let err = |a: &[f32], b: &[f32]| {
             let scale = a.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-6);
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+                / scale
         };
         let (eo, es) = (err(&o0, &o1), err(&s0, &s1));
         let (to, ts) = (err(&o0, &o2), err(&s0, &s2));
-        println!("T={t}: output error {eo:.2e}, state error {es:.2e}; tensor cores: output {to:.2e}, state {ts:.2e}");
+        println!(
+            "T={t}: output error {eo:.2e}, state error {es:.2e}; tensor cores: output {to:.2e}, state {ts:.2e}"
+        );
         assert!(eo < 1e-4 && es < 1e-4, "T={t}: output {eo}, state {es}");
-        assert!(to < 1e-4 && ts < 1e-4, "T={t}: tensor-core output {to}, state {ts}");
+        assert!(
+            to < 1e-4 && ts < 1e-4,
+            "T={t}: tensor-core output {to}, state {ts}"
+        );
     }
 }
 
@@ -368,7 +657,18 @@ fn draft_sketch_matches_full_head() {
     let scales = DeviceBuffer::new(n * D / 16).unwrap();
     let s2 = DeviceBuffer::new(4).unwrap();
     let amax = DeviceBuffer::new(4).unwrap();
-    kernels::quantize_nvfp4(&s, dw.addr(), 1, n, D, codes.addr(), scales.addr(), s2.addr(), amax.addr()).unwrap();
+    kernels::quantize_nvfp4(
+        &s,
+        dw.addr(),
+        1,
+        n,
+        D,
+        codes.addr(),
+        scales.addr(),
+        s2.addr(),
+        amax.addr(),
+    )
+    .unwrap();
     let sketch = DeviceBuffer::new(kernels::draft_sketch_bytes(n)).unwrap();
     kernels::build_draft_sketch(&s, dw.addr(), sketch.addr(), n).unwrap();
     let ys = DeviceBuffer::new(n * 4).unwrap();
@@ -380,13 +680,39 @@ fn draft_sketch_matches_full_head() {
     for trial in 0..20 {
         // A hidden state close to a few rows (a confident prediction) plus noise.
         let target = (trial * 7919) % n;
-        let x: Vec<f32> = (0..D).map(|i| w[target * D + i] * 20.0 + rng.next() * 0.5).collect();
+        let x: Vec<f32> = (0..D)
+            .map(|i| w[target * D + i] * 20.0 + rng.next() * 0.5)
+            .collect();
         let dx = upload(&s, &to_bf16(&x));
-        kernels::draft_head_argmax(&s, dx.addr(), sketch.addr(), (codes.addr(), scales.addr(), s2.addr()), ys.addr(), pick.addr(), n, out.addr(), 0, 0).unwrap();
-        kernels::nvfp4_dense_gemv(&s, dx.addr(), codes.addr(), scales.addr(), s2.addr(), full.addr(), n).unwrap();
+        kernels::draft_head_argmax(
+            &s,
+            dx.addr(),
+            sketch.addr(),
+            (codes.addr(), scales.addr(), s2.addr()),
+            ys.addr(),
+            pick.addr(),
+            n,
+            out.addr(),
+            0,
+            0,
+        )
+        .unwrap();
+        kernels::nvfp4_dense_gemv(
+            &s,
+            dx.addr(),
+            codes.addr(),
+            scales.addr(),
+            s2.addr(),
+            full.addr(),
+            n,
+        )
+        .unwrap();
         kernels::argmax(&s, full.addr(), 1, n, n, scratch.addr(), out.addr() + 4).unwrap();
         let r: Vec<i32> = s.download(out.addr(), 2).unwrap();
-        println!("trial {trial}: target {target}, sketch {}, full {}", r[0], r[1]);
+        println!(
+            "trial {trial}: target {target}, sketch {}, full {}",
+            r[0], r[1]
+        );
         same += (r[0] == r[1]) as usize;
     }
     assert!(same >= 19, "sketch agreed {same}/20");
@@ -400,7 +726,12 @@ fn fp4_grouped_gemm_matches_cpu() {
     let s = Stream::new().unwrap();
     let mut rng = Rng(0xf4f4_0001);
     for &(m, n, k) in &[(150usize, 256usize, 640usize), (70, 128, 2560)] {
-        let x: Vec<f32> = rng.vec(m * k).iter().enumerate().map(|(i, &v)| bf16::round(v * (1.0 + (i / k) as f32 * 0.37))).collect();
+        let x: Vec<f32> = rng
+            .vec(m * k)
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| bf16::round(v * (1.0 + (i / k) as f32 * 0.37)))
+            .collect();
         let dx = upload(&s, &to_bf16(&x));
         let qa = DeviceBuffer::zeroed(kernels::fp4_rows_bytes(m, k)).unwrap();
         kernels::fp4_quant_rows(&s, dx.addr(), m, k, qa.addr()).unwrap();
@@ -408,8 +739,12 @@ fn fp4_grouped_gemm_matches_cpu() {
         let codes_a: Vec<u8> = s.download(ca, m * k / 2).unwrap();
         let scales_a: Vec<u8> = s.download(sa, m * k / 16).unwrap();
         let rs: Vec<f32> = s.download(ra, m).unwrap();
-        let wc: Vec<u8> = (0..n * k / 2).map(|_| ((rng.next() + 1.0) * 127.9) as u8).collect();
-        let ws: Vec<u8> = (0..n * k / 16).map(|_| 0x20 + ((rng.next() + 1.0) * 10.0) as u8).collect();
+        let wc: Vec<u8> = (0..n * k / 2)
+            .map(|_| ((rng.next() + 1.0) * 127.9) as u8)
+            .collect();
+        let ws: Vec<u8> = (0..n * k / 16)
+            .map(|_| 0x20 + ((rng.next() + 1.0) * 10.0) as u8)
+            .collect();
         let (dwc, dws) = (upload(&s, &wc), upload(&s, &ws));
         let wptr = upload(&s, &[dwc.addr()]);
         let sptr = upload(&s, &[dws.addr()]);
@@ -419,22 +754,52 @@ fn fp4_grouped_gemm_matches_cpu() {
         let doff = upload(&s, &offsets);
         let tiles = m.div_ceil(kernels::fp4_tile_rows());
         let te = upload(&s, &vec![0i32; tiles]);
-        let tr = upload(&s, &(0..tiles).map(|t| (t * kernels::fp4_tile_rows()) as i32).collect::<Vec<_>>());
+        let tr = upload(
+            &s,
+            &(0..tiles)
+                .map(|t| (t * kernels::fp4_tile_rows()) as i32)
+                .collect::<Vec<_>>(),
+        );
         let nt = upload(&s, &[tiles as i32]);
         let dy = DeviceBuffer::zeroed(m * n * 4).unwrap();
-        kernels::moe_fp4_gemm(&s, qa.addr(), m, wptr.addr(), sptr.addr(), ws2.addr(), doff.addr(), te.addr(), tr.addr(), nt.addr(), tiles, dy.addr(), n, k).unwrap();
+        kernels::moe_fp4_gemm(
+            &s,
+            qa.addr(),
+            m,
+            wptr.addr(),
+            sptr.addr(),
+            ws2.addr(),
+            doff.addr(),
+            te.addr(),
+            tr.addr(),
+            nt.addr(),
+            tiles,
+            dy.addr(),
+            n,
+            k,
+        )
+        .unwrap();
         let y: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
         let deq = |codes: &[u8], scales: &[u8], row: usize, t: usize| {
             let idx = row * k + t;
             let byte = codes[idx / 2];
-            nvfp4_value(if idx % 2 == 0 { byte & 15 } else { byte >> 4 }) * fp8_e4m3(scales[idx / 16])
+            nvfp4_value(if idx % 2 == 0 { byte & 15 } else { byte >> 4 })
+                * fp8_e4m3(scales[idx / 16])
         };
         let mut worst = 0f64;
         for i in 0..m {
             for j in 0..n {
-                let dot: f64 = (0..k).map(|t| deq(&codes_a, &scales_a, i, t) as f64 * deq(&wc, &ws, j, t) as f64).sum();
+                let dot: f64 = (0..k)
+                    .map(|t| deq(&codes_a, &scales_a, i, t) as f64 * deq(&wc, &ws, j, t) as f64)
+                    .sum();
                 let want = dot * rs[i] as f64 * 0.5;
-                let mag: f64 = (0..k).map(|t| (deq(&codes_a, &scales_a, i, t) as f64 * deq(&wc, &ws, j, t) as f64).abs()).sum::<f64>() * rs[i] as f64 * 0.5;
+                let mag: f64 = (0..k)
+                    .map(|t| {
+                        (deq(&codes_a, &scales_a, i, t) as f64 * deq(&wc, &ws, j, t) as f64).abs()
+                    })
+                    .sum::<f64>()
+                    * rs[i] as f64
+                    * 0.5;
                 worst = worst.max((y[i * n + j] as f64 - want).abs() / mag.max(1e-30));
             }
         }
@@ -444,21 +809,62 @@ fn fp4_grouped_gemm_matches_cpu() {
             let wc2: Vec<u8> = wc.iter().rev().copied().collect();
             let ws2v: Vec<u8> = ws.iter().rev().copied().collect();
             let (dwc2, dws2) = (upload(&s, &wc2), upload(&s, &ws2v));
-            let (uptr, usptr, us2) = (upload(&s, &[dwc2.addr()]), upload(&s, &[dws2.addr()]), upload(&s, &[0.75f32]));
+            let (uptr, usptr, us2) = (
+                upload(&s, &[dwc2.addr()]),
+                upload(&s, &[dws2.addr()]),
+                upload(&s, &[0.75f32]),
+            );
             let du = DeviceBuffer::zeroed(m * n * 4).unwrap();
-            kernels::moe_fp4_gemm(&s, qa.addr(), m, uptr.addr(), usptr.addr(), us2.addr(), doff.addr(), te.addr(), tr.addr(), nt.addr(), tiles, du.addr(), n, k).unwrap();
+            kernels::moe_fp4_gemm(
+                &s,
+                qa.addr(),
+                m,
+                uptr.addr(),
+                usptr.addr(),
+                us2.addr(),
+                doff.addr(),
+                te.addr(),
+                tr.addr(),
+                nt.addr(),
+                tiles,
+                du.addr(),
+                n,
+                k,
+            )
+            .unwrap();
             let act1 = DeviceBuffer::zeroed(m * n * 2).unwrap();
             kernels::swiglu(&s, dy.addr(), du.addr(), n, n, act1.addr(), m).unwrap();
             let act2 = DeviceBuffer::zeroed(m * n * 2).unwrap();
-            kernels::moe_fp4_gate_up(&s, qa.addr(), m, (wptr.addr(), sptr.addr(), ws2.addr()), (uptr.addr(), usptr.addr(), us2.addr()), doff.addr(), te.addr(), tr.addr(), nt.addr(), tiles, act2.addr(), n, k).unwrap();
-            let (x1, x2): (Vec<u16>, Vec<u16>) = (s.download(act1.addr(), m * n).unwrap(), s.download(act2.addr(), m * n).unwrap());
+            kernels::moe_fp4_gate_up(
+                &s,
+                qa.addr(),
+                m,
+                (wptr.addr(), sptr.addr(), ws2.addr()),
+                (uptr.addr(), usptr.addr(), us2.addr()),
+                doff.addr(),
+                te.addr(),
+                tr.addr(),
+                nt.addr(),
+                tiles,
+                act2.addr(),
+                n,
+                k,
+            )
+            .unwrap();
+            let (x1, x2): (Vec<u16>, Vec<u16>) = (
+                s.download(act1.addr(), m * n).unwrap(),
+                s.download(act2.addr(), m * n).unwrap(),
+            );
             assert_eq!(x1, x2, "fused gate/up differs");
         }
         // The quantized activations approximate x.
         let mut err = 0f64;
         for i in 0..m {
             for t in 0..k {
-                err = err.max(((deq(&codes_a, &scales_a, i, t) * rs[i]) as f64 - x[i * k + t] as f64).abs() / (rs[i] as f64 * 6.0 * 448.0));
+                err = err.max(
+                    ((deq(&codes_a, &scales_a, i, t) * rs[i]) as f64 - x[i * k + t] as f64).abs()
+                        / (rs[i] as f64 * 6.0 * 448.0),
+                );
             }
         }
         assert!(err < 0.2, "fp4 activation quantization error {err}");
@@ -474,19 +880,53 @@ fn hc_up_mix_fused_matches_unfused() {
     let (m, k, h) = (300usize, 320usize, 10240usize);
     let z = upload(&s, &to_bf16(&rng.vec(m * k)));
     let n = upload(&s, &to_bf16(&rng.vec(m * h)));
-    let g = upload(&s, &to_bf16(&rng.vec(h).iter().map(|v| v * 0.1).collect::<Vec<_>>()));
+    let g = upload(
+        &s,
+        &to_bf16(&rng.vec(h).iter().map(|v| v * 0.1).collect::<Vec<_>>()),
+    );
     let wf = rng.vec(h * k).iter().map(|v| v * 0.05).collect::<Vec<_>>();
     let w = upload(&s, &to_bf16(&wf));
     let wq = DeviceBuffer::new(h * k).unwrap();
     let wsc = DeviceBuffer::new(h * k / 64 * 4).unwrap();
     kernels::quantize_int8_groups(&s, w.addr(), h, k, wq.addr(), wsc.addr()).unwrap();
-    for (fmt, waddr, scale) in [(WeightFormat::Bf16, w.addr(), 0), (WeightFormat::Int8Group, wq.addr(), wsc.addr())] {
+    for (fmt, waddr, scale) in [
+        (WeightFormat::Bf16, w.addr(), 0),
+        (WeightFormat::Int8Group, wq.addr(), wsc.addr()),
+    ] {
         let u = DeviceBuffer::new(m * h * 4).unwrap();
         let m1 = DeviceBuffer::new(m * 2560 * 2).unwrap();
         let m2 = DeviceBuffer::new(m * 2560 * 2).unwrap();
-        kernels::gemm_f32(&s, z.addr(), k, fmt, waddr, k, scale, u.addr(), h, m, h, k, 1.0, false).unwrap();
+        kernels::gemm_f32(
+            &s,
+            z.addr(),
+            k,
+            fmt,
+            waddr,
+            k,
+            scale,
+            u.addr(),
+            h,
+            m,
+            h,
+            k,
+            1.0,
+            false,
+        )
+        .unwrap();
         kernels::hc_mix(&s, u.addr(), n.addr(), g.addr(), m1.addr(), m).unwrap();
-        kernels::gemm_hc_up_mix(&s, z.addr(), fmt, waddr, scale, n.addr(), g.addr(), m2.addr(), m, k).unwrap();
+        kernels::gemm_hc_up_mix(
+            &s,
+            z.addr(),
+            fmt,
+            waddr,
+            scale,
+            n.addr(),
+            g.addr(),
+            m2.addr(),
+            m,
+            k,
+        )
+        .unwrap();
         let a: Vec<u16> = s.download(m1.addr(), m * 2560).unwrap();
         let b: Vec<u16> = s.download(m2.addr(), m * 2560).unwrap();
         let diff = a.iter().zip(&b).filter(|(x, y)| x != y).count();
@@ -505,13 +945,25 @@ fn hc_combine_norm_matches_separate() {
     let y = upload(&s, &rng.vec(t * 2560));
     let inj = upload(&s, &rng.vec(t * 4));
     let (ha, hb) = (upload(&s, &h0), upload(&s, &h0));
-    let (na, nb) = (DeviceBuffer::new(t * 10240 * 2).unwrap(), DeviceBuffer::new(t * 10240 * 2).unwrap());
+    let (na, nb) = (
+        DeviceBuffer::new(t * 10240 * 2).unwrap(),
+        DeviceBuffer::new(t * 10240 * 2).unwrap(),
+    );
     kernels::hc_combine(&s, ha.addr(), y.addr(), inj.addr(), t).unwrap();
     kernels::grouped_rmsnorm(&s, ha.addr(), 0, na.addr(), t).unwrap();
     kernels::hc_combine_norm(&s, hb.addr(), y.addr(), inj.addr(), nb.addr(), t).unwrap();
-    let (a, b): (Vec<f32>, Vec<f32>) = (s.download(ha.addr(), t * 10240).unwrap(), s.download(hb.addr(), t * 10240).unwrap());
-    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "residuals differ");
-    let (a, b): (Vec<u16>, Vec<u16>) = (s.download(na.addr(), t * 10240).unwrap(), s.download(nb.addr(), t * 10240).unwrap());
+    let (a, b): (Vec<f32>, Vec<f32>) = (
+        s.download(ha.addr(), t * 10240).unwrap(),
+        s.download(hb.addr(), t * 10240).unwrap(),
+    );
+    assert!(
+        a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+        "residuals differ"
+    );
+    let (a, b): (Vec<u16>, Vec<u16>) = (
+        s.download(na.addr(), t * 10240).unwrap(),
+        s.download(nb.addr(), t * 10240).unwrap(),
+    );
     assert_eq!(a, b, "norms differ");
 }
 
@@ -521,21 +973,53 @@ fn hc_combine_norm_matches_separate() {
 fn gemm_throughput() {
     quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
-    for &(m, n, k) in &[(8192usize, 16512usize, 2560usize), (8192, 2560, 6144), (8192, 324, 10240), (8192, 10240, 320)] {
+    for &(m, n, k) in &[
+        (8192usize, 16512usize, 2560usize),
+        (8192, 2560, 6144),
+        (8192, 324, 10240),
+        (8192, 10240, 320),
+    ] {
         let x = DeviceBuffer::zeroed(m * k * 2).unwrap();
         let w = DeviceBuffer::zeroed(n * k * 2).unwrap();
         let wq = DeviceBuffer::zeroed(n * k).unwrap();
         let sc = DeviceBuffer::zeroed(n * k / 64 * 4).unwrap();
         let y = DeviceBuffer::zeroed(m * n * 4).unwrap();
-        for (name, fmt, wa, sa) in [("bf16", WeightFormat::Bf16, w.addr(), 0), ("int8g", WeightFormat::Int8Group, wq.addr(), sc.addr())] {
-            let run = || kernels::gemm_f32(&s, x.addr(), k, fmt, wa, k, sa, y.addr(), n, m, n, k, 1.0, false).unwrap();
+        for (name, fmt, wa, sa) in [
+            ("bf16", WeightFormat::Bf16, w.addr(), 0),
+            ("int8g", WeightFormat::Int8Group, wq.addr(), sc.addr()),
+        ] {
+            let run = || {
+                kernels::gemm_f32(
+                    &s,
+                    x.addr(),
+                    k,
+                    fmt,
+                    wa,
+                    k,
+                    sa,
+                    y.addr(),
+                    n,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    false,
+                )
+                .unwrap()
+            };
             run();
             s.synchronize().unwrap();
             let t = std::time::Instant::now();
-            for _ in 0..10 { run(); }
+            for _ in 0..10 {
+                run();
+            }
             s.synchronize().unwrap();
             let secs = t.elapsed().as_secs_f64() / 10.0;
-            println!("{m}x{n}x{k} {name}: {:.3} ms, {:.0} TFLOPS", secs * 1e3, 2.0 * (m * n * k) as f64 / secs / 1e12);
+            println!(
+                "{m}x{n}x{k} {name}: {:.3} ms, {:.0} TFLOPS",
+                secs * 1e3,
+                2.0 * (m * n * k) as f64 / secs / 1e12
+            );
         }
     }
 }
@@ -552,19 +1036,52 @@ fn gemm_tiles_match_cpu(m: usize, n: usize, k: usize) {
     quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x7a11_0001);
-    let x = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
-    let w = rng.vec(n * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
+    let x = rng
+        .vec(m * k)
+        .iter()
+        .map(|&v| bf16::round(v))
+        .collect::<Vec<_>>();
+    let w = rng
+        .vec(n * k)
+        .iter()
+        .map(|&v| bf16::round(v))
+        .collect::<Vec<_>>();
     let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
     let wq = DeviceBuffer::new(n * k).unwrap();
     let wsc = DeviceBuffer::new(n * k / 64 * 4).unwrap();
     kernels::quantize_int8_groups(&s, dw.addr(), n, k, wq.addr(), wsc.addr()).unwrap();
     let q: Vec<i8> = s.download(wq.addr(), n * k).unwrap();
     let sc: Vec<f32> = s.download(wsc.addr(), n * k / 64).unwrap();
-    for (fmt, wa, sa) in [(WeightFormat::Bf16, dw.addr(), 0), (WeightFormat::Int8Group, wq.addr(), wsc.addr())] {
+    for (fmt, wa, sa) in [
+        (WeightFormat::Bf16, dw.addr(), 0),
+        (WeightFormat::Int8Group, wq.addr(), wsc.addr()),
+    ] {
         let dy = DeviceBuffer::zeroed(m * n * 4).unwrap();
-        kernels::gemm_f32(&s, dx.addr(), k, fmt, wa, k, sa, dy.addr(), n, m, n, k, 1.0, false).unwrap();
+        kernels::gemm_f32(
+            &s,
+            dx.addr(),
+            k,
+            fmt,
+            wa,
+            k,
+            sa,
+            dy.addr(),
+            n,
+            m,
+            n,
+            k,
+            1.0,
+            false,
+        )
+        .unwrap();
         let y: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
-        let wv = |j: usize, t: usize| if sa == 0 { w[j * k + t] } else { bf16::round(q[j * k + t] as f32 * sc[(j * k + t) / 64]) };
+        let wv = |j: usize, t: usize| {
+            if sa == 0 {
+                w[j * k + t]
+            } else {
+                bf16::round(q[j * k + t] as f32 * sc[(j * k + t) / 64])
+            }
+        };
         let mut worst = 0f64;
         for _ in 0..4000 {
             let i = (((rng.next() + 1.0) * 0.5) * m as f32) as usize % m;
@@ -587,12 +1104,32 @@ fn dequant_int8_groups_gemm_is_exact() {
     let x: Vec<f32> = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect();
     let w: Vec<f32> = rng.vec(n * k);
     let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
-    let (wq, wsc, wbf) = (DeviceBuffer::new(n * k).unwrap(), DeviceBuffer::new(n * k / 64 * 4).unwrap(), DeviceBuffer::new(n * k * 2).unwrap());
+    let (wq, wsc, wbf) = (
+        DeviceBuffer::new(n * k).unwrap(),
+        DeviceBuffer::new(n * k / 64 * 4).unwrap(),
+        DeviceBuffer::new(n * k * 2).unwrap(),
+    );
     kernels::quantize_int8_groups(&s, dw.addr(), n, k, wq.addr(), wsc.addr()).unwrap();
     kernels::dequant_int8_groups(&s, wq.addr(), wsc.addr(), n, k, wbf.addr()).unwrap();
     let run = |fmt, wa, sa| {
         let dy = DeviceBuffer::zeroed(m * n * 4).unwrap();
-        kernels::gemm_f32(&s, dx.addr(), k, fmt, wa, k, sa, dy.addr(), n, m, n, k, 1.0, false).unwrap();
+        kernels::gemm_f32(
+            &s,
+            dx.addr(),
+            k,
+            fmt,
+            wa,
+            k,
+            sa,
+            dy.addr(),
+            n,
+            m,
+            n,
+            k,
+            1.0,
+            false,
+        )
+        .unwrap();
         s.download::<f32>(dy.addr(), m * n).unwrap()
     };
     let a = run(WeightFormat::Int8Group, wq.addr(), wsc.addr());
@@ -613,13 +1150,21 @@ fn index_scores_tc_match_fp32() {
     let dstart = upload(&s, &[start as i32]);
     let run = |fp32: bool| -> (Vec<f32>, Vec<i32>) {
         unsafe {
-            if fp32 { std::env::set_var("QUENCH6K_SCORE_FP32", "1") } else { std::env::remove_var("QUENCH6K_SCORE_FP32") }
+            if fp32 {
+                std::env::set_var("QUENCH6K_SCORE_FP32", "1")
+            } else {
+                std::env::remove_var("QUENCH6K_SCORE_FP32")
+            }
         }
         let sc = DeviceBuffer::zeroed(t * ld * 4).unwrap();
-        kernels::qsa_index_scores(&s, diq.addr(), dp.addr(), sc.addr(), ld, dstart.addr(), t).unwrap();
+        kernels::qsa_index_scores(&s, diq.addr(), dp.addr(), sc.addr(), ld, dstart.addr(), t)
+            .unwrap();
         let sel = DeviceBuffer::zeroed(t * 512 * 4).unwrap();
         kernels::qsa_select(&s, sc.addr(), t, ld, dstart.addr(), sel.addr()).unwrap();
-        (s.download(sc.addr(), t * ld).unwrap(), s.download(sel.addr(), t * 512).unwrap())
+        (
+            s.download(sc.addr(), t * ld).unwrap(),
+            s.download(sel.addr(), t * 512).unwrap(),
+        )
     };
     let (a, sa) = run(true);
     let (b, sb) = run(false);
@@ -630,12 +1175,22 @@ fn index_scores_tc_match_fp32() {
         for g in 0..complete.min(ld) {
             worst = worst.max((a[r * ld + g] - b[r * ld + g]).abs() / (1.0 + a[r * ld + g].abs()));
         }
-        let set: std::collections::HashSet<i32> = sa[r * 512..(r + 1) * 512].iter().copied().collect();
-        same += sb[r * 512..(r + 1) * 512].iter().filter(|g| set.contains(g)).count();
+        let set: std::collections::HashSet<i32> =
+            sa[r * 512..(r + 1) * 512].iter().copied().collect();
+        same += sb[r * 512..(r + 1) * 512]
+            .iter()
+            .filter(|g| set.contains(g))
+            .count();
     }
-    println!("score error {worst:.2e}, selection overlap {:.5}", same as f64 / (t * 512) as f64);
+    println!(
+        "score error {worst:.2e}, selection overlap {:.5}",
+        same as f64 / (t * 512) as f64
+    );
     assert!(worst < 1e-4, "score error {worst}");
-    assert!(same as f64 / (t * 512) as f64 > 0.999, "selection overlap {same}");
+    assert!(
+        same as f64 / (t * 512) as f64 > 0.999,
+        "selection overlap {same}"
+    );
 }
 
 /// MXFP8 GEMM against the CPU product of the dequantized operands; the GEMV reads the same weights.
@@ -645,8 +1200,17 @@ fn mxfp8_gemm_matches_cpu() {
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x88f8_0001);
     let (m, n, k) = (200usize, 300usize, 512usize);
-    let x: Vec<f32> = rng.vec(m * k).iter().enumerate().map(|(i, &v)| bf16::round(v * (1.0 + (i % 97) as f32 * 0.1))).collect();
-    let w: Vec<f32> = rng.vec(n * k).iter().map(|&v| bf16::round(v * 0.05)).collect();
+    let x: Vec<f32> = rng
+        .vec(m * k)
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| bf16::round(v * (1.0 + (i % 97) as f32 * 0.1)))
+        .collect();
+    let w: Vec<f32> = rng
+        .vec(n * k)
+        .iter()
+        .map(|&v| bf16::round(v * 0.05))
+        .collect();
     let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
     let quant = |d: &DeviceBuffer, rows: usize| {
         let c = DeviceBuffer::zeroed(rows * k).unwrap();
@@ -658,9 +1222,23 @@ fn mxfp8_gemm_matches_cpu() {
     };
     let (ca, sa, cav, sav) = quant(&dx, m);
     let (cw, sw, cwv, swv) = quant(&dw, n);
-    let deq = |c: &[u8], sc: &[u8], r: usize, t: usize| fp8_e4m3(c[r * k + t]) * 2f32.powi(sc[r * k / 32 + t / 32] as i32 - 127);
+    let deq = |c: &[u8], sc: &[u8], r: usize, t: usize| {
+        fp8_e4m3(c[r * k + t]) * 2f32.powi(sc[r * k / 32 + t / 32] as i32 - 127)
+    };
     let dy = DeviceBuffer::zeroed(m * n * 4).unwrap();
-    kernels::gemm_mx8(&s, ca.addr(), sa.addr(), cw.addr(), sw.addr(), dy.addr(), n, m, n, k).unwrap();
+    kernels::gemm_mx8(
+        &s,
+        ca.addr(),
+        sa.addr(),
+        cw.addr(),
+        sw.addr(),
+        dy.addr(),
+        n,
+        m,
+        n,
+        k,
+    )
+    .unwrap();
     let y: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
     let mut worst = 0f64;
     for i in 0..m {
@@ -678,12 +1256,31 @@ fn mxfp8_gemm_matches_cpu() {
     // GEMV with MXFP8 weights (fmt 4) on BF16 activations.
     let yg = DeviceBuffer::zeroed(3 * n * 4).unwrap();
     let partial = DeviceBuffer::zeroed(1 << 20).unwrap();
-    kernels::gemv(&s, 3, dx.addr(), k, WeightFormat::Mxfp8, cw.addr(), sw.addr(), yg.addr(), n, partial.addr(), n, k, 1, 1.0, false).unwrap();
+    kernels::gemv(
+        &s,
+        3,
+        dx.addr(),
+        k,
+        WeightFormat::Mxfp8,
+        cw.addr(),
+        sw.addr(),
+        yg.addr(),
+        n,
+        partial.addr(),
+        n,
+        k,
+        1,
+        1.0,
+        false,
+    )
+    .unwrap();
     let g: Vec<f32> = s.download(yg.addr(), 3 * n).unwrap();
     let mut gw = 0f64;
     for i in 0..3 {
         for j in 0..n {
-            let dot: f64 = (0..k).map(|t| x[i * k + t] as f64 * deq(&cwv, &swv, j, t) as f64).sum();
+            let dot: f64 = (0..k)
+                .map(|t| x[i * k + t] as f64 * deq(&cwv, &swv, j, t) as f64)
+                .sum();
             gw = gw.max((g[i * n + j] as f64 - dot).abs() / (k as f64).sqrt());
         }
     }
@@ -697,19 +1294,50 @@ fn gemm_split_matches_cpu() {
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x5911_0001);
     let (m, n, k) = (300usize, 330usize, 4096usize);
-    let x = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
-    let w = rng.vec(n * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
+    let x = rng
+        .vec(m * k)
+        .iter()
+        .map(|&v| bf16::round(v))
+        .collect::<Vec<_>>();
+    let w = rng
+        .vec(n * k)
+        .iter()
+        .map(|&v| bf16::round(v))
+        .collect::<Vec<_>>();
     let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
     let partial = DeviceBuffer::zeroed(8 * m * n * 4).unwrap();
     let y0 = rng.vec(m * n);
     let dy = upload(&s, &y0);
-    kernels::gemm_f32_split(&s, dx.addr(), k, WeightFormat::Bf16, dw.addr(), k, 0, dy.addr(), n, m, n, k, 0.5, true, partial.addr(), 8).unwrap();
+    kernels::gemm_f32_split(
+        &s,
+        dx.addr(),
+        k,
+        WeightFormat::Bf16,
+        dw.addr(),
+        k,
+        0,
+        dy.addr(),
+        n,
+        m,
+        n,
+        k,
+        0.5,
+        true,
+        partial.addr(),
+        8,
+    )
+    .unwrap();
     let y: Vec<f32> = s.download(dy.addr(), m * n).unwrap();
     let mut worst = 0f64;
     for i in 0..m {
         for j in 0..n {
-            let dot: f64 = (0..k).map(|t| x[i * k + t] as f64 * w[j * k + t] as f64).sum();
-            worst = worst.max((y[i * n + j] as f64 - (y0[i * n + j] as f64 + 0.5 * dot)).abs() / (k as f64).sqrt());
+            let dot: f64 = (0..k)
+                .map(|t| x[i * k + t] as f64 * w[j * k + t] as f64)
+                .sum();
+            worst = worst.max(
+                (y[i * n + j] as f64 - (y0[i * n + j] as f64 + 0.5 * dot)).abs()
+                    / (k as f64).sqrt(),
+            );
         }
     }
     assert!(worst < 1e-4, "split gemm error {worst}");
@@ -722,8 +1350,16 @@ fn gemm_wide_matches_cpu() {
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x01de_0001);
     let (m, n, k) = (150usize, 324usize, 1024usize);
-    let x = rng.vec(m * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
-    let w = rng.vec(n * k).iter().map(|&v| bf16::round(v)).collect::<Vec<_>>();
+    let x = rng
+        .vec(m * k)
+        .iter()
+        .map(|&v| bf16::round(v))
+        .collect::<Vec<_>>();
+    let w = rng
+        .vec(n * k)
+        .iter()
+        .map(|&v| bf16::round(v))
+        .collect::<Vec<_>>();
     let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
     let wq = DeviceBuffer::new(n * k).unwrap();
     let wsc = DeviceBuffer::new(n * k / 64 * 4).unwrap();
@@ -731,12 +1367,30 @@ fn gemm_wide_matches_cpu() {
     let q: Vec<i8> = s.download(wq.addr(), n * k).unwrap();
     let sc: Vec<f32> = s.download(wsc.addr(), n * k / 64).unwrap();
     let dy = DeviceBuffer::zeroed(m * 330 * 4).unwrap();
-    kernels::gemm_wide(&s, dx.addr(), k, wq.addr(), k, wsc.addr(), dy.addr(), 330, m, n, k).unwrap();
+    kernels::gemm_wide(
+        &s,
+        dx.addr(),
+        k,
+        wq.addr(),
+        k,
+        wsc.addr(),
+        dy.addr(),
+        330,
+        m,
+        n,
+        k,
+    )
+    .unwrap();
     let y: Vec<f32> = s.download(dy.addr(), m * 330).unwrap();
     let mut worst = 0f64;
     for i in 0..m {
         for j in 0..n {
-            let dot: f64 = (0..k).map(|t| x[i * k + t] as f64 * bf16::round(q[j * k + t] as f32 * sc[(j * k + t) / 64]) as f64).sum();
+            let dot: f64 = (0..k)
+                .map(|t| {
+                    x[i * k + t] as f64
+                        * bf16::round(q[j * k + t] as f32 * sc[(j * k + t) / 64]) as f64
+                })
+                .sum();
             worst = worst.max((y[i * 330 + j] as f64 - dot).abs() / (k as f64).sqrt());
         }
     }
@@ -759,14 +1413,50 @@ fn gdn_conv_prep_fused_matches() {
     let run = |fused: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
         let st = upload(&s, &state0);
         let out = DeviceBuffer::zeroed(t * 10240 * 4).unwrap();
-        let (beta, g) = (DeviceBuffer::zeroed(t * 48 * 4).unwrap(), DeviceBuffer::zeroed(t * 48 * 4).unwrap());
+        let (beta, g) = (
+            DeviceBuffer::zeroed(t * 48 * 4).unwrap(),
+            DeviceBuffer::zeroed(t * 48 * 4).unwrap(),
+        );
         if fused {
-            kernels::gdn_conv_prep(&s, x.addr(), ld, out.addr(), st.addr(), w.addr(), a, b, ld, alog.addr(), dtb.addr(), beta.addr(), g.addr(), t).unwrap();
+            kernels::gdn_conv_prep(
+                &s,
+                x.addr(),
+                ld,
+                out.addr(),
+                st.addr(),
+                w.addr(),
+                a,
+                b,
+                ld,
+                alog.addr(),
+                dtb.addr(),
+                beta.addr(),
+                g.addr(),
+                t,
+            )
+            .unwrap();
         } else {
             kernels::gdn_conv(&s, x.addr(), ld, out.addr(), st.addr(), w.addr(), t).unwrap();
-            kernels::gdn_prep(&s, out.addr(), a, b, ld, alog.addr(), dtb.addr(), beta.addr(), g.addr(), t).unwrap();
+            kernels::gdn_prep(
+                &s,
+                out.addr(),
+                a,
+                b,
+                ld,
+                alog.addr(),
+                dtb.addr(),
+                beta.addr(),
+                g.addr(),
+                t,
+            )
+            .unwrap();
         }
-        (s.download(out.addr(), t * 10240).unwrap(), s.download(beta.addr(), t * 48).unwrap(), s.download(g.addr(), t * 48).unwrap(), s.download(st.addr(), 3 * 10240).unwrap())
+        (
+            s.download(out.addr(), t * 10240).unwrap(),
+            s.download(beta.addr(), t * 48).unwrap(),
+            s.download(g.addr(), t * 48).unwrap(),
+            s.download(st.addr(), 3 * 10240).unwrap(),
+        )
     };
     let (o0, b0, g0, s0) = run(false);
     let (o1, b1, g1, s1) = run(true);
@@ -792,18 +1482,57 @@ fn ple_conv_tiled_matches_sequential() {
         let st = upload(&s, &state0);
         let hb = upload(&s, &h0);
         if split {
-            kernels::ple_conv(&s, gv.addr(), xn.addr(), w.addr(), st.addr(), hb.addr(), 50, None).unwrap();
+            kernels::ple_conv(
+                &s,
+                gv.addr(),
+                xn.addr(),
+                w.addr(),
+                st.addr(),
+                hb.addr(),
+                50,
+                None,
+            )
+            .unwrap();
             let off = (50 * h * 4) as u64;
-            kernels::ple_conv(&s, gv.addr() + off, xn.addr() + off, w.addr(), st.addr(), hb.addr() + off, 50, None).unwrap();
+            kernels::ple_conv(
+                &s,
+                gv.addr() + off,
+                xn.addr() + off,
+                w.addr(),
+                st.addr(),
+                hb.addr() + off,
+                50,
+                None,
+            )
+            .unwrap();
         } else {
-            kernels::ple_conv(&s, gv.addr(), xn.addr(), w.addr(), st.addr(), hb.addr(), t, None).unwrap();
+            kernels::ple_conv(
+                &s,
+                gv.addr(),
+                xn.addr(),
+                w.addr(),
+                st.addr(),
+                hb.addr(),
+                t,
+                None,
+            )
+            .unwrap();
         }
-        (s.download(hb.addr(), t * h).unwrap(), s.download(st.addr(), 9 * h).unwrap())
+        (
+            s.download(hb.addr(), t * h).unwrap(),
+            s.download(st.addr(), 9 * h).unwrap(),
+        )
     };
     let (a, sa) = run(true);
     let (b, sb) = run(false);
-    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "outputs differ");
-    assert!(sa.iter().zip(&sb).all(|(x, y)| x.to_bits() == y.to_bits()), "state differs");
+    assert!(
+        a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+        "outputs differ"
+    );
+    assert!(
+        sa.iter().zip(&sb).all(|(x, y)| x.to_bits() == y.to_bits()),
+        "state differs"
+    );
 }
 
 /// The fused MoE combine + residual update + norm equals moe_combine_bf16 then hc_combine_norm.
@@ -823,14 +1552,50 @@ fn hc_moe_combine_norm_matches() {
     let inj = upload(&s, &rng.vec(t * 4));
     let h0 = rng.vec(t * 10240);
     let (ha, hb) = (upload(&s, &h0), upload(&s, &h0));
-    let (na, nb) = (DeviceBuffer::new(t * 10240 * 2).unwrap(), DeviceBuffer::new(t * 10240 * 2).unwrap());
+    let (na, nb) = (
+        DeviceBuffer::new(t * 10240 * 2).unwrap(),
+        DeviceBuffer::new(t * 10240 * 2).unwrap(),
+    );
     let y = DeviceBuffer::new(t * 2560 * 4).unwrap();
-    kernels::moe_combine_bf16(&s, yd.addr(), dpr.addr(), tw.addr(), sg.addr(), 5, sh.addr(), y.addr(), t).unwrap();
+    kernels::moe_combine_bf16(
+        &s,
+        yd.addr(),
+        dpr.addr(),
+        tw.addr(),
+        sg.addr(),
+        5,
+        sh.addr(),
+        y.addr(),
+        t,
+    )
+    .unwrap();
     kernels::hc_combine_norm(&s, ha.addr(), y.addr(), inj.addr(), na.addr(), t).unwrap();
-    kernels::hc_moe_combine_norm(&s, hb.addr(), yd.addr(), dpr.addr(), tw.addr(), sg.addr(), 5, sh.addr(), inj.addr(), nb.addr(), t).unwrap();
-    let (a, b): (Vec<f32>, Vec<f32>) = (s.download(ha.addr(), t * 10240).unwrap(), s.download(hb.addr(), t * 10240).unwrap());
-    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "residuals differ");
-    let (a, b): (Vec<u16>, Vec<u16>) = (s.download(na.addr(), t * 10240).unwrap(), s.download(nb.addr(), t * 10240).unwrap());
+    kernels::hc_moe_combine_norm(
+        &s,
+        hb.addr(),
+        yd.addr(),
+        dpr.addr(),
+        tw.addr(),
+        sg.addr(),
+        5,
+        sh.addr(),
+        inj.addr(),
+        nb.addr(),
+        t,
+    )
+    .unwrap();
+    let (a, b): (Vec<f32>, Vec<f32>) = (
+        s.download(ha.addr(), t * 10240).unwrap(),
+        s.download(hb.addr(), t * 10240).unwrap(),
+    );
+    assert!(
+        a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+        "residuals differ"
+    );
+    let (a, b): (Vec<u16>, Vec<u16>) = (
+        s.download(na.addr(), t * 10240).unwrap(),
+        s.download(nb.addr(), t * 10240).unwrap(),
+    );
     assert_eq!(a, b, "norms differ");
 }
 
@@ -846,26 +1611,74 @@ fn gemv_rows_are_independent_of_m() {
     let w: Vec<f32> = rng.vec(n * k).iter().map(|&v| bf16::round(v)).collect();
     let (dx, dw) = (upload(&s, &to_bf16(&x)), upload(&s, &to_bf16(&w)));
     let g = kernels::int8_group();
-    let (dq, dgs) = (DeviceBuffer::new(n * k).unwrap(), DeviceBuffer::new(n * (k / g) * 4).unwrap());
+    let (dq, dgs) = (
+        DeviceBuffer::new(n * k).unwrap(),
+        DeviceBuffer::new(n * (k / g) * 4).unwrap(),
+    );
     kernels::quantize_int8_groups(&s, dw.addr(), n, k, dq.addr(), dgs.addr()).unwrap();
     // MXFP8: finite E4M3 codes (no 0x7f / 0xff) and power-of-two scales near 1.
-    let codes: Vec<u8> = (0..n * k).map(|_| (rng.next().to_bits() as u8) & 0xf7).collect();
-    let scales: Vec<u8> = (0..n * k / 32).map(|_| 120 + (rng.next().to_bits() % 14) as u8).collect();
+    let codes: Vec<u8> = (0..n * k)
+        .map(|_| (rng.next().to_bits() as u8) & 0xf7)
+        .collect();
+    let scales: Vec<u8> = (0..n * k / 32)
+        .map(|_| 120 + (rng.next().to_bits() % 14) as u8)
+        .collect();
     let (dc, ds) = (upload(&s, &codes), upload(&s, &scales));
-    let formats = [(WeightFormat::Bf16, dw.addr(), 0), (WeightFormat::Int8Group, dq.addr(), dgs.addr()), (WeightFormat::Mxfp8, dc.addr(), ds.addr())];
+    let formats = [
+        (WeightFormat::Bf16, dw.addr(), 0),
+        (WeightFormat::Int8Group, dq.addr(), dgs.addr()),
+        (WeightFormat::Mxfp8, dc.addr(), ds.addr()),
+    ];
     let dy = DeviceBuffer::new(16 * n * 4).unwrap();
     let partial = DeviceBuffer::new(4 * 16 * n * 4).unwrap();
     for (fmt, wa, sa) in formats {
         for splits in [1, 4] {
             let mut single = Vec::with_capacity(16 * n);
             for r in 0..16 {
-                kernels::gemv(&s, 1, dx.addr() + (r * k * 2) as u64, k, fmt, wa, sa, dy.addr(), n, partial.addr(), n, k, splits, 1.0, false).unwrap();
+                kernels::gemv(
+                    &s,
+                    1,
+                    dx.addr() + (r * k * 2) as u64,
+                    k,
+                    fmt,
+                    wa,
+                    sa,
+                    dy.addr(),
+                    n,
+                    partial.addr(),
+                    n,
+                    k,
+                    splits,
+                    1.0,
+                    false,
+                )
+                .unwrap();
                 single.extend(s.download::<u32>(dy.addr(), n).unwrap());
             }
             for m in 1..=16 {
-                kernels::gemv(&s, m, dx.addr(), k, fmt, wa, sa, dy.addr(), n, partial.addr(), n, k, splits, 1.0, false).unwrap();
+                kernels::gemv(
+                    &s,
+                    m,
+                    dx.addr(),
+                    k,
+                    fmt,
+                    wa,
+                    sa,
+                    dy.addr(),
+                    n,
+                    partial.addr(),
+                    n,
+                    k,
+                    splits,
+                    1.0,
+                    false,
+                )
+                .unwrap();
                 let got: Vec<u32> = s.download(dy.addr(), m * n).unwrap();
-                assert!(got == single[..m * n], "{fmt:?} M = {m}, splits {splits}: rows differ from single-row results");
+                assert!(
+                    got == single[..m * n],
+                    "{fmt:?} M = {m}, splits {splits}: rows differ from single-row results"
+                );
             }
         }
     }
@@ -878,14 +1691,22 @@ fn topk_matches_cpu() {
     quench6k_cuda::set_device(0).unwrap();
     let s = Stream::new().unwrap();
     let mut rng = Rng(0x7091_0001);
-    for &(rows, n, k) in &[(3usize, 5000usize, 64usize), (5, 248_320, 64), (9, 248_320, 20), (1, 131_072, 64)] {
+    for &(rows, n, k) in &[
+        (3usize, 5000usize, 64usize),
+        (5, 248_320, 64),
+        (9, 248_320, 20),
+        (1, 131_072, 64),
+    ] {
         // Distinct values (ties at the selection threshold are taken in no particular order).
         let mut x: Vec<f32> = rng.vec(rows * n);
         for (i, v) in x.iter_mut().enumerate() {
             *v = *v * 8.0 + (i % n) as f32 * 1e-7;
         }
         let dx = upload(&s, &x);
-        let (di, dv) = (DeviceBuffer::new(rows * k * 4).unwrap(), DeviceBuffer::new(rows * k * 4).unwrap());
+        let (di, dv) = (
+            DeviceBuffer::new(rows * k * 4).unwrap(),
+            DeviceBuffer::new(rows * k * 4).unwrap(),
+        );
         for by_index in [false, true] {
             kernels::topk(&s, dx.addr(), rows, n, n, k, by_index, di.addr(), dv.addr()).unwrap();
             let gi: Vec<i32> = s.download(di.addr(), rows * k).unwrap();
@@ -899,7 +1720,10 @@ fn topk_matches_cpu() {
                     want.sort();
                 }
                 let got: Vec<usize> = gi[r * k..(r + 1) * k].iter().map(|&i| i as usize).collect();
-                assert_eq!(got, want, "rows {rows} n {n} k {k} by_index {by_index} row {r}");
+                assert_eq!(
+                    got, want,
+                    "rows {rows} n {n} k {k} by_index {by_index} row {r}"
+                );
                 for j in 0..k {
                     assert_eq!(gv[r * k + j].to_bits(), row[want[j]].to_bits());
                 }
@@ -918,18 +1742,27 @@ fn topk_timing() {
     let mut rng = Rng(0x7091_0002);
     let (rows, n, k) = (4usize, 248_320usize, 64usize);
     let dx = upload(&s, &rng.vec(rows * n));
-    let (di, dv) = (DeviceBuffer::new(rows * k * 4).unwrap(), DeviceBuffer::new(rows * k * 4).unwrap());
+    let (di, dv) = (
+        DeviceBuffer::new(rows * k * 4).unwrap(),
+        DeviceBuffer::new(rows * k * 4).unwrap(),
+    );
     for _ in 0..3 {
         kernels::topk(&s, dx.addr(), rows, n, n, k, false, di.addr(), dv.addr()).unwrap();
     }
-    let (a, b) = (quench6k_cuda::Event::timing().unwrap(), quench6k_cuda::Event::timing().unwrap());
+    let (a, b) = (
+        quench6k_cuda::Event::timing().unwrap(),
+        quench6k_cuda::Event::timing().unwrap(),
+    );
     a.record(&s).unwrap();
     for _ in 0..100 {
         kernels::topk(&s, dx.addr(), rows, n, n, k, false, di.addr(), dv.addr()).unwrap();
     }
     b.record(&s).unwrap();
     b.synchronize().unwrap();
-    println!("topk {rows} x {n}, k {k}: {:.1} us", quench6k_cuda::Event::elapsed_ms(&a, &b).unwrap() * 10.0);
+    println!(
+        "topk {rows} x {n}, k {k}: {:.1} us",
+        quench6k_cuda::Event::elapsed_ms(&a, &b).unwrap() * 10.0
+    );
 }
 
 #[test]
@@ -951,12 +1784,32 @@ fn penalties_match_cpu() {
     let flags = DeviceBuffer::zeroed(n * 4).unwrap();
     let list = DeviceBuffer::new(n * 4).unwrap();
     let dp = upload(&s, &prompt);
-    kernels::penalty_mark(&s, st.addr(), flags.addr(), list.addr(), dp.addr(), prompt.len(), 0, 1).unwrap();
+    kernels::penalty_mark(
+        &s,
+        st.addr(),
+        flags.addr(),
+        list.addr(),
+        dp.addr(),
+        prompt.len(),
+        0,
+        1,
+    )
+    .unwrap();
     // The generated tokens through the device count, as the speculative graph adds them.
     let mut g = generated.clone();
     g.push(generated.len() as i32);
     let dg = upload(&s, &g);
-    kernels::penalty_mark(&s, st.addr(), flags.addr(), list.addr(), dg.addr(), 0, dg.addr() + (generated.len() * 4) as u64, 3).unwrap();
+    kernels::penalty_mark(
+        &s,
+        st.addr(),
+        flags.addr(),
+        list.addr(),
+        dg.addr(),
+        0,
+        dg.addr() + (generated.len() * 4) as u64,
+        3,
+    )
+    .unwrap();
     // A verification of [x, d1 .. d4]: x new, d1 a prompt token, d2 = x, d3 generated, d4 new.
     let (_, draft_at, _, ints) = kernels::spec_layout();
     let mut rc = vec![0i32; ints];
@@ -967,11 +1820,27 @@ fn penalties_match_cpu() {
     }
     let drc = upload(&s, &rc);
     let dx = upload(&s, &x);
-    kernels::penalty_apply(&s, dx.addr(), rows, n, st.addr(), flags.addr(), list.addr(), drc.addr()).unwrap();
+    kernels::penalty_apply(
+        &s,
+        dx.addr(),
+        rows,
+        n,
+        st.addr(),
+        flags.addr(),
+        list.addr(),
+        drc.addr(),
+    )
+    .unwrap();
     let got: Vec<f32> = s.download(dx.addr(), rows * n).unwrap();
     for r in 0..rows {
-        let seen: std::collections::HashSet<i32> = prompt.iter().chain(&generated).chain(&verify[..=r]).copied().collect();
-        let out: std::collections::HashSet<i32> = generated.iter().chain(&verify[..=r]).copied().collect();
+        let seen: std::collections::HashSet<i32> = prompt
+            .iter()
+            .chain(&generated)
+            .chain(&verify[..=r])
+            .copied()
+            .collect();
+        let out: std::collections::HashSet<i32> =
+            generated.iter().chain(&verify[..=r]).copied().collect();
         for t in 0..n {
             let mut v = x[r * n + t];
             if seen.contains(&(t as i32)) {
@@ -988,7 +1857,10 @@ fn penalties_match_cpu() {
     kernels::penalty_apply(&s, dx.addr(), 1, n, st.addr(), flags.addr(), list.addr(), 0).unwrap();
     let got: Vec<f32> = s.download(dx.addr(), n).unwrap();
     let v = x[30_000];
-    assert_eq!(got[30_000].to_bits(), ((if v > 0.0 { v / rep } else { v * rep }) - pres).to_bits());
+    assert_eq!(
+        got[30_000].to_bits(),
+        ((if v > 0.0 { v / rep } else { v * rep }) - pres).to_bits()
+    );
     assert_eq!(got[200_000].to_bits(), x[200_000].to_bits());
 }
 
@@ -1004,15 +1876,49 @@ fn dflash_attention_matches_cpu() {
     let (kvh, hd, qh, b) = (8, 128, 32, 8);
     for &(lo, blk) in &[(0usize, 37usize), (0, 2000), (6144, 8192), (100, 5000)] {
         let q = rng.vec(b * qh * hd);
-        let rk: Vec<f32> = rng.vec(RING * kvh * hd).iter().map(|&v| bf16::round(v)).collect();
-        let rv: Vec<f32> = rng.vec(RING * kvh * hd).iter().map(|&v| bf16::round(v)).collect();
-        let bk: Vec<f32> = rng.vec(b * kvh * hd).iter().map(|&v| bf16::round(v)).collect();
-        let bv: Vec<f32> = rng.vec(b * kvh * hd).iter().map(|&v| bf16::round(v)).collect();
+        let rk: Vec<f32> = rng
+            .vec(RING * kvh * hd)
+            .iter()
+            .map(|&v| bf16::round(v))
+            .collect();
+        let rv: Vec<f32> = rng
+            .vec(RING * kvh * hd)
+            .iter()
+            .map(|&v| bf16::round(v))
+            .collect();
+        let bk: Vec<f32> = rng
+            .vec(b * kvh * hd)
+            .iter()
+            .map(|&v| bf16::round(v))
+            .collect();
+        let bv: Vec<f32> = rng
+            .vec(b * kvh * hd)
+            .iter()
+            .map(|&v| bf16::round(v))
+            .collect();
         let hdr: Vec<i32> = vec![lo as i32, 0, blk as i32, 0, 0, 0, 0, 0, 0, 0, 0];
-        let (dq, drk, drv, dbk, dbv, dh) = (upload(&s, &q), upload(&s, &to_bf16(&rk)), upload(&s, &to_bf16(&rv)), upload(&s, &to_bf16(&bk)), upload(&s, &to_bf16(&bv)), upload(&s, &hdr));
+        let (dq, drk, drv, dbk, dbv, dh) = (
+            upload(&s, &q),
+            upload(&s, &to_bf16(&rk)),
+            upload(&s, &to_bf16(&rv)),
+            upload(&s, &to_bf16(&bk)),
+            upload(&s, &to_bf16(&bv)),
+            upload(&s, &hdr),
+        );
         let part = DeviceBuffer::new(kernels::dflash_attention_floats() * 4).unwrap();
         let att = DeviceBuffer::new(b * qh * hd * 2).unwrap();
-        kernels::dflash_attention(&s, dq.addr(), drk.addr(), drv.addr(), dbk.addr(), dbv.addr(), dh.addr(), part.addr(), att.addr()).unwrap();
+        kernels::dflash_attention(
+            &s,
+            dq.addr(),
+            drk.addr(),
+            drv.addr(),
+            dbk.addr(),
+            dbv.addr(),
+            dh.addr(),
+            part.addr(),
+            att.addr(),
+        )
+        .unwrap();
         let got: Vec<u16> = s.download(att.addr(), b * qh * hd).unwrap();
         let first = lo.max(blk.saturating_sub(RING - 1));
         let mut worst = 0f32;
@@ -1031,33 +1937,56 @@ fn dflash_attention_matches_cpu() {
                     let o = (j * kvh + g) * hd;
                     keys.push((&bk[o..o + hd], &bv[o..o + hd]));
                 }
-                let sc: Vec<f32> = keys.iter().map(|(k, _)| k.iter().zip(qr).map(|(a, b)| a * b).sum::<f32>() / (hd as f32).sqrt()).collect();
+                let sc: Vec<f32> = keys
+                    .iter()
+                    .map(|(k, _)| {
+                        k.iter().zip(qr).map(|(a, b)| a * b).sum::<f32>() / (hd as f32).sqrt()
+                    })
+                    .collect();
                 let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let w: Vec<f32> = sc.iter().map(|x| (x - m).exp()).collect();
                 let l: f32 = w.iter().sum();
                 for d in 0..hd {
-                    let want: f32 = keys.iter().zip(&w).map(|((_, v), w)| v[d] * w).sum::<f32>() / l;
+                    let want: f32 =
+                        keys.iter().zip(&w).map(|((_, v), w)| v[d] * w).sum::<f32>() / l;
                     let have = bf16::to_f32(got[(i * qh + h) * hd + d]);
                     worst = worst.max((have - want).abs());
                 }
             }
         }
         assert!(worst < 2e-2, "lo {lo} blk {blk}: max error {worst}");
-        let (a, z) = (quench6k_cuda::Event::timing().unwrap(), quench6k_cuda::Event::timing().unwrap());
+        let (a, z) = (
+            quench6k_cuda::Event::timing().unwrap(),
+            quench6k_cuda::Event::timing().unwrap(),
+        );
         a.record(&s).unwrap();
         for _ in 0..100 {
-            kernels::dflash_attention(&s, dq.addr(), drk.addr(), drv.addr(), dbk.addr(), dbv.addr(), dh.addr(), part.addr(), att.addr()).unwrap();
+            kernels::dflash_attention(
+                &s,
+                dq.addr(),
+                drk.addr(),
+                drv.addr(),
+                dbk.addr(),
+                dbv.addr(),
+                dh.addr(),
+                part.addr(),
+                att.addr(),
+            )
+            .unwrap();
         }
         z.record(&s).unwrap();
         z.synchronize().unwrap();
         let total = 10.0 * quench6k_cuda::Event::elapsed_ms(&a, &z).unwrap();
         a.record(&s).unwrap();
         for _ in 0..100 {
-            kernels::dflash_attention(&s, 0, 0, 0, 0, 0, dh.addr(), part.addr(), att.addr()).unwrap();
+            kernels::dflash_attention(&s, 0, 0, 0, 0, 0, dh.addr(), part.addr(), att.addr())
+                .unwrap();
         }
         z.record(&s).unwrap();
         z.synchronize().unwrap();
         let combine = 10.0 * quench6k_cuda::Event::elapsed_ms(&a, &z).unwrap();
-        println!("dflash attention lo {lo} blk {blk}: max error {worst:.4}, {total:.1} us ({combine:.1} us combining)");
+        println!(
+            "dflash attention lo {lo} blk {blk}: max error {worst:.4}, {total:.1} us ({combine:.1} us combining)"
+        );
     }
 }

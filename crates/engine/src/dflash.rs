@@ -82,11 +82,18 @@ pub struct DFlash {
 impl DFlash {
     /// Loads the drafter from `dir` (config.json and BF16 safetensors) and checks it fits this engine.
     pub fn load(dir: &Path) -> Result<Self> {
-        let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).with_context(|| format!("reading {}/config.json", dir.display()))?)?;
+        let cfg: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("config.json"))
+                .with_context(|| format!("reading {}/config.json", dir.display()))?,
+        )?;
         let dc = &cfg["dflash_config"];
         let num = |v: &serde_json::Value| v.as_u64().map(|x| x as usize);
         let arch = cfg["architectures"][0].as_str().unwrap_or("");
-        ensure!(arch == "DFlash2DraftModel", "{}: architecture {arch:?}, expected DFlash2DraftModel", dir.display());
+        ensure!(
+            arch == "DFlash2DraftModel",
+            "{}: architecture {arch:?}, expected DFlash2DraftModel",
+            dir.display()
+        );
         let expect = [
             ("hidden_size", num(&cfg["hidden_size"]), D),
             ("num_hidden_layers", num(&cfg["num_hidden_layers"]), LAYERS),
@@ -105,21 +112,45 @@ impl DFlash {
         for (name, got, want) in expect {
             ensure!(got == Some(want), "drafter {name} {got:?}, expected {want}");
         }
-        let taps: Vec<usize> = dc["target_layer_ids"].as_array().map(|a| a.iter().filter_map(num).collect()).unwrap_or_default();
-        ensure!(taps == TAPS, "drafter target layers {taps:?}, expected {TAPS:?}");
-        ensure!(cfg["is_causal"].as_bool() == Some(false), "the drafter must be non-causal");
-        ensure!(cfg["rope_parameters"]["rope_theta"].as_f64() == Some(10000.0) && cfg["rope_parameters"]["rope_type"].as_str() == Some("default"), "drafter RoPE must be default with theta 10000");
+        let taps: Vec<usize> = dc["target_layer_ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(num).collect())
+            .unwrap_or_default();
+        ensure!(
+            taps == TAPS,
+            "drafter target layers {taps:?}, expected {TAPS:?}"
+        );
+        ensure!(
+            cfg["is_causal"].as_bool() == Some(false),
+            "the drafter must be non-causal"
+        );
+        ensure!(
+            cfg["rope_parameters"]["rope_theta"].as_f64() == Some(10000.0)
+                && cfg["rope_parameters"]["rope_type"].as_str() == Some("default"),
+            "drafter RoPE must be default with theta 10000"
+        );
         for (key, want) in [("input_embedding_scale", 1.0), ("output_multiplier", 1.0)] {
-            ensure!(dc[key].as_f64().unwrap_or(want) == want, "drafter {key} {:?} is not supported", dc[key]);
+            ensure!(
+                dc[key].as_f64().unwrap_or(want) == want,
+                "drafter {key} {:?} is not supported",
+                dc[key]
+            );
         }
-        ensure!(cfg["final_logit_softcapping"].is_null(), "drafter logit softcapping is not supported");
-        let mask = dc["mask_token_id"].as_i64().context("drafter config lacks mask_token_id")? as i32;
+        ensure!(
+            cfg["final_logit_softcapping"].is_null(),
+            "drafter logit softcapping is not supported"
+        );
+        let mask = dc["mask_token_id"]
+            .as_i64()
+            .context("drafter config lacks mask_token_id")? as i32;
 
         let ckpt = Checkpoint::open(dir)?;
         // Projections are staged in BF16 and stored as INT8 with a scale per 64 weights (as the target's
         // projections; QUENCH6K_DFLASH_BF16=1 keeps BF16), q/k/v and gate/up fused into one each.
         let int8 = std::env::var("QUENCH6K_DFLASH_BF16").as_deref() != Ok("1");
-        let is_proj = |n: &str| n.ends_with("_proj.weight") || n == "fc.weight" || n.ends_with("projection.weight");
+        let is_proj = |n: &str| {
+            n.ends_with("_proj.weight") || n == "fc.weight" || n.ends_with("projection.weight")
+        };
         let opts = crate::loader::LoadOptions::default();
         let (weights, stats) = crate::loader::upload(&ckpt, |n| !is_proj(n), opts)?;
         let (staged, staged_stats) = crate::loader::upload(&ckpt, is_proj, opts)?;
@@ -136,7 +167,13 @@ impl DFlash {
                     stream.copy_d2d(b.addr() + off as u64, l.addr, l.n * kk * 2)?;
                     off += l.n * kk * 2;
                 }
-                let l = Linear { fmt: k::WeightFormat::Bf16, addr: b.addr(), scale: 0, n, k: kk };
+                let l = Linear {
+                    fmt: k::WeightFormat::Bf16,
+                    addr: b.addr(),
+                    scale: 0,
+                    n,
+                    k: kk,
+                };
                 bufs.push(b);
                 l
             };
@@ -146,28 +183,59 @@ impl DFlash {
             let q = DeviceBuffer::new(n * kk)?;
             let sc = DeviceBuffer::new(n * kk / k::int8_group() * 4)?;
             k::quantize_int8_groups(&stream, fused.addr, n, kk, q.addr(), sc.addr())?;
-            let l = Linear { fmt: k::WeightFormat::Int8Group, addr: q.addr(), scale: sc.addr(), n, k: kk };
+            let l = Linear {
+                fmt: k::WeightFormat::Int8Group,
+                addr: q.addr(),
+                scale: sc.addr(),
+                n,
+                k: kk,
+            };
             bufs.push(q);
             bufs.push(sc);
             Ok(l)
         };
         let w = |name: &str| -> Result<u64> {
             let t = weights.get(name)?;
-            ensure!(t.dtype == DType::BF16, "{name}: {:?}, expected BF16", t.dtype);
+            ensure!(
+                t.dtype == DType::BF16,
+                "{name}: {:?}, expected BF16",
+                t.dtype
+            );
             Ok(t.addr)
         };
         let lin = |name: &str, n: usize, kk: usize| -> Result<Linear> {
             let t = staged.get(name)?;
-            ensure!(t.dtype == DType::BF16 && t.shape == [n, kk], "{name}: {:?} {:?}, expected BF16 [{n}, {kk}]", t.dtype, t.shape);
-            Ok(Linear { fmt: k::WeightFormat::Bf16, addr: t.addr, scale: 0, n, k: kk })
+            ensure!(
+                t.dtype == DType::BF16 && t.shape == [n, kk],
+                "{name}: {:?} {:?}, expected BF16 [{n}, {kk}]",
+                t.dtype,
+                t.shape
+            );
+            Ok(Linear {
+                fmt: k::WeightFormat::Bf16,
+                addr: t.addr,
+                scale: 0,
+                n,
+                k: kk,
+            })
         };
         let mut layers = Vec::with_capacity(LAYERS);
         for i in 0..LAYERS {
             let p = format!("layers.{i}");
             let mut conv = |c: &str| -> Result<(Linear, u64)> {
                 let base = format!("{p}.{c}.base_kernel");
-                ensure!(weights.get(&base)?.shape == [2, 2, D], "{base}: unexpected shape");
-                Ok((finish(&[lin(&format!("{p}.{c}.kernel_projection.weight"), 4 * D / 16, D)?])?, w(&base)?))
+                ensure!(
+                    weights.get(&base)?.shape == [2, 2, D],
+                    "{base}: unexpected shape"
+                );
+                Ok((
+                    finish(&[lin(
+                        &format!("{p}.{c}.kernel_projection.weight"),
+                        4 * D / 16,
+                        D,
+                    )?])?,
+                    w(&base)?,
+                ))
             };
             let (attn_conv, mlp_conv) = (conv("attention_conv")?, conv("mlp_conv")?);
             layers.push(DLayer {
@@ -180,30 +248,61 @@ impl DFlash {
                     lin(&format!("{p}.self_attn.k_proj.weight"), KVH * HD, D)?,
                     lin(&format!("{p}.self_attn.v_proj.weight"), KVH * HD, D)?,
                 ])?,
-                kv: Linear { fmt: k::WeightFormat::Bf16, addr: 0, scale: 0, n: 0, k: 0 },
+                kv: Linear {
+                    fmt: k::WeightFormat::Bf16,
+                    addr: 0,
+                    scale: 0,
+                    n: 0,
+                    k: 0,
+                },
                 o: finish(&[lin(&format!("{p}.self_attn.o_proj.weight"), D, QH * HD)?])?,
                 q_norm: w(&format!("{p}.self_attn.q_norm.weight"))?,
                 k_norm: w(&format!("{p}.self_attn.k_norm.weight"))?,
-                gate_up: finish(&[lin(&format!("{p}.mlp.gate_proj.weight"), FF, D)?, lin(&format!("{p}.mlp.up_proj.weight"), FF, D)?])?,
+                gate_up: finish(&[
+                    lin(&format!("{p}.mlp.gate_proj.weight"), FF, D)?,
+                    lin(&format!("{p}.mlp.up_proj.weight"), FF, D)?,
+                ])?,
                 down: finish(&[lin(&format!("{p}.mlp.down_proj.weight"), D, FF)?])?,
             });
             // The k | v rows of the fused projection (context rows need no queries).
             let l = layers.last_mut().unwrap();
             let r0 = QH * HD;
-            let bytes = if l.qkv.fmt == k::WeightFormat::Bf16 { 2 } else { 1 };
-            let scale = if l.qkv.scale == 0 { 0 } else { l.qkv.scale + (r0 * D / k::int8_group() * 4) as u64 };
-            l.kv = Linear { fmt: l.qkv.fmt, addr: l.qkv.addr + (r0 * D * bytes) as u64, scale, n: 2 * KVH * HD, k: D };
+            let bytes = if l.qkv.fmt == k::WeightFormat::Bf16 {
+                2
+            } else {
+                1
+            };
+            let scale = if l.qkv.scale == 0 {
+                0
+            } else {
+                l.qkv.scale + (r0 * D / k::int8_group() * 4) as u64
+            };
+            l.kv = Linear {
+                fmt: l.qkv.fmt,
+                addr: l.qkv.addr + (r0 * D * bytes) as u64,
+                scale,
+                n: 2 * KVH * HD,
+                k: D,
+            };
         }
         let codebook = |name: &str| -> Result<u64> {
             let t = weights.get(name)?;
-            ensure!(t.dtype == DType::BF16 && t.shape == [VOCAB, RANK], "{name}: unexpected layout");
+            ensure!(
+                t.dtype == DType::BF16 && t.shape == [VOCAB, RANK],
+                "{name}: unexpected layout"
+            );
             Ok(t.addr)
         };
         let fc = finish(&[lin("fc.weight", D, TAPS.len() * D)?])?;
         let select_proj = finish(&[lin("candidate_selector.hidden_projection.weight", RANK, D)?])?;
         stream.synchronize()?;
         // INT8: the staged BF16 projections are no longer needed.
-        let staged = if int8 { drop(staged); None } else { Some(staged) };
+        let staged = if int8 {
+            drop(staged);
+            None
+        } else {
+            Some(staged)
+        };
         let d = Self {
             fc,
             hidden_norm: w("hidden_norm.weight")?,
@@ -222,7 +321,11 @@ impl DFlash {
             dir.display(),
             (stats.bytes + staged_stats.bytes) as f64 / 1073741824.0,
             stats.seconds + staged_stats.seconds,
-            if int8 { "INT8 (a scale per 64)" } else { "BF16" }
+            if int8 {
+                "INT8 (a scale per 64)"
+            } else {
+                "BF16"
+            }
         );
         Ok(d)
     }
@@ -241,7 +344,11 @@ const RING_BYTES: usize = RING * KVH * HD * 2;
 impl DState {
     /// `rows`: verification rows to keep features of.
     pub fn new(rows: usize) -> Result<Self> {
-        Ok(Self { kv: DeviceBuffer::zeroed(LAYERS * 2 * RING_BYTES)?, feat: DeviceBuffer::zeroed(rows * FEAT_BYTES)?, hdr: DeviceBuffer::zeroed(HDR_INTS * 4)? })
+        Ok(Self {
+            kv: DeviceBuffer::zeroed(LAYERS * 2 * RING_BYTES)?,
+            feat: DeviceBuffer::zeroed(rows * FEAT_BYTES)?,
+            hdr: DeviceBuffer::zeroed(HDR_INTS * 4)?,
+        })
     }
 
     fn ring(&self, layer: usize) -> (u64, u64) {
@@ -343,23 +450,84 @@ macro_rules! op {
 }
 
 /// Adds `rows` (≤ RING) feature rows at `feat` (positions `pos` ..) to the sequence's context ring.
-pub fn context(d: &DFlash, sc: &Scratch, st: &DState, s: &Stream, feat: u64, rows: usize, pos: Pos) -> Result<()> {
+pub fn context(
+    d: &DFlash,
+    sc: &Scratch,
+    st: &DState,
+    s: &Stream,
+    feat: u64,
+    rows: usize,
+    pos: Pos,
+) -> Result<()> {
     context_profiled(d, sc, st, s, feat, rows, pos, None)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn context_profiled(d: &DFlash, sc: &Scratch, st: &DState, s: &Stream, feat: u64, rows: usize, pos: Pos, mut prof: Option<&mut Profiler>) -> Result<()> {
+fn context_profiled(
+    d: &DFlash,
+    sc: &Scratch,
+    st: &DState,
+    s: &Stream,
+    feat: u64,
+    rows: usize,
+    pos: Pos,
+    mut prof: Option<&mut Profiler>,
+) -> Result<()> {
     ensure!(rows <= RING, "{rows} context rows exceed the ring");
     if rows == 0 {
         return Ok(());
     }
-    op!(prof, "ctx fc", s, forward::linear_rows(s, sc.partial, feat, TAPS.len() * D, &d.fc, sc.ctx_f, D, rows));
-    op!(prof, "ctx norm", s, k::dflash_rmsnorm(s, sc.ctx_f, D, d.hidden_norm, sc.ctx_bf, D, rows));
+    op!(
+        prof,
+        "ctx fc",
+        s,
+        forward::linear_rows(
+            s,
+            sc.partial,
+            feat,
+            TAPS.len() * D,
+            &d.fc,
+            sc.ctx_f,
+            D,
+            rows
+        )
+    );
+    op!(
+        prof,
+        "ctx norm",
+        s,
+        k::dflash_rmsnorm(s, sc.ctx_f, D, d.hidden_norm, sc.ctx_bf, D, rows)
+    );
     let ld = 2 * KVH * HD;
     for (i, l) in d.layers.iter().enumerate() {
-        op!(prof, "ctx kv", s, forward::linear_rows(s, sc.partial, sc.ctx_bf, D, &l.kv, sc.ctx_kv, ld, rows));
+        op!(
+            prof,
+            "ctx kv",
+            s,
+            forward::linear_rows(s, sc.partial, sc.ctx_bf, D, &l.kv, sc.ctx_kv, ld, rows)
+        );
         let (rk, rv) = st.ring(i);
-        op!(prof, "ctx kv prep", s, k::dflash_qkv(s, sc.ctx_kv, ld, (0, 0, KVH * HD), 0, l.k_norm, pos.0, pos.1, rows, 0, 0, rk, rv, true));
+        op!(
+            prof,
+            "ctx kv prep",
+            s,
+            k::dflash_qkv(
+                s,
+                sc.ctx_kv,
+                ld,
+                (0, 0, KVH * HD),
+                0,
+                l.k_norm,
+                pos.0,
+                pos.1,
+                rows,
+                0,
+                0,
+                rk,
+                rv,
+                true
+            )
+        );
     }
     Ok(())
 }
@@ -368,44 +536,207 @@ fn context_profiled(d: &DFlash, sc: &Scratch, st: &DState, s: &Stream, feat: u64
 /// committed rows), then the block from the round control's position `rc_p` and next token `rc_x`.
 /// The 7 drafts go to `drafts` (i32), their distributions to `qs` when `params` asks for sampled drafts.
 #[allow(clippy::too_many_arguments)]
-pub fn draft(model: &Model, d: &DFlash, sc: &Scratch, st: &DState, s: &Stream, c: usize, rc_p: u64, rc_x: u64, drafts: u64, qs: u64, params: u64, mut prof: Option<&mut Profiler>) -> Result<()> {
+pub fn draft(
+    model: &Model,
+    d: &DFlash,
+    sc: &Scratch,
+    st: &DState,
+    s: &Stream,
+    c: usize,
+    rc_p: u64,
+    rc_x: u64,
+    drafts: u64,
+    qs: u64,
+    params: u64,
+    mut prof: Option<&mut Profiler>,
+) -> Result<()> {
     let hdr = st.hdr.addr();
-    op!(prof, "header", s, k::dflash_header(s, rc_p, rc_x, c, hdr, d.mask));
-    context_profiled(d, sc, st, s, st.feat.addr(), c, Pos(hdr + (HDR_CTX * 4) as u64, 0), prof.as_deref_mut())?;
-    let lin = |x: u64, ldx: usize, w: &Linear, y: u64, ldy: usize, rows: usize| forward::linear_rows(s, sc.partial, x, ldx, w, y, ldy, rows);
+    op!(
+        prof,
+        "header",
+        s,
+        k::dflash_header(s, rc_p, rc_x, c, hdr, d.mask)
+    );
+    context_profiled(
+        d,
+        sc,
+        st,
+        s,
+        st.feat.addr(),
+        c,
+        Pos(hdr + (HDR_CTX * 4) as u64, 0),
+        prof.as_deref_mut(),
+    )?;
+    let lin = |x: u64, ldx: usize, w: &Linear, y: u64, ldy: usize, rows: usize| {
+        forward::linear_rows(s, sc.partial, x, ldx, w, y, ldy, rows)
+    };
     let b = BLOCK;
     let ld_dyn = 4 * D / 16;
     op!(prof, "embed", s, k::dflash_embed(s, hdr, model.embed, sc.h));
     for (i, l) in d.layers.iter().enumerate() {
         // Attention: norm, convolution, projections, head norms and RoPE, block attention, output
         // projection, convolution added to the residual.
-        op!(prof, "norm", s, k::dflash_rmsnorm(s, sc.h, D, l.in_norm, sc.hn, D, b));
-        op!(prof, "proj attn_conv", s, lin(sc.hn, D, &l.attn_conv.0, sc.dynb, ld_dyn, b));
-        op!(prof, "conv", s, k::dflash_conv(s, sc.hn, true, sc.dynb, ld_dyn, l.attn_conv.1, sc.hc, false));
+        op!(
+            prof,
+            "norm",
+            s,
+            k::dflash_rmsnorm(s, sc.h, D, l.in_norm, sc.hn, D, b)
+        );
+        op!(
+            prof,
+            "proj attn_conv",
+            s,
+            lin(sc.hn, D, &l.attn_conv.0, sc.dynb, ld_dyn, b)
+        );
+        op!(
+            prof,
+            "conv",
+            s,
+            k::dflash_conv(s, sc.hn, true, sc.dynb, ld_dyn, l.attn_conv.1, sc.hc, false)
+        );
         let ld = (QH + 2 * KVH) * HD;
         op!(prof, "proj qkv", s, lin(sc.hc, D, &l.qkv, sc.qkv, ld, b));
-        op!(prof, "qkv prep", s, k::dflash_qkv(s, sc.qkv, ld, (0, QH * HD, (QH + KVH) * HD), l.q_norm, l.k_norm, hdr + (HDR_BLK * 4) as u64, 0, b, QH, sc.q, sc.bk, sc.bv, false));
+        op!(
+            prof,
+            "qkv prep",
+            s,
+            k::dflash_qkv(
+                s,
+                sc.qkv,
+                ld,
+                (0, QH * HD, (QH + KVH) * HD),
+                l.q_norm,
+                l.k_norm,
+                hdr + (HDR_BLK * 4) as u64,
+                0,
+                b,
+                QH,
+                sc.q,
+                sc.bk,
+                sc.bv,
+                false
+            )
+        );
         let (rk, rv) = st.ring(i);
-        op!(prof, "attention", s, k::dflash_attention(s, sc.q, rk, rv, sc.bk, sc.bv, hdr, sc.part, 0));
-        op!(prof, "attention combine", s, k::dflash_attention(s, 0, 0, 0, 0, 0, hdr, sc.part, sc.att));
+        op!(
+            prof,
+            "attention",
+            s,
+            k::dflash_attention(s, sc.q, rk, rv, sc.bk, sc.bv, hdr, sc.part, 0)
+        );
+        op!(
+            prof,
+            "attention combine",
+            s,
+            k::dflash_attention(s, 0, 0, 0, 0, 0, hdr, sc.part, sc.att)
+        );
         op!(prof, "proj o", s, lin(sc.att, QH * HD, &l.o, sc.o, D, b));
-        op!(prof, "conv", s, k::dflash_conv(s, sc.o, false, sc.dynb + (2 * D / 16 * 4) as u64, ld_dyn, l.attn_conv.1 + (2 * D * 2) as u64, sc.h, true));
+        op!(
+            prof,
+            "conv",
+            s,
+            k::dflash_conv(
+                s,
+                sc.o,
+                false,
+                sc.dynb + (2 * D / 16 * 4) as u64,
+                ld_dyn,
+                l.attn_conv.1 + (2 * D * 2) as u64,
+                sc.h,
+                true
+            )
+        );
         // MLP, the same way.
-        op!(prof, "norm", s, k::dflash_rmsnorm(s, sc.h, D, l.post_norm, sc.hn, D, b));
-        op!(prof, "proj mlp_conv", s, lin(sc.hn, D, &l.mlp_conv.0, sc.dynb, ld_dyn, b));
-        op!(prof, "conv", s, k::dflash_conv(s, sc.hn, true, sc.dynb, ld_dyn, l.mlp_conv.1, sc.hc, false));
-        op!(prof, "proj gate_up", s, lin(sc.hc, D, &l.gate_up, sc.gu, 2 * FF, b));
-        op!(prof, "swiglu", s, k::swiglu(s, sc.gu, sc.gu + (FF * 4) as u64, 2 * FF, FF, sc.act, b));
+        op!(
+            prof,
+            "norm",
+            s,
+            k::dflash_rmsnorm(s, sc.h, D, l.post_norm, sc.hn, D, b)
+        );
+        op!(
+            prof,
+            "proj mlp_conv",
+            s,
+            lin(sc.hn, D, &l.mlp_conv.0, sc.dynb, ld_dyn, b)
+        );
+        op!(
+            prof,
+            "conv",
+            s,
+            k::dflash_conv(s, sc.hn, true, sc.dynb, ld_dyn, l.mlp_conv.1, sc.hc, false)
+        );
+        op!(
+            prof,
+            "proj gate_up",
+            s,
+            lin(sc.hc, D, &l.gate_up, sc.gu, 2 * FF, b)
+        );
+        op!(
+            prof,
+            "swiglu",
+            s,
+            k::swiglu(s, sc.gu, sc.gu + (FF * 4) as u64, 2 * FF, FF, sc.act, b)
+        );
         op!(prof, "proj down", s, lin(sc.act, FF, &l.down, sc.o, D, b));
-        op!(prof, "conv", s, k::dflash_conv(s, sc.o, false, sc.dynb + (2 * D / 16 * 4) as u64, ld_dyn, l.mlp_conv.1 + (2 * D * 2) as u64, sc.h, true));
+        op!(
+            prof,
+            "conv",
+            s,
+            k::dflash_conv(
+                s,
+                sc.o,
+                false,
+                sc.dynb + (2 * D / 16 * 4) as u64,
+                ld_dyn,
+                l.mlp_conv.1 + (2 * D * 2) as u64,
+                sc.h,
+                true
+            )
+        );
     }
-    op!(prof, "norm", s, k::dflash_rmsnorm(s, sc.h, D, d.norm, sc.out, D, b));
+    op!(
+        prof,
+        "norm",
+        s,
+        k::dflash_rmsnorm(s, sc.h, D, d.norm, sc.out, D, b)
+    );
     // Rows 1 .. 7 (the mask positions): LM-head logits, their top 16, the selector's context gate.
     let rows = sc.out + (D * 2) as u64;
-    op!(prof, "lm head", s, forward::head_logits_rows(model, &sc.head, s, rows, DRAFTS));
-    op!(prof, "topk", s, k::topk(s, sc.head.logits_addr(), DRAFTS, VOCAB, VOCAB, CAND, false, sc.ids, sc.vals));
-    op!(prof, "proj select_proj", s, lin(rows, D, &d.select_proj, sc.hp, RANK, DRAFTS));
-    op!(prof, "select", s, k::dflash_select(s, sc.ids, sc.vals, sc.hp, d.pred_cb, d.succ_cb, rc_x, drafts, qs, params));
+    op!(
+        prof,
+        "lm head",
+        s,
+        forward::head_logits_rows(model, &sc.head, s, rows, DRAFTS)
+    );
+    op!(
+        prof,
+        "topk",
+        s,
+        k::topk(
+            s,
+            sc.head.logits_addr(),
+            DRAFTS,
+            VOCAB,
+            VOCAB,
+            CAND,
+            false,
+            sc.ids,
+            sc.vals
+        )
+    );
+    op!(
+        prof,
+        "proj select_proj",
+        s,
+        lin(rows, D, &d.select_proj, sc.hp, RANK, DRAFTS)
+    );
+    op!(
+        prof,
+        "select",
+        s,
+        k::dflash_select(
+            s, sc.ids, sc.vals, sc.hp, d.pred_cb, d.succ_cb, rc_x, drafts, qs, params
+        )
+    );
     Ok(())
 }
-

@@ -11,7 +11,13 @@ use quench6k_engine::model::{D, H, Precision};
 
 const DRAFTS: usize = 3;
 
-pub fn probe(model_dir: &Path, precision: Precision, fixture: &Path, steps: usize, chunk: usize) -> Result<()> {
+pub fn probe(
+    model_dir: &Path,
+    precision: Precision,
+    fixture: &Path,
+    steps: usize,
+    chunk: usize,
+) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct Sequence {
         tokens: Vec<i32>,
@@ -78,9 +84,21 @@ pub fn probe(model_dir: &Path, precision: Precision, fixture: &Path, steps: usiz
     }
     let n = rounds as f64;
     let at_least = |k: usize| prefix[k..].iter().sum::<usize>() as f64 / n;
-    println!("{} rounds: P(accept >= 1) {:.3}, >= 2 {:.3}, >= 3 {:.3}", rounds, at_least(1), at_least(2), at_least(3));
-    let mean: f64 = (0..=DRAFTS).map(|a| a as f64 * prefix[a] as f64).sum::<f64>() / n;
-    println!("expected tokens per verification round with 3 drafts: {:.2}", 1.0 + mean);
+    println!(
+        "{} rounds: P(accept >= 1) {:.3}, >= 2 {:.3}, >= 3 {:.3}",
+        rounds,
+        at_least(1),
+        at_least(2),
+        at_least(3)
+    );
+    let mean: f64 = (0..=DRAFTS)
+        .map(|a| a as f64 * prefix[a] as f64)
+        .sum::<f64>()
+        / n;
+    println!(
+        "expected tokens per verification round with 3 drafts: {:.2}",
+        1.0 + mean
+    );
     let _ = D;
     Ok(())
 }
@@ -88,7 +106,18 @@ pub fn probe(model_dir: &Path, precision: Precision, fixture: &Path, steps: usiz
 /// Generates `n` tokens after a fixture prompt with plain greedy decoding and with MTP speculative
 /// decoding, and checks that both produce exactly the same tokens.
 #[allow(clippy::too_many_arguments)]
-pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, drafts: usize, chunk: usize, graphs: bool, adaptive: bool, profile_rounds: usize, steer: &crate::SteerArgs) -> Result<()> {
+pub fn check(
+    model_dir: &Path,
+    precision: Precision,
+    fixture: &Path,
+    n: usize,
+    drafts: usize,
+    chunk: usize,
+    graphs: bool,
+    adaptive: bool,
+    profile_rounds: usize,
+    steer: &crate::SteerArgs,
+) -> Result<()> {
     use quench6k_engine::spec::SpecDecoder;
     #[derive(serde::Deserialize)]
     struct Sequence {
@@ -106,6 +135,7 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
     // Plain greedy decoding.
     let mut state = SequenceState::new(cap)?;
     state.set_steering_strength(&s, strength)?;
+    state.set_adapter_scale(&s, steer.adapter_scale())?;
     for c in prompt.chunks(chunk) {
         forward::forward(&model, &mut state, &mut ws, &s, c)?;
     }
@@ -124,8 +154,15 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
     // Speculative decoding.
     let mut state = SequenceState::with_mtp(cap, true)?;
     state.set_steering_strength(&s, strength)?;
+    state.set_adapter_scale(&s, steer.adapter_scale())?;
     let mut dec = SpecDecoder::prefill(&model, &mut state, &mut ws, &s, prompt, drafts, chunk)?;
-    let mut g = if graphs { Some(quench6k_engine::spec::SpecGraphs::capture(&model, &state, &mut ws, &dec, &s, adaptive, None, None)?) } else { None };
+    let mut g = if graphs {
+        Some(quench6k_engine::spec::SpecGraphs::capture(
+            &model, &state, &mut ws, &dec, &s, adaptive, None,
+        )?)
+    } else {
+        None
+    };
     let t0 = std::time::Instant::now();
     let mut spec = Vec::with_capacity(n + drafts);
     while spec.len() < n {
@@ -154,10 +191,18 @@ pub fn check(model_dir: &Path, precision: Precision, fixture: &Path, n: usize, d
         dec.rounds,
         (dec.accepted + dec.rounds) as f64 / dec.rounds as f64
     );
-    println!("per round: draft {:.3} ms, verify {:.3} ms", 1e3 * dec.draft_secs / dec.rounds as f64, 1e3 * dec.verify_secs / dec.rounds as f64);
+    println!(
+        "per round: draft {:.3} ms, verify {:.3} ms",
+        1e3 * dec.draft_secs / dec.rounds as f64,
+        1e3 * dec.verify_secs / dec.rounds as f64
+    );
     match first_diff {
         None => println!("spec-check: {n}/{n} tokens identical to plain greedy decoding"),
-        Some(i) => anyhow::bail!("spec-check FAILED: token {i}: plain {} vs speculative {}", plain[i], spec[i]),
+        Some(i) => anyhow::bail!(
+            "spec-check FAILED: token {i}: plain {} vs speculative {}",
+            plain[i],
+            spec[i]
+        ),
     }
     Ok(())
 }

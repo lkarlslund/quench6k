@@ -42,7 +42,8 @@ quench6k vision-check --model $M --reference out/vision/shapes
 Changes that are meant to be exact must leave the `score` outputs byte-identical; changes to
 numerics must pass `gate`. `spec-check` requires speculative greedy decoding to match plain greedy
 decoding token for token; `batch-check` requires the same of batched plain steps and of speculative
-pair rounds (two sequences).
+group rounds (`--seqs N` sequences, fixtures cycled; group rounds of every size from 2 to N), and
+prints the eager and graph speeds of the batched plain steps.
 
 ## Kernel iteration
 
@@ -90,6 +91,16 @@ quench6k [--kv fp8] flint bench --model $F --text corpus.txt --ctx 512 8192 6553
 `ppl` scores like llama-perplexity (second half of each chunk), so the numbers compare directly; `bench`
 checks graph against eager decoding and reports how much of the corpus continuation greedy decoding
 reproduces.
+
+## Model variants
+
+`quench6k overlay --base $M --variant DIR` compares a variant checkpoint (for example a BF16 weight
+edit of the model) with the checkpoint we run, tensor by tensor: bitwise where both hold a tensor in
+the same format, by pattern otherwise. With `--out OUT` it writes the tensors the variant changes as an
+overlay directory (`overlay.json` naming the base, `overlay.safetensors`, links to the base's other
+files) that loads as the base with those tensors replaced; stored contexts and the oracle check see it
+as a different checkpoint. A rank-1 edit of the output projections is better served as an adapter
+(`serve --adapter`), which runs both models from one copy of the weights.
 
 ## Releases
 

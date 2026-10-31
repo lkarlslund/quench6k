@@ -38,8 +38,16 @@ pub fn open_direct(path: &Path) -> Option<File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         // O_DIRECT differs between architectures.
-        const O_DIRECT: i32 = if cfg!(any(target_arch = "aarch64", target_arch = "arm")) { 0o200000 } else { 0o40000 };
-        std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path).ok()
+        const O_DIRECT: i32 = if cfg!(any(target_arch = "aarch64", target_arch = "arm")) {
+            0o200000
+        } else {
+            0o40000
+        };
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECT)
+            .open(path)
+            .ok()
     }
     #[cfg(not(target_os = "linux"))]
     {

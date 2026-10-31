@@ -32,11 +32,13 @@ Not supported: quantized attention or shared experts, compressed-tensors exports
 | `--listen ADDR` | `127.0.0.1:8080` | |
 | `--name NAME` | `quench6k` | Model name in `/v1/models` |
 | `--context N` | 65536 | Longest prompt + completion, per slot |
-| `--slots N` | 2 | Concurrent requests (1 or 2) |
+| `--slots N` | 2 | Concurrent requests (1 to 8), each keeping its conversation on the GPU |
+| `--plan-tokens N` | 16384 | Completion tokens a request's memory plan counts on (see below) |
 | `--kv bf16\|fp8` | `bf16` | Attention KV cache format (global flag, before `serve`); FP8 halves its memory |
 | `--drafts N` | 6 | Longest speculative draft; each round picks 1..N |
 | `--default-max-tokens N` | 65536 | Completion limit when a request sets none |
 | `--tool-retries N` | 2 | Regenerations of a malformed tool call |
+| `--no-thinking` | | Chat requests do not think unless they set `enable_thinking` or `reasoning_effort` |
 | `--cache-host-gib N` | 16 | Pinned host memory for stored contexts |
 | `--cache-dir DIR` | | Disk tier for stored contexts, kept across restarts |
 | `--cache-disk-gib N` | 200 | Most disk space for the disk tier (0: no limit) |
@@ -45,12 +47,23 @@ Not supported: quantized attention or shared experts, compressed-tensors exports
 | `--steering FILE` | | Steering pack to load |
 | `--strength X` | pack default | Strength of the steered model |
 | `--steered-name NAME` | `<name>-steered` | Model name that applies the pack |
+| `--adapter DIR` | | Rank-1 adapter on the output projections (PEFT directory: `adapter_config.json`, `adapter_model.safetensors`), served as a second model |
+| `--adapted-name NAME` | `<name>-adapted` | Model name that applies the adapter |
 | `--capture-dir DIR` | | Enables activation capture requests |
 | `--no-vision` | | Skips the vision tower (image and video requests are rejected) |
 | `--image-max-pixels N` | 4194304 | Largest image area after resizing (each 32×32 block is one token) |
 | `--video-max-frames N` | 128 | Most frames sampled from a video (2 per second) |
 
-`--context 262144 --slots 2 --kv fp8` fits in 96 GB together with the weights and the vision tower.
+Attention-cache memory is used per token a slot holds, not reserved per slot: about 18 KB per token
+with `--kv fp8` (36 KB with BF16). With `--context 262144 --slots 8 --kv fp8`, the weights and the
+vision tower, about 12 GB remain for conversations (some 600K tokens); idle slots give up theirs
+when that runs out (see [Context cache](#context-cache)).
+
+Requests start by plan: a request starts only when its prompt plus its expected completion
+(`--plan-tokens`, at most its `max_tokens`) fits in device memory next to the plans of the running
+requests, counting what idle slots hold as free. Otherwise it waits for a running request to finish,
+so a newer request never cuts a running one short. A request alone always starts. A completion longer
+than its plan grows into free memory; only if none is left does it fail.
 
 ## HTTP API
 
@@ -72,8 +85,8 @@ Not supported: quantized attention or shared experts, compressed-tensors exports
   chat template, as a chat request would be prompted) or a raw `prompt` / `content` string.
 - `POST /detokenize`: `{"tokens": [...]}` to text, returned as `prompt` (vLLM) and `content` (llama.cpp).
 - `GET /metrics`: Prometheus counters per slot (generations, prompt tokens, prompt tokens served from
-  the cache, generated tokens, prefill and decode seconds), failed generations, and the waiting and
-  running requests.
+  the cache, generated tokens, prefill and decode seconds, attention-cache bytes in use), failed
+  generations, and the waiting and running requests.
 
 A prompt of `--context` tokens or more is rejected with HTTP 400 and code `context_length_exceeded`.
 
@@ -91,7 +104,7 @@ A prompt of `--context` tokens or more is rejected with HTTP 400 and code `conte
 | `max_tokens` / `max_completion_tokens` | `--default-max-tokens` | Capped by the context |
 | `stop` | | String or list of strings |
 | `tools` | | OpenAI function tools |
-| `chat_template_kwargs.enable_thinking` | template default | Anthropic: `"thinking": {"type": "enabled"}` |
+| `chat_template_kwargs.enable_thinking` | template default (off with `--no-thinking`) | Anthropic: `"thinking": {"type": "enabled"}` |
 | `reasoning_effort` | template default (`xhigh`) | `low`, `medium`, `high` (as `xhigh`) or `xhigh`; `none` and `minimal` turn thinking off |
 
 Extensions:
@@ -113,9 +126,12 @@ model verifies them in one step, and the draft length adapts to the observed acc
 is identical to plain greedy decoding; sampled output has exactly the distribution of plain sampling.
 Penalties are applied in the verification step, so they keep this property.
 
-Two concurrent requests decode speculatively together: both drafters run, then one batched
-verification step covers both requests' drafts, and each request accepts and samples on its own.
-If one of them uses plain decoding (`"mtp": false`, capture), both continue with batched plain steps.
+Concurrent requests decode speculatively together: each drafter runs, then one batched verification
+step covers every request's drafts, and each request accepts and samples on its own. They draft the
+same length per round, chosen per number of running requests (more requests verify more rows per
+draft token, so they draft shorter; at most 16 rows are verified, so that the step uses the decoding
+kernels and greedy output stays identical: 7 drafts for 2 requests, 3 for 4, 1 for 5 to 8). Requests with plain decoding (`"mtp": false`, capture) take
+batched plain steps alongside. A new request's prefill pauses the others while it runs.
 
 `--dflash DIR` (any command that decodes speculatively) drafts with the
 [DFlash 2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) block drafter instead of the MTP
@@ -140,7 +156,10 @@ the text before it is kept. While a tool call is being generated, streaming clie
   boundaries and at intervals inside long prompts, so a follow-up turn or an edited prompt reuses
   the longest cached prefix.
 - A request starts on the free slot that holds the most of its prompt, or else on the one holding the
-  shorter conversation, so two conversations running side by side each keep their own slot.
+  shortest conversation, so conversations running side by side each keep their own slot.
+- When device memory runs out, it is taken from the slots without a running request, least recently
+  used first: memory past what a slot holds, then periodic snapshots, then a slot's whole conversation
+  (saved to the host tier first, so the next request of that conversation loads it from there).
 - When a request would overwrite a different conversation, that conversation's state is moved to
   pinned host memory (`--cache-host-gib`) and, with `--cache-dir`, to disk.
 - The disk tier keeps within `--cache-disk-gib` and `--cache-max-age-days` by deleting the least

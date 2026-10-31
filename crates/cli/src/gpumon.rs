@@ -34,16 +34,25 @@ unsafe impl Send for Nvml {}
 
 impl Nvml {
     fn open() -> Result<Self, String> {
-        let name = if cfg!(windows) { "nvml.dll" } else { "libnvidia-ml.so.1" };
+        let name = if cfg!(windows) {
+            "nvml.dll"
+        } else {
+            "libnvidia-ml.so.1"
+        };
         unsafe {
             let lib = libloading::Library::new(name).map_err(|e| format!("{name}: {e}"))?;
             let sym = |n: &[u8]| -> Result<*const (), String> {
-                lib.get::<*const ()>(n).map(|s| *s).map_err(|e| format!("{}: {e}", String::from_utf8_lossy(n)))
+                lib.get::<*const ()>(n)
+                    .map(|s| *s)
+                    .map_err(|e| format!("{}: {e}", String::from_utf8_lossy(n)))
             };
             let init: unsafe extern "C" fn() -> i32 = std::mem::transmute(sym(b"nvmlInit_v2\0")?);
-            let count: unsafe extern "C" fn(*mut u32) -> i32 = std::mem::transmute(sym(b"nvmlDeviceGetCount_v2\0")?);
-            let by_index: unsafe extern "C" fn(u32, *mut Device) -> i32 = std::mem::transmute(sym(b"nvmlDeviceGetHandleByIndex_v2\0")?);
-            let reasons = sym(b"nvmlDeviceGetCurrentClocksEventReasons\0").or_else(|_| sym(b"nvmlDeviceGetCurrentClocksThrottleReasons\0"))?;
+            let count: unsafe extern "C" fn(*mut u32) -> i32 =
+                std::mem::transmute(sym(b"nvmlDeviceGetCount_v2\0")?);
+            let by_index: unsafe extern "C" fn(u32, *mut Device) -> i32 =
+                std::mem::transmute(sym(b"nvmlDeviceGetHandleByIndex_v2\0")?);
+            let reasons = sym(b"nvmlDeviceGetCurrentClocksEventReasons\0")
+                .or_else(|_| sym(b"nvmlDeviceGetCurrentClocksThrottleReasons\0"))?;
             let rc = init();
             if rc != 0 {
                 return Err(format!("nvmlInit failed ({rc})"));
@@ -78,7 +87,13 @@ impl Nvml {
             (self.power)(self.device, &mut p);
             (self.reasons)(self.device, &mut r);
         }
-        Sample { temp: t, sm_mhz: c, power_mw: p, power_limit: self.power_limit(), reasons: r }
+        Sample {
+            temp: t,
+            sm_mhz: c,
+            power_mw: p,
+            power_limit: self.power_limit(),
+            reasons: r,
+        }
     }
 
     /// The enforced power limit in watts (what `nvidia-smi -pl` set).
@@ -113,15 +128,24 @@ pub struct Window {
 impl Window {
     /// The window saw a thermal or hardware slowdown.
     pub fn slowed(&self) -> bool {
-        REASONS.iter().any(|&(bit, _, bad)| bad && self.reasons & bit != 0)
+        REASONS
+            .iter()
+            .any(|&(bit, _, bad)| bad && self.reasons & bit != 0)
     }
 
     pub fn reason_names(&self) -> Vec<&'static str> {
-        REASONS.iter().filter(|&&(bit, _, _)| self.reasons & bit != 0).map(|&(_, n, _)| n).collect()
+        REASONS
+            .iter()
+            .filter(|&&(bit, _, _)| self.reasons & bit != 0)
+            .map(|&(_, n, _)| n)
+            .collect()
     }
 
     pub fn summary(&self) -> String {
-        format!("GPU max {} C, SM {}-{:.0} MHz (min-mean), {:.0} W of {} W", self.temp_max, self.sm_mhz_min, self.sm_mhz_mean, self.power_w_mean, self.power_limit_w)
+        format!(
+            "GPU max {} C, SM {}-{:.0} MHz (min-mean), {:.0} W of {} W",
+            self.temp_max, self.sm_mhz_min, self.sm_mhz_mean, self.power_w_mean, self.power_limit_w
+        )
     }
 
     pub fn json(&self) -> serde_json::Value {
@@ -132,7 +156,11 @@ impl Window {
 
 impl Acc {
     fn add(&mut self, x: Sample) {
-        self.sm_min = if self.n == 0 { x.sm_mhz } else { self.sm_min.min(x.sm_mhz) };
+        self.sm_min = if self.n == 0 {
+            x.sm_mhz
+        } else {
+            self.sm_min.min(x.sm_mhz)
+        };
         self.n += 1;
         self.temp_max = self.temp_max.max(x.temp);
         self.sm_sum += x.sm_mhz as f64;
@@ -182,7 +210,12 @@ impl Monitor {
                 std::thread::sleep(INTERVAL);
             }
         });
-        Some(Self { nvml, acc, stop, thread: Some(thread) })
+        Some(Self {
+            nvml,
+            acc,
+            stop,
+            thread: Some(thread),
+        })
     }
 
     pub fn begin(&self) {
@@ -196,7 +229,15 @@ impl Monitor {
             g.add(self.nvml.lock().unwrap().sample());
         }
         let n = g.n.max(1) as f64;
-        Window { samples: g.n, temp_max: g.temp_max, sm_mhz_min: g.sm_min, sm_mhz_mean: g.sm_sum / n, power_w_mean: g.power_sum / n, power_limit_w: g.power_limit, reasons: g.reasons }
+        Window {
+            samples: g.n,
+            temp_max: g.temp_max,
+            sm_mhz_min: g.sm_min,
+            sm_mhz_mean: g.sm_sum / n,
+            power_w_mean: g.power_sum / n,
+            power_limit_w: g.power_limit,
+            reasons: g.reasons,
+        }
     }
 }
 

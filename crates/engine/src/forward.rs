@@ -1,7 +1,7 @@
 //! Eager forward pass of the text model over a chunk of new tokens for one sequence.
 
 use anyhow::{Result, ensure};
-use quench6k_cuda::{DeviceBuffer, Event, PinnedBuffer, Stream, kernels as k};
+use quench6k_cuda::{DeviceBuffer, Event, PinnedBuffer, Stream, VmBuffer, kernels as k};
 
 use crate::profile::Profiler;
 
@@ -22,10 +22,15 @@ macro_rules! op {
 /// are wrong).
 fn dup(name: &str) -> bool {
     static DUP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    DUP.get_or_init(|| std::env::var("QUENCH6K_DUP").ok()).as_deref() == Some(name)
+    DUP.get_or_init(|| std::env::var("QUENCH6K_DUP").ok())
+        .as_deref()
+        == Some(name)
 }
 
-use crate::model::{Block, D, EOS, EXPERT_WIDTH, EXPERTS, H, HC_RANK, Hc, LAYERS, Linear, Model, Proj, S, TOP_K, VOCAB, is_attention};
+use crate::model::{
+    Block, D, EOS, EXPERT_WIDTH, EXPERTS, H, HC_RANK, Hc, LAYERS, Linear, Model, Proj, S, TOP_K,
+    VOCAB, is_attention,
+};
 
 const QSA_HEADS: usize = 24;
 const QSA_KV: usize = 2;
@@ -40,21 +45,44 @@ const PLE_HIST: usize = 9;
 /// Widest projection group: GDN in_proj (10240 + 6144 + 48 + 48).
 const PROJ_WIDTH: usize = GDN_CONV + GDN_Z + 2 * GDN_HEADS;
 
+/// An attention cache, position-indexed up to the sequence's capacity. Its buffers are backed by
+/// device memory only for the positions in use (see [`SequenceState::ensure_kv`]).
 pub struct QsaCache {
-    pub k: DeviceBuffer,
-    pub v: DeviceBuffer,
-    pub raw: DeviceBuffer,
-    pub pooled: DeviceBuffer,
+    pub k: VmBuffer,
+    pub v: VmBuffer,
+    pub raw: VmBuffer,
+    pub pooled: VmBuffer,
     /// K and V rows are FP8 E4M3 with a per-(position, KV head) scale (272 bytes) instead of BF16.
     pub fp8: bool,
 }
+
+impl QsaCache {
+    /// (buffer, bytes per position) of each buffer (pooled: one row per 4 positions).
+    fn parts(&mut self) -> [(&mut VmBuffer, f64); 4] {
+        let kv = kv_row_bytes(self.fp8) as f64;
+        [
+            (&mut self.k, kv),
+            (&mut self.v, kv),
+            (&mut self.raw, (INDEX_DIM * 2) as f64),
+            (&mut self.pooled, (INDEX_DIM * 2) as f64 / 4.0),
+        ]
+    }
+}
+
+/// Positions mapped past those a sequence needs, so kernels that read whole tiles stay inside mapped
+/// memory, and growth in steps of at least this many positions.
+pub const KV_MARGIN: usize = 4096;
 
 /// KV cache format for sequences created from now on (false: BF16, true: FP8 E4M3 with scales).
 pub static KV_FP8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Bytes per position of one K or V cache.
 pub fn kv_row_bytes(fp8: bool) -> usize {
-    if fp8 { QSA_KV * (QSA_DIM + 16) } else { QSA_KV * QSA_DIM * 2 }
+    if fp8 {
+        QSA_KV * (QSA_DIM + 16)
+    } else {
+        QSA_KV * QSA_DIM * 2
+    }
 }
 
 pub struct GdnState {
@@ -76,6 +104,8 @@ pub struct SequenceState {
     pub spec: Option<Spec>,
     /// Device f32: strength of the model's steering pack for this sequence (0: unsteered).
     pub steer_strength: DeviceBuffer,
+    /// Device f32: scale of the model's rank-1 adapter for this sequence (0: the base model).
+    pub adapter_scale: DeviceBuffer,
     /// Image / video spans of the prompt, in order (their embeddings replace the placeholder tokens).
     pub mm: Vec<std::sync::Arc<MmSpan>>,
 }
@@ -121,15 +151,24 @@ impl SequenceState {
         Self::with_mtp(capacity, false)
     }
 
+    /// A sequence of up to `capacity` positions with its attention caches fully backed by memory.
     pub fn with_mtp(capacity: usize, mtp: bool) -> Result<Self> {
+        let mut st = Self::growable(capacity, mtp)?;
+        st.ensure_kv(st.capacity)?;
+        Ok(st)
+    }
+
+    /// As [`with_mtp`](Self::with_mtp), with no attention-cache memory yet: [`ensure_kv`](Self::ensure_kv)
+    /// backs the positions before they are used.
+    pub fn growable(capacity: usize, mtp: bool) -> Result<Self> {
         let capacity = capacity.div_ceil(4) * 4;
         let fp8 = KV_FP8.load(std::sync::atomic::Ordering::Relaxed);
         let qsa_cache = || -> Result<QsaCache> {
             Ok(QsaCache {
-                k: DeviceBuffer::new(capacity * kv_row_bytes(fp8))?,
-                v: DeviceBuffer::new(capacity * kv_row_bytes(fp8))?,
-                raw: DeviceBuffer::new(capacity * INDEX_DIM * 2)?,
-                pooled: DeviceBuffer::new(capacity / 4 * INDEX_DIM * 2)?,
+                k: VmBuffer::reserve(capacity * kv_row_bytes(fp8))?,
+                v: VmBuffer::reserve(capacity * kv_row_bytes(fp8))?,
+                raw: VmBuffer::reserve(capacity * INDEX_DIM * 2)?,
+                pooled: VmBuffer::reserve(capacity / 4 * INDEX_DIM * 2)?,
                 fp8,
             })
         };
@@ -158,7 +197,15 @@ impl SequenceState {
             spec: if mtp {
                 Some(Spec {
                     ctl: DeviceBuffer::zeroed(8)?,
-                    gdn_rec: (0..LAYERS).map(|l| if is_attention(l) { Ok(None) } else { DeviceBuffer::new(k::gdn_record_floats() * 4).map(Some) }).collect::<Result<_>>()?,
+                    gdn_rec: (0..LAYERS)
+                        .map(|l| {
+                            if is_attention(l) {
+                                Ok(None)
+                            } else {
+                                DeviceBuffer::new(k::gdn_record_floats() * 4).map(Some)
+                            }
+                        })
+                        .collect::<Result<_>>()?,
                     ple_rec: DeviceBuffer::new(k::ple_record_floats() * 4)?,
                     replay: 0,
                     parity: 0,
@@ -167,6 +214,7 @@ impl SequenceState {
                 None
             },
             steer_strength: DeviceBuffer::zeroed(4)?,
+            adapter_scale: DeviceBuffer::zeroed(4)?,
             mm: Vec::new(),
         })
     }
@@ -196,8 +244,82 @@ impl SequenceState {
         s.synchronize()
     }
 
+    /// Sets this sequence's adapter scale (read on the device by every later step).
+    pub fn set_adapter_scale(&self, s: &Stream, scale: f32) -> Result<()> {
+        s.upload(&self.adapter_scale, &[scale])?;
+        s.synchronize()
+    }
+
     pub fn len(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// Positions whose attention-cache memory is mapped (all caches map the same positions).
+    pub fn kv_positions(&self) -> usize {
+        self.mtp_qsa
+            .iter()
+            .chain(self.qsa.iter().flatten())
+            .map(|c| {
+                (c.k.mapped() / kv_row_bytes(c.fp8))
+                    .min(c.raw.mapped() / (INDEX_DIM * 2))
+                    .min(c.pooled.mapped() * 4 / (INDEX_DIM * 2))
+            })
+            .min()
+            .unwrap_or(self.capacity)
+            .min(self.capacity)
+    }
+
+    /// Attention-cache bytes per position (all caches together).
+    pub fn kv_bytes_per_position(&self) -> f64 {
+        self.mtp_qsa
+            .iter()
+            .chain(self.qsa.iter().flatten())
+            .map(|c| {
+                (2 * kv_row_bytes(c.fp8) + INDEX_DIM * 2) as f64 + (INDEX_DIM * 2) as f64 / 4.0
+            })
+            .sum()
+    }
+
+    /// Device memory mapped for the attention caches.
+    pub fn kv_bytes(&self) -> usize {
+        self.mtp_qsa
+            .iter()
+            .chain(self.qsa.iter().flatten())
+            .map(|c| c.k.mapped() + c.v.mapped() + c.raw.mapped() + c.pooled.mapped())
+            .sum()
+    }
+
+    /// Backs positions [0, positions) of every attention cache with device memory (plus
+    /// [`KV_MARGIN`]; at most the capacity). Fails with "out of memory" when the device is full; what
+    /// was mapped stays mapped.
+    pub fn ensure_kv(&mut self, positions: usize) -> Result<()> {
+        if positions + KV_MARGIN / 2 <= self.kv_positions() || self.kv_positions() == self.capacity
+        {
+            return Ok(());
+        }
+        let want = (positions + KV_MARGIN).min(self.capacity);
+        for c in self.mtp_qsa.iter_mut().chain(self.qsa.iter_mut().flatten()) {
+            for (b, per) in c.parts() {
+                b.map_to((want as f64 * per).ceil() as usize)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Releases attention-cache memory past position `positions` (plus [`KV_MARGIN`]). The device
+    /// must be done with the sequence's earlier steps.
+    pub fn trim_kv(&mut self, positions: usize) -> Result<()> {
+        let keep = if positions == 0 {
+            0
+        } else {
+            (positions + KV_MARGIN).min(self.capacity)
+        };
+        for c in self.mtp_qsa.iter_mut().chain(self.qsa.iter_mut().flatten()) {
+            for (b, per) in c.parts() {
+                b.unmap_to((keep as f64 * per).ceil() as usize)?;
+            }
+        }
+        Ok(())
     }
 
     /// MRoPE position (t, h, w) of sequence index `p`: text tokens advance all three axes by one;
@@ -339,7 +461,8 @@ impl Workspace {
                 total
             });
             let prefix: Vec<u64> = prefix.collect();
-            ws.layer_weight_bytes.push(prefix.last().copied().unwrap_or(0));
+            ws.layer_weight_bytes
+                .push(prefix.last().copied().unwrap_or(0));
             ws.prefetch.push((b.addr(), prefix));
             ws.bufs.push(b);
         }
@@ -347,8 +470,14 @@ impl Workspace {
             ws.dflash = Some(crate::dflash::Scratch::new()?);
         }
         let elems = model.max_int8g_elems();
-        if max_tokens >= DEQUANT_MIN_ROWS && elems > 0 && std::env::var("QUENCH6K_DEQUANT_GEMM").as_deref() != Ok("0") {
-            eprintln!("BF16 weight buffer for prefill GEMMs: {} MiB", (elems * 2) >> 20);
+        if max_tokens >= DEQUANT_MIN_ROWS
+            && elems > 0
+            && std::env::var("QUENCH6K_DEQUANT_GEMM").as_deref() != Ok("0")
+        {
+            eprintln!(
+                "BF16 weight buffer for prefill GEMMs: {} MiB",
+                (elems * 2) >> 20
+            );
             let b = DeviceBuffer::new(elems * 2)?;
             ws.dq = b.addr();
             ws.dq_elems = elems;
@@ -386,7 +515,11 @@ impl Workspace {
             conv: alloc(t * GDN_CONV * 4)?,
             beta: alloc(t * GDN_HEADS * 4)?,
             g: alloc(t * GDN_HEADS * 4)?,
-            gdn_chunks: alloc(if t >= 64 { k::gdn_chunk_scratch_floats(t).max(k::gdn_tc_scratch_floats(t)) * 4 } else { 4 })?,
+            gdn_chunks: alloc(if t >= 64 {
+                k::gdn_chunk_scratch_floats(t).max(k::gdn_tc_scratch_floats(t)) * 4
+            } else {
+                4
+            })?,
             o: alloc(t * GDN_Z * 4)?,
             o_bf: alloc(t * GDN_Z * 2)?,
             q: alloc(t * QSA_HEADS * QSA_DIM * 4)?,
@@ -473,18 +606,45 @@ pub(crate) const PARTIAL_FLOATS: usize = 1 << 22;
 /// GEMM otherwise.
 /// [`linear_ld`] for other modules' projections (BF16 activations, FP32 output).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn linear_rows(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, ldy: usize, t: usize) -> Result<()> {
+pub(crate) fn linear_rows(
+    s: &Stream,
+    partial: u64,
+    x: u64,
+    ldx: usize,
+    w: &Linear,
+    y: u64,
+    ldy: usize,
+    t: usize,
+) -> Result<()> {
     linear_ld(s, partial, x, ldx, w, y, ldy, t)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn linear_ld(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, ldy: usize, t: usize) -> Result<()> {
+fn linear_ld(
+    s: &Stream,
+    partial: u64,
+    x: u64,
+    ldx: usize,
+    w: &Linear,
+    y: u64,
+    ldy: usize,
+    t: usize,
+) -> Result<()> {
     // A few rows over 16 (MTP catch-up projects 4 stream rows per token) stay on the GEMV path in
     // 16-row slices; each row's arithmetic is the same either way.
     if t > k::gemv_max_m() && t <= 4 * k::gemv_max_m() {
         let m = k::gemv_max_m();
         for r0 in (0..t).step_by(m) {
-            linear_ld(s, partial, x + (r0 * ldx * 2) as u64, ldx, w, y + (r0 * ldy * 4) as u64, ldy, m.min(t - r0))?;
+            linear_ld(
+                s,
+                partial,
+                x + (r0 * ldx * 2) as u64,
+                ldx,
+                w,
+                y + (r0 * ldy * 4) as u64,
+                ldy,
+                m.min(t - r0),
+            )?;
         }
         return Ok(());
     }
@@ -494,19 +654,40 @@ fn linear_ld(s: &Stream, partial: u64, x: u64, ldx: usize, w: &Linear, y: u64, l
     if t <= k::gemv_max_m() {
         // Split K only when even one row per warp leaves fewer CTAs than SMs.
         let ctas = w.n.div_ceil(8);
-        let splits = if ctas >= TARGET_CTAS / 2 { 1 } else { (TARGET_CTAS / 2).div_ceil(ctas).clamp(1, w.k.div_ceil(512)).min(PARTIAL_FLOATS / (t * w.n)).max(1) };
-        k::gemv(s, t, x, ldx, w.fmt, w.addr, w.scale, y, ldy, partial, w.n, w.k, splits, 1.0, false)
+        let splits = if ctas >= TARGET_CTAS / 2 {
+            1
+        } else {
+            (TARGET_CTAS / 2)
+                .div_ceil(ctas)
+                .clamp(1, w.k.div_ceil(512))
+                .min(PARTIAL_FLOATS / (t * w.n))
+                .max(1)
+        };
+        k::gemv(
+            s, t, x, ldx, w.fmt, w.addr, w.scale, y, ldy, partial, w.n, w.k, splits, 1.0, false,
+        )
     } else {
         // Grids smaller than the GPU (short prefills) split K: the largest split up to two CTAs per SM
         // that divides K into 32-multiples and fits the partial buffer.
         let ctas = w.n.div_ceil(128) * t.div_ceil(128);
-        if ctas < SMS && w.k >= 1024 && matches!(w.fmt, k::WeightFormat::Bf16 | k::WeightFormat::Int8Group) {
-            let splits = (2..=(2 * SMS / ctas).min(16)).rev().find(|&sp| w.k % (32 * sp) == 0 && t * w.n * sp <= PARTIAL_FLOATS).unwrap_or(1);
+        if ctas < SMS
+            && w.k >= 1024
+            && matches!(w.fmt, k::WeightFormat::Bf16 | k::WeightFormat::Int8Group)
+        {
+            let splits = (2..=(2 * SMS / ctas).min(16))
+                .rev()
+                .find(|&sp| w.k % (32 * sp) == 0 && t * w.n * sp <= PARTIAL_FLOATS)
+                .unwrap_or(1);
             if splits > 1 {
-                return k::gemm_f32_split(s, x, ldx, w.fmt, w.addr, w.k, w.scale, y, ldy, t, w.n, w.k, 1.0, false, partial, splits);
+                return k::gemm_f32_split(
+                    s, x, ldx, w.fmt, w.addr, w.k, w.scale, y, ldy, t, w.n, w.k, 1.0, false,
+                    partial, splits,
+                );
             }
         }
-        k::gemm_f32(s, x, ldx, w.fmt, w.addr, w.k, w.scale, y, ldy, t, w.n, w.k, 1.0, false)
+        k::gemm_f32(
+            s, x, ldx, w.fmt, w.addr, w.k, w.scale, y, ldy, t, w.n, w.k, 1.0, false,
+        )
     }
 }
 
@@ -519,9 +700,22 @@ fn linear(s: &Stream, ws: &Workspace, x: u64, w: &Linear, y: u64, t: usize) -> R
 /// As [`linear_ld`], with MXFP8 weights on prefill-sized batches: the activations are quantized to MXFP8
 /// in the workspace and multiplied on the FP8 tensor cores.
 #[allow(clippy::too_many_arguments)]
-fn linear_ws(s: &Stream, ws: &Workspace, x: u64, ldx: usize, w: &Linear, y: u64, ldy: usize, t: usize) -> Result<()> {
+fn linear_ws(
+    s: &Stream,
+    ws: &Workspace,
+    x: u64,
+    ldx: usize,
+    w: &Linear,
+    y: u64,
+    ldy: usize,
+    t: usize,
+) -> Result<()> {
     if w.fmt == k::WeightFormat::Mxfp8 && t > 4 * k::gemv_max_m() {
-        ensure!(t * w.k <= ws.xq_bytes, "MXFP8 activation buffer holds {} bytes", ws.xq_bytes);
+        ensure!(
+            t * w.k <= ws.xq_bytes,
+            "MXFP8 activation buffer holds {} bytes",
+            ws.xq_bytes
+        );
         let scales = ws.xq + (t * w.k).div_ceil(256) as u64 * 256;
         k::mxfp8_rows(s, x, t, w.k, ldx, ws.xq, scales)?;
         return k::gemm_mx8(s, ws.xq, scales, w.addr, w.scale, y, ldy, t, w.n, w.k);
@@ -543,7 +737,13 @@ fn dequantized(s: &Stream, ws: &Workspace, w: &Linear, t: usize) -> Result<Optio
         return Ok(None);
     }
     k::dequant_int8_groups(s, w.addr, w.scale, w.n, w.k, ws.dq)?;
-    Ok(Some(Linear { fmt: k::WeightFormat::Bf16, addr: ws.dq, scale: 0, n: w.n, k: w.k }))
+    Ok(Some(Linear {
+        fmt: k::WeightFormat::Bf16,
+        addr: ws.dq,
+        scale: 0,
+        n: w.n,
+        k: w.k,
+    }))
 }
 
 /// Computes every member of `proj` for `t` rows of `x` into `out` ([t, proj.n], FP32).
@@ -563,28 +763,81 @@ fn project(s: &Stream, ws: &Workspace, x: u64, proj: &Proj, out: u64, t: usize) 
 /// injects, the injection weights to `ws.inj`.
 /// `pending`: the previous block's output, still to be added to the residual with the injection
 /// weights in `ws.inj` (fused with the norm).
-fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, pending: Option<u64>, moe: Option<(u64, usize)>, out: u64, mut prof: Option<&mut Profiler>) -> Result<()> {
+fn hyper_connection(
+    s: &Stream,
+    ws: &Workspace,
+    hc: &Hc,
+    t: usize,
+    pending: Option<u64>,
+    moe: Option<(u64, usize)>,
+    out: u64,
+    mut prof: Option<&mut Profiler>,
+) -> Result<()> {
     let inj = if hc.injects { ws.inj } else { 0 };
     {
         match (pending, moe) {
-            (_, Some((sg, ld))) => op!(prof, "hc moe+combine+norm", s, k::hc_moe_combine_norm(s, ws.h, ws.yd, ws.pair_row, ws.top_w, sg, ld, ws.sh, ws.inj, ws.n, t)),
-            (Some(y), None) => op!(prof, "hc combine+norm", s, k::hc_combine_norm(s, ws.h, y, ws.inj, ws.n, t)),
+            (_, Some((sg, ld))) => op!(
+                prof,
+                "hc moe+combine+norm",
+                s,
+                k::hc_moe_combine_norm(
+                    s,
+                    ws.h,
+                    ws.yd,
+                    ws.pair_row,
+                    ws.top_w,
+                    sg,
+                    ld,
+                    ws.sh,
+                    ws.inj,
+                    ws.n,
+                    t
+                )
+            ),
+            (Some(y), None) => op!(
+                prof,
+                "hc combine+norm",
+                s,
+                k::hc_combine_norm(s, ws.h, y, ws.inj, ws.n, t)
+            ),
             (None, None) => op!(prof, "hc norm", s, k::grouped_rmsnorm(s, ws.h, 0, ws.n, t)),
         }
         if t > k::gemv_max_m() && fake_set("hc") {
             k::fake_mxfp8(s, ws.n, t, H, H)?;
         }
-        op!(prof, "hc down", s, project(s, ws, ws.n, &hc.down, ws.proj, t));
-        op!(prof, "hc act", s, k::hc_act(s, ws.proj, hc.down.n, ws.low_bf, inj, t));
+        op!(
+            prof,
+            "hc down",
+            s,
+            project(s, ws, ws.n, &hc.down, ws.proj, t)
+        );
+        op!(
+            prof,
+            "hc act",
+            s,
+            k::hc_act(s, ws.proj, hc.down.n, ws.low_bf, inj, t)
+        );
         if t > k::gemv_max_m() && fake_set("hc") {
             k::fake_mxfp8(s, ws.low_bf, t, hc.up.k, hc.up.k)?;
         }
         if t > 4 * k::gemv_max_m() && std::env::var_os("QUENCH6K_HC_UNFUSED").is_none() {
             let up = dequantized(s, ws, &hc.up, t)?.unwrap_or(hc.up);
-            op!(prof, "hc up+mix", s, k::gemm_hc_up_mix(s, ws.low_bf, up.fmt, up.addr, up.scale, ws.n, hc.norm, out, t, up.k));
+            op!(
+                prof,
+                "hc up+mix",
+                s,
+                k::gemm_hc_up_mix(
+                    s, ws.low_bf, up.fmt, up.addr, up.scale, ws.n, hc.norm, out, t, up.k
+                )
+            );
         } else {
             op!(prof, "hc up", s, linear(s, ws, ws.low_bf, &hc.up, ws.up, t));
-            op!(prof, "hc mix", s, k::hc_mix(s, ws.up, ws.n, hc.norm, out, t));
+            op!(
+                prof,
+                "hc mix",
+                s,
+                k::hc_mix(s, ws.up, ws.n, hc.norm, out, t)
+            );
         }
     }
     Ok(())
@@ -593,21 +846,52 @@ fn hyper_connection(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, pending: Opti
 /// Small-batch HyperConnection: one cooperative kernel. `pending` is the previous block's output and
 /// injection weights, applied to the residual first; the new injection weights go to `inj_out`.
 #[allow(clippy::too_many_arguments)]
-fn hyper_connection_small(s: &Stream, ws: &Workspace, hc: &Hc, t: usize, pending: Option<(u64, u64)>, inj_out: u64, out: u64) -> Result<()> {
+fn hyper_connection_small(
+    s: &Stream,
+    ws: &Workspace,
+    hc: &Hc,
+    t: usize,
+    pending: Option<(u64, u64)>,
+    inj_out: u64,
+    out: u64,
+) -> Result<()> {
     let weight = |l: &Linear| (l.fmt, l.addr, l.scale);
     let down = weight(&hc.down.parts[0].0);
     let inject = hc.injects.then(|| weight(&hc.down.parts[1].0));
     let (y, inj_prev) = pending.unwrap_or((0, ws.inj));
-    k::hc_small(s, ws.h, t, y, inj_prev, down, inject, weight(&hc.up), hc.norm, ws.hc_scratch, ws.low_bf, ws.hc_r, inj_out, out)
+    k::hc_small(
+        s,
+        ws.h,
+        t,
+        y,
+        inj_prev,
+        down,
+        inject,
+        weight(&hc.up),
+        hc.norm,
+        ws.hc_scratch,
+        ws.low_bf,
+        ws.hc_r,
+        inj_out,
+        out,
+    )
 }
 
 /// PLE row indices of the token at position `p` given the full token history (SPEC §8.1).
 /// Faults the PLE rows of `tokens[from..]` into the page cache from `threads` threads, in order (blocks
 /// of 64 positions), until done or `stop` is set. Run alongside a prefill, it turns the host gather's
 /// page faults (the table is larger than RAM) into parallel reads ahead of the GPU.
-pub fn warm_ple(model: &Model, tokens: &[i32], from: usize, threads: usize, stop: &std::sync::atomic::AtomicBool) {
+pub fn warm_ple(
+    model: &Model,
+    tokens: &[i32],
+    from: usize,
+    threads: usize,
+    stop: &std::sync::atomic::AtomicBool,
+) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let Some(ple) = model.layers[1].ple.as_ref() else { return };
+    let Some(ple) = model.layers[1].ple.as_ref() else {
+        return;
+    };
     const BLOCK: usize = 64;
     let next = AtomicUsize::new(from);
     std::thread::scope(|sc| {
@@ -631,10 +915,24 @@ pub fn warm_ple(model: &Model, tokens: &[i32], from: usize, threads: usize, stop
     });
 }
 
-pub fn ple_rows(tokens: &[i32], p: usize, mult: &[i64; 3], sizes: &[i64; 16], offsets: &[i64; 16]) -> [usize; 16] {
+pub fn ple_rows(
+    tokens: &[i32],
+    p: usize,
+    mult: &[i64; 3],
+    sizes: &[i64; 16],
+    offsets: &[i64; 16],
+) -> [usize; 16] {
     let s0 = tokens[p] as i64;
-    let s1 = if p >= 1 && tokens[p - 1] != EOS { tokens[p - 1] } else { EOS } as i64;
-    let s2 = if p >= 2 && tokens[p - 1] != EOS && tokens[p - 2] != EOS { tokens[p - 2] } else { EOS } as i64;
+    let s1 = if p >= 1 && tokens[p - 1] != EOS {
+        tokens[p - 1]
+    } else {
+        EOS
+    } as i64;
+    let s2 = if p >= 2 && tokens[p - 1] != EOS && tokens[p - 2] != EOS {
+        tokens[p - 2]
+    } else {
+        EOS
+    } as i64;
     let bigram = s0.wrapping_mul(mult[0]) ^ s1.wrapping_mul(mult[1]);
     let trigram = bigram ^ s2.wrapping_mul(mult[2]);
     std::array::from_fn(|j| {
@@ -679,12 +977,20 @@ struct StepLayout {
     bytes: usize,
 }
 
+/// The most sequences a batched step takes (the step block's header holds each one's start).
+pub const MAX_SEGMENTS: usize = 8;
+
 impl StepLayout {
     fn new(max_tokens: usize) -> Self {
-        let tokens = 16;
+        let tokens = 4 * MAX_SEGMENTS;
         let pos = tokens + 4 * max_tokens;
         let ple = (pos + 12 * max_tokens).div_ceil(16) * 16;
-        Self { tokens, pos, ple, bytes: ple + 2 * D * max_tokens }
+        Self {
+            tokens,
+            pos,
+            ple,
+            bytes: ple + 2 * D * max_tokens,
+        }
     }
 
     /// Bytes to transfer for a step of `t` tokens.
@@ -695,17 +1001,34 @@ impl StepLayout {
 
 /// Fills the pinned step block for `new_tokens` (appending them to `state`): start position, token
 /// IDs, positions, and the PLE rows gathered from the host table. Returns the bytes to transfer.
-pub fn prepare(model: &Model, state: &mut SequenceState, ws: &mut Workspace, new_tokens: &[i32]) -> Result<usize> {
+pub fn prepare(
+    model: &Model,
+    state: &mut SequenceState,
+    ws: &mut Workspace,
+    new_tokens: &[i32],
+) -> Result<usize> {
     prepare_tokens(state, ws, new_tokens)?;
     prepare_ple(model, state, ws, new_tokens.len())
 }
 
 /// First half of [`prepare`]: start position, token IDs and positions (appends to `state`).
-pub fn prepare_tokens(state: &mut SequenceState, ws: &mut Workspace, new_tokens: &[i32]) -> Result<()> {
+pub fn prepare_tokens(
+    state: &mut SequenceState,
+    ws: &mut Workspace,
+    new_tokens: &[i32],
+) -> Result<()> {
     let t = new_tokens.len();
     let start = state.len();
-    ensure!(t > 0 && t <= ws.max_tokens, "step of {t} tokens exceeds the workspace ({})", ws.max_tokens);
-    ensure!(start + t <= state.capacity, "sequence would exceed its capacity of {}", state.capacity);
+    ensure!(
+        t > 0 && t <= ws.max_tokens,
+        "step of {t} tokens exceeds the workspace ({})",
+        ws.max_tokens
+    );
+    ensure!(
+        start + t <= state.capacity,
+        "sequence would exceed its capacity of {}",
+        state.capacity
+    );
     state.tokens.extend_from_slice(new_tokens);
     let layout = StepLayout::new(t);
     let block = ws.step_host.as_mut_slice();
@@ -723,7 +1046,12 @@ pub fn prepare_tokens(state: &mut SequenceState, ws: &mut Workspace, new_tokens:
 
 /// Second half of [`prepare`]: gathers the PLE rows of the last `t` tokens of `state`. Returns the bytes
 /// of step block to transfer.
-pub fn prepare_ple(model: &Model, state: &SequenceState, ws: &mut Workspace, t: usize) -> Result<usize> {
+pub fn prepare_ple(
+    model: &Model,
+    state: &SequenceState,
+    ws: &mut Workspace,
+    t: usize,
+) -> Result<usize> {
     let layout = StepLayout::new(t);
     let region = &mut ws.step_host.as_mut_slice()[layout.ple..layout.ple + 2 * D * t];
     gather_ple(model, state, t, 0, region);
@@ -737,7 +1065,17 @@ fn gather_ple(model: &Model, state: &SequenceState, t: usize, j0: usize, out: &m
     let ple = model.layers[1].ple.as_ref().expect("layer 1 has PLE");
     let gather = |j0: usize, out: &mut [u8]| {
         let n = out.len() / (2 * D);
-        let row_ids: Vec<[usize; 16]> = (j0..j0 + n).map(|j| ple_rows(&state.tokens, start + j, &ple.multipliers, &ple.sizes, &ple.offsets)).collect();
+        let row_ids: Vec<[usize; 16]> = (j0..j0 + n)
+            .map(|j| {
+                ple_rows(
+                    &state.tokens,
+                    start + j,
+                    &ple.multipliers,
+                    &ple.sizes,
+                    &ple.offsets,
+                )
+            })
+            .collect();
         for ids in &row_ids {
             for &r in ids {
                 model.ple_table.prefetch(r);
@@ -781,22 +1119,38 @@ fn upload_ple(model: &Model, state: &SequenceState, ws: &mut Workspace, t: usize
         let n = PIECE.min(t - j0);
         let (o, len) = (layout.ple + 2 * D * j0, 2 * D * n);
         gather_ple(model, state, t, j0, &mut host[o..o + len]);
-        unsafe { ws.side.copy_h2d(ws.step + o as u64, host.as_ptr().add(o), len)? };
+        unsafe {
+            ws.side
+                .copy_h2d(ws.step + o as u64, host.as_ptr().add(o), len)?
+        };
     }
     ws.join.record(&ws.side)
 }
 
-/// Prepares a batched decode step: token `tokens[b]` for sequence `states[b]` (at most 4 sequences).
+/// Prepares a batched decode step: token `tokens[b]` for sequence `states[b]` (at most
+/// [`MAX_SEGMENTS`] sequences).
 /// Writes each sequence's start at word b of the step block, then tokens, positions and PLE rows per row.
-pub fn prepare_batch(model: &Model, states: &mut [&mut SequenceState], ws: &mut Workspace, tokens: &[i32]) -> Result<usize> {
+pub fn prepare_batch(
+    model: &Model,
+    states: &mut [&mut SequenceState],
+    ws: &mut Workspace,
+    tokens: &[i32],
+) -> Result<usize> {
     let b = states.len();
-    ensure!(b >= 1 && b <= 4 && tokens.len() == b && b <= ws.max_tokens, "batch of {b} sequences");
+    ensure!(
+        (1..=MAX_SEGMENTS).contains(&b) && tokens.len() == b && b <= ws.max_tokens,
+        "batch of {b} sequences"
+    );
     let layout = StepLayout::new(b);
     let ple = model.layers[1].ple.as_ref().expect("layer 1 has PLE");
     let mut rows = Vec::with_capacity(D);
     for (j, (st, &tok)) in states.iter_mut().zip(tokens).enumerate() {
         let p = st.len();
-        ensure!(p < st.capacity, "sequence would exceed its capacity of {}", st.capacity);
+        ensure!(
+            p < st.capacity,
+            "sequence would exceed its capacity of {}",
+            st.capacity
+        );
         st.tokens.push(tok);
         let block = ws.step_host.as_mut_slice();
         block[4 * j..4 * j + 4].copy_from_slice(&(p as i32).to_le_bytes());
@@ -822,8 +1176,21 @@ pub fn prepare_batch(model: &Model, states: &mut [&mut SequenceState], ws: &mut 
 /// Runs a step prepared by [`prepare_batch`] on the device (capturable): one token per sequence, the
 /// weight-bound operations batched over the rows, stateful ones per sequence. `ws.out` row b holds
 /// sequence b's final mixer output.
-pub fn forward_batch(model: &Model, states: &[&SequenceState], ws: &Workspace, s: &Stream, bytes: usize) -> Result<()> {
-    let segs: Vec<Seg> = states.iter().map(|&state| Seg { state, rows: 1, defer: None }).collect();
+pub fn forward_batch(
+    model: &Model,
+    states: &[&SequenceState],
+    ws: &Workspace,
+    s: &Stream,
+    bytes: usize,
+) -> Result<()> {
+    let segs: Vec<Seg> = states
+        .iter()
+        .map(|&state| Seg {
+            state,
+            rows: 1,
+            defer: None,
+        })
+        .collect();
     forward_segments(model, &segs, ws, s, bytes, Part::Whole)
 }
 
@@ -848,28 +1215,59 @@ fn seg_rows(segs: &[Seg]) -> (Vec<usize>, usize) {
     (r, t)
 }
 
-/// Runs a batched step over segments (at most 4 sequences, capturable): the step block holds each
+/// Runs a batched step over segments (at most [`MAX_SEGMENTS`] sequences, capturable): the step block holds each
 /// segment's start at word b and its rows' tokens, positions and PLE rows in segment order (see
 /// [`prepare_segments`]). Weight-bound operations run over all rows, stateful ones per segment.
 /// `part` splits the step around PLE as in [`forward_part`].
-pub fn forward_segments(model: &Model, segs: &[Seg], ws: &Workspace, s: &Stream, bytes: usize, part: Part) -> Result<()> {
+pub fn forward_segments(
+    model: &Model,
+    segs: &[Seg],
+    ws: &Workspace,
+    s: &Stream,
+    bytes: usize,
+    part: Part,
+) -> Result<()> {
     let (offsets, t) = seg_rows(segs);
-    ensure!((1..=4).contains(&segs.len()) && t <= ws.max_tokens, "batch of {} segments, {t} rows", segs.len());
+    ensure!(
+        (1..=MAX_SEGMENTS).contains(&segs.len()) && t <= ws.max_tokens,
+        "batch of {} segments, {t} rows",
+        segs.len()
+    );
     let layout = StepLayout::new(t);
     match part {
         Part::Whole => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? },
         Part::BeforePle => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), layout.ple)? },
-        Part::FromPle => unsafe { s.copy_h2d(ws.step + layout.ple as u64, ws.step_host.as_ptr().add(layout.ple), bytes - layout.ple)? },
+        Part::FromPle => unsafe {
+            s.copy_h2d(
+                ws.step + layout.ple as u64,
+                ws.step_host.as_ptr().add(layout.ple),
+                bytes - layout.ple,
+            )?
+        },
         Part::Staged => {}
     }
     let from_ple = matches!(part, Part::FromPle | Part::Staged);
     if !from_ple {
         for (b, (g, &r)) in segs.iter().zip(&offsets).enumerate() {
-            k::store_positions(s, ws.step + (layout.pos + 12 * r) as u64, g.state.pos3.addr(), ws.step + 4 * b as u64, g.rows)?;
+            k::store_positions(
+                s,
+                ws.step + (layout.pos + 12 * r) as u64,
+                g.state.pos3.addr(),
+                ws.step + 4 * b as u64,
+                g.rows,
+            )?;
         }
         k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h)?;
     }
-    let steer = model.steering.as_ref().map(|p| (p.directions.addr(), p.ranks.addr(), p.masks.addr(), p.norm_preserve, 0));
+    let steer = model.steering.as_ref().map(|p| {
+        (
+            p.directions.addr(),
+            p.ranks.addr(),
+            p.masks.addr(),
+            p.norm_preserve,
+            0,
+        )
+    });
     let ctx = LayerCtx {
         ws,
         s,
@@ -881,6 +1279,7 @@ pub fn forward_segments(model: &Model, segs: &[Seg], ws: &Workspace, s: &Stream,
         ple_state: 0,
         spec: None,
         steer,
+        adapter: model.adapter.as_ref().map(|a| (a, 0)),
         batch: Some(segs),
         capture: None,
         taps: ws.taps,
@@ -892,7 +1291,16 @@ pub fn forward_segments(model: &Model, segs: &[Seg], ws: &Workspace, s: &Stream,
         Part::FromPle | Part::Staged => 1..model.layers.len(),
     };
     for i in layers {
-        layer_forward(i, &model.layers[i], None, None, None, &ctx, &mut carry, None)?;
+        layer_forward(
+            i,
+            &model.layers[i],
+            None,
+            None,
+            None,
+            &ctx,
+            &mut carry,
+            None,
+        )?;
     }
     if part == Part::BeforePle {
         carry.materialize(s, ws, t)?;
@@ -903,19 +1311,34 @@ pub fn forward_segments(model: &Model, segs: &[Seg], ws: &Workspace, s: &Stream,
 
 /// First half of [`prepare_segments`]: segment b's start at word b, then its tokens and positions
 /// (appended to each state).
-pub fn prepare_segments_tokens(states: &mut [&mut SequenceState], ws: &mut Workspace, tokens: &[&[i32]]) -> Result<()> {
+pub fn prepare_segments_tokens(
+    states: &mut [&mut SequenceState],
+    ws: &mut Workspace,
+    tokens: &[&[i32]],
+) -> Result<()> {
     let t: usize = tokens.iter().map(|x| x.len()).sum();
-    ensure!((1..=4).contains(&states.len()) && tokens.len() == states.len() && t <= ws.max_tokens, "batch of {} segments, {t} rows", states.len());
+    ensure!(
+        (1..=MAX_SEGMENTS).contains(&states.len())
+            && tokens.len() == states.len()
+            && t <= ws.max_tokens,
+        "batch of {} segments, {t} rows",
+        states.len()
+    );
     let layout = StepLayout::new(t);
     let block = ws.step_host.as_mut_slice();
     let mut r = 0;
     for (b, (st, toks)) in states.iter_mut().zip(tokens).enumerate() {
         let p = st.len();
-        ensure!(!toks.is_empty() && p + toks.len() <= st.capacity, "sequence would exceed its capacity of {}", st.capacity);
+        ensure!(
+            !toks.is_empty() && p + toks.len() <= st.capacity,
+            "sequence would exceed its capacity of {}",
+            st.capacity
+        );
         st.tokens.extend_from_slice(toks);
         block[4 * b..4 * b + 4].copy_from_slice(&(p as i32).to_le_bytes());
         for (j, tok) in toks.iter().enumerate() {
-            block[layout.tokens + 4 * (r + j)..layout.tokens + 4 * (r + j) + 4].copy_from_slice(&tok.to_le_bytes());
+            block[layout.tokens + 4 * (r + j)..layout.tokens + 4 * (r + j) + 4]
+                .copy_from_slice(&tok.to_le_bytes());
             let pos = st.position(p + j);
             for a in 0..3 {
                 let o = layout.pos + 12 * (r + j) + 4 * a;
@@ -929,13 +1352,24 @@ pub fn prepare_segments_tokens(states: &mut [&mut SequenceState], ws: &mut Works
 
 /// Second half of [`prepare_segments`]: the PLE rows of each segment's last `rows[b]` tokens. Returns
 /// the bytes of step block to transfer.
-pub fn prepare_segments_ple(model: &Model, states: &[&SequenceState], ws: &mut Workspace, rows: &[usize]) -> Result<usize> {
+pub fn prepare_segments_ple(
+    model: &Model,
+    states: &[&SequenceState],
+    ws: &mut Workspace,
+    rows: &[usize],
+) -> Result<usize> {
     let t: usize = rows.iter().sum();
     let layout = StepLayout::new(t);
     let mut r = 0;
     for (st, &n) in states.iter().zip(rows) {
         let o = layout.ple + 2 * D * r;
-        gather_ple(model, st, n, 0, &mut ws.step_host.as_mut_slice()[o..o + 2 * D * n]);
+        gather_ple(
+            model,
+            st,
+            n,
+            0,
+            &mut ws.step_host.as_mut_slice()[o..o + 2 * D * n],
+        );
         r += n;
     }
     Ok(layout.used(t))
@@ -948,16 +1382,58 @@ pub fn segments_bytes(t: usize) -> usize {
 
 /// Commits a speculative sequence's deferred recurrent state (the accepted tokens of its last round,
 /// recorded but not yet applied) so that it can continue with plain steps.
-pub fn flush_spec(model: &Model, state: &mut SequenceState, ws: &Workspace, s: &Stream) -> Result<()> {
-    let Some(sp) = state.spec.as_ref() else { return Ok(()) };
+pub fn flush_spec(
+    model: &Model,
+    state: &mut SequenceState,
+    ws: &Workspace,
+    s: &Stream,
+) -> Result<()> {
+    let Some(sp) = state.spec.as_ref() else {
+        return Ok(());
+    };
     for (i, layer) in model.layers.iter().enumerate() {
-        if let (Block::Gdn(g), Some(st), Some(rec)) = (&layer.block, state.gdn[i].as_ref(), sp.gdn_rec[i].as_ref()) {
-            let flush = k::Deferral { rec: rec.addr(), ctl: sp.ctl.addr(), defer: false };
-            k::gdn_fused_small(s, ws.proj, g.proj.n, 0, g.conv, st.conv.addr(), st.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, Some(flush))?;
+        if let (Block::Gdn(g), Some(st), Some(rec)) =
+            (&layer.block, state.gdn[i].as_ref(), sp.gdn_rec[i].as_ref())
+        {
+            let flush = k::Deferral {
+                rec: rec.addr(),
+                ctl: sp.ctl.addr(),
+                defer: false,
+            };
+            k::gdn_fused_small(
+                s,
+                ws.proj,
+                g.proj.n,
+                0,
+                g.conv,
+                st.conv.addr(),
+                st.recurrent.addr(),
+                g.a_log,
+                g.dt_bias,
+                g.norm,
+                g.proj.col(1),
+                g.proj.col(2),
+                g.proj.col(3),
+                ws.o_bf,
+                Some(flush),
+            )?;
         }
         if let Some(ple) = &layer.ple {
-            let flush = k::Deferral { rec: sp.ple_rec.addr(), ctl: sp.ctl.addr(), defer: false };
-            k::ple_conv(s, ws.gv, ws.xn, ple.conv, state.ple_conv.addr(), ws.h, 0, Some(flush))?;
+            let flush = k::Deferral {
+                rec: sp.ple_rec.addr(),
+                ctl: sp.ctl.addr(),
+                defer: false,
+            };
+            k::ple_conv(
+                s,
+                ws.gv,
+                ws.xn,
+                ple.conv,
+                state.ple_conv.addr(),
+                ws.h,
+                0,
+                Some(flush),
+            )?;
         }
     }
     // Nothing left to replay.
@@ -979,19 +1455,41 @@ pub struct BatchGraph {
 }
 
 impl BatchGraph {
-    pub fn capture(model: &Model, states: &[&SequenceState], ws: &Workspace, hw: &HeadWorkspace, s: &Stream, out: u64) -> Result<Self> {
+    pub fn capture(
+        model: &Model,
+        states: &[&SequenceState],
+        ws: &Workspace,
+        hw: &HeadWorkspace,
+        s: &Stream,
+        out: u64,
+    ) -> Result<Self> {
         let bytes = StepLayout::new(states.len()).used(states.len());
         let graph = quench6k_cuda::Graph::capture(s, |s| {
             forward_batch(model, states, ws, s, bytes)?;
             head_argmax_into(model, hw, s, ws.out, states.len(), out)
         })?;
-        Ok(Self { graph, bytes, rows: states.len() })
+        Ok(Self {
+            graph,
+            bytes,
+            rows: states.len(),
+        })
     }
 
     /// One step: `tokens[b]` for `states[b]` (the captured sequences, in order); the next greedy tokens
     /// are in `out` after the stream synchronizes.
-    pub fn step(&self, model: &Model, states: &mut [&mut SequenceState], ws: &mut Workspace, s: &Stream, tokens: &[i32]) -> Result<()> {
-        ensure!(states.len() == self.rows, "graph captured for {} sequences", self.rows);
+    pub fn step(
+        &self,
+        model: &Model,
+        states: &mut [&mut SequenceState],
+        ws: &mut Workspace,
+        s: &Stream,
+        tokens: &[i32],
+    ) -> Result<()> {
+        ensure!(
+            states.len() == self.rows,
+            "graph captured for {} sequences",
+            self.rows
+        );
         let bytes = prepare_batch(model, states, ws, tokens)?;
         ensure!(bytes == self.bytes, "step layout changed");
         self.graph.launch(s)
@@ -1001,7 +1499,15 @@ impl BatchGraph {
 /// Runs the step prepared by [`prepare`] (`t` tokens, `bytes` of step block) entirely on the device:
 /// no host synchronization, so it can be captured into a CUDA graph. Afterwards `ws.out` holds the final
 /// mixer output, BF16 [T, D].
-pub fn forward_device(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, bytes: usize, prof: Option<&mut Profiler>) -> Result<()> {
+pub fn forward_device(
+    model: &Model,
+    state: &SequenceState,
+    ws: &Workspace,
+    s: &Stream,
+    t: usize,
+    bytes: usize,
+    prof: Option<&mut Profiler>,
+) -> Result<()> {
     forward_part(model, state, ws, s, t, bytes, Part::Whole, false, prof)
 }
 
@@ -1019,28 +1525,94 @@ pub enum Part {
 #[allow(clippy::too_many_arguments)]
 /// With `defer` (speculative verification, needs `state.spec`), the recurrent layers record this step's
 /// tokens instead of committing them; see [`Spec`].
-pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, bytes: usize, part: Part, defer: bool, mut prof: Option<&mut Profiler>) -> Result<()> {
+pub fn forward_part(
+    model: &Model,
+    state: &SequenceState,
+    ws: &Workspace,
+    s: &Stream,
+    t: usize,
+    bytes: usize,
+    part: Part,
+    defer: bool,
+    mut prof: Option<&mut Profiler>,
+) -> Result<()> {
     let layout = StepLayout::new(t);
     match part {
         Part::Whole => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), bytes)? },
         Part::BeforePle => unsafe { s.copy_h2d(ws.step, ws.step_host.as_ptr(), layout.ple)? },
-        Part::FromPle => unsafe { s.copy_h2d(ws.step + layout.ple as u64, ws.step_host.as_ptr().add(layout.ple), bytes - layout.ple)? },
+        Part::FromPle => unsafe {
+            s.copy_h2d(
+                ws.step + layout.ple as u64,
+                ws.step_host.as_ptr().add(layout.ple),
+                bytes - layout.ple,
+            )?
+        },
         Part::Staged => {}
     }
     let from_ple = matches!(part, Part::FromPle | Part::Staged);
-    let spec = state.spec.as_ref().map(|sp| (sp.ctl.addr(), sp.ple_rec.addr(), defer));
-    let steer = model.steering.as_ref().map(|p| (p.directions.addr(), p.ranks.addr(), p.masks.addr(), p.norm_preserve, state.steer_strength.addr()));
+    let spec = state
+        .spec
+        .as_ref()
+        .map(|sp| (sp.ctl.addr(), sp.ple_rec.addr(), defer));
+    let steer = model.steering.as_ref().map(|p| {
+        (
+            p.directions.addr(),
+            p.ranks.addr(),
+            p.masks.addr(),
+            p.norm_preserve,
+            state.steer_strength.addr(),
+        )
+    });
     let first = state.len() - t;
-    let capture = ws.capture.filter(|c| c.pos >= first && c.pos < first + t).map(|c| (c.buf, c.pos - first));
-    let ctx = LayerCtx { ws, s, t, start: ws.step, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: ws.step + layout.ple as u64, ple_state: state.ple_conv.addr(), spec, steer, batch: None, capture, taps: ws.taps };
+    let capture = ws
+        .capture
+        .filter(|c| c.pos >= first && c.pos < first + t)
+        .map(|c| (c.buf, c.pos - first));
+    let ctx = LayerCtx {
+        ws,
+        s,
+        t,
+        start: ws.step,
+        pos3: state.pos3.addr(),
+        capacity: state.capacity,
+        ple_rows: ws.step + layout.ple as u64,
+        ple_state: state.ple_conv.addr(),
+        spec,
+        steer,
+        adapter: model
+            .adapter
+            .as_ref()
+            .map(|a| (a, state.adapter_scale.addr())),
+        batch: None,
+        capture,
+        taps: ws.taps,
+    };
     if !from_ple {
-        op!(prof, "store_positions", s, k::store_positions(s, ws.step + layout.pos as u64, ctx.pos3, ctx.start, t));
-        op!(prof, "embed", s, k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h));
+        op!(
+            prof,
+            "store_positions",
+            s,
+            k::store_positions(s, ws.step + layout.pos as u64, ctx.pos3, ctx.start, t)
+        );
+        op!(
+            prof,
+            "embed",
+            s,
+            k::embed(s, ws.step + layout.tokens as u64, t, model.embed, ws.h)
+        );
         for sp in &state.mm {
             let (a, b) = (sp.start.max(first), (sp.start + sp.len()).min(first + t));
             if a < b {
-                let emb = sp.emb.as_ref().ok_or_else(|| anyhow::anyhow!("image span at {} was not encoded", sp.start))?;
-                k::embed_rows(s, emb.addr() + ((sp.row + a - sp.start) * D * 4) as u64, b - a, ws.h + ((a - first) * H * 4) as u64)?;
+                let emb = sp
+                    .emb
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("image span at {} was not encoded", sp.start))?;
+                k::embed_rows(
+                    s,
+                    emb.addr() + ((sp.row + a - sp.start) * D * 4) as u64,
+                    b - a,
+                    ws.h + ((a - first) * H * 4) as u64,
+                )?;
             }
         }
     }
@@ -1053,12 +1625,19 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
     };
     // Small batches (decode, verify rounds): optionally prefetch the next layer's static weights into L2
     // on a side stream while this layer runs (kbench variant l2.prefetch = MiB per layer, 0: off).
-    let prefetch_mib = if t <= k::gemv_max_m() { quench6k_cuda::variants::get("l2.prefetch", 0) } else { 0 };
+    let prefetch_mib = if t <= k::gemv_max_m() {
+        quench6k_cuda::variants::get("l2.prefetch", 0)
+    } else {
+        0
+    };
     let mut forked = false;
     for i in layers {
         if prefetch_mib > 0 && i + 1 < model.layers.len() && i + 1 < ws.prefetch.len() {
             let (list, prefix) = &ws.prefetch[i + 1];
-            let n = prefix.iter().take_while(|&&b| b <= (prefetch_mib as u64) << 20).count();
+            let n = prefix
+                .iter()
+                .take_while(|&&b| b <= (prefetch_mib as u64) << 20)
+                .count();
             if n > 0 {
                 ws.fork.record(s)?;
                 ws.side.wait(&ws.fork)?;
@@ -1066,8 +1645,20 @@ pub fn forward_part(model: &Model, state: &SequenceState, ws: &Workspace, s: &St
                 forked = true;
             }
         }
-        let rec = state.spec.as_ref().and_then(|sp| sp.gdn_rec[i].as_ref().map(|b| b.addr()));
-        layer_forward(i, &model.layers[i], state.gdn[i].as_ref(), rec, state.qsa[i].as_ref(), &ctx, &mut carry, prof.as_deref_mut())?;
+        let rec = state
+            .spec
+            .as_ref()
+            .and_then(|sp| sp.gdn_rec[i].as_ref().map(|b| b.addr()));
+        layer_forward(
+            i,
+            &model.layers[i],
+            state.gdn[i].as_ref(),
+            rec,
+            state.qsa[i].as_ref(),
+            &ctx,
+            &mut carry,
+            prof.as_deref_mut(),
+        )?;
     }
     if forked {
         ws.join.record(&ws.side)?;
@@ -1088,7 +1679,9 @@ fn layer_weight_ranges(layer: &crate::model::Layer) -> Vec<(u64, u64)> {
         let n = (l.n * l.k) as u64;
         match l.fmt {
             k::WeightFormat::Bf16 => v.push((l.addr, 2 * n)),
-            k::WeightFormat::Int8Group => v.extend([(l.addr, n), (l.scale, n / k::int8_group() as u64 * 4)]),
+            k::WeightFormat::Int8Group => {
+                v.extend([(l.addr, n), (l.scale, n / k::int8_group() as u64 * 4)])
+            }
             k::WeightFormat::Mxfp8 => v.extend([(l.addr, n), (l.scale, n / 32)]),
         }
     }
@@ -1134,6 +1727,9 @@ struct LayerCtx<'a> {
     spec: Option<(u64, u64, bool)>,
     /// Steering: (directions, ranks, masks, norm_preserve, strength) when the model has a pack.
     steer: Option<(u64, u64, u64, bool, u64)>,
+    /// The sequence's adapter scale (device f32) when the model has an adapter; batched steps read
+    /// each segment's own.
+    adapter: Option<(&'a crate::adapter::Adapter, u64)>,
     /// Batched decode: row b is the next token of sequence b (with its start position at
     /// `start + 4 b`); stateful operations run per sequence.
     batch: Option<&'a [Seg<'a>]>,
@@ -1158,7 +1754,12 @@ struct Carry {
 
 impl Carry {
     fn new(ws: &Workspace, after_layer0: bool) -> Self {
-        Self { pending: if after_layer0 { Some(ws.y) } else { None }, moe: None, inj: ws.inj, inj_next: ws.inj2 }
+        Self {
+            pending: if after_layer0 { Some(ws.y) } else { None },
+            moe: None,
+            inj: ws.inj,
+            inj_next: ws.inj2,
+        }
     }
 
     /// Turns a pending MoE combine into ws.y.
@@ -1171,20 +1772,116 @@ impl Carry {
     }
 }
 
-fn final_mixer(hc: &Hc, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>) -> Result<()> {
+/// The model's rank-1 adapter on layer `index`'s output projection (input `x` BF16 with row stride
+/// `ldx`, output `ws.y`), with the sequence's scale (each segment's own in a batched step).
+fn adapt(
+    ctx: &LayerCtx,
+    index: usize,
+    x: u64,
+    ldx: usize,
+    t: usize,
+    mut prof: Option<&mut Profiler>,
+) -> Result<()> {
+    let Some((adapter, scale)) = ctx.adapter else {
+        return Ok(());
+    };
+    let Some((a, b)) = adapter.layers.get(index).and_then(Option::as_ref) else {
+        return Ok(());
+    };
+    let (s, ws) = (ctx.s, ctx.ws);
+    match ctx.batch {
+        None => op!(
+            prof,
+            "adapter",
+            s,
+            k::adapter_rank1(
+                s,
+                x,
+                ldx,
+                crate::adapter::K,
+                t,
+                ws.y,
+                a.addr(),
+                b.addr(),
+                scale
+            )
+        ),
+        Some(segs) => {
+            let mut r = 0;
+            for g in segs {
+                op!(
+                    prof,
+                    "adapter",
+                    s,
+                    k::adapter_rank1(
+                        s,
+                        x + (r * ldx * 2) as u64,
+                        ldx,
+                        crate::adapter::K,
+                        g.rows,
+                        ws.y + (r * D * 4) as u64,
+                        a.addr(),
+                        b.addr(),
+                        g.state.adapter_scale.addr()
+                    )
+                );
+                r += g.rows;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn final_mixer(
+    hc: &Hc,
+    ctx: &LayerCtx,
+    carry: &mut Carry,
+    mut prof: Option<&mut Profiler>,
+) -> Result<()> {
     let (ws, s, t) = (ctx.ws, ctx.s, ctx.t);
     if t <= k::gemv_max_m() {
-        op!(prof, "hc_small", s, hyper_connection_small(s, ws, hc, t, carry.pending.take().map(|y| (y, carry.inj)), carry.inj_next, ws.out));
+        op!(
+            prof,
+            "hc_small",
+            s,
+            hyper_connection_small(
+                s,
+                ws,
+                hc,
+                t,
+                carry.pending.take().map(|y| (y, carry.inj)),
+                carry.inj_next,
+                ws.out
+            )
+        );
         Ok(())
     } else {
-        hyper_connection(s, ws, hc, t, carry.pending.take(), carry.moe.take(), ws.out, prof)
+        hyper_connection(
+            s,
+            ws,
+            hc,
+            t,
+            carry.pending.take(),
+            carry.moe.take(),
+            ws.out,
+            prof,
+        )
     }
 }
 
 /// One decoder layer (SPEC §3) over the step's tokens, with the layer's own GDN or QSA state.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnState>, gdn_rec: Option<u64>, qsa: Option<&QsaCache>, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>) -> Result<()> {
+fn layer_forward(
+    index: usize,
+    layer: &crate::model::Layer,
+    gdn: Option<&GdnState>,
+    gdn_rec: Option<u64>,
+    qsa: Option<&QsaCache>,
+    ctx: &LayerCtx,
+    carry: &mut Carry,
+    mut prof: Option<&mut Profiler>,
+) -> Result<()> {
     let (ws, s, t, start, pos3) = (ctx.ws, ctx.s, ctx.t, ctx.start, ctx.pos3);
     let small = t <= k::gemv_max_m();
     // DFlash features: the completed output of a tapped layer is this layer's residual input.
@@ -1193,30 +1890,100 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
     {
         carry.materialize(s, ws, t)?;
         if let Some(y) = carry.pending.take() {
-            op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, carry.inj, t));
+            op!(
+                prof,
+                "hc_combine",
+                s,
+                k::hc_combine(s, ws.h, y, carry.inj, t)
+            );
         }
-        op!(prof, "dflash_tap", s, k::dflash_tap(s, ws.h + (tp.first * H * 4) as u64, tp.rows, tp.buf, j));
+        op!(
+            prof,
+            "dflash_tap",
+            s,
+            k::dflash_tap(s, ws.h + (tp.first * H * 4) as u64, tp.rows, tp.buf, j)
+        );
     }
     if let Some(ple) = &layer.ple {
         carry.materialize(s, ws, t)?;
         if let Some(y) = carry.pending.take() {
-            op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, carry.inj, t));
+            op!(
+                prof,
+                "hc_combine",
+                s,
+                k::hc_combine(s, ws.h, y, carry.inj, t)
+            );
         }
-        op!(prof, "ple.key", s, linear(s, ws, ctx.ple_rows, &ple.key, ws.kp, t));
-        op!(prof, "ple.value", s, linear(s, ws, ctx.ple_rows, &ple.value, ws.pv, t));
-        op!(prof, "ple_gate", s, k::ple_gate(s, ws.kp, ws.h, ws.pv, ple.norm_key, ple.norm_query, ple.norm_conv, ws.gv, ws.xn, t));
-        let spec = ctx.spec.map(|(ctl, rec, defer)| k::Deferral { rec, ctl, defer });
+        op!(
+            prof,
+            "ple.key",
+            s,
+            linear(s, ws, ctx.ple_rows, &ple.key, ws.kp, t)
+        );
+        op!(
+            prof,
+            "ple.value",
+            s,
+            linear(s, ws, ctx.ple_rows, &ple.value, ws.pv, t)
+        );
+        op!(
+            prof,
+            "ple_gate",
+            s,
+            k::ple_gate(
+                s,
+                ws.kp,
+                ws.h,
+                ws.pv,
+                ple.norm_key,
+                ple.norm_query,
+                ple.norm_conv,
+                ws.gv,
+                ws.xn,
+                t
+            )
+        );
+        let spec = ctx
+            .spec
+            .map(|(ctl, rec, defer)| k::Deferral { rec, ctl, defer });
         match ctx.batch {
-            None => op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv, ws.xn, ple.conv, ctx.ple_state, ws.h, t, spec)),
+            None => op!(
+                prof,
+                "ple_conv",
+                s,
+                k::ple_conv(s, ws.gv, ws.xn, ple.conv, ctx.ple_state, ws.h, t, spec)
+            ),
             Some(segs) => {
                 let mut r = 0;
                 for g in segs {
                     let row = (r * H * 4) as u64;
                     let spec = g.defer.map(|defer| {
-                        let sp = g.state.spec.as_ref().expect("deferred segment without speculative state");
-                        k::Deferral { rec: sp.ple_rec.addr(), ctl: sp.ctl.addr(), defer }
+                        let sp = g
+                            .state
+                            .spec
+                            .as_ref()
+                            .expect("deferred segment without speculative state");
+                        k::Deferral {
+                            rec: sp.ple_rec.addr(),
+                            ctl: sp.ctl.addr(),
+                            defer,
+                        }
                     });
-                    op!(prof, "ple_conv", s, k::ple_conv(s, ws.gv + row, ws.xn + row, ple.conv, g.state.ple_conv.addr(), ws.h + row, g.rows, spec));
+                    op!(
+                        prof,
+                        "ple_conv",
+                        s,
+                        k::ple_conv(
+                            s,
+                            ws.gv + row,
+                            ws.xn + row,
+                            ple.conv,
+                            g.state.ple_conv.addr(),
+                            ws.h + row,
+                            g.rows,
+                            spec
+                        )
+                    );
                     r += g.rows;
                 }
             }
@@ -1225,38 +1992,113 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
 
     // Steering at the attention-input pre-mix point: the pending block output is committed first
     // (the same FMA the HC kernels would apply), so a zero strength leaves every value unchanged.
-    if let Some((dirs, ranks, masks, norm_preserve, strength)) = ctx.steer.filter(|_| index < LAYERS) {
+    if let Some((dirs, ranks, masks, norm_preserve, strength)) =
+        ctx.steer.filter(|_| index < LAYERS)
+    {
         carry.materialize(s, ws, t)?;
         if let Some(y) = carry.pending.take() {
-            op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, carry.inj, t));
+            op!(
+                prof,
+                "hc_combine",
+                s,
+                k::hc_combine(s, ws.h, y, carry.inj, t)
+            );
         }
         match ctx.batch {
-            None => op!(prof, "steer", s, k::steer(s, ws.h, t, dirs, ranks, masks, norm_preserve, strength, index)),
+            None => op!(
+                prof,
+                "steer",
+                s,
+                k::steer(
+                    s,
+                    ws.h,
+                    t,
+                    dirs,
+                    ranks,
+                    masks,
+                    norm_preserve,
+                    strength,
+                    index
+                )
+            ),
             Some(segs) => {
                 let mut r = 0;
                 for g in segs {
-                    op!(prof, "steer", s, k::steer(s, ws.h + (r * H * 4) as u64, g.rows, dirs, ranks, masks, norm_preserve, g.state.steer_strength.addr(), index));
+                    op!(
+                        prof,
+                        "steer",
+                        s,
+                        k::steer(
+                            s,
+                            ws.h + (r * H * 4) as u64,
+                            g.rows,
+                            dirs,
+                            ranks,
+                            masks,
+                            norm_preserve,
+                            g.state.steer_strength.addr(),
+                            index
+                        )
+                    );
                     r += g.rows;
                 }
             }
         }
     }
-    let rec = ctx.capture.filter(|_| index < LAYERS).map(|(buf, row)| (buf + (index * CaptureLayout::BYTES) as u64, row));
+    let rec = ctx
+        .capture
+        .filter(|_| index < LAYERS)
+        .map(|(buf, row)| (buf + (index * CaptureLayout::BYTES) as u64, row));
     if let Some((buf, row)) = rec {
         carry.materialize(s, ws, t)?;
         if let Some(y) = carry.pending.take() {
-            op!(prof, "hc_combine", s, k::hc_combine(s, ws.h, y, carry.inj, t));
+            op!(
+                prof,
+                "hc_combine",
+                s,
+                k::hc_combine(s, ws.h, y, carry.inj, t)
+            );
         }
-        s.copy_d2d(buf + CaptureLayout::PREMIX as u64, ws.h + (row * H * 4) as u64, H * 4)?;
+        s.copy_d2d(
+            buf + CaptureLayout::PREMIX as u64,
+            ws.h + (row * H * 4) as u64,
+            H * 4,
+        )?;
     }
     if small {
-        op!(prof, "hc_small", s, hyper_connection_small(s, ws, &layer.attn_hc, t, carry.pending.map(|y| (y, carry.inj)), carry.inj_next, ws.m));
+        op!(
+            prof,
+            "hc_small",
+            s,
+            hyper_connection_small(
+                s,
+                ws,
+                &layer.attn_hc,
+                t,
+                carry.pending.map(|y| (y, carry.inj)),
+                carry.inj_next,
+                ws.m
+            )
+        );
         std::mem::swap(&mut carry.inj, &mut carry.inj_next);
     } else {
-        hyper_connection(s, ws, &layer.attn_hc, t, carry.pending.take(), carry.moe.take(), ws.m, prof.as_deref_mut())?;
+        hyper_connection(
+            s,
+            ws,
+            &layer.attn_hc,
+            t,
+            carry.pending.take(),
+            carry.moe.take(),
+            ws.m,
+            prof.as_deref_mut(),
+        )?;
     }
     if let Some((buf, row)) = rec {
-        s.copy_d2d(buf + CaptureLayout::MIX as u64, ws.m + (row * D * 2) as u64, D * 2)?;
+        s.copy_d2d(
+            buf + CaptureLayout::MIX as u64,
+            ws.m + (row * D * 2) as u64,
+            D * 2,
+        )?;
     }
     match &layer.block {
         Block::Gdn(g) => {
@@ -1277,28 +2119,156 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
                     let sg = sgm.state.gdn[index].as_ref().expect("GDN layer state");
                     let (xr, yr) = (x + (r * ld * 4) as u64, ws.o_bf + (r * GDN_Z * 2) as u64);
                     let spec = sgm.defer.map(|defer| {
-                        let sp = sgm.state.spec.as_ref().expect("deferred segment without speculative state");
-                        k::Deferral { rec: sp.gdn_rec[index].as_ref().expect("GDN record buffer").addr(), ctl: sp.ctl.addr(), defer }
+                        let sp = sgm
+                            .state
+                            .spec
+                            .as_ref()
+                            .expect("deferred segment without speculative state");
+                        k::Deferral {
+                            rec: sp.gdn_rec[index]
+                                .as_ref()
+                                .expect("GDN record buffer")
+                                .addr(),
+                            ctl: sp.ctl.addr(),
+                            defer,
+                        }
                     });
-                    op!(prof, "gdn_fused_small", s, k::gdn_fused_small(s, xr, ld, sgm.rows, g.conv, sg.conv.addr(), sg.recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), yr, spec));
+                    op!(
+                        prof,
+                        "gdn_fused_small",
+                        s,
+                        k::gdn_fused_small(
+                            s,
+                            xr,
+                            ld,
+                            sgm.rows,
+                            g.conv,
+                            sg.conv.addr(),
+                            sg.recurrent.addr(),
+                            g.a_log,
+                            g.dt_bias,
+                            g.norm,
+                            g.proj.col(1),
+                            g.proj.col(2),
+                            g.proj.col(3),
+                            yr,
+                            spec
+                        )
+                    );
                     r += sgm.rows;
                 }
             } else if t <= k::gemv_max_m() {
-                op!(prof, "gdn_fused_small", s, k::gdn_fused_small(s, x, ld, t, g.conv, st().conv.addr(), st().recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, spec));
+                op!(
+                    prof,
+                    "gdn_fused_small",
+                    s,
+                    k::gdn_fused_small(
+                        s,
+                        x,
+                        ld,
+                        t,
+                        g.conv,
+                        st().conv.addr(),
+                        st().recurrent.addr(),
+                        g.a_log,
+                        g.dt_bias,
+                        g.norm,
+                        g.proj.col(1),
+                        g.proj.col(2),
+                        g.proj.col(3),
+                        ws.o_bf,
+                        spec
+                    )
+                );
             } else {
                 // The chunked prefill kernels work on committed state: replay any pending records first.
                 if let Some(sp) = spec {
-                    op!(prof, "gdn_flush", s, k::gdn_fused_small(s, x, ld, 0, g.conv, st().conv.addr(), st().recurrent.addr(), g.a_log, g.dt_bias, g.norm, g.proj.col(1), g.proj.col(2), g.proj.col(3), ws.o_bf, Some(k::Deferral { defer: false, ..sp })));
+                    op!(
+                        prof,
+                        "gdn_flush",
+                        s,
+                        k::gdn_fused_small(
+                            s,
+                            x,
+                            ld,
+                            0,
+                            g.conv,
+                            st().conv.addr(),
+                            st().recurrent.addr(),
+                            g.a_log,
+                            g.dt_bias,
+                            g.norm,
+                            g.proj.col(1),
+                            g.proj.col(2),
+                            g.proj.col(3),
+                            ws.o_bf,
+                            Some(k::Deferral { defer: false, ..sp })
+                        )
+                    );
                 }
-                op!(prof, "gdn_conv_prep", s, k::gdn_conv_prep(s, col(0), ld, ws.conv, st().conv.addr(), g.conv, col(2), col(3), ld, g.a_log, g.dt_bias, ws.beta, ws.g, t));
+                op!(
+                    prof,
+                    "gdn_conv_prep",
+                    s,
+                    k::gdn_conv_prep(
+                        s,
+                        col(0),
+                        ld,
+                        ws.conv,
+                        st().conv.addr(),
+                        g.conv,
+                        col(2),
+                        col(3),
+                        ld,
+                        g.a_log,
+                        g.dt_bias,
+                        ws.beta,
+                        ws.g,
+                        t
+                    )
+                );
                 if t >= 64 && gdn_tc() {
-                    op!(prof, "gdn_chunked_tc", s, k::gdn_chunked_tc(s, ws.conv, ws.beta, ws.g, st().recurrent.addr(), ws.o, t, ws.gdn_chunks));
+                    op!(
+                        prof,
+                        "gdn_chunked_tc",
+                        s,
+                        k::gdn_chunked_tc(
+                            s,
+                            ws.conv,
+                            ws.beta,
+                            ws.g,
+                            st().recurrent.addr(),
+                            ws.o,
+                            t,
+                            ws.gdn_chunks
+                        )
+                    );
                 } else {
-                    op!(prof, "gdn_recurrent", s, k::gdn_recurrent(s, ws.conv, ws.beta, ws.g, st().recurrent.addr(), ws.o, t, ws.gdn_chunks));
+                    op!(
+                        prof,
+                        "gdn_recurrent",
+                        s,
+                        k::gdn_recurrent(
+                            s,
+                            ws.conv,
+                            ws.beta,
+                            ws.g,
+                            st().recurrent.addr(),
+                            ws.o,
+                            t,
+                            ws.gdn_chunks
+                        )
+                    );
                 }
-                op!(prof, "gdn_gated_norm", s, k::gdn_gated_norm(s, ws.o, col(1), ld, g.norm, ws.o_bf, t));
+                op!(
+                    prof,
+                    "gdn_gated_norm",
+                    s,
+                    k::gdn_gated_norm(s, ws.o, col(1), ld, g.norm, ws.o_bf, t)
+                );
             }
             op!(prof, "gdn out", s, linear(s, ws, ws.o_bf, &g.out, ws.y, t));
+            adapt(ctx, index, ws.o_bf, GDN_Z, t, prof.as_deref_mut())?;
         }
         Block::Qsa(q) => {
             let (ld, x) = (q.proj.n, ws.proj);
@@ -1309,43 +2279,253 @@ fn layer_forward(index: usize, layer: &crate::model::Layer, gdn: Option<&GdnStat
                 for (b, g) in segs.iter().enumerate() {
                     let (sq, n) = (g.state, g.rows);
                     let c = sq.qsa[index].as_ref().expect("QSA layer cache");
-                    let (row, start_b, pos3_b) = ((r * ld * 4) as u64, start + 4 * b as u64, sq.pos3.addr());
+                    let (row, start_b, pos3_b) =
+                        ((r * ld * 4) as u64, start + 4 * b as u64, sq.pos3.addr());
                     let colr = |j: usize| col(j) + row;
-                    let (qr, iqr) = (ws.q + (r * QSA_HEADS * QSA_DIM * 4) as u64, ws.iq + (r * 4 * INDEX_DIM * 4) as u64);
-                    let (scores, sel) = (ws.scores + (r * ws.score_cols * 4) as u64, ws.sel + (r * TOP_GROUPS * 4) as u64);
+                    let (qr, iqr) = (
+                        ws.q + (r * QSA_HEADS * QSA_DIM * 4) as u64,
+                        ws.iq + (r * 4 * INDEX_DIM * 4) as u64,
+                    );
+                    let (scores, sel) = (
+                        ws.scores + (r * ws.score_cols * 4) as u64,
+                        ws.sel + (r * TOP_GROUPS * 4) as u64,
+                    );
                     let att = ws.att + (r * QSA_HEADS * QSA_DIM * 2) as u64;
-                    op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, colr(0), colr(1), ld, q.q_norm, q.k_norm, qr, c.k.addr(), c.v.addr(), pos3_b, start_b, n, c.fp8));
-                    op!(prof, "qsa_index_prep", s, k::qsa_index_prep(s, colr(3), ld, q.index_q_norm, iqr, c.raw.addr(), pos3_b, start_b, n));
-                    op!(prof, "qsa_pool", s, k::qsa_pool(s, c.raw.addr(), q.index_k_norm, c.pooled.addr(), pos3_b, start_b, n));
+                    op!(
+                        prof,
+                        "qsa_qkv_prep",
+                        s,
+                        k::qsa_qkv_prep(
+                            s,
+                            colr(0),
+                            colr(1),
+                            ld,
+                            q.q_norm,
+                            q.k_norm,
+                            qr,
+                            c.k.addr(),
+                            c.v.addr(),
+                            pos3_b,
+                            start_b,
+                            n,
+                            c.fp8
+                        )
+                    );
+                    op!(
+                        prof,
+                        "qsa_index_prep",
+                        s,
+                        k::qsa_index_prep(
+                            s,
+                            colr(3),
+                            ld,
+                            q.index_q_norm,
+                            iqr,
+                            c.raw.addr(),
+                            pos3_b,
+                            start_b,
+                            n
+                        )
+                    );
+                    op!(
+                        prof,
+                        "qsa_pool",
+                        s,
+                        k::qsa_pool(
+                            s,
+                            c.raw.addr(),
+                            q.index_k_norm,
+                            c.pooled.addr(),
+                            pos3_b,
+                            start_b,
+                            n
+                        )
+                    );
                     if sq.capacity / 4 > TOP_GROUPS {
-                        op!(prof, "qsa_index_scores", s, k::qsa_index_scores(s, iqr, c.pooled.addr(), scores, ws.score_cols, start_b, n));
-                        op!(prof, "qsa_select", s, k::qsa_select(s, scores, n, ws.score_cols, start_b, sel));
+                        op!(
+                            prof,
+                            "qsa_index_scores",
+                            s,
+                            k::qsa_index_scores(
+                                s,
+                                iqr,
+                                c.pooled.addr(),
+                                scores,
+                                ws.score_cols,
+                                start_b,
+                                n
+                            )
+                        );
+                        op!(
+                            prof,
+                            "qsa_select",
+                            s,
+                            k::qsa_select(s, scores, n, ws.score_cols, start_b, sel)
+                        );
                     }
-                    op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, qr, colr(0), ld, c.k.addr(), c.v.addr(), sel, start_b, n, c.fp8, ws.att_part, att));
+                    op!(
+                        prof,
+                        "qsa_attention_split",
+                        s,
+                        k::qsa_attention_split(
+                            s,
+                            qr,
+                            colr(0),
+                            ld,
+                            c.k.addr(),
+                            c.v.addr(),
+                            sel,
+                            start_b,
+                            n,
+                            c.fp8,
+                            ws.att_part,
+                            att
+                        )
+                    );
                     r += n;
                 }
                 op!(prof, "qsa o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
+                adapt(
+                    ctx,
+                    index,
+                    ws.att,
+                    QSA_HEADS * QSA_DIM,
+                    t,
+                    prof.as_deref_mut(),
+                )?;
                 return finish_layer(layer, ctx, carry, prof, None);
             }
             let c = qsa.expect("QSA layer cache");
-            op!(prof, "qsa_qkv_prep", s, k::qsa_qkv_prep(s, col(0), col(1), ld, q.q_norm, q.k_norm, ws.q, c.k.addr(), c.v.addr(), pos3, start, t, c.fp8));
-            op!(prof, "qsa_index_prep", s, k::qsa_index_prep(s, col(3), ld, q.index_q_norm, ws.iq, c.raw.addr(), pos3, start, t));
-            op!(prof, "qsa_pool", s, k::qsa_pool(s, c.raw.addr(), q.index_k_norm, c.pooled.addr(), pos3, start, t));
+            op!(
+                prof,
+                "qsa_qkv_prep",
+                s,
+                k::qsa_qkv_prep(
+                    s,
+                    col(0),
+                    col(1),
+                    ld,
+                    q.q_norm,
+                    q.k_norm,
+                    ws.q,
+                    c.k.addr(),
+                    c.v.addr(),
+                    pos3,
+                    start,
+                    t,
+                    c.fp8
+                )
+            );
+            op!(
+                prof,
+                "qsa_index_prep",
+                s,
+                k::qsa_index_prep(
+                    s,
+                    col(3),
+                    ld,
+                    q.index_q_norm,
+                    ws.iq,
+                    c.raw.addr(),
+                    pos3,
+                    start,
+                    t
+                )
+            );
+            op!(
+                prof,
+                "qsa_pool",
+                s,
+                k::qsa_pool(
+                    s,
+                    c.raw.addr(),
+                    q.index_k_norm,
+                    c.pooled.addr(),
+                    pos3,
+                    start,
+                    t
+                )
+            );
             // Rows whose query sees at most 512 complete groups attend densely and skip selection.
             if ctx.capacity / 4 > TOP_GROUPS {
-                op!(prof, "qsa_index_scores", s, k::qsa_index_scores(s, ws.iq, c.pooled.addr(), ws.scores, ws.score_cols, start, t));
-                op!(prof, "qsa_select", s, k::qsa_select(s, ws.scores, t, ws.score_cols, start, ws.sel));
+                op!(
+                    prof,
+                    "qsa_index_scores",
+                    s,
+                    k::qsa_index_scores(
+                        s,
+                        ws.iq,
+                        c.pooled.addr(),
+                        ws.scores,
+                        ws.score_cols,
+                        start,
+                        t
+                    )
+                );
+                op!(
+                    prof,
+                    "qsa_select",
+                    s,
+                    k::qsa_select(s, ws.scores, t, ws.score_cols, start, ws.sel)
+                );
             }
             if t <= k::gemv_max_m() {
-                op!(prof, "qsa_attention_split", s, k::qsa_attention_split(s, ws.q, col(0), ld, c.k.addr(), c.v.addr(), ws.sel, start, t, c.fp8, ws.att_part, ws.att));
+                op!(
+                    prof,
+                    "qsa_attention_split",
+                    s,
+                    k::qsa_attention_split(
+                        s,
+                        ws.q,
+                        col(0),
+                        ld,
+                        c.k.addr(),
+                        c.v.addr(),
+                        ws.sel,
+                        start,
+                        t,
+                        c.fp8,
+                        ws.att_part,
+                        ws.att
+                    )
+                );
             } else {
-                op!(prof, "qsa_attention", s, k::qsa_attention(s, ws.q, col(0), ld, c.k.addr(), c.v.addr(), ws.sel, start, t, c.fp8, ws.att));
+                op!(
+                    prof,
+                    "qsa_attention",
+                    s,
+                    k::qsa_attention(
+                        s,
+                        ws.q,
+                        col(0),
+                        ld,
+                        c.k.addr(),
+                        c.v.addr(),
+                        ws.sel,
+                        start,
+                        t,
+                        c.fp8,
+                        ws.att
+                    )
+                );
             }
             op!(prof, "qsa o", s, linear(s, ws, ws.att, &q.o, ws.y, t));
+            adapt(
+                ctx,
+                index,
+                ws.att,
+                QSA_HEADS * QSA_DIM,
+                t,
+                prof.as_deref_mut(),
+            )?;
         }
     }
     if let Some((buf, row)) = rec {
-        s.copy_d2d(buf + CaptureLayout::BLOCK as u64, ws.y + (row * D * 4) as u64, D * 4)?;
+        s.copy_d2d(
+            buf + CaptureLayout::BLOCK as u64,
+            ws.y + (row * D * 4) as u64,
+            D * 4,
+        )?;
     }
     finish_layer(layer, ctx, carry, prof, rec)
 }
@@ -1371,18 +2551,51 @@ pub fn fp4_prefill() -> bool {
 /// only, 4: gate/up only (down BF16).
 fn fp4_mode() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QUENCH6K_PREFILL_FP4").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
+    *ON.get_or_init(|| {
+        std::env::var("QUENCH6K_PREFILL_FP4")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    })
 }
 
 /// The second half of a layer: the MLP HyperConnection, the MoE block and its output.
-fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, mut prof: Option<&mut Profiler>, rec: Option<(u64, usize)>) -> Result<()> {
+fn finish_layer(
+    layer: &crate::model::Layer,
+    ctx: &LayerCtx,
+    carry: &mut Carry,
+    mut prof: Option<&mut Profiler>,
+    rec: Option<(u64, usize)>,
+) -> Result<()> {
     let (ws, s, t) = (ctx.ws, ctx.s, ctx.t);
     let small = t <= k::gemv_max_m();
     if small {
-        op!(prof, "hc_small", s, hyper_connection_small(s, ws, &layer.mlp_hc, t, Some((ws.y, carry.inj)), carry.inj_next, ws.m));
+        op!(
+            prof,
+            "hc_small",
+            s,
+            hyper_connection_small(
+                s,
+                ws,
+                &layer.mlp_hc,
+                t,
+                Some((ws.y, carry.inj)),
+                carry.inj_next,
+                ws.m
+            )
+        );
         std::mem::swap(&mut carry.inj, &mut carry.inj_next);
     } else {
-        hyper_connection(s, ws, &layer.mlp_hc, t, Some(ws.y), None, ws.m, prof.as_deref_mut())?;
+        hyper_connection(
+            s,
+            ws,
+            &layer.mlp_hc,
+            t,
+            Some(ws.y),
+            None,
+            ws.m,
+            prof.as_deref_mut(),
+        )?;
     }
     let moe = &layer.moe;
     let (ld, x) = (moe.proj.n, ws.proj);
@@ -1391,40 +2604,166 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
     let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
     // Small batches: the shared expert's SwiGLU and down projection depend only on the projection, so
     // they run on a side stream while the routing (one block) and the routed experts run.
-    let side = t > 1 && t <= k::moe_small_tokens() && quench6k_cuda::variants::get("moe.shared_side", 1) != 0;
+    let side = t > 1
+        && t <= k::moe_small_tokens()
+        && quench6k_cuda::variants::get("moe.shared_side", 1) != 0;
     // FP4 prefill: the routed experts' down projection is written in BF16 (QUENCH6K_YD_BF16=0: FP32).
-    let yd_bf16 = t > k::moe_small_tokens() && matches!(fp4_mode(), 1 | 3) && std::env::var("QUENCH6K_YD_BF16").map_or(true, |v| v != "0");
+    let yd_bf16 = t > k::moe_small_tokens()
+        && matches!(fp4_mode(), 1 | 3)
+        && std::env::var("QUENCH6K_YD_BF16").map_or(true, |v| v != "0");
     if t == 1 {
-        op!(prof, "experts t1", s, k::moe_experts_t1(s, ws.m, col(0), tables(&moe.gate), tables(&moe.up), tables(&moe.down), ws.top_i, ws.top_w, ws.pair_row, ws.act, ws.yd));
+        op!(
+            prof,
+            "experts t1",
+            s,
+            k::moe_experts_t1(
+                s,
+                ws.m,
+                col(0),
+                tables(&moe.gate),
+                tables(&moe.up),
+                tables(&moe.down),
+                ws.top_i,
+                ws.top_w,
+                ws.pair_row,
+                ws.act,
+                ws.yd
+            )
+        );
     } else if t <= k::moe_small_tokens() {
         let max_active = (t * TOP_K).min(EXPERTS);
         if side {
             ws.moe_fork.record(s)?;
             ws.moe_side.wait(&ws.moe_fork)?;
             let ss = &ws.moe_side;
-            op!(prof, "shared swiglu", ss, k::swiglu(ss, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
-            op!(prof, "shared down", ss, linear(ss, ws, ws.sact, &moe.shared_down, ws.sh, t));
+            op!(
+                prof,
+                "shared swiglu",
+                ss,
+                k::swiglu(ss, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t)
+            );
+            op!(
+                prof,
+                "shared down",
+                ss,
+                linear(ss, ws, ws.sact, &moe.shared_down, ws.sh, t)
+            );
             ws.moe_join.record(ss)?;
         }
-        op!(prof, "moe_route_small", s, k::moe_route_small(s, col(0), ld, t, ws.top_i, ws.top_w, ws.offsets, ws.pair_row, ws.row_token, ws.active, ws.num_active));
-        op!(prof, "experts gate_up", s, k::moe_gate_up_small(s, ws.m, ws.row_token, tables(&moe.gate), tables(&moe.up), ws.offsets, ws.active, ws.num_active, max_active, t, ws.act));
-        op!(prof, "experts down", s, k::moe_down_small(s, ws.act, tables(&moe.down), ws.offsets, ws.active, ws.num_active, max_active, t, ws.yd));
+        op!(
+            prof,
+            "moe_route_small",
+            s,
+            k::moe_route_small(
+                s,
+                col(0),
+                ld,
+                t,
+                ws.top_i,
+                ws.top_w,
+                ws.offsets,
+                ws.pair_row,
+                ws.row_token,
+                ws.active,
+                ws.num_active
+            )
+        );
+        op!(
+            prof,
+            "experts gate_up",
+            s,
+            k::moe_gate_up_small(
+                s,
+                ws.m,
+                ws.row_token,
+                tables(&moe.gate),
+                tables(&moe.up),
+                ws.offsets,
+                ws.active,
+                ws.num_active,
+                max_active,
+                t,
+                ws.act
+            )
+        );
+        op!(
+            prof,
+            "experts down",
+            s,
+            k::moe_down_small(
+                s,
+                ws.act,
+                tables(&moe.down),
+                ws.offsets,
+                ws.active,
+                ws.num_active,
+                max_active,
+                t,
+                ws.yd
+            )
+        );
     } else {
-        op!(prof, "moe_route", s, k::moe_route(s, col(0), ld, t, ws.top_i, ws.top_w));
+        op!(
+            prof,
+            "moe_route",
+            s,
+            k::moe_route(s, col(0), ld, t, ws.top_i, ws.top_w)
+        );
         if std::env::var_os("QUENCH6K_CHECK_ROUTE").is_some() {
             let ti: Vec<i32> = s.download(ws.top_i, t * TOP_K)?;
             if let Some(bad) = ti.iter().position(|&e| !(0..EXPERTS as i32).contains(&e)) {
                 let row = bad / TOP_K;
                 let lg: Vec<f32> = s.download(col(0) + (row * ld * 4) as u64, EXPERTS)?;
                 let nan = lg.iter().filter(|v| v.is_nan()).count();
-                eprintln!("bad route: t {t}, row {row}, index {}, logits nan {nan}, first {:?}", ti[bad], &lg[..4]);
+                eprintln!(
+                    "bad route: t {t}, row {row}, index {}, logits nan {nan}, first {:?}",
+                    ti[bad],
+                    &lg[..4]
+                );
             }
         }
-        let tile_rows = if fp4_prefill() && fp4_mode() != 3 { k::fp4_tile_rows() } else { k::moe_tile_rows() };
-        op!(prof, "moe_plan", s, k::moe_plan(s, ws.top_i, t, ws.counts, ws.cursor, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row, tile_rows));
-        let tiles = ws.max_tiles().min((t * TOP_K).div_ceil(tile_rows) + EXPERTS);
+        let tile_rows = if fp4_prefill() && fp4_mode() != 3 {
+            k::fp4_tile_rows()
+        } else {
+            k::moe_tile_rows()
+        };
+        op!(
+            prof,
+            "moe_plan",
+            s,
+            k::moe_plan(
+                s,
+                ws.top_i,
+                t,
+                ws.counts,
+                ws.cursor,
+                ws.offsets,
+                ws.tile_expert,
+                ws.tile_row,
+                ws.num_tiles,
+                ws.pair_row,
+                tile_rows
+            )
+        );
+        let tiles = ws
+            .max_tiles()
+            .min((t * TOP_K).div_ceil(tile_rows) + EXPERTS);
         let grouped = |proj: &crate::model::ExpertProj, x: u64, y: u64, n: usize, kk: usize| {
-            k::moe_nvfp4_gemm(s, x, proj.weights, proj.scales, proj.scale2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, y, n, kk)
+            k::moe_nvfp4_gemm(
+                s,
+                x,
+                proj.weights,
+                proj.scales,
+                proj.scale2,
+                ws.offsets,
+                ws.tile_expert,
+                ws.tile_row,
+                ws.num_tiles,
+                tiles,
+                y,
+                n,
+                kk,
+            )
         };
         let fake_fp4 = std::env::var_os("QUENCH6K_FAKE_FP4").is_some();
         if fp4_prefill() {
@@ -1434,9 +2773,38 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
             let pairs = t * TOP_K;
             let mode = fp4_mode();
             if mode != 3 {
-                op!(prof, "fp4 quant", s, k::fp4_quant_rows(s, ws.m, t, D, ws.yd));
-                op!(prof, "fp4 gather", s, k::fp4_gather(s, ws.yd, t, D, ws.pair_row, ws.xs));
-                op!(prof, "experts gate_up", s, k::moe_fp4_gate_up(s, ws.xs, pairs, tables(&moe.gate), tables(&moe.up), ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, ws.act, EXPERT_WIDTH, D));
+                op!(
+                    prof,
+                    "fp4 quant",
+                    s,
+                    k::fp4_quant_rows(s, ws.m, t, D, ws.yd)
+                );
+                op!(
+                    prof,
+                    "fp4 gather",
+                    s,
+                    k::fp4_gather(s, ws.yd, t, D, ws.pair_row, ws.xs)
+                );
+                op!(
+                    prof,
+                    "experts gate_up",
+                    s,
+                    k::moe_fp4_gate_up(
+                        s,
+                        ws.xs,
+                        pairs,
+                        tables(&moe.gate),
+                        tables(&moe.up),
+                        ws.offsets,
+                        ws.tile_expert,
+                        ws.tile_row,
+                        ws.num_tiles,
+                        tiles,
+                        ws.act,
+                        EXPERT_WIDTH,
+                        D
+                    )
+                );
             } else {
                 k::moe_gather(s, ws.m, ws.pair_row, t, ws.xs)?;
                 k::fake_fp4_act(s, ws.xs, pairs, D)?;
@@ -1444,58 +2812,172 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
                 grouped(&moe.up, ws.xs, ws.eu, EXPERT_WIDTH, D)?;
             }
             if mode == 3 {
-                op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, pairs));
+                op!(
+                    prof,
+                    "swiglu",
+                    s,
+                    k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, pairs)
+                );
             }
             if mode == 1 || mode == 3 {
-                op!(prof, "fp4 quant", s, k::fp4_quant_rows(s, ws.act, pairs, EXPERT_WIDTH, ws.eg));
+                op!(
+                    prof,
+                    "fp4 quant",
+                    s,
+                    k::fp4_quant_rows(s, ws.act, pairs, EXPERT_WIDTH, ws.eg)
+                );
                 let down = &moe.down;
-                op!(prof, "experts down", s, k::moe_fp4_gemm_out(s, ws.eg, pairs, down.weights, down.scales, down.scale2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, ws.yd, D, EXPERT_WIDTH, yd_bf16));
+                op!(
+                    prof,
+                    "experts down",
+                    s,
+                    k::moe_fp4_gemm_out(
+                        s,
+                        ws.eg,
+                        pairs,
+                        down.weights,
+                        down.scales,
+                        down.scale2,
+                        ws.offsets,
+                        ws.tile_expert,
+                        ws.tile_row,
+                        ws.num_tiles,
+                        tiles,
+                        ws.yd,
+                        D,
+                        EXPERT_WIDTH,
+                        yd_bf16
+                    )
+                );
             } else {
                 if mode == 2 {
                     k::fake_fp4_act(s, ws.act, pairs, EXPERT_WIDTH)?;
                 }
-                op!(prof, "experts down", s, grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH));
+                op!(
+                    prof,
+                    "experts down",
+                    s,
+                    grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH)
+                );
             }
         } else {
-        op!(prof, "moe_gather", s, k::moe_gather(s, ws.m, ws.pair_row, t, ws.xs));
-        if fake_fp4 {
-            k::fake_fp4_act(s, ws.xs, t * TOP_K, D)?;
-        }
-        op!(prof, "experts gate", s, grouped(&moe.gate, ws.xs, ws.eg, EXPERT_WIDTH, D));
-        op!(prof, "experts up", s, grouped(&moe.up, ws.xs, ws.eu, EXPERT_WIDTH, D));
-        op!(prof, "swiglu", s, k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, t * TOP_K));
-        if fake_fp4 {
-            k::fake_fp4_act(s, ws.act, t * TOP_K, EXPERT_WIDTH)?;
-        }
-        op!(prof, "experts down", s, grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH));
+            op!(
+                prof,
+                "moe_gather",
+                s,
+                k::moe_gather(s, ws.m, ws.pair_row, t, ws.xs)
+            );
+            if fake_fp4 {
+                k::fake_fp4_act(s, ws.xs, t * TOP_K, D)?;
+            }
+            op!(
+                prof,
+                "experts gate",
+                s,
+                grouped(&moe.gate, ws.xs, ws.eg, EXPERT_WIDTH, D)
+            );
+            op!(
+                prof,
+                "experts up",
+                s,
+                grouped(&moe.up, ws.xs, ws.eu, EXPERT_WIDTH, D)
+            );
+            op!(
+                prof,
+                "swiglu",
+                s,
+                k::swiglu(
+                    s,
+                    ws.eg,
+                    ws.eu,
+                    EXPERT_WIDTH,
+                    EXPERT_WIDTH,
+                    ws.act,
+                    t * TOP_K
+                )
+            );
+            if fake_fp4 {
+                k::fake_fp4_act(s, ws.act, t * TOP_K, EXPERT_WIDTH)?;
+            }
+            op!(
+                prof,
+                "experts down",
+                s,
+                grouped(&moe.down, ws.act, ws.yd, D, EXPERT_WIDTH)
+            );
         }
     }
     // One token: the shared-expert tail (SwiGLU, down projection, combine) in one kernel. Larger
     // batches are faster as three kernels; the arithmetic is the same either way.
     if t == 1 {
-        let down = (moe.shared_down.fmt, moe.shared_down.addr, moe.shared_down.scale);
-        op!(prof, "moe_shared_combine", s, k::moe_shared_combine(s, x, ld, t, down, ws.yd, ws.pair_row, ws.top_w, ws.y));
+        let down = (
+            moe.shared_down.fmt,
+            moe.shared_down.addr,
+            moe.shared_down.scale,
+        );
+        op!(
+            prof,
+            "moe_shared_combine",
+            s,
+            k::moe_shared_combine(s, x, ld, t, down, ws.yd, ws.pair_row, ws.top_w, ws.y)
+        );
     } else {
         if side {
             s.wait(&ws.moe_join)?;
         } else {
-            op!(prof, "shared swiglu", s, k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t));
-            op!(prof, "shared down", s, linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t));
+            op!(
+                prof,
+                "shared swiglu",
+                s,
+                k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t)
+            );
+            op!(
+                prof,
+                "shared down",
+                s,
+                linear(s, ws, ws.sact, &moe.shared_down, ws.sh, t)
+            );
         }
         if yd_bf16 && rec.is_none() {
             // Combined by the next HyperConnection's norm kernel (or materialized by another reader).
             carry.moe = Some((col(3), ld));
         } else if yd_bf16 {
-            op!(prof, "moe_combine", s, k::moe_combine_bf16(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
+            op!(
+                prof,
+                "moe_combine",
+                s,
+                k::moe_combine_bf16(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t)
+            );
         } else {
-            op!(prof, "moe_combine", s, k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t));
+            op!(
+                prof,
+                "moe_combine",
+                s,
+                k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t)
+            );
         }
     }
     if let Some((buf, row)) = rec {
-        s.copy_d2d(buf + CaptureLayout::MOE as u64, ws.y + (row * D * 4) as u64, D * 4)?;
-        s.copy_d2d(buf + CaptureLayout::ROUTER as u64, col(0) + (row * ld * 4) as u64, EXPERTS * 4)?;
-        s.copy_d2d(buf + CaptureLayout::TOP_I as u64, ws.top_i + (row * TOP_K * 4) as u64, TOP_K * 4)?;
-        s.copy_d2d(buf + CaptureLayout::TOP_W as u64, ws.top_w + (row * TOP_K * 4) as u64, TOP_K * 4)?;
+        s.copy_d2d(
+            buf + CaptureLayout::MOE as u64,
+            ws.y + (row * D * 4) as u64,
+            D * 4,
+        )?;
+        s.copy_d2d(
+            buf + CaptureLayout::ROUTER as u64,
+            col(0) + (row * ld * 4) as u64,
+            EXPERTS * 4,
+        )?;
+        s.copy_d2d(
+            buf + CaptureLayout::TOP_I as u64,
+            ws.top_i + (row * TOP_K * 4) as u64,
+            TOP_K * 4,
+        )?;
+        s.copy_d2d(
+            buf + CaptureLayout::TOP_W as u64,
+            ws.top_w + (row * TOP_K * 4) as u64,
+            TOP_K * 4,
+        )?;
     }
     // The block output is added to the residual by whatever reads it next (the next HyperConnection
     // fuses it with its norm).
@@ -1507,7 +2989,11 @@ fn finish_layer(layer: &crate::model::Layer, ctx: &LayerCtx, carry: &mut Carry, 
 
 /// Stages an MTP step: `tokens` at positions `start ..` (written to the position table by the step).
 pub fn prepare_mtp(ws: &mut Workspace, start: usize, tokens: &[i32]) -> Result<()> {
-    ensure!(!tokens.is_empty() && tokens.len() <= ws.max_tokens, "MTP step of {} tokens exceeds the workspace", tokens.len());
+    ensure!(
+        !tokens.is_empty() && tokens.len() <= ws.max_tokens,
+        "MTP step of {} tokens exceeds the workspace",
+        tokens.len()
+    );
     let layout = StepLayout::new(ws.max_tokens);
     let block = ws.mtp_step_host.as_mut_slice();
     block[0..4].copy_from_slice(&(start as i32).to_le_bytes());
@@ -1525,7 +3011,15 @@ pub fn prepare_mtp(ws: &mut Workspace, start: usize, tokens: &[i32]) -> Result<(
 /// preceding hidden rows `hprev` (FP32 [t, 10240], each the pre-mixer residual of the position before
 /// its token). Afterwards `ws.out` holds the MTP mixer output (BF16 [t, 2560]) and `ws.h` the MTP
 /// pre-mixer residual, the `hprev` of the next draft step.
-pub fn forward_mtp(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, hprev: u64, prof: Option<&mut Profiler>) -> Result<()> {
+pub fn forward_mtp(
+    model: &Model,
+    state: &SequenceState,
+    ws: &Workspace,
+    s: &Stream,
+    t: usize,
+    hprev: u64,
+    prof: Option<&mut Profiler>,
+) -> Result<()> {
     let layout = StepLayout::new(ws.max_tokens);
     unsafe { s.copy_h2d(ws.mtp_step, ws.mtp_step_host.as_ptr(), layout.ple)? };
     forward_mtp_staged(model, state, ws, s, t, hprev, prof)
@@ -1538,27 +3032,107 @@ pub fn step_offsets(ws: &Workspace) -> (usize, usize) {
 }
 
 /// As [`forward_mtp`], with the MTP step block already on the device at `ws.mtp_step`.
-pub fn forward_mtp_staged(model: &Model, state: &SequenceState, ws: &Workspace, s: &Stream, t: usize, hprev: u64, mut prof: Option<&mut Profiler>) -> Result<()> {
+pub fn forward_mtp_staged(
+    model: &Model,
+    state: &SequenceState,
+    ws: &Workspace,
+    s: &Stream,
+    t: usize,
+    hprev: u64,
+    mut prof: Option<&mut Profiler>,
+) -> Result<()> {
     let mtp = model.mtp.as_ref().expect("model loaded without MTP");
     let cache = state.mtp_qsa.as_ref().expect("sequence without MTP cache");
     let layout = StepLayout::new(ws.max_tokens);
     let start = ws.mtp_step;
-    op!(prof, "store_positions", s, k::store_positions(s, ws.mtp_step + layout.pos as u64, state.pos3.addr(), start, t));
-    op!(prof, "mtp embed", s, k::embed(s, ws.mtp_step + layout.tokens as u64, t, model.embed, ws.h));
-    op!(prof, "mtp norm e", s, k::rmsnorm_rows(s, ws.h, H, mtp.norm_embedding, ws.e_bf, t));
-    op!(prof, "mtp norm h", s, k::grouped_rmsnorm(s, hprev, mtp.norm_hidden, ws.n, t));
-    op!(prof, "mtp fc_e", s, linear(s, ws, ws.e_bf, &mtp.fc_embedding, ws.y, t));
+    op!(
+        prof,
+        "store_positions",
+        s,
+        k::store_positions(
+            s,
+            ws.mtp_step + layout.pos as u64,
+            state.pos3.addr(),
+            start,
+            t
+        )
+    );
+    op!(
+        prof,
+        "mtp embed",
+        s,
+        k::embed(s, ws.mtp_step + layout.tokens as u64, t, model.embed, ws.h)
+    );
+    op!(
+        prof,
+        "mtp norm e",
+        s,
+        k::rmsnorm_rows(s, ws.h, H, mtp.norm_embedding, ws.e_bf, t)
+    );
+    op!(
+        prof,
+        "mtp norm h",
+        s,
+        k::grouped_rmsnorm(s, hprev, mtp.norm_hidden, ws.n, t)
+    );
+    op!(
+        prof,
+        "mtp fc_e",
+        s,
+        linear(s, ws, ws.e_bf, &mtp.fc_embedding, ws.y, t)
+    );
     // fc_hidden maps each of the 4 streams: rows of the [t, 4, 2560] input are the 4t stream slices.
-    op!(prof, "mtp fc_h", s, linear_ws(s, ws, ws.n, D, &mtp.fc_hidden, ws.h, D, S * t));
-    op!(prof, "mtp combine", s, k::hc_combine(s, ws.h, ws.y, ws.ones, t));
-    let ctx = LayerCtx { ws, s, t, start, pos3: state.pos3.addr(), capacity: state.capacity, ple_rows: 0, ple_state: 0, spec: None, steer: None, batch: None, capture: None, taps: None };
+    op!(
+        prof,
+        "mtp fc_h",
+        s,
+        linear_ws(s, ws, ws.n, D, &mtp.fc_hidden, ws.h, D, S * t)
+    );
+    op!(
+        prof,
+        "mtp combine",
+        s,
+        k::hc_combine(s, ws.h, ws.y, ws.ones, t)
+    );
+    let ctx = LayerCtx {
+        ws,
+        s,
+        t,
+        start,
+        pos3: state.pos3.addr(),
+        capacity: state.capacity,
+        ple_rows: 0,
+        ple_state: 0,
+        spec: None,
+        steer: None,
+        adapter: None,
+        batch: None,
+        capture: None,
+        taps: None,
+    };
     let mut carry = Carry::new(ws, false);
-    layer_forward(LAYERS, &mtp.layer, None, None, Some(cache), &ctx, &mut carry, prof.as_deref_mut())?;
+    layer_forward(
+        LAYERS,
+        &mtp.layer,
+        None,
+        None,
+        Some(cache),
+        &ctx,
+        &mut carry,
+        prof.as_deref_mut(),
+    )?;
     final_mixer(&mtp.final_hc, &ctx, &mut carry, prof)
 }
 
 /// Eager step with per-op GPU timing collected into `prof`.
-pub fn forward_profiled(model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, new_tokens: &[i32], prof: &mut Profiler) -> Result<()> {
+pub fn forward_profiled(
+    model: &Model,
+    state: &mut SequenceState,
+    ws: &mut Workspace,
+    s: &Stream,
+    new_tokens: &[i32],
+    prof: &mut Profiler,
+) -> Result<()> {
     let bytes = prepare(model, state, ws, new_tokens)?;
     forward_device(model, state, ws, s, new_tokens.len(), bytes, Some(prof))?;
     s.synchronize()?;
@@ -1575,7 +3149,13 @@ pub fn step_bytes(t: usize) -> usize {
 /// gathers the PLE rows, overlapping layer 0 on the GPU) the remaining layers. The PLE rows go up on the
 /// side stream piece by piece as they are gathered (see [`upload_ple`]); the main stream waits for
 /// them before layer 1, their first reader.
-pub fn forward(model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, new_tokens: &[i32]) -> Result<()> {
+pub fn forward(
+    model: &Model,
+    state: &mut SequenceState,
+    ws: &mut Workspace,
+    s: &Stream,
+    new_tokens: &[i32],
+) -> Result<()> {
     let t = new_tokens.len();
     prepare_tokens(state, ws, new_tokens)?;
     forward_part(model, state, ws, s, t, 0, Part::BeforePle, false, None)?;
@@ -1598,24 +3178,53 @@ pub struct DecodeGraph {
 }
 
 impl DecodeGraph {
-    pub fn capture(model: &Model, state: &SequenceState, ws: &Workspace, hw: &HeadWorkspace, s: &Stream) -> Result<Self> {
+    pub fn capture(
+        model: &Model,
+        state: &SequenceState,
+        ws: &Workspace,
+        hw: &HeadWorkspace,
+        s: &Stream,
+    ) -> Result<Self> {
         let bytes = StepLayout::new(1).used(1);
-        let before_ple = quench6k_cuda::Graph::capture(s, |s| forward_part(model, state, ws, s, 1, bytes, Part::BeforePle, false, None))?;
+        let before_ple = quench6k_cuda::Graph::capture(s, |s| {
+            forward_part(model, state, ws, s, 1, bytes, Part::BeforePle, false, None)
+        })?;
         let from_ple = quench6k_cuda::Graph::capture(s, |s| {
             forward_part(model, state, ws, s, 1, bytes, Part::FromPle, false, None)?;
             head_argmax(model, hw, s, ws.out)
         })?;
-        Ok(Self { before_ple, from_ple, bytes })
+        Ok(Self {
+            before_ple,
+            from_ple,
+            bytes,
+        })
     }
 
     /// Decodes `token` (appended to `state`) and returns the greedy next token.
-    pub fn step(&self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, hw: &HeadWorkspace, s: &Stream, token: i32) -> Result<i32> {
+    pub fn step(
+        &self,
+        model: &Model,
+        state: &mut SequenceState,
+        ws: &mut Workspace,
+        hw: &HeadWorkspace,
+        s: &Stream,
+        token: i32,
+    ) -> Result<i32> {
         self.step_timed(model, state, ws, hw, s, token, &mut [0.0; 2])
     }
 
     /// As [`step`](Self::step), adding host preparation and graph execution seconds to `times`.
     #[allow(clippy::too_many_arguments)]
-    pub fn step_timed(&self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, hw: &HeadWorkspace, s: &Stream, token: i32, times: &mut [f64; 2]) -> Result<i32> {
+    pub fn step_timed(
+        &self,
+        model: &Model,
+        state: &mut SequenceState,
+        ws: &mut Workspace,
+        hw: &HeadWorkspace,
+        s: &Stream,
+        token: i32,
+        times: &mut [f64; 2],
+    ) -> Result<i32> {
         let t0 = std::time::Instant::now();
         prepare_tokens(state, ws, &[token])?;
         self.before_ple.launch(s)?;
@@ -1626,41 +3235,140 @@ impl DecodeGraph {
         s.synchronize()?;
         times[0] += (t1 - t0).as_secs_f64();
         times[1] += t1.elapsed().as_secs_f64();
-        Ok(i32::from_le_bytes(hw.token_host.as_slice()[..4].try_into().unwrap()))
+        Ok(i32::from_le_bytes(
+            hw.token_host.as_slice()[..4].try_into().unwrap(),
+        ))
     }
 }
 
 /// Greedy tokens of `rows` final hidden states (BF16 [rows, 2560]) written to the device i32s at `out`.
-pub fn head_argmax_into(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64, rows: usize, out: u64) -> Result<()> {
+pub fn head_argmax_into(
+    model: &Model,
+    hw: &HeadWorkspace,
+    s: &Stream,
+    hidden: u64,
+    rows: usize,
+    out: u64,
+) -> Result<()> {
     ensure!(rows <= hw.rows, "head workspace holds {} rows", hw.rows);
-    linear_ld(s, hw.partial.addr(), hidden, D, &model.lm_head, hw.logits.addr(), VOCAB, rows)?;
-    k::argmax(s, hw.logits.addr(), rows, VOCAB, VOCAB, hw.argmax.addr(), out)
+    linear_ld(
+        s,
+        hw.partial.addr(),
+        hidden,
+        D,
+        &model.lm_head,
+        hw.logits.addr(),
+        VOCAB,
+        rows,
+    )?;
+    k::argmax(
+        s,
+        hw.logits.addr(),
+        rows,
+        VOCAB,
+        VOCAB,
+        hw.argmax.addr(),
+        out,
+    )
+}
+
+/// Greedy tokens of `rows` logits rows (VOCAB f32 each, at `logits`) written to the device i32s at
+/// `out`, with `hw`'s argmax scratch.
+pub fn argmax_into(
+    hw: &HeadWorkspace,
+    s: &Stream,
+    logits: u64,
+    rows: usize,
+    out: u64,
+) -> Result<()> {
+    ensure!(rows <= hw.rows, "head workspace holds {} rows", hw.rows);
+    k::argmax(s, logits, rows, VOCAB, VOCAB, hw.argmax.addr(), out)
 }
 
 /// Greedy draft token for one hidden state, written to `out`: a 1-bit sketch of the LM head shortlists
 /// 8 candidates per 8192 rows and the drafter's NVFP4 head rescores them (the NVFP4 argmax whenever
 /// it is shortlisted, which is nearly always).
 /// `params` / `q`: sampled drafting (see [`k::draft_head_argmax`]), or 0 for greedy.
-pub fn draft_head_argmax_into(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64, out: u64, params: u64, q: u64) -> Result<()> {
+pub fn draft_head_argmax_into(
+    model: &Model,
+    hw: &HeadWorkspace,
+    s: &Stream,
+    hidden: u64,
+    out: u64,
+    params: u64,
+    q: u64,
+) -> Result<()> {
     let mtp = model.mtp.as_ref().expect("model loaded without MTP");
-    k::draft_head_argmax(s, hidden, mtp.draft_sketch, mtp.draft_head, hw.logits.addr(), hw.pick.addr(), VOCAB, out, params, q)
+    k::draft_head_argmax(
+        s,
+        hidden,
+        mtp.draft_sketch,
+        mtp.draft_head,
+        hw.logits.addr(),
+        hw.pick.addr(),
+        VOCAB,
+        out,
+        params,
+        q,
+    )
 }
 
 /// LM-head logits of `rows` consecutive hidden rows into the head workspace.
-pub fn head_logits_rows(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64, rows: usize) -> Result<()> {
+pub fn head_logits_rows(
+    model: &Model,
+    hw: &HeadWorkspace,
+    s: &Stream,
+    hidden: u64,
+    rows: usize,
+) -> Result<()> {
     ensure!(rows <= hw.rows, "head workspace holds {} rows", hw.rows);
-    linear_ld(s, hw.partial.addr(), hidden, D, &model.lm_head, hw.logits.addr(), VOCAB, rows)
+    linear_ld(
+        s,
+        hw.partial.addr(),
+        hidden,
+        D,
+        &model.lm_head,
+        hw.logits.addr(),
+        VOCAB,
+        rows,
+    )
 }
 
 /// LM-head logits of one hidden row into the head workspace (row 0).
 pub fn head_logits(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64) -> Result<()> {
-    linear_ld(s, hw.partial.addr(), hidden, D, &model.lm_head, hw.logits.addr(), VOCAB, 1)
+    linear_ld(
+        s,
+        hw.partial.addr(),
+        hidden,
+        D,
+        &model.lm_head,
+        hw.logits.addr(),
+        VOCAB,
+        1,
+    )
 }
 
 /// Greedy next token for one hidden state: LM head, argmax, and a copy of the token to `hw.token_host`.
 pub fn head_argmax(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64) -> Result<()> {
-    linear_ld(s, hw.partial.addr(), hidden, D, &model.lm_head, hw.logits.addr(), VOCAB, 1)?;
-    k::argmax(s, hw.logits.addr(), 1, VOCAB, VOCAB, hw.argmax.addr(), hw.top_ids.addr())?;
+    linear_ld(
+        s,
+        hw.partial.addr(),
+        hidden,
+        D,
+        &model.lm_head,
+        hw.logits.addr(),
+        VOCAB,
+        1,
+    )?;
+    k::argmax(
+        s,
+        hw.logits.addr(),
+        1,
+        VOCAB,
+        VOCAB,
+        hw.argmax.addr(),
+        hw.top_ids.addr(),
+    )?;
     unsafe { s.copy_d2h(hw.token_host.as_ptr(), hw.top_ids.addr(), 4) }
 }
 
@@ -1710,18 +3418,60 @@ impl HeadWorkspace {
     }
 }
 
-pub fn head_stats(model: &Model, hw: &HeadWorkspace, s: &Stream, hidden: u64, targets: &[i32], top_k: usize) -> Result<HeadStats> {
-    let mut out = HeadStats { lse: vec![], target: vec![], top_ids: vec![], top_logits: vec![] };
+pub fn head_stats(
+    model: &Model,
+    hw: &HeadWorkspace,
+    s: &Stream,
+    hidden: u64,
+    targets: &[i32],
+    top_k: usize,
+) -> Result<HeadStats> {
+    let mut out = HeadStats {
+        lse: vec![],
+        target: vec![],
+        top_ids: vec![],
+        top_logits: vec![],
+    };
     for r0 in (0..targets.len()).step_by(hw.rows) {
         let n = hw.rows.min(targets.len() - r0);
-        linear_ld(s, hw.partial.addr(), hidden + (r0 * D * 2) as u64, D, &model.lm_head, hw.logits.addr(), VOCAB, n)?;
+        linear_ld(
+            s,
+            hw.partial.addr(),
+            hidden + (r0 * D * 2) as u64,
+            D,
+            &model.lm_head,
+            hw.logits.addr(),
+            VOCAB,
+            n,
+        )?;
         s.upload_to(hw.targets.addr(), &targets[r0..r0 + n])?;
-        k::row_lse(s, hw.logits.addr(), n, VOCAB, VOCAB, hw.targets.addr(), hw.lse.addr(), hw.target.addr())?;
-        k::topk(s, hw.logits.addr(), n, VOCAB, VOCAB, top_k, false, hw.top_ids.addr(), hw.top_logits.addr())?;
+        k::row_lse(
+            s,
+            hw.logits.addr(),
+            n,
+            VOCAB,
+            VOCAB,
+            hw.targets.addr(),
+            hw.lse.addr(),
+            hw.target.addr(),
+        )?;
+        k::topk(
+            s,
+            hw.logits.addr(),
+            n,
+            VOCAB,
+            VOCAB,
+            top_k,
+            false,
+            hw.top_ids.addr(),
+            hw.top_logits.addr(),
+        )?;
         out.lse.extend(s.download::<f32>(hw.lse.addr(), n)?);
         out.target.extend(s.download::<f32>(hw.target.addr(), n)?);
-        out.top_ids.extend(s.download::<i32>(hw.top_ids.addr(), n * top_k)?);
-        out.top_logits.extend(s.download::<f32>(hw.top_logits.addr(), n * top_k)?);
+        out.top_ids
+            .extend(s.download::<i32>(hw.top_ids.addr(), n * top_k)?);
+        out.top_logits
+            .extend(s.download::<f32>(hw.top_logits.addr(), n * top_k)?);
     }
     Ok(out)
 }

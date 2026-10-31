@@ -13,7 +13,12 @@ pub struct Profiler {
 
 impl Profiler {
     /// Times `op` on `s` under `name`.
-    pub fn time<T>(&mut self, name: &'static str, s: &Stream, op: impl FnOnce() -> Result<T>) -> Result<T> {
+    pub fn time<T>(
+        &mut self,
+        name: &'static str,
+        s: &Stream,
+        op: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         let (a, b) = (Event::timing()?, Event::timing()?);
         a.record(s)?;
         let out = op()?;
@@ -40,7 +45,10 @@ impl Profiler {
         rows.sort_by(|a, b| b.1.1.partial_cmp(&a.1.1).unwrap());
         let mut out = format!("{:<22} {:>7} {:>10} {:>7}\n", "op", "calls", "ms", "share");
         for (name, (calls, ms)) in rows {
-            out += &format!("{name:<22} {calls:>7} {ms:>10.3} {:>6.1}%\n", 100.0 * ms / total);
+            out += &format!(
+                "{name:<22} {calls:>7} {ms:>10.3} {:>6.1}%\n",
+                100.0 * ms / total
+            );
         }
         out + &format!("{:<22} {:>7} {total:>10.3}\n", "total", "")
     }

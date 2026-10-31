@@ -36,10 +36,28 @@ const ROW: u64 = (H * 4) as u64;
 impl SpecDecoder {
     /// Prefills `prompt` into `state` (target and MTP caches) and returns the decoder positioned on the
     /// target's greedy next token.
-    pub fn prefill(model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], drafts: usize, chunk: usize) -> Result<Self> {
-        ensure!(state.spec.is_some() && (model.mtp.is_some() || model.dflash.is_some()), "speculative decoding needs a drafter and a sequence with speculative state");
-        let max = if model.dflash.is_some() { crate::dflash::DRAFTS } else { 8 };
-        ensure!((1..=max).contains(&drafts), "draft length {drafts} out of range (1 ..= {max})");
+    pub fn prefill(
+        model: &Model,
+        state: &mut SequenceState,
+        ws: &mut Workspace,
+        s: &Stream,
+        prompt: &[i32],
+        drafts: usize,
+        chunk: usize,
+    ) -> Result<Self> {
+        ensure!(
+            state.spec.is_some() && (model.mtp.is_some() || model.dflash.is_some()),
+            "speculative decoding needs a drafter and a sequence with speculative state"
+        );
+        let max = if model.dflash.is_some() {
+            crate::dflash::DRAFTS
+        } else {
+            8
+        };
+        ensure!(
+            (1..=max).contains(&drafts),
+            "draft length {drafts} out of range (1 ..= {max})"
+        );
         let mut dec = Self {
             drafts,
             pending: DeviceBuffer::zeroed(H * 4)?,
@@ -51,7 +69,11 @@ impl SpecDecoder {
             accepted: 0,
             draft_secs: 0.0,
             verify_secs: 0.0,
-            dflash: if model.dflash.is_some() { Some(crate::dflash::DState::new(crate::dflash::BLOCK)?) } else { None },
+            dflash: if model.dflash.is_some() {
+                Some(crate::dflash::DState::new(crate::dflash::BLOCK)?)
+            } else {
+                None
+            },
         };
         dec.restart(model, state, ws, s, prompt, chunk)?;
         Ok(dec)
@@ -59,17 +81,57 @@ impl SpecDecoder {
 
     /// Prefills a new `prompt` into the (reset) `state`, reusing this decoder's buffers so graphs captured
     /// for it stay valid.
-    pub fn restart(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], chunk: usize) -> Result<()> {
+    pub fn restart(
+        &mut self,
+        model: &Model,
+        state: &mut SequenceState,
+        ws: &mut Workspace,
+        s: &Stream,
+        prompt: &[i32],
+        chunk: usize,
+    ) -> Result<()> {
         s.memset(self.pending.addr(), 0, H * 4)?;
-        self.prefill_from(model, state, ws, s, prompt, 0, chunk, &[], |_, _, _| Ok(()), None)
+        self.prefill_from(
+            model,
+            state,
+            ws,
+            s,
+            prompt,
+            0,
+            chunk,
+            &[],
+            |_, _, _| Ok(()),
+            None,
+        )
     }
 
     /// As [`restart`](Self::restart), breaking the chunking at `pauses` (as a fresh prompt is chunked at
     /// turn boundaries) and reporting `progress`.
     #[allow(clippy::too_many_arguments)]
-    pub fn prefill_new(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], chunk: usize, pauses: &[usize], progress: Option<&(dyn Fn(usize) + Send + Sync)>) -> Result<()> {
+    pub fn prefill_new(
+        &mut self,
+        model: &Model,
+        state: &mut SequenceState,
+        ws: &mut Workspace,
+        s: &Stream,
+        prompt: &[i32],
+        chunk: usize,
+        pauses: &[usize],
+        progress: Option<&(dyn Fn(usize) + Send + Sync)>,
+    ) -> Result<()> {
         s.memset(self.pending.addr(), 0, H * 4)?;
-        self.prefill_from(model, state, ws, s, prompt, 0, chunk, pauses, |_, _, _| Ok(()), progress)
+        self.prefill_from(
+            model,
+            state,
+            ws,
+            s,
+            prompt,
+            0,
+            chunk,
+            pauses,
+            |_, _, _| Ok(()),
+            progress,
+        )
     }
 
     /// Prefills `prompt[start..]` into `state`, which already holds `prompt[..start]` (target and MTP
@@ -77,12 +139,32 @@ impl SpecDecoder {
     /// `pauses` (ascending, in start..len) the chunking breaks and `at_pause(state, pos, pending)` runs.
     /// `progress(pos)` is called when the prompt up to `pos` has been computed (after each chunk).
     #[allow(clippy::too_many_arguments)]
-    pub fn prefill_from(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream, prompt: &[i32], start: usize, chunk: usize, pauses: &[usize], mut at_pause: impl FnMut(&SequenceState, usize, u64) -> Result<()>, progress: Option<&(dyn Fn(usize) + Send + Sync)>) -> Result<()> {
+    pub fn prefill_from(
+        &mut self,
+        model: &Model,
+        state: &mut SequenceState,
+        ws: &mut Workspace,
+        s: &Stream,
+        prompt: &[i32],
+        start: usize,
+        chunk: usize,
+        pauses: &[usize],
+        mut at_pause: impl FnMut(&SequenceState, usize, u64) -> Result<()>,
+        progress: Option<&(dyn Fn(usize) + Send + Sync)>,
+    ) -> Result<()> {
         ensure!(start < prompt.len(), "nothing to prefill");
-        ensure!(state.len() == start, "state holds {} tokens, expected {start}", state.len());
+        ensure!(
+            state.len() == start,
+            "state holds {} tokens, expected {start}",
+            state.len()
+        );
         let mut next = 0;
         let mut c0 = start;
-        let mut pause = pauses.iter().copied().filter(|&p| p > start && p < prompt.len()).peekable();
+        let mut pause = pauses
+            .iter()
+            .copied()
+            .filter(|&p| p > start && p < prompt.len())
+            .peekable();
         // DFlash: the drafter's context ring gets the features of the prompt's last RING positions.
         let lo = prompt.len().saturating_sub(crate::dflash::RING).max(start);
         if let Some(st) = &self.dflash {
@@ -98,8 +180,16 @@ impl SpecDecoder {
             let t = c.len();
             let first = lo.max(c0).min(end) - c0;
             if self.dflash.is_some() && first < t {
-                let buf = ws.dflash.as_ref().map(|sc| sc.feat).context("workspace without DFlash scratch")?;
-                ws.taps = Some(crate::dflash::Taps { buf, first, rows: t - first });
+                let buf = ws
+                    .dflash
+                    .as_ref()
+                    .map(|sc| sc.feat)
+                    .context("workspace without DFlash scratch")?;
+                ws.taps = Some(crate::dflash::Taps {
+                    buf,
+                    first,
+                    rows: t - first,
+                });
             }
             let r = forward::forward(model, state, ws, s, c);
             ws.taps = None;
@@ -108,8 +198,19 @@ impl SpecDecoder {
                 next = argmax_rows(model, &self.head, s, ws.out + ((t - 1) * D * 2) as u64, 1)?[0];
             }
             if let (Some(st), Some(d)) = (&self.dflash, &model.dflash) {
-                let sc = ws.dflash.as_ref().context("workspace without DFlash scratch")?;
-                crate::dflash::context(d, sc, st, s, sc.feat, t - first, crate::dflash::Pos(0, c0 + first))?;
+                let sc = ws
+                    .dflash
+                    .as_ref()
+                    .context("workspace without DFlash scratch")?;
+                crate::dflash::context(
+                    d,
+                    sc,
+                    st,
+                    s,
+                    sc.feat,
+                    t - first,
+                    crate::dflash::Pos(0, c0 + first),
+                )?;
             } else {
                 s.copy_d2d(ws.mtp_hin, self.pending.addr(), H * 4)?;
                 s.copy_d2d(ws.mtp_hin + ROW, ws.h, (t - 1) * H * 4)?;
@@ -149,8 +250,17 @@ impl SpecDecoder {
 
     /// One draft-and-verify round; returns the tokens committed to the sequence (the previous `next`
     /// and the accepted drafts). `self.next` becomes the target's following token.
-    pub fn round(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, s: &Stream) -> Result<Vec<i32>> {
-        ensure!(self.dflash.is_none(), "DFlash rounds run as graphs (SpecGraphs)");
+    pub fn round(
+        &mut self,
+        model: &Model,
+        state: &mut SequenceState,
+        ws: &mut Workspace,
+        s: &Stream,
+    ) -> Result<Vec<i32>> {
+        ensure!(
+            self.dflash.is_none(),
+            "DFlash rounds run as graphs (SpecGraphs)"
+        );
         let p = state.len();
         let n = self.drafts;
         // Draft 1: the MTP cache catches up on the last accepted tokens, paired with the target rows
@@ -162,7 +272,11 @@ impl SpecDecoder {
         if t > 1 {
             s.copy_d2d(ws.mtp_hin + ROW, self.verified.addr(), (t - 1) * H * 4)?;
             // The newest committed target row becomes the pending row.
-            s.copy_d2d(self.pending.addr(), self.verified.addr() + ((t - 2) as u64) * ROW, H * 4)?;
+            s.copy_d2d(
+                self.pending.addr(),
+                self.verified.addr() + ((t - 2) as u64) * ROW,
+                H * 4,
+            )?;
         }
         forward::prepare_mtp(ws, p - (t - 1), &mtp_tokens)?;
         forward::forward_mtp(model, state, ws, s, t, ws.mtp_hin, None)?;
@@ -188,7 +302,10 @@ impl SpecDecoder {
         }
 
         // Commit [next, d1 .. da]: replay a + 1 recorded tokens in the next step.
-        let spec = state.spec.as_mut().context("sequence without speculative state")?;
+        let spec = state
+            .spec
+            .as_mut()
+            .context("sequence without speculative state")?;
         spec.parity ^= 1;
         spec.replay = (a + 1) as i32;
         s.upload_to(spec.ctl.addr(), &[spec.replay, spec.parity])?;
@@ -207,7 +324,13 @@ impl SpecDecoder {
 }
 
 /// Greedy tokens for `rows` consecutive final hidden states (BF16 [rows, 2560]) at `hidden`.
-fn argmax_rows(model: &Model, head: &HeadWorkspace, s: &Stream, hidden: u64, rows: usize) -> Result<Vec<i32>> {
+fn argmax_rows(
+    model: &Model,
+    head: &HeadWorkspace,
+    s: &Stream,
+    hidden: u64,
+    rows: usize,
+) -> Result<Vec<i32>> {
     Ok(forward::head_stats(model, head, s, hidden, &vec![0; rows], 1)?.top_ids)
 }
 
@@ -221,18 +344,123 @@ pub struct SpecGraphs {
     /// DFlash drafting graphs, indexed by catch-up length (the same for every draft length); empty
     /// when the MTP layer drafts.
     draft: Vec<quench6k_cuda::Graph>,
-    _rc: DeviceBuffer,
+    tail: Tail,
     rc_host: quench6k_cuda::PinnedBuffer,
     pub policy: DraftPolicy,
-    /// Sampled rounds: the parameters and generator state, and the verified rows' top candidates.
-    sample_params: DeviceBuffer,
-    _top_ids: DeviceBuffer,
-    _top_vals: DeviceBuffer,
-    /// Distributions of the round's sampled drafts (one record per draft).
-    _draft_q: DeviceBuffer,
     sampled: bool,
     /// Sampled rounds penalize the verified rows (the session's slot-0 penalty history).
     pub penalized: bool,
+}
+
+/// The device buffers of a sequence's rounds, and the verification's tail over them.
+struct Tail {
+    /// Round control: next position and token, catch-up length, accepted drafts, drafts, greedy tokens.
+    rc: DeviceBuffer,
+    /// Sampled rounds: the parameters and generator state, and the verified rows' top candidates.
+    sample_params: DeviceBuffer,
+    top_ids: DeviceBuffer,
+    top_vals: DeviceBuffer,
+    /// Distributions of the round's sampled drafts (one record per draft).
+    draft_q: DeviceBuffer,
+    /// The penalty history (state, flags, list), for penalized rounds.
+    pen: Option<(u64, u64, u64)>,
+    /// The sequence's speculative control word.
+    ctl: u64,
+    /// DFlash: the verification's captured drafter features.
+    vfeat: Option<u64>,
+}
+
+impl Tail {
+    /// The verification's head, sampling, acceptance and bookkeeping for rows `off ..= off + n` of the
+    /// step output (capturable). Modes: 0 greedy, 1 sampled, 2 sampled with penalties. `logits`: the
+    /// rows' LM-head logits when already computed (else the decoder's head workspace computes them).
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        model: &Model,
+        dec: &SpecDecoder,
+        ws: &Workspace,
+        s: &Stream,
+        mode: usize,
+        off: usize,
+        n: usize,
+        logits: Option<u64>,
+        rc_host: &quench6k_cuda::PinnedBuffer,
+    ) -> Result<()> {
+        use quench6k_cuda::kernels as k;
+        let (_, _, greedy_at, ints) = k::spec_layout();
+        let (commit_at, commit_count) = k::spec_commit_layout();
+        let rc = self.rc.addr();
+        let (out, h) = (ws.out + (off * D * 2) as u64, ws.h + off as u64 * ROW);
+        let logits = match logits {
+            Some(l) => l,
+            None => {
+                forward::head_logits_rows(model, &dec.head, s, out, n + 1)?;
+                dec.head.logits_addr()
+            }
+        };
+        if mode == 0 {
+            forward::argmax_into(&dec.head, s, logits, n + 1, rc + (greedy_at * 4) as u64)?;
+        } else {
+            if mode == 2 {
+                let pen = self.pen.context("graphs captured without penalties")?;
+                k::penalty_apply(
+                    s,
+                    logits,
+                    n + 1,
+                    crate::model::VOCAB,
+                    pen.0,
+                    pen.1,
+                    pen.2,
+                    rc,
+                )?;
+            }
+            k::topk(
+                s,
+                logits,
+                n + 1,
+                crate::model::VOCAB,
+                crate::model::VOCAB,
+                SAMPLE_TOP,
+                false,
+                self.top_ids.addr(),
+                self.top_vals.addr(),
+            )?;
+            k::spec_sample_rows(
+                s,
+                self.top_ids.addr(),
+                self.top_vals.addr(),
+                SAMPLE_TOP,
+                n,
+                rc,
+                self.sample_params.addr(),
+                self.draft_q.addr(),
+            )?;
+        }
+        k::spec_accept(s, rc, self.ctl, n)?;
+        if mode == 2 {
+            let pen = self.pen.context("graphs captured without penalties")?;
+            k::penalty_mark(
+                s,
+                pen.0,
+                pen.1,
+                pen.2,
+                rc + (commit_at * 4) as u64,
+                0,
+                rc + (commit_count * 4) as u64,
+                3,
+            )?;
+        }
+        s.copy_d2d(dec.verified.addr(), h, (n + 1) * H * 4)?;
+        if let (Some(st), Some(vf)) = (&dec.dflash, self.vfeat) {
+            s.copy_d2d(
+                st.feat.addr(),
+                vf + (off * crate::dflash::FEAT_BYTES) as u64,
+                (n + 1) * crate::dflash::FEAT_BYTES,
+            )?;
+        }
+        unsafe { s.copy_d2h(rc_host.as_ptr(), rc, ints * 4) }
+    }
 }
 
 /// Candidates per verified row in sampled rounds (the request's top_k is a prefix of them).
@@ -262,9 +490,6 @@ struct GraphSet {
     /// The sampled verification with repetition/presence penalties: the verified rows are penalized
     /// before top-k, and the committed tokens join the history.
     verify_from_ple_penalized: Option<quench6k_cuda::Graph>,
-    /// Pair rounds ([`PairGraphs`]): the head, acceptance and bookkeeping of this sequence's rows of a
-    /// batched verification step, per mode (greedy, sampled, penalized).
-    pair_tail: [Option<quench6k_cuda::Graph>; 3],
     bytes: usize,
 }
 
@@ -289,13 +514,28 @@ pub struct DraftPolicy {
 impl DraftPolicy {
     pub fn new(lengths: Vec<usize>) -> Self {
         let max = lengths.iter().copied().max().unwrap_or(1);
-        let mut p = Self { lengths, counts: vec![(0.0, 0.0); max], times: vec![None; max + 1], r: 0.19, decay: 0.9, prior: 0.8, fixed: None };
+        let mut p = Self {
+            lengths,
+            counts: vec![(0.0, 0.0); max],
+            times: vec![None; max + 1],
+            r: 0.19,
+            decay: 0.9,
+            prior: 0.8,
+            fixed: None,
+        };
         // Experiments: QUENCH6K_POLICY=decay=0.95,prior=0.6,fixed=3
-        for kv in std::env::var("QUENCH6K_POLICY").unwrap_or_default().split(',').filter(|kv| !kv.is_empty()) {
+        for kv in std::env::var("QUENCH6K_POLICY")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|kv| !kv.is_empty())
+        {
             match kv.split_once('=') {
                 Some(("decay", v)) => p.decay = v.parse().expect("decay"),
                 Some(("prior", v)) => p.prior = v.parse().expect("prior"),
-                Some(("fixed", v)) => p.fixed = Some(v.parse::<usize>().expect("fixed")).filter(|n| p.lengths.contains(n)),
+                Some(("fixed", v)) => {
+                    p.fixed =
+                        Some(v.parse::<usize>().expect("fixed")).filter(|n| p.lengths.contains(n))
+                }
                 _ => panic!("QUENCH6K_POLICY: unknown setting {kv}"),
             }
         }
@@ -314,7 +554,10 @@ impl DraftPolicy {
             return t;
         }
         let model = |m: usize| 1.0 + self.r * m as f64;
-        match (1..self.times.len()).filter_map(|m| self.times[m].map(|t| (m, t))).min_by_key(|&(m, _)| m.abs_diff(n)) {
+        match (1..self.times.len())
+            .filter_map(|m| self.times[m].map(|t| (m, t)))
+            .min_by_key(|&(m, _)| m.abs_diff(n))
+        {
             Some((m, t)) => t * model(n) / model(m),
             None => model(n),
         }
@@ -332,7 +575,11 @@ impl DraftPolicy {
             }
             tokens / self.time(n)
         };
-        *self.lengths.iter().max_by(|&&a, &&b| value(a).partial_cmp(&value(b)).unwrap()).unwrap()
+        *self
+            .lengths
+            .iter()
+            .max_by(|&&a, &&b| value(a).partial_cmp(&value(b)).unwrap())
+            .unwrap()
     }
 
     /// A round with `n` drafts of which the first `a` were accepted, taking `secs`.
@@ -358,34 +605,73 @@ impl SpecGraphs {
     /// Captures the graphs for `dec` (after its prefill) with the fixed draft length `dec.drafts`, or with
     /// every length 1 ..= `dec.drafts` when `adaptive`, and loads the round control buffer.
     /// `pen`: the penalty history (state, flags, list; see `kernels::penalty_apply`), for penalized rounds.
-    /// `pair_slot`: also capture the tails of pair rounds, for this sequence as segment 0 or 1 of the
-    /// batched verification.
-    #[allow(clippy::too_many_arguments)]
-    pub fn capture(model: &Model, state: &SequenceState, ws: &mut Workspace, dec: &SpecDecoder, s: &Stream, adaptive: bool, pen: Option<(u64, u64, u64)>, pair_slot: Option<usize>) -> Result<Self> {
+    pub fn capture(
+        model: &Model,
+        state: &SequenceState,
+        ws: &mut Workspace,
+        dec: &SpecDecoder,
+        s: &Stream,
+        adaptive: bool,
+        pen: Option<(u64, u64, u64)>,
+    ) -> Result<Self> {
         use quench6k_cuda::kernels as k;
         let nmax = dec.drafts;
-        let (layout_max, draft_at, greedy_at, ints) = k::spec_layout();
-        let (commit_at, commit_count) = k::spec_commit_layout();
+        let (layout_max, draft_at, _, ints) = k::spec_layout();
         ensure!(nmax <= layout_max, "at most {layout_max} drafts");
         let rc = DeviceBuffer::zeroed(ints * 4)?;
         let sample_params = DeviceBuffer::zeroed(k::SAMPLE_PARAMS_BYTES)?;
         let top_ids = DeviceBuffer::new((nmax + 1) * SAMPLE_TOP * 4)?;
         let top_vals = DeviceBuffer::new((nmax + 1) * SAMPLE_TOP * 4)?;
         let dflash = dec.dflash.as_ref().zip(model.dflash.as_ref());
-        ensure!(dflash.is_none() || nmax <= crate::dflash::DRAFTS, "DFlash drafts at most {} tokens", crate::dflash::DRAFTS);
+        ensure!(
+            dflash.is_none() || nmax <= crate::dflash::DRAFTS,
+            "DFlash drafts at most {} tokens",
+            crate::dflash::DRAFTS
+        );
         // DFlash writes the distributions of all 7 drafts.
-        let draft_q = DeviceBuffer::zeroed(nmax.max(if dflash.is_some() { crate::dflash::DRAFTS } else { 0 }) * k::draft_q_bytes())?;
+        let draft_q = DeviceBuffer::zeroed(
+            nmax.max(if dflash.is_some() {
+                crate::dflash::DRAFTS
+            } else {
+                0
+            }) * k::draft_q_bytes(),
+        )?;
         let rc_host = quench6k_cuda::PinnedBuffer::new(ints * 4)?;
-        let ctl = state.spec.as_ref().context("sequence without speculative state")?.ctl.addr();
+        let ctl = state
+            .spec
+            .as_ref()
+            .context("sequence without speculative state")?
+            .ctl
+            .addr();
         let (tok_off, pos_off) = forward::step_offsets(ws);
-        let lengths: Vec<usize> = if adaptive { (1..=nmax).collect() } else { vec![nmax] };
+        let lengths: Vec<usize> = if adaptive {
+            (1..=nmax).collect()
+        } else {
+            vec![nmax]
+        };
         let mut draft = Vec::new();
         let vfeat = match dflash {
             Some((st, d)) => {
-                let sc = ws.dflash.as_ref().context("workspace without DFlash scratch")?;
+                let sc = ws
+                    .dflash
+                    .as_ref()
+                    .context("workspace without DFlash scratch")?;
                 for c in 0..=nmax + 1 {
                     draft.push(quench6k_cuda::Graph::capture(s, |s| {
-                        crate::dflash::draft(model, d, sc, st, s, c, rc.addr(), rc.addr() + 4, rc.addr() + (draft_at * 4) as u64, draft_q.addr(), sample_params.addr(), None)?;
+                        crate::dflash::draft(
+                            model,
+                            d,
+                            sc,
+                            st,
+                            s,
+                            c,
+                            rc.addr(),
+                            rc.addr() + 4,
+                            rc.addr() + (draft_at * 4) as u64,
+                            draft_q.addr(),
+                            sample_params.addr(),
+                            None,
+                        )?;
                         unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
                     })?);
                 }
@@ -393,6 +679,17 @@ impl SpecGraphs {
             }
             None => None,
         };
+        let tail = Tail {
+            rc,
+            sample_params,
+            top_ids,
+            top_vals,
+            draft_q,
+            pen,
+            ctl,
+            vfeat,
+        };
+        let (rc, sample_params, draft_q) = (&tail.rc, &tail.sample_params, &tail.draft_q);
         let mut sets = Vec::with_capacity(lengths.len());
         for &n in &lengths {
             let mut mtp = Vec::with_capacity(nmax + 2);
@@ -401,14 +698,26 @@ impl SpecGraphs {
                     s.copy_d2d(ws.mtp_hin, dec.pending.addr(), H * 4)?;
                     if c > 0 {
                         s.copy_d2d(ws.mtp_hin + ROW, dec.verified.addr(), c * H * 4)?;
-                        s.copy_d2d(dec.pending.addr(), dec.verified.addr() + ((c - 1) as u64) * ROW, H * 4)?;
+                        s.copy_d2d(
+                            dec.pending.addr(),
+                            dec.verified.addr() + ((c - 1) as u64) * ROW,
+                            H * 4,
+                        )?;
                     }
                     for j in 0..n {
                         let t = if j == 0 { c + 1 } else { 1 };
                         k::spec_mtp_header(s, rc.addr(), ws.mtp_step, tok_off, pos_off, j, c)?;
                         forward::forward_mtp_staged(model, state, ws, s, t, ws.mtp_hin, None)?;
                         let q = draft_q.addr() + (j * k::draft_q_bytes()) as u64;
-                        forward::draft_head_argmax_into(model, &dec.head, s, ws.out + ((t - 1) * D * 2) as u64, rc.addr() + ((draft_at + j) * 4) as u64, sample_params.addr(), q)?;
+                        forward::draft_head_argmax_into(
+                            model,
+                            &dec.head,
+                            s,
+                            ws.out + ((t - 1) * D * 2) as u64,
+                            rc.addr() + ((draft_at + j) * 4) as u64,
+                            sample_params.addr(),
+                            q,
+                        )?;
                         s.copy_d2d(ws.mtp_hin, ws.h + ((t - 1) as u64) * ROW, H * 4)?;
                     }
                     unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
@@ -417,52 +726,53 @@ impl SpecGraphs {
             }
             let bytes = forward::step_bytes(n + 1);
             // DFlash: the verification captures the drafter's features of its rows.
-            ws.taps = vfeat.map(|buf| crate::dflash::Taps { buf, first: 0, rows: n + 1 });
-            let ws: &Workspace = ws;
-            let verify_before_ple = quench6k_cuda::Graph::capture(s, |s| forward::forward_part(model, state, ws, s, n + 1, bytes, Part::BeforePle, true, None))?;
-            // The verification's head, sampling, acceptance and bookkeeping for rows `off ..= off + n` of
-            // the step output. Modes: 0 greedy, 1 sampled, 2 sampled with penalties.
-            let tail = |s: &Stream, mode: usize, off: usize| -> Result<()> {
-                let (out, h) = (ws.out + (off * D * 2) as u64, ws.h + off as u64 * ROW);
-                if mode == 0 {
-                    forward::head_argmax_into(model, &dec.head, s, out, n + 1, rc.addr() + (greedy_at * 4) as u64)?;
-                } else {
-                    forward::head_logits_rows(model, &dec.head, s, out, n + 1)?;
-                    if mode == 2 {
-                        let pen = pen.context("graphs captured without penalties")?;
-                        k::penalty_apply(s, dec.head.logits_addr(), n + 1, crate::model::VOCAB, pen.0, pen.1, pen.2, rc.addr())?;
-                    }
-                    k::topk(s, dec.head.logits_addr(), n + 1, crate::model::VOCAB, crate::model::VOCAB, SAMPLE_TOP, false, top_ids.addr(), top_vals.addr())?;
-                    k::spec_sample_rows(s, top_ids.addr(), top_vals.addr(), SAMPLE_TOP, n, rc.addr(), sample_params.addr(), draft_q.addr())?;
-                }
-                k::spec_accept(s, rc.addr(), ctl, n)?;
-                if mode == 2 {
-                    let pen = pen.context("graphs captured without penalties")?;
-                    k::penalty_mark(s, pen.0, pen.1, pen.2, rc.addr() + (commit_at * 4) as u64, 0, rc.addr() + (commit_count * 4) as u64, 3)?;
-                }
-                s.copy_d2d(dec.verified.addr(), h, (n + 1) * H * 4)?;
-                if let (Some(st), Some(vf)) = (&dec.dflash, vfeat) {
-                    s.copy_d2d(st.feat.addr(), vf + (off * crate::dflash::FEAT_BYTES) as u64, (n + 1) * crate::dflash::FEAT_BYTES)?;
-                }
-                unsafe { s.copy_d2h(rc_host.as_ptr(), rc.addr(), ints * 4) }
-            };
-            let verify = |mode: usize| quench6k_cuda::Graph::capture(s, |s| {
-                forward::forward_part(model, state, ws, s, n + 1, bytes, Part::FromPle, true, None)?;
-                tail(s, mode, 0)
+            ws.taps = vfeat.map(|buf| crate::dflash::Taps {
+                buf,
+                first: 0,
+                rows: n + 1,
             });
+            let ws: &Workspace = ws;
+            let verify_before_ple = quench6k_cuda::Graph::capture(s, |s| {
+                forward::forward_part(
+                    model,
+                    state,
+                    ws,
+                    s,
+                    n + 1,
+                    bytes,
+                    Part::BeforePle,
+                    true,
+                    None,
+                )
+            })?;
+            let verify = |mode: usize| {
+                quench6k_cuda::Graph::capture(s, |s| {
+                    forward::forward_part(
+                        model,
+                        state,
+                        ws,
+                        s,
+                        n + 1,
+                        bytes,
+                        Part::FromPle,
+                        true,
+                        None,
+                    )?;
+                    tail.run(model, dec, ws, s, mode, 0, n, None, &rc_host)
+                })
+            };
             let verify_from_ple = verify(0)?;
             let verify_from_ple_sampled = verify(1)?;
             let verify_from_ple_penalized = pen.map(|_| verify(2)).transpose()?;
-            let mut pair_tail = [None, None, None];
-            if let Some(slot) = pair_slot {
-                let off = slot * (n + 1);
-                for (mode, g) in pair_tail.iter_mut().enumerate() {
-                    if mode < 2 || pen.is_some() {
-                        *g = Some(quench6k_cuda::Graph::capture(s, |s| tail(s, mode, off))?);
-                    }
-                }
-            }
-            sets.push(GraphSet { n, mtp, verify_before_ple, verify_from_ple, verify_from_ple_sampled, verify_from_ple_penalized, pair_tail, bytes });
+            sets.push(GraphSet {
+                n,
+                mtp,
+                verify_before_ple,
+                verify_from_ple,
+                verify_from_ple_sampled,
+                verify_from_ple_penalized,
+                bytes,
+            });
         }
         ws.taps = None;
         // Round state: next token at position len(state), nothing to catch up yet.
@@ -472,7 +782,15 @@ impl SpecGraphs {
             // Drafting costs the same for every length; only the verification grows.
             policy.r = 0.05;
         }
-        Ok(Self { sets, draft, _rc: rc, rc_host, policy, sample_params, _top_ids: top_ids, _top_vals: top_vals, _draft_q: draft_q, sampled: false, penalized: false })
+        Ok(Self {
+            sets,
+            draft,
+            tail,
+            rc_host,
+            policy,
+            sampled: false,
+            penalized: false,
+        })
     }
 
     /// Greedy rounds (`None`), or sampled rounds; top_k is capped at [`SAMPLE_TOP`] (0: all of them).
@@ -481,11 +799,29 @@ impl SpecGraphs {
     pub fn set_sampling(&mut self, s: &Stream, sampling: Option<Sampling>) -> Result<()> {
         self.sampled = sampling.is_some();
         let mut b = vec![0u8; quench6k_cuda::kernels::SAMPLE_PARAMS_BYTES];
-        if let Some(Sampling { temperature: t, top_p, top_k: k, min_p, seed }) = sampling {
-            let k = if k == 0 { SAMPLE_TOP } else { k.min(SAMPLE_TOP) } as u32;
+        if let Some(Sampling {
+            temperature: t,
+            top_p,
+            top_k: k,
+            min_p,
+            seed,
+        }) = sampling
+        {
+            let k = if k == 0 {
+                SAMPLE_TOP
+            } else {
+                k.min(SAMPLE_TOP)
+            } as u32;
             // Drafts are drawn at this percentage of the temperature (0: greedy drafts).
             // Top-1 rounds (penalized greedy) take the drafter's most likely token.
-            let draft_sampled: u32 = if k == 1 { 0 } else { std::env::var("QUENCH6K_SAMPLED_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(DRAFT_TEMPERATURE_PERCENT) };
+            let draft_sampled: u32 = if k == 1 {
+                0
+            } else {
+                std::env::var("QUENCH6K_SAMPLED_DRAFTS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(DRAFT_TEMPERATURE_PERCENT)
+            };
             b.clear();
             b.extend_from_slice(&t.to_le_bytes());
             b.extend_from_slice(&top_p.to_le_bytes());
@@ -497,35 +833,72 @@ impl SpecGraphs {
             b.extend_from_slice(&0u32.to_le_bytes());
         }
         // Greedy rounds read the parameters too (the draft flag), so they are always rewritten.
-        s.upload_to(self.sample_params.addr(), &b)
+        s.upload_to(self.tail.sample_params.addr(), &b)
     }
 
     /// Points the round control at a decoder restarted on a new prompt.
     pub fn restart(&self, state: &SequenceState, dec: &SpecDecoder, s: &Stream) -> Result<()> {
-        s.upload_to(self._rc.addr(), &[state.len() as i32, dec.next, 0, 0])
+        s.upload_to(self.tail.rc.addr(), &[state.len() as i32, dec.next, 0, 0])
     }
 
     fn rc_word(&self, i: usize) -> i32 {
-        i32::from_le_bytes(self.rc_host.as_slice()[4 * i..4 * i + 4].try_into().unwrap())
+        i32::from_le_bytes(
+            self.rc_host.as_slice()[4 * i..4 * i + 4]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// One round with the policy's draft length; returns the committed tokens.
-    pub fn round(&mut self, model: &Model, state: &mut SequenceState, ws: &mut Workspace, dec: &mut SpecDecoder, s: &Stream) -> Result<Vec<i32>> {
+    pub fn round(
+        &mut self,
+        model: &Model,
+        state: &mut SequenceState,
+        ws: &mut Workspace,
+        dec: &mut SpecDecoder,
+        s: &Stream,
+    ) -> Result<Vec<i32>> {
         let (_, draft_at, _, _) = quench6k_cuda::kernels::spec_layout();
         let n = self.policy.choose();
-        let set = self.sets.iter().find(|g| g.n == n).expect("a graph set per draft length");
+        let set = self
+            .sets
+            .iter()
+            .find(|g| g.n == n)
+            .expect("a graph set per draft length");
         let c = dec.catch_up.len();
         // Debugging: QUENCH6K_DFLASH_PROFILE=N times round N's drafting eagerly, per op, before the graph
         // repeats it (context rows are rewritten in place; greedy drafts are the same).
-        if let (Some(at), Some(st), Some(d), Some(sc)) = (std::env::var("QUENCH6K_DFLASH_PROFILE").ok().and_then(|v| v.parse::<usize>().ok()), &dec.dflash, &model.dflash, &ws.dflash)
-            && at == dec.rounds
+        if let (Some(at), Some(st), Some(d), Some(sc)) = (
+            std::env::var("QUENCH6K_DFLASH_PROFILE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok()),
+            &dec.dflash,
+            &model.dflash,
+            &ws.dflash,
+        ) && at == dec.rounds
         {
             let mut prof = crate::profile::Profiler::default();
             for _ in 0..10 {
-                crate::dflash::draft(model, d, sc, st, s, c, self._rc.addr(), self._rc.addr() + 4, self._rc.addr() + (draft_at * 4) as u64, self._draft_q.addr(), self.sample_params.addr(), Some(&mut prof))?;
+                crate::dflash::draft(
+                    model,
+                    d,
+                    sc,
+                    st,
+                    s,
+                    c,
+                    self.tail.rc.addr(),
+                    self.tail.rc.addr() + 4,
+                    self.tail.rc.addr() + (draft_at * 4) as u64,
+                    self.tail.draft_q.addr(),
+                    self.tail.sample_params.addr(),
+                    Some(&mut prof),
+                )?;
             }
             prof.collect()?;
-            eprintln!("DFlash drafting (c = {c}), 10 eager steps:\n{}", prof.report());
+            eprintln!(
+                "DFlash drafting (c = {c}), 10 eager steps:\n{}",
+                prof.report()
+            );
         }
         let t0 = std::time::Instant::now();
         self.draft_graph(set, c).launch(s)?;
@@ -540,7 +913,10 @@ impl SpecGraphs {
         let bytes = forward::prepare_ple(model, state, ws, n + 1)?;
         debug_assert_eq!(bytes, set.bytes);
         if self.penalized {
-            set.verify_from_ple_penalized.as_ref().context("graphs captured without penalties")?.launch(s)?
+            set.verify_from_ple_penalized
+                .as_ref()
+                .context("graphs captured without penalties")?
+                .launch(s)?
         } else if self.sampled {
             set.verify_from_ple_sampled.launch(s)?
         } else {
@@ -556,7 +932,13 @@ impl SpecGraphs {
     /// After a verification (read back into `rc_host`): truncates the sequence to the accepted tokens
     /// and positions the decoder on the target's next token. Returns the accepted draft count and the
     /// committed tokens.
-    fn commit(&self, state: &mut SequenceState, dec: &mut SpecDecoder, verify: &[i32], p: usize) -> (usize, Vec<i32>) {
+    fn commit(
+        &self,
+        state: &mut SequenceState,
+        dec: &mut SpecDecoder,
+        verify: &[i32],
+        p: usize,
+    ) -> (usize, Vec<i32>) {
         let a = self.rc_word(3) as usize;
         state.tokens.truncate(p + a + 1);
         let committed = verify[..=a].to_vec();
@@ -569,82 +951,187 @@ impl SpecGraphs {
 
     /// The drafting graph of a round with draft set `set` after `c` committed tokens.
     fn draft_graph<'a>(&'a self, set: &'a GraphSet, c: usize) -> &'a quench6k_cuda::Graph {
-        if self.draft.is_empty() { &set.mtp[c] } else { &self.draft[c] }
+        if self.draft.is_empty() {
+            &set.mtp[c]
+        } else {
+            &self.draft[c]
+        }
     }
 
     /// The tail mode of this sequence's rounds (greedy, sampled, penalized).
     fn mode(&self) -> usize {
-        if self.penalized { 2 } else if self.sampled { 1 } else { 0 }
-    }
-}
-
-/// Speculative rounds of two sequences together: both drafters run, then one batched verification
-/// step over `[x, d1 .. dn]` of each (segments of [`forward::forward_segments`], recurrent commits
-/// deferred per sequence), then each sequence's own tail (head, sampling, acceptance; captured in its
-/// [`SpecGraphs`] with `pair_slot`). Both sequences draft the same length, chosen by a policy fed
-/// with both sequences' acceptance.
-pub struct PairGraphs {
-    sets: Vec<(usize, quench6k_cuda::Graph, quench6k_cuda::Graph, usize)>,
-    pub policy: DraftPolicy,
-}
-
-impl PairGraphs {
-    /// Captures the batched verification for every draft length both decoders support (1 ..= the
-    /// shorter longest draft) over `states` (slot 0, slot 1).
-    pub fn capture(model: &Model, states: [&SequenceState; 2], ws: &mut Workspace, s: &Stream, max_drafts: usize) -> Result<Self> {
-        let mut sets = Vec::with_capacity(max_drafts);
-        let vfeat = ws.dflash.as_ref().filter(|_| model.dflash.is_some()).map(|sc| sc.vfeat);
-        for n in 1..=max_drafts {
-            ws.taps = vfeat.map(|buf| crate::dflash::Taps { buf, first: 0, rows: 2 * (n + 1) });
-            let ws: &Workspace = ws;
-            let segs = [forward::Seg { state: states[0], rows: n + 1, defer: Some(true) }, forward::Seg { state: states[1], rows: n + 1, defer: Some(true) }];
-            let bytes = forward::segments_bytes(2 * (n + 1));
-            let before = quench6k_cuda::Graph::capture(s, |s| forward::forward_segments(model, &segs, ws, s, bytes, Part::BeforePle))?;
-            let from = quench6k_cuda::Graph::capture(s, |s| forward::forward_segments(model, &segs, ws, s, bytes, Part::FromPle))?;
-            sets.push((n, before, from, bytes));
+        if self.penalized {
+            2
+        } else if self.sampled {
+            1
+        } else {
+            0
         }
-        ws.taps = None;
-        Ok(Self { sets, policy: DraftPolicy::new((1..=max_drafts).collect()) })
+    }
+}
+
+/// One sequence of a group round: its graphs, state and decoder.
+pub type Member<'a> = (
+    &'a mut SpecGraphs,
+    &'a mut SequenceState,
+    &'a mut SpecDecoder,
+);
+
+/// The most sequences a group round (and a batched step) takes.
+pub const MAX_GROUP: usize = forward::MAX_SEGMENTS;
+
+/// Speculative rounds of several sequences together: each drafter runs (its own graphs), then one
+/// batched verification step over `[x, d1 .. dn]` of every sequence (segments of
+/// [`forward::forward_segments`], recurrent commits deferred per sequence; issued eagerly, so any set
+/// of sequences and any row count runs without its own graph), then each sequence's tail (head,
+/// sampling, acceptance). All sequences draft the same length, chosen by a policy per group size fed
+/// with every sequence's acceptance: larger groups verify more rows per draft token, so they settle on
+/// shorter drafts (and at most [`GroupRounds::max_rows`] rows are verified: 16 / k - 1 drafts each).
+pub struct GroupRounds {
+    /// Indexed by group size.
+    policies: Vec<DraftPolicy>,
+    /// The LM-head logits of every verified row (one pass over the head for the whole group).
+    head: HeadWorkspace,
+}
+
+impl GroupRounds {
+    /// Rounds of up to [`MAX_GROUP`] sequences drafting 1 ..= `max_drafts` tokens, and at most
+    /// [`max_rows`](Self::max_rows) verified rows in all: past them the batched step would take the
+    /// prefill kernels, whose arithmetic differs from decoding (greedy output would no longer match).
+    pub fn new(max_drafts: usize) -> Result<Self> {
+        let mut policies: Vec<DraftPolicy> = (0..=MAX_GROUP)
+            .map(|k| {
+                DraftPolicy::new(
+                    (1..=max_drafts
+                        .min((Self::max_rows() / k.max(1)).saturating_sub(1))
+                        .max(1))
+                        .collect(),
+                )
+            })
+            .collect();
+        // Unmeasured lengths: one more draft token adds a verification row per sequence.
+        for (k, p) in policies.iter_mut().enumerate() {
+            p.r *= (k.max(1) as f64).sqrt();
+        }
+        Ok(Self {
+            policies,
+            head: HeadWorkspace::new(Self::max_rows(), 1)?,
+        })
     }
 
-    /// One round of both sequences; returns each one's committed tokens.
-    #[allow(clippy::too_many_arguments)]
-    pub fn round(&mut self, model: &Model, ws: &mut Workspace, s: &Stream, a: (&mut SpecGraphs, &mut SequenceState, &mut SpecDecoder), b: (&mut SpecGraphs, &mut SequenceState, &mut SpecDecoder)) -> Result<[Vec<i32>; 2]> {
+    /// Verified rows a group round stays within (the decode kernels' batch limit).
+    pub fn max_rows() -> usize {
+        quench6k_cuda::kernels::gemv_max_m()
+    }
+
+    /// One round of every member; returns each one's committed tokens.
+    pub fn round(
+        &mut self,
+        model: &Model,
+        ws: &mut Workspace,
+        s: &Stream,
+        members: &mut [Member],
+    ) -> Result<Vec<Vec<i32>>> {
         let (_, draft_at, _, _) = quench6k_cuda::kernels::spec_layout();
-        let (ga, sa, da) = a;
-        let (gb, sb, db) = b;
-        let n = self.policy.choose();
-        let (_, before, from, bytes) = self.sets.iter().find(|x| x.0 == n).context("no pair graphs for this draft length")?;
-        let seta = ga.sets.iter().find(|g| g.n == n).context("slot 0 lacks this draft length")?;
-        let setb = gb.sets.iter().find(|g| g.n == n).context("slot 1 lacks this draft length")?;
+        let k = members.len();
+        ensure!(
+            (2..=MAX_GROUP).contains(&k),
+            "group rounds take 2 to {MAX_GROUP} sequences"
+        );
+        let n = self.policies[k].choose();
+        let mut sets = Vec::with_capacity(k);
+        for (g, _, _) in members.iter() {
+            sets.push(
+                g.sets
+                    .iter()
+                    .position(|x| x.n == n)
+                    .context("a member lacks this draft length")?,
+            );
+        }
         let t0 = std::time::Instant::now();
-        ga.draft_graph(seta, da.catch_up.len()).launch(s)?;
-        gb.draft_graph(setb, db.catch_up.len()).launch(s)?;
+        for ((g, _, d), &i) in members.iter().zip(&sets) {
+            g.draft_graph(&g.sets[i], d.catch_up.len()).launch(s)?;
+        }
         s.synchronize()?;
         let t1 = std::time::Instant::now();
-        let mut va = vec![da.next];
-        va.extend((0..n).map(|j| ga.rc_word(draft_at + j)));
-        let mut vb = vec![db.next];
-        vb.extend((0..n).map(|j| gb.rc_word(draft_at + j)));
-        let (pa, pb) = (sa.len(), sb.len());
-        forward::prepare_segments_tokens(&mut [&mut *sa, &mut *sb], ws, &[&va, &vb])?;
-        before.launch(s)?;
-        let used = forward::prepare_segments_ple(model, &[&*sa, &*sb], ws, &[n + 1, n + 1])?;
-        debug_assert_eq!(used, *bytes);
-        from.launch(s)?;
-        seta.pair_tail[ga.mode()].as_ref().context("slot 0 graphs captured without pair tails")?.launch(s)?;
-        setb.pair_tail[gb.mode()].as_ref().context("slot 1 graphs captured without pair tails")?.launch(s)?;
-        s.synchronize()?;
-        let (draft, verify) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
-        for d in [&mut *da, &mut *db] {
-            d.draft_secs += draft / 2.0;
-            d.verify_secs += verify / 2.0;
+        let verify: Vec<Vec<i32>> = members
+            .iter()
+            .map(|(g, _, d)| {
+                std::iter::once(d.next)
+                    .chain((0..n).map(|j| g.rc_word(draft_at + j)))
+                    .collect()
+            })
+            .collect();
+        let starts: Vec<usize> = members.iter().map(|(_, st, _)| st.len()).collect();
+        {
+            let mut states: Vec<&mut SequenceState> =
+                members.iter_mut().map(|(_, st, _)| &mut **st).collect();
+            let toks: Vec<&[i32]> = verify.iter().map(|v| v.as_slice()).collect();
+            forward::prepare_segments_tokens(&mut states, ws, &toks)?;
         }
-        let (acc_a, ca) = ga.commit(sa, da, &va, pa);
-        let (acc_b, cb) = gb.commit(sb, db, &vb, pb);
+        let rows = vec![n + 1; k];
+        let bytes = forward::segments_bytes(k * (n + 1));
+        let vfeat = ws
+            .dflash
+            .as_ref()
+            .filter(|_| model.dflash.is_some())
+            .map(|sc| sc.vfeat);
+        ws.taps = vfeat.map(|buf| crate::dflash::Taps {
+            buf,
+            first: 0,
+            rows: k * (n + 1),
+        });
+        let r = (|| -> Result<()> {
+            let segs: Vec<forward::Seg> = members
+                .iter()
+                .map(|(_, st, _)| forward::Seg {
+                    state: &**st,
+                    rows: n + 1,
+                    defer: Some(true),
+                })
+                .collect();
+            forward::forward_segments(model, &segs, ws, s, bytes, Part::BeforePle)?;
+            let states: Vec<&SequenceState> = members.iter().map(|(_, st, _)| &**st).collect();
+            let used = forward::prepare_segments_ple(model, &states, ws, &rows)?;
+            debug_assert_eq!(used, bytes);
+            let segs: Vec<forward::Seg> = members
+                .iter()
+                .map(|(_, st, _)| forward::Seg {
+                    state: &**st,
+                    rows: n + 1,
+                    defer: Some(true),
+                })
+                .collect();
+            forward::forward_segments(model, &segs, ws, s, bytes, Part::FromPle)
+        })();
+        ws.taps = None;
+        r?;
+        forward::head_logits_rows(model, &self.head, s, ws.out, k * (n + 1))?;
+        for (b, (g, _, d)) in members.iter().enumerate() {
+            let logits = self.head.logits_addr() + (b * (n + 1) * crate::model::VOCAB * 4) as u64;
+            g.tail.run(
+                model,
+                d,
+                ws,
+                s,
+                g.mode(),
+                b * (n + 1),
+                n,
+                Some(logits),
+                &g.rc_host,
+            )?;
+        }
+        s.synchronize()?;
+        let (draft, verify_secs) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
+        let mut out = Vec::with_capacity(k);
         let secs = t0.elapsed().as_secs_f64();
-        self.policy.record(n, acc_a, secs);
-        self.policy.record(n, acc_b, secs);
-        Ok([ca, cb])
+        for (b, (g, st, d)) in members.iter_mut().enumerate() {
+            d.draft_secs += draft / k as f64;
+            d.verify_secs += verify_secs / k as f64;
+            let (acc, committed) = g.commit(st, d, &verify[b], starts[b]);
+            self.policies[k].record(n, acc, secs);
+            out.push(committed);
+        }
+        Ok(out)
     }
 }

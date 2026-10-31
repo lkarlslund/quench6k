@@ -143,8 +143,10 @@ impl Reader<'_> {
 
 impl Gguf {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let map = unsafe { Mmap::map(&file) }.with_context(|| format!("mapping {}", path.display()))?;
+        let file =
+            std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let map =
+            unsafe { Mmap::map(&file) }.with_context(|| format!("mapping {}", path.display()))?;
         let mut r = Reader { b: &map, at: 0 };
         ensure!(r.take(4)? == b"GGUF", "{}: not a GGUF file", path.display());
         let version = r.u32()?;
@@ -169,20 +171,38 @@ impl Gguf {
             let offset = r.u64()? as usize;
             dir.push((name, dims, ty, offset));
         }
-        let align = meta.get("general.alignment").and_then(Value::as_i64).unwrap_or(32) as usize;
+        let align = meta
+            .get("general.alignment")
+            .and_then(Value::as_i64)
+            .unwrap_or(32) as usize;
         let data = r.at.div_ceil(align) * align;
         let mut tensors = HashMap::new();
         for (name, dims, ty, offset) in dir {
             let elements: usize = dims.iter().product();
-            let bytes = ty.bytes(elements).with_context(|| format!("{name}: unsupported tensor type {ty:?}"))?;
-            ensure!(data + offset + bytes <= map.len(), "{name}: data beyond the end of the file");
-            tensors.insert(name, TensorInfo { dims, ty, offset: data + offset, bytes });
+            let bytes = ty
+                .bytes(elements)
+                .with_context(|| format!("{name}: unsupported tensor type {ty:?}"))?;
+            ensure!(
+                data + offset + bytes <= map.len(),
+                "{name}: data beyond the end of the file"
+            );
+            tensors.insert(
+                name,
+                TensorInfo {
+                    dims,
+                    ty,
+                    offset: data + offset,
+                    bytes,
+                },
+            );
         }
         Ok(Self { map, meta, tensors })
     }
 
     pub fn get(&self, name: &str) -> Result<&TensorInfo> {
-        self.tensors.get(name).with_context(|| format!("tensor {name} missing"))
+        self.tensors
+            .get(name)
+            .with_context(|| format!("tensor {name} missing"))
     }
 
     pub fn data(&self, t: &TensorInfo) -> &[u8] {
@@ -192,10 +212,17 @@ impl Gguf {
     pub fn f32s(&self, name: &str) -> Result<Vec<f32>> {
         let t = self.get(name)?;
         ensure!(t.ty == GgmlType::F32, "{name}: expected F32");
-        Ok(self.data(t).chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        Ok(self
+            .data(t)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect())
     }
 
     pub fn meta_i64(&self, key: &str) -> Result<i64> {
-        self.meta.get(key).and_then(Value::as_i64).with_context(|| format!("metadata {key} missing"))
+        self.meta
+            .get(key)
+            .and_then(Value::as_i64)
+            .with_context(|| format!("metadata {key} missing"))
     }
 }

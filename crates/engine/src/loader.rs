@@ -36,7 +36,9 @@ pub struct DeviceWeights {
 
 impl DeviceWeights {
     pub fn get(&self, name: &str) -> Result<&DeviceTensor> {
-        self.tensors.get(name).ok_or_else(|| anyhow!("weights have no device tensor {name}"))
+        self.tensors
+            .get(name)
+            .ok_or_else(|| anyhow!("weights have no device tensor {name}"))
     }
 
     pub fn device_bytes(&self) -> usize {
@@ -67,13 +69,24 @@ pub fn upload_quantized(
     stream: &quench6k_cuda::Stream,
 ) -> Result<(DeviceWeights, LoadStats)> {
     use quench6k_cuda::kernels::{self as k, WeightFormat};
-    anyhow::ensure!(format == WeightFormat::Int8Group, "upload_quantized produces group-scaled INT8 only");
+    anyhow::ensure!(
+        format == WeightFormat::Int8Group,
+        "upload_quantized produces group-scaled INT8 only"
+    );
     let start = Instant::now();
     // GDN input projections become MXFP8 (gate PASS; FP8 tensor cores for prefill), the rest INT8 with
     // group scales. QUENCH6K_GDN_MXFP8=0 keeps them INT8.
     let mx8_on = std::env::var("QUENCH6K_GDN_MXFP8").map_or(true, |v| v != "0");
-    let is_mx8 = |group: Option<&str>| mx8_on && group.is_some_and(|g| g.ends_with(".linear_attn.quench6k.in_proj"));
-    let scale_bytes = |mx8: bool, rows: usize, kk: usize| if mx8 { rows * kk / 32 } else { rows * (kk / k::int8_group()) * 4 };
+    let is_mx8 = |group: Option<&str>| {
+        mx8_on && group.is_some_and(|g| g.ends_with(".linear_attn.quench6k.in_proj"))
+    };
+    let scale_bytes = |mx8: bool, rows: usize, kk: usize| {
+        if mx8 {
+            rows * kk / 32
+        } else {
+            rows * (kk / k::int8_group()) * 4
+        }
+    };
 
     // Units of contiguous placement: a group's members, or a single tensor. Units are uploaded in
     // batches per checkpoint file (a group with the file of its first member; the others are read
@@ -86,27 +99,50 @@ pub fn upload_quantized(
         let file = ckpt.get(&members[0])?.file;
         let kk = ckpt.get(&members[0])?.shape[1];
         for m in members {
-            anyhow::ensure!(select(m), "fusion group {name}: member {m} is not selected for quantization");
+            anyhow::ensure!(
+                select(m),
+                "fusion group {name}: member {m} is not selected for quantization"
+            );
             let info = ckpt.get(m)?;
-            anyhow::ensure!(info.shape[1] == kk, "fusion group {name}: members differ in K");
+            anyhow::ensure!(
+                info.shape[1] == kk,
+                "fusion group {name}: members differ in K"
+            );
             grouped.insert(m.as_str());
         }
         units[file].push(unit_list.len());
-        unit_list.push((Some(name.as_str()), members.iter().map(|m| m.as_str()).collect()));
+        unit_list.push((
+            Some(name.as_str()),
+            members.iter().map(|m| m.as_str()).collect(),
+        ));
     }
-    let mut singles: Vec<&str> = ckpt.tensors.keys().map(|n| n.as_str()).filter(|n| select(n) && !grouped.contains(n)).collect();
+    let mut singles: Vec<&str> = ckpt
+        .tensors
+        .keys()
+        .map(|n| n.as_str())
+        .filter(|n| select(n) && !grouped.contains(n))
+        .collect();
     singles.sort();
     for name in singles {
         let info = &ckpt.tensors[name];
-        anyhow::ensure!(info.dtype == DType::BF16 && info.shape.len() == 2, "{name}: only 2-D BF16 tensors quantize");
+        anyhow::ensure!(
+            info.dtype == DType::BF16 && info.shape.len() == 2,
+            "{name}: only 2-D BF16 tensors quantize"
+        );
         units[info.file].push(unit_list.len());
         unit_list.push((None, vec![name]));
     }
 
-    let mut out = DeviceWeights { segments: Vec::new(), tensors: HashMap::new() };
+    let mut out = DeviceWeights {
+        segments: Vec::new(),
+        tensors: HashMap::new(),
+    };
     let mut stats = LoadStats::default();
     for file_units in units.iter().filter(|u| !u.is_empty()) {
-        let mut names: Vec<&str> = file_units.iter().flat_map(|&u| unit_list[u].1.iter().copied()).collect();
+        let mut names: Vec<&str> = file_units
+            .iter()
+            .flat_map(|&u| unit_list[u].1.iter().copied())
+            .collect();
         names.sort();
         let (staged, s) = upload(ckpt, |n| names.binary_search(&n).is_ok(), opts)?;
         stats.bytes += s.bytes;
@@ -128,7 +164,16 @@ pub fn upload_quantized(
             let mx8 = is_mx8(*group);
             let dtype = if mx8 { DType::MX8 } else { DType::I8G };
             if let Some(g) = group {
-                out.tensors.insert(g.to_string(), DeviceTensor { addr: qa, bytes: (rows * kk) as u64, dtype, shape: vec![rows, kk], scale: sa });
+                out.tensors.insert(
+                    g.to_string(),
+                    DeviceTensor {
+                        addr: qa,
+                        bytes: (rows * kk) as u64,
+                        dtype,
+                        shape: vec![rows, kk],
+                        scale: sa,
+                    },
+                );
             }
             for name in members {
                 let src = staged.get(name)?;
@@ -138,10 +183,22 @@ pub fn upload_quantized(
                     anyhow::ensure!(kk % 128 == 0, "{name}: K {kk} is not a multiple of 128");
                     k::mxfp8_rows(stream, src.addr, n, kk, kk, qa, sa)?;
                 } else {
-                    anyhow::ensure!(kk % k::int8_group() == 0, "{name}: K {kk} is not a multiple of the INT8 group");
+                    anyhow::ensure!(
+                        kk % k::int8_group() == 0,
+                        "{name}: K {kk} is not a multiple of the INT8 group"
+                    );
                     k::quantize_int8_groups(stream, src.addr, n, kk, qa, sa)?;
                 }
-                out.tensors.insert(name.to_string(), DeviceTensor { addr: qa, bytes: (n * kk) as u64, dtype, shape: src.shape.clone(), scale: sa });
+                out.tensors.insert(
+                    name.to_string(),
+                    DeviceTensor {
+                        addr: qa,
+                        bytes: (n * kk) as u64,
+                        dtype,
+                        shape: src.shape.clone(),
+                        scale: sa,
+                    },
+                );
                 qa += (n * kk) as u64;
                 sa += scale_bytes(mx8, n, kk) as u64;
             }
@@ -166,7 +223,12 @@ pub struct LoadOptions {
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        Self { threads: 8, chunk_bytes: 32 << 20, direct: true, layers: crate::model::LAYERS }
+        Self {
+            threads: 8,
+            chunk_bytes: 32 << 20,
+            direct: true,
+            layers: crate::model::LAYERS,
+        }
     }
 }
 
@@ -186,11 +248,19 @@ struct Chunk {
 
 fn required_alignment(ckpt: &Checkpoint, name: &str) -> u64 {
     let info = &ckpt.tensors[name];
-    if info.bytes >= 16 { 16 } else { info.dtype.size() as u64 }
+    if info.bytes >= 16 {
+        16
+    } else {
+        info.dtype.size() as u64
+    }
 }
 
 /// Uploads every tensor for which `select` returns true.
-pub fn upload(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, opts: LoadOptions) -> Result<(DeviceWeights, LoadStats)> {
+pub fn upload(
+    ckpt: &Checkpoint,
+    select: impl Fn(&str) -> bool,
+    opts: LoadOptions,
+) -> Result<(DeviceWeights, LoadStats)> {
     let start = Instant::now();
 
     let mut by_file: Vec<Vec<(&str, u64, u64)>> = vec![Vec::new(); ckpt.files.len()];
@@ -213,7 +283,10 @@ pub fn upload(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, opts: LoadOption
             let seg_begin = list[i].1;
             let mut seg_end = list[i].2;
             let mut j = i + 1;
-            while j < list.len() && list[j].1 <= seg_end + MAX_GAP && (list[j].1 - seg_begin) % required_alignment(ckpt, list[j].0) == 0 {
+            while j < list.len()
+                && list[j].1 <= seg_end + MAX_GAP
+                && (list[j].1 - seg_begin) % required_alignment(ckpt, list[j].0) == 0
+            {
                 seg_end = seg_end.max(list[j].2);
                 j += 1;
             }
@@ -223,13 +296,24 @@ pub fn upload(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, opts: LoadOption
                 let info = &ckpt.tensors[name];
                 tensors.insert(
                     name.to_string(),
-                    DeviceTensor { addr: buffer.addr() + (begin - seg_begin), bytes: end - begin, dtype: info.dtype, shape: info.shape.clone(), scale: 0 },
+                    DeviceTensor {
+                        addr: buffer.addr() + (begin - seg_begin),
+                        bytes: end - begin,
+                        dtype: info.dtype,
+                        shape: info.shape.clone(),
+                        scale: 0,
+                    },
                 );
             }
             let mut offset = 0usize;
             while offset < len {
                 let n = opts.chunk_bytes.min(len - offset);
-                chunks.push(Chunk { file, offset: seg_begin + offset as u64, len: n, dst: buffer.addr() + offset as u64 });
+                chunks.push(Chunk {
+                    file,
+                    offset: seg_begin + offset as u64,
+                    len: n,
+                    dst: buffer.addr() + offset as u64,
+                });
                 offset += n;
             }
             total += len as u64;
@@ -240,13 +324,19 @@ pub fn upload(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, opts: LoadOption
 
     // Largest chunks first keeps the threads evenly loaded at the end.
     chunks.sort_by_key(|c| std::cmp::Reverse(c.len));
-    let direct = if opts.direct { open_direct(&ckpt.files) } else { None };
+    let direct = if opts.direct {
+        open_direct(&ckpt.files)
+    } else {
+        None
+    };
     let next = AtomicUsize::new(0);
     let error = Mutex::new(None);
     std::thread::scope(|scope| {
         for _ in 0..opts.threads.max(1) {
             scope.spawn(|| {
-                if let Err(e) = upload_worker(ckpt, direct.as_deref(), &chunks, &next, opts.chunk_bytes) {
+                if let Err(e) =
+                    upload_worker(ckpt, direct.as_deref(), &chunks, &next, opts.chunk_bytes)
+                {
                     error.lock().unwrap().get_or_insert(e);
                     next.store(chunks.len(), Ordering::Relaxed);
                 }
@@ -257,7 +347,11 @@ pub fn upload(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, opts: LoadOption
         return Err(e);
     }
 
-    let stats = LoadStats { bytes: total, segments: segments.len(), seconds: start.elapsed().as_secs_f64() };
+    let stats = LoadStats {
+        bytes: total,
+        segments: segments.len(),
+        seconds: start.elapsed().as_secs_f64(),
+    };
     Ok((DeviceWeights { segments, tensors }, stats))
 }
 
@@ -265,19 +359,33 @@ pub fn upload(ckpt: &Checkpoint, select: impl Fn(&str) -> bool, opts: LoadOption
 const DIRECT_ALIGN: u64 = 4096;
 
 fn open_direct(files: &[crate::checkpoint::SafetensorsFile]) -> Option<Vec<File>> {
-    files.iter().map(|f| crate::fileio::open_direct(&f.path)).collect()
+    files
+        .iter()
+        .map(|f| crate::fileio::open_direct(&f.path))
+        .collect()
 }
 
-fn upload_worker(ckpt: &Checkpoint, direct: Option<&[File]>, chunks: &[Chunk], next: &AtomicUsize, chunk_bytes: usize) -> Result<()> {
+fn upload_worker(
+    ckpt: &Checkpoint,
+    direct: Option<&[File]>,
+    chunks: &[Chunk],
+    next: &AtomicUsize,
+    chunk_bytes: usize,
+) -> Result<()> {
     let stream = Stream::new()?;
     let buffer_bytes = chunk_bytes + 2 * DIRECT_ALIGN as usize;
-    let mut buffers = [PinnedBuffer::new(buffer_bytes)?, PinnedBuffer::new(buffer_bytes)?];
+    let mut buffers = [
+        PinnedBuffer::new(buffer_bytes)?,
+        PinnedBuffer::new(buffer_bytes)?,
+    ];
     let events = [Event::new()?, Event::new()?];
     let mut used = [false; 2];
     let mut slot = 0;
     loop {
         let index = next.fetch_add(1, Ordering::Relaxed);
-        let Some(chunk) = chunks.get(index) else { break };
+        let Some(chunk) = chunks.get(index) else {
+            break;
+        };
         if used[slot] {
             events[slot].synchronize()?;
         }
@@ -291,14 +399,26 @@ fn upload_worker(ckpt: &Checkpoint, direct: Option<&[File]>, chunks: &[Chunk], n
                 let skip = (chunk.offset - begin) as usize;
                 let mut filled = 0;
                 while filled < skip + chunk.len {
-                    let n = crate::fileio::read_at(&files[chunk.file], &mut window[filled..], begin + filled as u64)?;
-                    anyhow::ensure!(n > 0, "unexpected end of {}", ckpt.files[chunk.file].path.display());
+                    let n = crate::fileio::read_at(
+                        &files[chunk.file],
+                        &mut window[filled..],
+                        begin + filled as u64,
+                    )?;
+                    anyhow::ensure!(
+                        n > 0,
+                        "unexpected end of {}",
+                        ckpt.files[chunk.file].path.display()
+                    );
                     filled += n;
                 }
                 &buffer[skip..skip + chunk.len]
             }
             None => {
-                crate::fileio::read_exact_at(&ckpt.files[chunk.file].file, &mut buffer[..chunk.len], chunk.offset)?;
+                crate::fileio::read_exact_at(
+                    &ckpt.files[chunk.file].file,
+                    &mut buffer[..chunk.len],
+                    chunk.offset,
+                )?;
                 &buffer[..chunk.len]
             }
         };

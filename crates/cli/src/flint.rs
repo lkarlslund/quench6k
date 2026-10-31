@@ -57,19 +57,47 @@ pub enum FlintCmd {
 
 pub fn run(cmd: FlintCmd) -> Result<()> {
     match cmd {
-        FlintCmd::Generate { model, prompt, raw, n, context } => generate(&model, &prompt, raw, n, context),
-        FlintCmd::Ppl { model, file, ctx, chunks } => ppl(&model, &file, ctx, chunks),
-        FlintCmd::Bench { model, text, ctx, generate, json } => bench(&model, &text, &ctx, generate, json.as_deref()),
+        FlintCmd::Generate {
+            model,
+            prompt,
+            raw,
+            n,
+            context,
+        } => generate(&model, &prompt, raw, n, context),
+        FlintCmd::Ppl {
+            model,
+            file,
+            ctx,
+            chunks,
+        } => ppl(&model, &file, ctx, chunks),
+        FlintCmd::Bench {
+            model,
+            text,
+            ctx,
+            generate,
+            json,
+        } => bench(&model, &text, &ctx, generate, json.as_deref()),
     }
 }
 
-fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, json: Option<&Path>) -> Result<()> {
+fn bench(
+    dir: &Path,
+    text: &Path,
+    ctxs: &[usize],
+    generate: usize,
+    json: Option<&Path>,
+) -> Result<()> {
     let chat = Chat::load(dir, None)?;
     let ids = chat.encode(&std::fs::read_to_string(text)?)?;
     let (model, s) = load(dir)?;
     let mut ws = Workspace::new(1)?;
     for (i, &ctx) in ctxs.iter().enumerate() {
-        anyhow::ensure!(ctx + generate <= ids.len(), "corpus has {} tokens, {} needed", ids.len(), ctx + generate);
+        anyhow::ensure!(
+            ctx + generate <= ids.len(),
+            "corpus has {} tokens, {} needed",
+            ids.len(),
+            ctx + generate
+        );
         let mut seq = FlintSeq::new(&model, ctx + generate + 8)?;
         s.synchronize()?;
         let t0 = Instant::now();
@@ -94,7 +122,11 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, json: Option<
                 fl::forward(&model, &ws, &mut eager, &[*e.last().unwrap()], false, &s)?;
                 e.push(fl::argmax(&ws, 1, &s)?[0]);
             }
-            anyhow::ensure!(e[..] == out[..e.len()], "graph decoding differs from eager decoding: {e:?} vs {:?}", &out[..e.len()]);
+            anyhow::ensure!(
+                e[..] == out[..e.len()],
+                "graph decoding differs from eager decoding: {e:?} vs {:?}",
+                &out[..e.len()]
+            );
             println!("graph decoding matches eager decoding ({} tokens)", e.len());
         }
         let pf = ctx as f64 / prefill;
@@ -107,7 +139,13 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, json: Option<
             use std::io::Write;
             let rec = serde_json::json!({"engine": "quench6k", "model": "flint-nvfp4", "mode": "plain", "kv": if seq.fp8 { "fp8" } else { "bf16" }, "ctx": ctx, "generate": generate,
                 "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0, "copied": copied});
-            writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path)?, "{rec}")?;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+                "{rec}"
+            )?;
         }
     }
     Ok(())
@@ -117,7 +155,11 @@ fn ppl(dir: &Path, file: &Path, ctx: usize, chunks: usize) -> Result<()> {
     let chat = Chat::load(dir, None)?;
     let ids = chat.encode(&std::fs::read_to_string(file)?)?;
     let n_chunks = (ids.len() / ctx).min(chunks);
-    anyhow::ensure!(n_chunks > 0, "{} tokens: fewer than one chunk of {ctx}", ids.len());
+    anyhow::ensure!(
+        n_chunks > 0,
+        "{} tokens: fewer than one chunk of {ctx}",
+        ids.len()
+    );
     let (model, s) = load(dir)?;
     let half = ctx / 2;
     let piece = fl::MAX_CHUNK.min(half);
@@ -137,7 +179,16 @@ fn ppl(dir: &Path, file: &Path, ctx: usize, chunks: usize) -> Result<()> {
             let rows = piece.min(ctx - 1 - at);
             fl::forward(&model, &ws, &mut seq, &toks[at..at + rows], true, &s)?;
             s.upload(&targets, &toks[at + 1..at + 1 + rows])?;
-            quench6k_cuda::kernels::row_lse(&s, ws.logits, rows, fl::VOCAB, fl::VOCAB, targets.addr(), lse.addr(), tl.addr())?;
+            quench6k_cuda::kernels::row_lse(
+                &s,
+                ws.logits,
+                rows,
+                fl::VOCAB,
+                fl::VOCAB,
+                targets.addr(),
+                lse.addr(),
+                tl.addr(),
+            )?;
             let a = s.download::<f32>(lse.addr(), rows)?;
             let b = s.download::<f32>(tl.addr(), rows)?;
             for (x, y) in a.iter().zip(&b) {
@@ -148,7 +199,11 @@ fn ppl(dir: &Path, file: &Path, ctx: usize, chunks: usize) -> Result<()> {
         }
         println!("[{}] {:.4}", c + 1, (nll / count as f64).exp());
     }
-    println!("PPL over {n_chunks} chunks of {ctx}: {:.4} ({:.1}s)", (nll / count as f64).exp(), t0.elapsed().as_secs_f64());
+    println!(
+        "PPL over {n_chunks} chunks of {ctx}: {:.4} ({:.1}s)",
+        (nll / count as f64).exp(),
+        t0.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -161,7 +216,16 @@ pub fn load(dir: &Path) -> Result<(FlintModel, quench6k_cuda::Stream)> {
 
 fn generate(dir: &Path, prompt: &str, raw: bool, n: usize, context: usize) -> Result<()> {
     let chat = Chat::load(dir, None)?;
-    let text = if raw { prompt.to_string() } else { chat.render(&serde_json::json!([{"role": "user", "content": prompt}]), None, None, None)? };
+    let text = if raw {
+        prompt.to_string()
+    } else {
+        chat.render(
+            &serde_json::json!([{"role": "user", "content": prompt}]),
+            None,
+            None,
+            None,
+        )?
+    };
     let ids = chat.encode(&text)?;
     println!("prompt: {} tokens", ids.len());
     let (model, s) = load(dir)?;
@@ -172,10 +236,30 @@ fn generate(dir: &Path, prompt: &str, raw: bool, n: usize, context: usize) -> Re
     let mut next = fl::argmax(&ws, 1, &s)?[0];
     let prefill = t0.elapsed().as_secs_f64();
     {
-        let (idx, val) = (quench6k_cuda::DeviceBuffer::new(32)?, quench6k_cuda::DeviceBuffer::new(32)?);
-        quench6k_cuda::kernels::topk(&s, ws.logits, 1, fl::VOCAB, fl::VOCAB, 5, false, idx.addr(), val.addr())?;
-        let (i, v) = (s.download::<i32>(idx.addr(), 5)?, s.download::<f32>(val.addr(), 5)?);
-        let top: Vec<String> = i.iter().zip(&v).map(|(t, l)| format!("{:?} {l:.3}", chat.decode(&[*t], false).unwrap_or_default())).collect();
+        let (idx, val) = (
+            quench6k_cuda::DeviceBuffer::new(32)?,
+            quench6k_cuda::DeviceBuffer::new(32)?,
+        );
+        quench6k_cuda::kernels::topk(
+            &s,
+            ws.logits,
+            1,
+            fl::VOCAB,
+            fl::VOCAB,
+            5,
+            false,
+            idx.addr(),
+            val.addr(),
+        )?;
+        let (i, v) = (
+            s.download::<i32>(idx.addr(), 5)?,
+            s.download::<f32>(val.addr(), 5)?,
+        );
+        let top: Vec<String> = i
+            .iter()
+            .zip(&v)
+            .map(|(t, l)| format!("{:?} {l:.3}", chat.decode(&[*t], false).unwrap_or_default()))
+            .collect();
         println!("first-token top 5: {}", top.join(", "));
     }
     let mut out = vec![next];
@@ -221,7 +305,14 @@ const MAX_ROWS: usize = 8;
 
 impl Sampler {
     pub fn new() -> Result<Self> {
-        Ok(Self { buf: quench6k_cuda::DeviceBuffer::new(MAX_ROWS * POOL * 8)?, ids: Vec::new(), vals: Vec::new(), pool: 1, state: 0, seed: None })
+        Ok(Self {
+            buf: quench6k_cuda::DeviceBuffer::new(MAX_ROWS * POOL * 8)?,
+            ids: Vec::new(),
+            vals: Vec::new(),
+            pool: 1,
+            state: 0,
+            seed: None,
+        })
     }
 
     fn uniform(&mut self) -> f64 {
@@ -234,22 +325,43 @@ impl Sampler {
     }
 
     /// The candidates of `rows` consecutive logits rows at `logits` (n columns each).
-    pub fn fetch(&mut self, s: &quench6k_cuda::Stream, logits: u64, rows: usize, n: usize, p: &quench6k_engine::session::GenParams) -> Result<()> {
+    pub fn fetch(
+        &mut self,
+        s: &quench6k_cuda::Stream,
+        logits: u64,
+        rows: usize,
+        n: usize,
+        p: &quench6k_engine::session::GenParams,
+    ) -> Result<()> {
         anyhow::ensure!(rows <= MAX_ROWS, "{rows} rows to sample");
         let penalized = p.presence_penalty != 0.0 || p.repetition_penalty != 1.0;
         let greedy = p.temperature <= 0.0 || p.top_k == 1;
-        let pool = if greedy && !penalized { 1 } else if p.top_k == 0 { POOL } else { p.top_k.max(if penalized { 64 } else { 1 }).min(POOL) };
+        let pool = if greedy && !penalized {
+            1
+        } else if p.top_k == 0 {
+            POOL
+        } else {
+            p.top_k.max(if penalized { 64 } else { 1 }).min(POOL)
+        };
         let (idx, val) = (self.buf.addr(), self.buf.addr() + (rows * pool * 4) as u64);
         quench6k_cuda::kernels::topk(s, logits, rows, n, n, pool, false, idx, val)?;
         let raw = s.download::<u32>(idx, 2 * rows * pool)?;
         self.ids = raw[..rows * pool].iter().map(|&v| v as i32).collect();
-        self.vals = raw[rows * pool..].iter().map(|&v| f32::from_bits(v)).collect();
+        self.vals = raw[rows * pool..]
+            .iter()
+            .map(|&v| f32::from_bits(v))
+            .collect();
         self.pool = pool;
         Ok(())
     }
 
     /// The next token from fetched row `row`; `generated`: this request's output so far.
-    pub fn pick(&mut self, row: usize, p: &quench6k_engine::session::GenParams, generated: &[i32]) -> i32 {
+    pub fn pick(
+        &mut self,
+        row: usize,
+        p: &quench6k_engine::session::GenParams,
+        generated: &[i32],
+    ) -> i32 {
         if generated.is_empty() || self.seed != Some(p.seed) {
             self.seed = Some(p.seed);
             self.state = p.seed;
@@ -262,7 +374,11 @@ impl Sampler {
             for (v, id) in vals.iter_mut().zip(ids) {
                 if generated.contains(id) {
                     *v -= p.presence_penalty;
-                    *v = if *v > 0.0 { *v / p.repetition_penalty } else { *v * p.repetition_penalty };
+                    *v = if *v > 0.0 {
+                        *v / p.repetition_penalty
+                    } else {
+                        *v * p.repetition_penalty
+                    };
                 }
             }
         }
@@ -271,10 +387,17 @@ impl Sampler {
         if p.temperature <= 0.0 || p.top_k == 1 {
             return ids[order[0]];
         }
-        let keep = if p.top_k == 0 { pool } else { p.top_k.min(pool) };
+        let keep = if p.top_k == 0 {
+            pool
+        } else {
+            p.top_k.min(pool)
+        };
         let order = &order[..keep];
         let top = vals[order[0]];
-        let mut probs: Vec<f64> = order.iter().map(|&i| (((vals[i] - top) / p.temperature) as f64).exp()).collect();
+        let mut probs: Vec<f64> = order
+            .iter()
+            .map(|&i| (((vals[i] - top) / p.temperature) as f64).exp())
+            .collect();
         if p.min_p > 0.0 {
             for q in probs.iter_mut() {
                 if *q < p.min_p as f64 {

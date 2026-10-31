@@ -3,7 +3,8 @@
 //! it) keyed by its tokens. Entries live in pinned host memory up to a byte budget and spill to disk
 //! (least recently used first); disk entries persist across restarts and are indexed at startup. The
 //! disk tier is kept within a size and an age limit by deleting the least recently used files; a file's
-//! modification time is its entry's last use, so the order survives restarts.
+//! modification time is its entry's last use, so the order survives restarts. Entries of a model
+//! variant (a steering strength, an adapter) carry its tag and only match prompts of that variant.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,8 @@ pub struct StoreOptions {
 
 struct Entry {
     tokens: Vec<i32>,
+    /// The model variant the state was computed with ("" for the base model).
+    variant: String,
     bytes: usize,
     /// The data in pinned memory, and its file in the disk tier; at least one of them.
     host: Option<PinnedBuffer>,
@@ -57,7 +60,8 @@ impl ContextStore {
         let mut entries = Vec::new();
         let mut foreign = Vec::new();
         if let Some(dir) = &opts.dir {
-            std::fs::create_dir_all(dir).with_context(|| format!("context directory {}", dir.display()))?;
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("context directory {}", dir.display()))?;
             for e in std::fs::read_dir(dir)? {
                 let path = e?.path();
                 match path.extension().and_then(|x| x.to_str()) {
@@ -72,14 +76,27 @@ impl ContextStore {
                 let meta = std::fs::metadata(&path)?;
                 let used = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 match read_header(&path) {
-                    Ok((model_id, tokens, bytes)) if model_id == opts.model_id => entries.push(Entry { tokens, bytes, host: None, file: Some(path), used }),
-                    Ok(_) => foreign.push((path, meta.len() as usize, used)),
+                    Ok((model_id, tokens, bytes)) => match variant_of(&model_id, &opts.model_id) {
+                        Some(variant) => entries.push(Entry {
+                            tokens,
+                            variant: variant.to_string(),
+                            bytes,
+                            host: None,
+                            file: Some(path),
+                            used,
+                        }),
+                        None => foreign.push((path, meta.len() as usize, used)),
+                    },
                     Err(e) => eprintln!("ignoring context file {}: {e:#}", path.display()),
                 }
             }
         }
         foreign.sort_by_key(|f| f.2);
-        let mut store = Self { opts, entries, foreign };
+        let mut store = Self {
+            opts,
+            entries,
+            foreign,
+        };
         store.trim_disk();
         Ok(store)
     }
@@ -96,24 +113,38 @@ impl ContextStore {
         self.opts.host_bytes > 0 || self.opts.dir.is_some()
     }
 
-    /// The entry with the longest token prefix of `prompt` (shorter than the prompt): (index, length).
-    pub fn best(&self, prompt: &[i32]) -> Option<(usize, usize)> {
+    /// The entry of `variant` with the longest token prefix of `prompt` (shorter than the prompt):
+    /// (index, length).
+    pub fn best(&self, prompt: &[i32], variant: &str) -> Option<(usize, usize)> {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.tokens.len() < prompt.len() && prompt.starts_with(&e.tokens))
+            .filter(|(_, e)| {
+                e.variant == variant
+                    && e.tokens.len() < prompt.len()
+                    && prompt.starts_with(&e.tokens)
+            })
             .max_by_key(|(_, e)| e.tokens.len())
             .map(|(i, e)| (i, e.tokens.len()))
     }
 
-    pub fn contains(&self, tokens: &[i32]) -> bool {
-        self.entries.iter().any(|e| e.tokens == tokens)
+    pub fn contains(&self, tokens: &[i32], variant: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.variant == variant && e.tokens == tokens)
     }
 
     /// Adds an entry (data in pinned memory), then keeps the host tier within budget.
-    pub fn insert(&mut self, tokens: Vec<i32>, data: PinnedBuffer) -> Result<()> {
+    pub fn insert(&mut self, tokens: Vec<i32>, variant: &str, data: PinnedBuffer) -> Result<()> {
         let bytes = data.len();
-        self.entries.push(Entry { tokens, bytes, host: Some(data), file: None, used: SystemTime::now() });
+        self.entries.push(Entry {
+            tokens,
+            variant: variant.to_string(),
+            bytes,
+            host: Some(data),
+            file: None,
+            used: SystemTime::now(),
+        });
         self.evict()
     }
 
@@ -126,7 +157,11 @@ impl ContextStore {
             if e.host.is_none() {
                 e.host = Some(read_data(path, e.bytes)?);
             }
-            if let Err(err) = std::fs::File::options().write(true).open(path).and_then(|f| f.set_modified(e.used)) {
+            if let Err(err) = std::fs::File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_modified(e.used))
+            {
                 eprintln!("marking context file {} as used: {err}", path.display());
             }
         }
@@ -134,24 +169,48 @@ impl ContextStore {
     }
 
     fn host_bytes(&self) -> usize {
-        self.entries.iter().filter(|e| e.host.is_some()).map(|e| e.bytes).sum()
+        self.entries
+            .iter()
+            .filter(|e| e.host.is_some())
+            .map(|e| e.bytes)
+            .sum()
     }
 
     fn disk_bytes(&self) -> usize {
-        self.entries.iter().filter(|e| e.file.is_some()).map(Entry::file_bytes).sum::<usize>() + self.foreign.iter().map(|f| f.1).sum::<usize>()
+        self.entries
+            .iter()
+            .filter(|e| e.file.is_some())
+            .map(Entry::file_bytes)
+            .sum::<usize>()
+            + self.foreign.iter().map(|f| f.1).sum::<usize>()
     }
 
     /// Moves least recently used host entries to disk (or drops them without a disk tier) until the
     /// host tier fits its budget. An entry read back from disk still has its file and is not rewritten.
     fn evict(&mut self) -> Result<()> {
         while self.host_bytes() > self.opts.host_bytes {
-            let Some(i) = self.entries.iter().enumerate().filter(|(_, e)| e.host.is_some()).min_by_key(|(_, e)| e.used).map(|(i, _)| i) else { break };
+            let Some(i) = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.host.is_some())
+                .min_by_key(|(_, e)| e.used)
+                .map(|(i, _)| i)
+            else {
+                break;
+            };
             match &self.opts.dir {
                 Some(dir) => {
                     let e = &mut self.entries[i];
                     if e.file.is_none() {
-                        let path = dir.join(format!("{:016x}.ctx", hash_tokens(&e.tokens)));
-                        write_file(&path, &self.opts.model_id, &e.tokens, e.host.as_ref().unwrap().as_slice(), e.used)?;
+                        let path = dir.join(file_name(&e.tokens, &e.variant));
+                        write_file(
+                            &path,
+                            &file_model_id(&self.opts.model_id, &e.variant),
+                            &e.tokens,
+                            e.host.as_ref().unwrap().as_slice(),
+                            e.used,
+                        )?;
                         e.file = Some(path);
                     }
                     e.host = None;
@@ -169,7 +228,10 @@ impl ContextStore {
     /// (oldest first), then the least recently used entries' (an entry whose data is also in host memory
     /// stays, without its file).
     fn trim_disk(&mut self) {
-        let cutoff = self.opts.max_age.and_then(|a| SystemTime::now().checked_sub(a));
+        let cutoff = self
+            .opts
+            .max_age
+            .and_then(|a| SystemTime::now().checked_sub(a));
         let expired = |used: SystemTime| cutoff.is_some_and(|c| used < c);
         let mut total = self.disk_bytes();
         loop {
@@ -178,7 +240,16 @@ impl ContextStore {
                 let (path, bytes, _) = self.foreign.remove(0);
                 (path, bytes)
             } else {
-                let Some(i) = self.entries.iter().enumerate().filter(|(_, e)| e.file.is_some()).min_by_key(|(_, e)| e.used).map(|(i, _)| i) else { break };
+                let Some(i) = self
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.file.is_some())
+                    .min_by_key(|(_, e)| e.used)
+                    .map(|(i, _)| i)
+                else {
+                    break;
+                };
                 if !over && !expired(self.entries[i].used) {
                     break;
                 }
@@ -200,11 +271,19 @@ impl ContextStore {
 
     /// Writes every host entry to the disk tier (for persistence at shutdown).
     pub fn persist(&mut self) -> Result<()> {
-        let Some(dir) = self.opts.dir.clone() else { return Ok(()) };
+        let Some(dir) = self.opts.dir.clone() else {
+            return Ok(());
+        };
         for e in &mut self.entries {
             if let (Some(buf), None) = (&e.host, &e.file) {
-                let path = dir.join(format!("{:016x}.ctx", hash_tokens(&e.tokens)));
-                write_file(&path, &self.opts.model_id, &e.tokens, buf.as_slice(), e.used)?;
+                let path = dir.join(file_name(&e.tokens, &e.variant));
+                write_file(
+                    &path,
+                    &file_model_id(&self.opts.model_id, &e.variant),
+                    &e.tokens,
+                    buf.as_slice(),
+                    e.used,
+                )?;
                 e.file = Some(path);
             }
         }
@@ -213,22 +292,49 @@ impl ContextStore {
     }
 }
 
-fn hash_tokens(tokens: &[i32]) -> u64 {
-    // FNV-1a over the token bytes.
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for t in tokens {
-        for b in t.to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100_0000_01b3);
-        }
+/// File name of an entry: FNV-1a over the token bytes, then the variant's (none for the base model).
+fn file_name(tokens: &[i32], variant: &str) -> String {
+    let h = tokens
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .chain(variant.bytes())
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+        });
+    format!("{h:016x}.ctx")
+}
+
+/// The identity a variant's files are written under: the model's, plus "+variant".
+fn file_model_id(model_id: &str, variant: &str) -> String {
+    if variant.is_empty() {
+        model_id.to_string()
+    } else {
+        format!("{model_id}+{variant}")
     }
-    h
+}
+
+/// The variant of a file written under `file_id`, when it belongs to `model_id`.
+fn variant_of<'a>(file_id: &'a str, model_id: &str) -> Option<&'a str> {
+    if file_id == model_id {
+        return Some("");
+    }
+    file_id
+        .strip_prefix(model_id)
+        .and_then(|rest| rest.strip_prefix('+'))
 }
 
 /// File: magic, u64 header length, JSON header {model_id, tokens, bytes}, token ids (i32 LE), data.
 /// Its modification time is `used`, the entry's last use.
-fn write_file(path: &Path, model_id: &str, tokens: &[i32], data: &[u8], used: SystemTime) -> Result<()> {
-    let header = serde_json::json!({"model_id": model_id, "tokens": tokens.len(), "bytes": data.len()}).to_string();
+fn write_file(
+    path: &Path,
+    model_id: &str,
+    tokens: &[i32],
+    data: &[u8],
+    used: SystemTime,
+) -> Result<()> {
+    let header =
+        serde_json::json!({"model_id": model_id, "tokens": tokens.len(), "bytes": data.len()})
+            .to_string();
     let tmp = path.with_extension("tmp");
     {
         let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
@@ -239,7 +345,9 @@ fn write_file(path: &Path, model_id: &str, tokens: &[i32], data: &[u8], used: Sy
             f.write_all(&t.to_le_bytes())?;
         }
         f.write_all(data)?;
-        f.into_inner().map_err(|e| e.into_error())?.set_modified(used)?;
+        f.into_inner()
+            .map_err(|e| e.into_error())?
+            .set_modified(used)?;
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -263,8 +371,15 @@ fn read_header(path: &Path) -> Result<(String, Vec<i32>, usize)> {
     let n = h["tokens"].as_u64().context("tokens")? as usize;
     let mut raw = vec![0u8; n * 4];
     f.read_exact(&mut raw)?;
-    let tokens = raw.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
-    Ok((h["model_id"].as_str().unwrap_or("").to_string(), tokens, h["bytes"].as_u64().context("bytes")? as usize))
+    let tokens = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    Ok((
+        h["model_id"].as_str().unwrap_or("").to_string(),
+        tokens,
+        h["bytes"].as_u64().context("bytes")? as usize,
+    ))
 }
 
 fn read_data(path: &Path, bytes: usize) -> Result<PinnedBuffer> {
@@ -294,14 +409,22 @@ mod tests {
     }
 
     fn files(dir: &Path) -> Vec<PathBuf> {
-        let mut v: Vec<PathBuf> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
         v.sort();
         v
     }
 
     fn age(path: &Path, days: u64) {
         let t = SystemTime::now() - Duration::from_secs(days * 86400);
-        std::fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
     }
 
     // Needs the CUDA driver (pinned host memory).
@@ -311,32 +434,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("left.tmp"), b"partial").unwrap();
-        let opts = |disk_bytes, max_age| StoreOptions { host_bytes: 1000, dir: Some(dir.clone()), disk_bytes, max_age, model_id: "m".into() };
+        let opts = |disk_bytes, max_age| StoreOptions {
+            host_bytes: 1000,
+            dir: Some(dir.clone()),
+            disk_bytes,
+            max_age,
+            model_id: "m".into(),
+        };
         // A file of another model, written by a store with another identity.
-        let mut other = ContextStore::open(StoreOptions { model_id: "other".into(), ..opts(0, None) }).unwrap();
-        other.insert(vec![9], data(1000, 9)).unwrap();
+        let mut other = ContextStore::open(StoreOptions {
+            model_id: "other".into(),
+            ..opts(0, None)
+        })
+        .unwrap();
+        other.insert(vec![9], "", data(1000, 9)).unwrap();
         other.persist().unwrap();
-        let other_file = files(&dir).into_iter().find(|p| p.extension().unwrap() == "ctx").unwrap();
+        let other_file = files(&dir)
+            .into_iter()
+            .find(|p| p.extension().unwrap() == "ctx")
+            .unwrap();
         age(&other_file, 1);
 
         // Each entry is 1000 bytes + 4 per token; the host tier holds one.
         let mut st = ContextStore::open(opts(3000, None)).unwrap();
-        assert!(!dir.join("left.tmp").exists(), "a partial write is cleaned up");
+        assert!(
+            !dir.join("left.tmp").exists(),
+            "a partial write is cleaned up"
+        );
         assert_eq!(st.len(), 0);
-        st.insert(vec![1], data(1000, 1)).unwrap();
+        st.insert(vec![1], "", data(1000, 1)).unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        st.insert(vec![1, 2], data(1000, 2)).unwrap(); // [1] to disk
+        st.insert(vec![1, 2], "", data(1000, 2)).unwrap(); // [1] to disk
         std::thread::sleep(Duration::from_millis(20));
-        st.insert(vec![1, 2, 3], data(1000, 3)).unwrap(); // [1, 2] to disk: 3 files, over budget, the other model's goes
+        st.insert(vec![1, 2, 3], "", data(1000, 3)).unwrap(); // [1, 2] to disk: 3 files, over budget, the other model's goes
         assert!(!other_file.exists());
         assert_eq!(files(&dir).len(), 2);
         // Reusing [1] renews it, so [1, 2] is the least recently used when the next one spills.
-        let (i, _) = st.best(&[1, 7]).unwrap();
+        let (i, _) = st.best(&[1, 7], "").unwrap();
         assert_eq!(st.get(i).unwrap().1.as_slice()[0], 1);
         std::thread::sleep(Duration::from_millis(20));
-        st.insert(vec![4], data(1000, 4)).unwrap(); // [1] (host, has a file) and [1, 2, 3] leave the host tier
-        assert!(st.best(&[1, 2, 3, 4]).is_some_and(|(_, n)| n == 3));
-        assert!(st.best(&[1, 2, 5]).is_some_and(|(_, n)| n == 1), "[1, 2] was deleted");
+        st.insert(vec![4], "", data(1000, 4)).unwrap(); // [1] (host, has a file) and [1, 2, 3] leave the host tier
+        assert!(st.best(&[1, 2, 3, 4], "").is_some_and(|(_, n)| n == 3));
+        assert!(
+            st.best(&[1, 2, 5], "").is_some_and(|(_, n)| n == 1),
+            "[1, 2] was deleted"
+        );
         assert_eq!(files(&dir).len(), 2);
         drop(st);
 
@@ -350,6 +492,47 @@ mod tests {
         let st = ContextStore::open(opts(0, Some(Duration::from_secs(5 * 86400)))).unwrap();
         assert_eq!(st.len(), 1);
         assert!(!names[0].exists() && names[1].exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn variant_ids() {
+        assert_eq!(variant_of("m", "m"), Some(""));
+        assert_eq!(variant_of("m+adapter=1", "m"), Some("adapter=1"));
+        assert_eq!(variant_of("mx", "m"), None);
+        assert_ne!(file_name(&[1, 2], ""), file_name(&[1, 2], "adapter=1"));
+    }
+
+    // Needs the CUDA driver (pinned host memory).
+    #[test]
+    fn variants_are_separate() {
+        let dir = std::env::temp_dir().join(format!(
+            "quench6k-store-variant-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = StoreOptions {
+            host_bytes: 0,
+            dir: Some(dir.clone()),
+            disk_bytes: 0,
+            max_age: None,
+            model_id: "m".into(),
+        };
+        let mut st = ContextStore::open(opts.clone()).unwrap();
+        st.insert(vec![1, 2], "", data(10, 1)).unwrap();
+        st.insert(vec![1, 2], "adapter=1", data(10, 2)).unwrap();
+        assert_eq!(
+            files(&dir).len(),
+            2,
+            "the same tokens, one file per variant"
+        );
+        drop(st);
+        let mut st = ContextStore::open(opts).unwrap();
+        let (i, _) = st.best(&[1, 2, 3], "adapter=1").unwrap();
+        assert_eq!(st.get(i).unwrap().1.as_slice()[0], 2);
+        let (i, _) = st.best(&[1, 2, 3], "").unwrap();
+        assert_eq!(st.get(i).unwrap().1.as_slice()[0], 1);
+        assert!(st.best(&[1, 2, 3], "steer=0.5").is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

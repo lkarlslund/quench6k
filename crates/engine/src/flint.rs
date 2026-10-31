@@ -37,7 +37,9 @@ const MAX_SPLITS: usize = 128;
 /// KV heads when the context is long enough).
 fn decode_splits() -> usize {
     static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *S.get_or_init(|| (quench6k_cuda::variants::get("flint.splits", 94).max(1) as usize).min(MAX_SPLITS))
+    *S.get_or_init(|| {
+        (quench6k_cuda::variants::get("flint.splits", 94).max(1) as usize).min(MAX_SPLITS)
+    })
 }
 
 pub struct Layer {
@@ -111,10 +113,17 @@ impl Loader<'_> {
     /// An NVFP4 tensor (rows = product of the outer dims) as codes/scales; `pb` 64-value blocks per piece row.
     fn fp4(&mut self, name: &str, pb: Option<usize>) -> Result<(u64, u64, usize, usize)> {
         let t = self.g.get(name)?.clone();
-        ensure!(t.ty == GgmlType::Nvfp4, "{name}: expected NVFP4, found {:?}", t.ty);
+        ensure!(
+            t.ty == GgmlType::Nvfp4,
+            "{name}: expected NVFP4, found {:?}",
+            t.ty
+        );
         let kdim = t.dims[0];
         let rows: usize = t.dims[1..].iter().product();
-        ensure!(kdim % 256 == 0, "{name}: K = {kdim} is not a multiple of 256");
+        ensure!(
+            kdim % 256 == 0,
+            "{name}: K = {kdim} is not a multiple of 256"
+        );
         let kblocks = kdim / 64;
         // Pieces split only the input dimension of a single matrix.
         let pb = pb.unwrap_or(kblocks);
@@ -128,8 +137,21 @@ impl Loader<'_> {
             let n = per.min(total - first);
             let src = &data[first * 36..(first + n) * 36];
             self.pinned.as_mut_slice()[..src.len()].copy_from_slice(src);
-            unsafe { self.s.copy_h2d(self.staging.addr(), self.pinned.as_ptr(), src.len())? };
-            fk::repack(self.s, self.staging.addr(), n, first, kblocks, rows, pb, codes, scales)?;
+            unsafe {
+                self.s
+                    .copy_h2d(self.staging.addr(), self.pinned.as_ptr(), src.len())?
+            };
+            fk::repack(
+                self.s,
+                self.staging.addr(),
+                n,
+                first,
+                kblocks,
+                rows,
+                pb,
+                codes,
+                scales,
+            )?;
             self.s.synchronize()?;
             first += n;
         }
@@ -146,7 +168,16 @@ impl Loader<'_> {
         let s2 = self.scale(name)?;
         ensure!(s2.len() == 1, "{name}: expected one global scale");
         let t = self.table(&[(codes, scales, s2[0])])?;
-        Ok((Fp4 { codes, scales, s2: t.2, n, k: kdim }, t))
+        Ok((
+            Fp4 {
+                codes,
+                scales,
+                s2: t.2,
+                n,
+                k: kdim,
+            },
+            t,
+        ))
     }
 
     fn table(&mut self, entries: &[(u64, u64, f32)]) -> Result<Table> {
@@ -168,25 +199,54 @@ impl FlintModel {
             .filter(|p| p.extension().is_some_and(|x| x == "gguf"))
             .collect();
         files.sort();
-        ensure!(files.len() == 1, "{}: expected exactly one .gguf file, found {}", dir.display(), files.len());
+        ensure!(
+            files.len() == 1,
+            "{}: expected exactly one .gguf file, found {}",
+            dir.display(),
+            files.len()
+        );
         Ok(files.remove(0))
     }
 
     pub fn is_flint(dir: &Path) -> bool {
-        Self::gguf_path(dir).is_ok_and(|p| Gguf::open(&p).is_ok_and(|g| g.meta.get("general.architecture").and_then(|v| v.as_str()) == Some("flint")))
+        Self::gguf_path(dir).is_ok_and(|p| {
+            Gguf::open(&p).is_ok_and(|g| {
+                g.meta.get("general.architecture").and_then(|v| v.as_str()) == Some("flint")
+            })
+        })
     }
 
     pub fn load(dir: &Path, s: &Stream) -> Result<Self> {
         let path = Self::gguf_path(dir)?;
         let g = Gguf::open(&path)?;
-        let arch = g.meta.get("general.architecture").and_then(|v| v.as_str()).unwrap_or("");
-        ensure!(arch == "flint", "{}: architecture {arch:?} is not flint", path.display());
-        ensure!(g.meta_i64("flint.block_count")? as usize == LAYERS, "unexpected layer count");
-        ensure!(g.meta_i64("flint.embedding_length")? as usize == D, "unexpected hidden size");
-        ensure!(g.meta_i64("flint.attention.sliding_window")? as usize == WINDOW, "unexpected sliding window");
+        let arch = g
+            .meta
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        ensure!(
+            arch == "flint",
+            "{}: architecture {arch:?} is not flint",
+            path.display()
+        );
+        ensure!(
+            g.meta_i64("flint.block_count")? as usize == LAYERS,
+            "unexpected layer count"
+        );
+        ensure!(
+            g.meta_i64("flint.embedding_length")? as usize == D,
+            "unexpected hidden size"
+        );
+        ensure!(
+            g.meta_i64("flint.attention.sliding_window")? as usize == WINDOW,
+            "unexpected sliding window"
+        );
         let pattern = |key: &str| -> Result<Vec<bool>> {
             match g.meta.get(key) {
-                Some(crate::gguf::Value::Array(a)) => Ok(a.iter().map(|v| matches!(v, crate::gguf::Value::Bool(true))).collect()),
+                Some(crate::gguf::Value::Array(a)) => Ok(a
+                    .iter()
+                    .map(|v| matches!(v, crate::gguf::Value::Bool(true)))
+                    .collect()),
                 _ => anyhow::bail!("metadata {key} missing"),
             }
         };
@@ -198,10 +258,20 @@ impl FlintModel {
             stop_tokens.extend(a.iter().filter_map(|v| v.as_i64()).map(|v| v as i32));
         }
 
-        let mut l = Loader { g: &g, s, buffers: Vec::new(), pinned: PinnedBuffer::new(STAGING)?, staging: DeviceBuffer::new(STAGING)?, bytes: 0 };
+        let mut l = Loader {
+            g: &g,
+            s,
+            buffers: Vec::new(),
+            pinned: PinnedBuffer::new(STAGING)?,
+            staging: DeviceBuffer::new(STAGING)?,
+            bytes: 0,
+        };
         let t0 = std::time::Instant::now();
         let emb = g.get("token_embd.weight")?.clone();
-        ensure!(emb.ty == GgmlType::Bf16 && emb.dims == [D, VOCAB], "token_embd: unexpected layout");
+        ensure!(
+            emb.ty == GgmlType::Bf16 && emb.dims == [D, VOCAB],
+            "token_embd: unexpected layout"
+        );
         let embed = l.alloc(emb.bytes)?;
         for (i, chunk) in g.data(&emb).chunks(STAGING).enumerate() {
             l.pinned.as_mut_slice()[..chunk.len()].copy_from_slice(chunk);
@@ -210,7 +280,10 @@ impl FlintModel {
         }
         let out_norm = l.f32s("output_norm.weight")?;
         let (lm_head, lm_t) = l.matrix("output.weight")?;
-        ensure!(lm_head.n == VOCAB && lm_head.k == D, "output: unexpected shape");
+        ensure!(
+            lm_head.n == VOCAB && lm_head.k == D,
+            "output: unexpected shape"
+        );
 
         let mut layers = Vec::with_capacity(LAYERS);
         for i in 0..LAYERS {
@@ -221,11 +294,17 @@ impl FlintModel {
             let (kk, k_t) = l.matrix(&n("attn_k.weight"))?;
             let (v, v_t) = l.matrix(&n("attn_v.weight"))?;
             let (o, o_t) = l.matrix(&n("attn_output.weight"))?;
-            ensure!(q.n == HQ * HD && kk.n == HKV * HD && v.n == HKV * HD && o.n == D && o.k == HQ * HD, "layer {i}: unexpected attention shapes");
+            ensure!(
+                q.n == HQ * HD && kk.n == HKV * HD && v.n == HKV * HD && o.n == D && o.k == HQ * HD,
+                "layer {i}: unexpected attention shapes"
+            );
             let q_norm = l.f32s(&n("attn_q_norm.weight"))?;
             let k_norm = l.f32s(&n("attn_k_norm.weight"))?;
             let sinks = l.f32s(&n("attn_sinks.weight"))?;
-            ensure!(!g.tensors.contains_key(&n("ffn_exp_probs_b.bias")), "router expert bias is not supported");
+            ensure!(
+                !g.tensors.contains_key(&n("ffn_exp_probs_b.bias")),
+                "router expert bias is not supported"
+            );
             let (router, slots, gate, up, down);
             let mut entries_g = Vec::new();
             let mut entries_u = Vec::new();
@@ -234,27 +313,48 @@ impl FlintModel {
                 let (gc, gs, rows, _) = l.fp4(&n("ffn_gate.weight"), None)?;
                 let (uc, us, _, _) = l.fp4(&n("ffn_up.weight"), None)?;
                 let (dc, ds, drows, dk) = l.fp4(&n("ffn_down.weight"), Some(EW / 64))?;
-                ensure!(drows == D && dk == rows && rows % EW == 0, "layer {i}: unexpected dense MLP shapes");
-                let (g2, u2, d2) = (l.scale(&n("ffn_gate.weight"))?[0], l.scale(&n("ffn_up.weight"))?[0], l.scale(&n("ffn_down.weight"))?[0]);
+                ensure!(
+                    drows == D && dk == rows && rows % EW == 0,
+                    "layer {i}: unexpected dense MLP shapes"
+                );
+                let (g2, u2, d2) = (
+                    l.scale(&n("ffn_gate.weight"))?[0],
+                    l.scale(&n("ffn_up.weight"))?[0],
+                    l.scale(&n("ffn_down.weight"))?[0],
+                );
                 for p in 0..rows / EW {
                     let off = (p * EW) as u64;
                     entries_g.push((gc + off * (D / 2) as u64, gs + off * (D / 16) as u64, g2));
                     entries_u.push((uc + off * (D / 2) as u64, us + off * (D / 16) as u64, u2));
                     let piece = (p * D) as u64;
-                    entries_d.push((dc + piece * (EW / 2) as u64, ds + piece * (EW / 16) as u64, d2));
+                    entries_d.push((
+                        dc + piece * (EW / 2) as u64,
+                        ds + piece * (EW / 16) as u64,
+                        d2,
+                    ));
                 }
                 router = None;
                 slots = rows / EW;
             } else {
                 let rt = g.get(&n("ffn_gate_inp.weight"))?.clone();
-                ensure!(rt.ty == GgmlType::Bf16 && rt.dims == [D, EXPERTS], "layer {i}: unexpected router");
+                ensure!(
+                    rt.ty == GgmlType::Bf16 && rt.dims == [D, EXPERTS],
+                    "layer {i}: unexpected router"
+                );
                 let data = g.data(&rt).to_vec();
                 router = Some(l.upload(&data)?);
                 let (gc, gs, grows, _) = l.fp4(&n("ffn_gate_exps.weight"), None)?;
                 let (uc, us, _, _) = l.fp4(&n("ffn_up_exps.weight"), None)?;
                 let (dc, ds, drows, dk) = l.fp4(&n("ffn_down_exps.weight"), None)?;
-                ensure!(grows == EXPERTS * EW && drows == EXPERTS * D && dk == EW, "layer {i}: unexpected expert shapes");
-                let (g2, u2, d2) = (l.scale(&n("ffn_gate_exps.weight"))?, l.scale(&n("ffn_up_exps.weight"))?, l.scale(&n("ffn_down_exps.weight"))?);
+                ensure!(
+                    grows == EXPERTS * EW && drows == EXPERTS * D && dk == EW,
+                    "layer {i}: unexpected expert shapes"
+                );
+                let (g2, u2, d2) = (
+                    l.scale(&n("ffn_gate_exps.weight"))?,
+                    l.scale(&n("ffn_up_exps.weight"))?,
+                    l.scale(&n("ffn_down_exps.weight"))?,
+                );
                 for e in 0..EXPERTS {
                     let r = (e * EW) as u64;
                     entries_g.push((gc + r * (D / 2) as u64, gs + r * (D / 16) as u64, g2[e]));
@@ -265,14 +365,25 @@ impl FlintModel {
                 let (sgc, sgs, srows, _) = l.fp4(&n("ffn_gate_shexp.weight"), None)?;
                 let (suc, sus, _, _) = l.fp4(&n("ffn_up_shexp.weight"), None)?;
                 let (sdc, sds, sdrows, sdk) = l.fp4(&n("ffn_down_shexp.weight"), Some(EW / 64))?;
-                ensure!(srows == 2 * EW && sdrows == D && sdk == 2 * EW, "layer {i}: unexpected shared expert shapes");
-                let (sg2, su2, sd2) = (l.scale(&n("ffn_gate_shexp.weight"))?[0], l.scale(&n("ffn_up_shexp.weight"))?[0], l.scale(&n("ffn_down_shexp.weight"))?[0]);
+                ensure!(
+                    srows == 2 * EW && sdrows == D && sdk == 2 * EW,
+                    "layer {i}: unexpected shared expert shapes"
+                );
+                let (sg2, su2, sd2) = (
+                    l.scale(&n("ffn_gate_shexp.weight"))?[0],
+                    l.scale(&n("ffn_up_shexp.weight"))?[0],
+                    l.scale(&n("ffn_down_shexp.weight"))?[0],
+                );
                 for p in 0..2 {
                     let off = (p * EW) as u64;
                     entries_g.push((sgc + off * (D / 2) as u64, sgs + off * (D / 16) as u64, sg2));
                     entries_u.push((suc + off * (D / 2) as u64, sus + off * (D / 16) as u64, su2));
                     let piece = (p * D) as u64;
-                    entries_d.push((sdc + piece * (EW / 2) as u64, sds + piece * (EW / 16) as u64, sd2));
+                    entries_d.push((
+                        sdc + piece * (EW / 2) as u64,
+                        sds + piece * (EW / 16) as u64,
+                        sd2,
+                    ));
                 }
                 slots = 8;
             }
@@ -303,9 +414,22 @@ impl FlintModel {
                 down,
             });
         }
-        eprintln!("flint: loaded {} in {:.1}s ({:.1} GiB on the device)", path.display(), t0.elapsed().as_secs_f64(), l.bytes as f64 / (1u64 << 30) as f64);
+        eprintln!(
+            "flint: loaded {} in {:.1}s ({:.1} GiB on the device)",
+            path.display(),
+            t0.elapsed().as_secs_f64(),
+            l.bytes as f64 / (1u64 << 30) as f64
+        );
         let Loader { buffers, .. } = l;
-        Ok(Self { layers, embed, out_norm, lm_head, lm_t, stop_tokens, _buffers: buffers })
+        Ok(Self {
+            layers,
+            embed,
+            out_norm,
+            lm_head,
+            lm_t,
+            stop_tokens,
+            _buffers: buffers,
+        })
     }
 }
 
@@ -341,7 +465,16 @@ impl FlintSeq {
             k.push(DeviceBuffer::new(bytes)?);
             v.push(DeviceBuffer::new(bytes)?);
         }
-        Ok(Self { capacity, fp8, tokens: Vec::new(), k, v, graphs: (0..=SMALL).map(|_| None).collect(), snap: None, sliding: model.layers.iter().map(|l| l.sliding).collect() })
+        Ok(Self {
+            capacity,
+            fp8,
+            tokens: Vec::new(),
+            k,
+            v,
+            graphs: (0..=SMALL).map(|_| None).collect(),
+            snap: None,
+            sliding: model.layers.iter().map(|l| l.sliding).collect(),
+        })
     }
 
     /// Keeps the longest prefix of `prompt` whose state is available and drops the rest of the cached
@@ -350,7 +483,12 @@ impl FlintSeq {
     /// overwrites a key its queries need); otherwise the ring snapshot is restored when it covers it.
     pub fn rewind(&mut self, prompt: &[i32], s: &Stream) -> Result<usize> {
         const REACH: usize = SWA_RING - WINDOW;
-        let common = self.tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        let common = self
+            .tokens
+            .iter()
+            .zip(prompt)
+            .take_while(|(a, b)| a == b)
+            .count();
         let p = common.min(prompt.len().saturating_sub(1));
         let live = if self.tokens.len() <= p + REACH { p } else { 0 };
         let snap = match &self.snap {
@@ -391,7 +529,9 @@ impl FlintSeq {
     }
 
     fn restore(&mut self, s: &Stream) -> Result<()> {
-        let Some((_, buf)) = &self.snap else { return Ok(()) };
+        let Some((_, buf)) = &self.snap else {
+            return Ok(());
+        };
         let ring = SWA_RING * HKV * HD * 2;
         let mut at = 0;
         for i in 0..self.k.len() {
@@ -483,7 +623,9 @@ impl Workspace {
             qb: a(t * HQ * HD * 2)?,
             attn: a(t * HQ * HD * 2)?,
             of: a(t * D * 4)?,
-            part_o: a(t * HQ * MAX_SPLITS.min(8).max(1) * HD * 4 + SMALL * HQ * MAX_SPLITS * HD * 4)?,
+            part_o: a(
+                t * HQ * MAX_SPLITS.min(8).max(1) * HD * 4 + SMALL * HQ * MAX_SPLITS * HD * 4
+            )?,
             part_ml: a(t * HQ * MAX_SPLITS * 2 * 4)?,
             rlogits: a(t * EXPERTS * 4)?,
             sel_e: a(pairs * 4)?,
@@ -533,13 +675,21 @@ impl Workspace {
 /// Splits the attention of a step of `t` tokens may use (bounded by the partial buffers).
 fn splits_for(t: usize, start: usize, window: usize) -> usize {
     let s = fk::attn_splits(t, start, window).min(64);
-    if t > SMALL { s.min(8.max(1)).min((MAX_CHUNK * 8) / t.max(1)).max(1) } else { s }
+    if t > SMALL {
+        s.min(8.max(1)).min((MAX_CHUNK * 8) / t.max(1)).max(1)
+    } else {
+        s
+    }
 }
 
 /// QUENCH6K_FLINT_SYNC=1: synchronize after every op and name the failing one (debugging).
 fn checkpoint(s: &Stream, what: &str) -> Result<()> {
     static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    if let Some(v) = ON.get_or_init(|| std::env::var("QUENCH6K_FLINT_SYNC").ok()).as_deref().filter(|v| *v == "1" || *v == what) {
+    if let Some(v) = ON
+        .get_or_init(|| std::env::var("QUENCH6K_FLINT_SYNC").ok())
+        .as_deref()
+        .filter(|v| *v == "1" || *v == what)
+    {
         let _ = v;
         s.synchronize().with_context(|| format!("after {what}"))?;
     }
@@ -548,11 +698,22 @@ fn checkpoint(s: &Stream, what: &str) -> Result<()> {
 
 /// Runs `tokens` (at positions seq.tokens.len() ..) through the model, appending them to the sequence.
 /// With `all_logits`, logits of every token are written (t <= logit_rows); otherwise of the last token.
-pub fn forward(model: &FlintModel, ws: &Workspace, seq: &mut FlintSeq, tokens: &[i32], all_logits: bool, s: &Stream) -> Result<()> {
+pub fn forward(
+    model: &FlintModel,
+    ws: &Workspace,
+    seq: &mut FlintSeq,
+    tokens: &[i32],
+    all_logits: bool,
+    s: &Stream,
+) -> Result<()> {
     let t = tokens.len();
     ensure!(t > 0 && t <= MAX_CHUNK, "chunk of {t} tokens");
     let start = seq.tokens.len();
-    ensure!(start + t <= seq.capacity, "sequence capacity {} exceeded", seq.capacity);
+    ensure!(
+        start + t <= seq.capacity,
+        "sequence capacity {} exceeded",
+        seq.capacity
+    );
     s.upload_to(ws.tok, tokens)?;
     s.upload_to(ws.start, &[start as i32])?;
     body(model, ws, seq, t, Some(start), all_logits, s)?;
@@ -561,17 +722,36 @@ pub fn forward(model: &FlintModel, ws: &Workspace, seq: &mut FlintSeq, tokens: &
 }
 
 /// One decode token through the sequence's CUDA graph (captured on first use); logits in `ws.logits`.
-pub fn decode(model: &FlintModel, ws: &mut Workspace, seq: &mut FlintSeq, token: i32, s: &Stream) -> Result<()> {
+pub fn decode(
+    model: &FlintModel,
+    ws: &mut Workspace,
+    seq: &mut FlintSeq,
+    token: i32,
+    s: &Stream,
+) -> Result<()> {
     step(model, ws, seq, &[token], s)
 }
 
 /// 1..=SMALL tokens (a speculative verification) through the sequence's CUDA graph for that count;
 /// logits of every token in `ws.logits` (the workspace must hold that many rows).
-pub fn step(model: &FlintModel, ws: &mut Workspace, seq: &mut FlintSeq, tokens: &[i32], s: &Stream) -> Result<()> {
+pub fn step(
+    model: &FlintModel,
+    ws: &mut Workspace,
+    seq: &mut FlintSeq,
+    tokens: &[i32],
+    s: &Stream,
+) -> Result<()> {
     let t = tokens.len();
-    ensure!((1..=SMALL).contains(&t) && t <= ws.logit_rows, "step of {t} tokens");
+    ensure!(
+        (1..=SMALL).contains(&t) && t <= ws.logit_rows,
+        "step of {t} tokens"
+    );
     let start = seq.tokens.len();
-    ensure!(start + t <= seq.capacity, "sequence capacity {} exceeded", seq.capacity);
+    ensure!(
+        start + t <= seq.capacity,
+        "sequence capacity {} exceeded",
+        seq.capacity
+    );
     let io = ws.io.as_mut_slice();
     for (i, tok) in tokens.iter().enumerate() {
         io[4 * i..4 * i + 4].copy_from_slice(&tok.to_le_bytes());
@@ -592,15 +772,45 @@ pub fn step(model: &FlintModel, ws: &mut Workspace, seq: &mut FlintSeq, tokens: 
 
 /// The step's kernels for `t` tokens whose ids and start position are already on the device. `start`:
 /// the host position for choosing attention splits, or None for a position-independent (graph) step.
-fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Option<usize>, all_logits: bool, s: &Stream) -> Result<()> {
+fn body(
+    model: &FlintModel,
+    ws: &Workspace,
+    seq: &FlintSeq,
+    t: usize,
+    start: Option<usize>,
+    all_logits: bool,
+    s: &Stream,
+) -> Result<()> {
     fk::embed(s, ws.tok, t, model.embed, ws.h)?;
     let bm = k::moe_tile_rows();
     let small = t <= SMALL;
     if !small {
-        fk::dense_plan(s, t, bm, ws.d_offsets, ws.d_tile_expert, ws.d_tile_row, ws.d_num_tiles)?;
+        fk::dense_plan(
+            s,
+            t,
+            bm,
+            ws.d_offsets,
+            ws.d_tile_expert,
+            ws.d_tile_row,
+            ws.d_num_tiles,
+        )?;
     }
     let dense_gemm = |tb: Table, x: u64, y: u64, n: usize, kdim: usize| -> Result<()> {
-        k::moe_nvfp4_gemm(s, x, tb.0, tb.1, tb.2, ws.d_offsets, ws.d_tile_expert, ws.d_tile_row, ws.d_num_tiles, t.div_ceil(bm), y, n, kdim)
+        k::moe_nvfp4_gemm(
+            s,
+            x,
+            tb.0,
+            tb.1,
+            tb.2,
+            ws.d_offsets,
+            ws.d_tile_expert,
+            ws.d_tile_row,
+            ws.d_num_tiles,
+            t.div_ceil(bm),
+            y,
+            n,
+            kdim,
+        )
     };
     for (li, layer) in model.layers.iter().enumerate() {
         let fuse = t == 1 && quench6k_cuda::variants::get("flint.fuse_norm", 1) != 0;
@@ -609,21 +819,66 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
         }
         let (qi, ki, vi) = if small {
             if fuse {
-                fk::gemv(s, ws.h, Some(layer.attn_norm), 1, &[layer.q, layer.k, layer.v], ws.qkv, QKV, false)?;
+                fk::gemv(
+                    s,
+                    ws.h,
+                    Some(layer.attn_norm),
+                    1,
+                    &[layer.q, layer.k, layer.v],
+                    ws.qkv,
+                    QKV,
+                    false,
+                )?;
             } else {
-                fk::gemv(s, ws.xn, None, t, &[layer.q, layer.k, layer.v], ws.qkv, QKV, false)?;
+                fk::gemv(
+                    s,
+                    ws.xn,
+                    None,
+                    t,
+                    &[layer.q, layer.k, layer.v],
+                    ws.qkv,
+                    QKV,
+                    false,
+                )?;
             }
-            ((ws.qkv, QKV), (ws.qkv + (HQ * HD * 4) as u64, QKV), (ws.qkv + ((HQ + HKV) * HD * 4) as u64, QKV))
+            (
+                (ws.qkv, QKV),
+                (ws.qkv + (HQ * HD * 4) as u64, QKV),
+                (ws.qkv + ((HQ + HKV) * HD * 4) as u64, QKV),
+            )
         } else {
             dense_gemm(layer.q_t, ws.xn, ws.qf, HQ * HD, D)?;
             dense_gemm(layer.k_t, ws.xn, ws.kf, HKV * HD, D)?;
             dense_gemm(layer.v_t, ws.xn, ws.vf, HKV * HD, D)?;
             ((ws.qf, HQ * HD), (ws.kf, HKV * HD), (ws.vf, HKV * HD))
         };
-        let (mask, window) = if layer.sliding { ((SWA_RING - 1) as i32, WINDOW) } else { (i32::MAX, 0) };
-        let f8_rows = if seq.fp8 && !layer.sliding { seq.capacity } else { 0 };
+        let (mask, window) = if layer.sliding {
+            ((SWA_RING - 1) as i32, WINDOW)
+        } else {
+            (i32::MAX, 0)
+        };
+        let f8_rows = if seq.fp8 && !layer.sliding {
+            seq.capacity
+        } else {
+            0
+        };
         checkpoint(s, "qkv")?;
-        fk::qk_prep(s, qi, ki, vi, layer.q_norm, layer.k_norm, layer.rope, ws.start, mask, f8_rows, t, ws.qb, seq.k[li].addr(), seq.v[li].addr())?;
+        fk::qk_prep(
+            s,
+            qi,
+            ki,
+            vi,
+            layer.q_norm,
+            layer.k_norm,
+            layer.rope,
+            ws.start,
+            mask,
+            f8_rows,
+            t,
+            ws.qb,
+            seq.k[li].addr(),
+            seq.v[li].addr(),
+        )?;
         checkpoint(s, "qk_prep")?;
         // Steps of few tokens always split the keys MAX_SPLITS ways, so that eager and graph steps
         // sum in the same order (empty splits exit at once).
@@ -631,7 +886,23 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
             Some(start) if !small => splits_for(t, start, window),
             _ => decode_splits(),
         };
-        fk::attention(s, ws.qb, seq.k[li].addr(), seq.v[li].addr(), t, ws.start, window, mask, splits, layer.sinks, ws.part_o, ws.part_ml, ws.attn_tickets, ws.attn, f8_rows)?;
+        fk::attention(
+            s,
+            ws.qb,
+            seq.k[li].addr(),
+            seq.v[li].addr(),
+            t,
+            ws.start,
+            window,
+            mask,
+            splits,
+            layer.sinks,
+            ws.part_o,
+            ws.part_ml,
+            ws.attn_tickets,
+            ws.attn,
+            f8_rows,
+        )?;
         checkpoint(s, "attention")?;
         if small {
             fk::gemv(s, ws.attn, None, t, &[layer.o], ws.h, D, true)?;
@@ -643,13 +914,55 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
 
         checkpoint(s, "o")?;
         match layer.router {
-            Some(router) if small => fk::router(s, ws.h, layer.ffn_norm, router, t, ws.rlogits, ws.xn, ws.ticket, ws.sel_e, ws.sel_w)?,
+            Some(router) if small => fk::router(
+                s,
+                ws.h,
+                layer.ffn_norm,
+                router,
+                t,
+                ws.rlogits,
+                ws.xn,
+                ws.ticket,
+                ws.sel_e,
+                ws.sel_w,
+            )?,
             Some(router) => {
                 fk::rmsnorm_add(s, ws.h, o_add, layer.ffn_norm, EPS, ws.xn, t)?;
                 if t <= k::gemv_max_m() {
-                    k::gemv(s, t, ws.xn, D, WeightFormat::Bf16, router, 0, ws.rlogits, EXPERTS, 0, EXPERTS, D, 1, 1.0, false)?;
+                    k::gemv(
+                        s,
+                        t,
+                        ws.xn,
+                        D,
+                        WeightFormat::Bf16,
+                        router,
+                        0,
+                        ws.rlogits,
+                        EXPERTS,
+                        0,
+                        EXPERTS,
+                        D,
+                        1,
+                        1.0,
+                        false,
+                    )?;
                 } else {
-                    k::gemm_f32(s, ws.xn, D, WeightFormat::Bf16, router, D, 0, ws.rlogits, EXPERTS, t, EXPERTS, D, 1.0, false)?;
+                    k::gemm_f32(
+                        s,
+                        ws.xn,
+                        D,
+                        WeightFormat::Bf16,
+                        router,
+                        D,
+                        0,
+                        ws.rlogits,
+                        EXPERTS,
+                        t,
+                        EXPERTS,
+                        D,
+                        1.0,
+                        false,
+                    )?;
                 }
                 fk::route(s, ws.rlogits, t, ws.sel_e, ws.sel_w)?;
             }
@@ -661,27 +974,99 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
         checkpoint(s, "route")?;
         let slots = layer.slots;
         if small {
-            fk::moe_small(s, ws.xn, t, slots, ws.sel_e, ws.sel_w, layer.gate, layer.up, layer.down, ws.act, ws.h)?;
+            fk::moe_small(
+                s, ws.xn, t, slots, ws.sel_e, ws.sel_w, layer.gate, layer.up, layer.down, ws.act,
+                ws.h,
+            )?;
             checkpoint(s, "moe_small")?;
         } else if quench6k_cuda::variants::get("flint.prefill_fp4", 0) != 0 {
             // W4A4: activations quantized to NVFP4 per row, FP4 tensor cores (as the Qwen prefill).
             let pairs = t * slots;
             let bm4 = k::fp4_tile_rows();
             let max_tiles = pairs.div_ceil(bm4) + layer.entries;
-            fk::moe_plan(s, ws.sel_e, pairs, layer.entries, bm4, ws.counts, ws.cursor, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
+            fk::moe_plan(
+                s,
+                ws.sel_e,
+                pairs,
+                layer.entries,
+                bm4,
+                ws.counts,
+                ws.cursor,
+                ws.offsets,
+                ws.tile_expert,
+                ws.tile_row,
+                ws.num_tiles,
+                ws.pair_row,
+            )?;
             fk::gather(s, ws.xn, ws.pair_row, pairs, slots, ws.xs)?;
             k::fp4_quant_rows(s, ws.xs, pairs, D, ws.q4)?;
-            k::moe_fp4_gate_up(s, ws.q4, pairs, layer.gate, layer.up, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, max_tiles, ws.actb, EW, D)?;
+            k::moe_fp4_gate_up(
+                s,
+                ws.q4,
+                pairs,
+                layer.gate,
+                layer.up,
+                ws.offsets,
+                ws.tile_expert,
+                ws.tile_row,
+                ws.num_tiles,
+                max_tiles,
+                ws.actb,
+                EW,
+                D,
+            )?;
             k::fp4_quant_rows(s, ws.actb, pairs, EW, ws.q4b)?;
-            k::moe_fp4_gemm(s, ws.q4b, pairs, layer.down.0, layer.down.1, layer.down.2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, max_tiles, ws.yd, D, EW)?;
+            k::moe_fp4_gemm(
+                s,
+                ws.q4b,
+                pairs,
+                layer.down.0,
+                layer.down.1,
+                layer.down.2,
+                ws.offsets,
+                ws.tile_expert,
+                ws.tile_row,
+                ws.num_tiles,
+                max_tiles,
+                ws.yd,
+                D,
+                EW,
+            )?;
             fk::combine(s, ws.yd, ws.pair_row, ws.sel_w, t, slots, ws.h)?;
         } else {
             let pairs = t * slots;
             let max_tiles = pairs.div_ceil(bm) + layer.entries;
-            fk::moe_plan(s, ws.sel_e, pairs, layer.entries, bm, ws.counts, ws.cursor, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
+            fk::moe_plan(
+                s,
+                ws.sel_e,
+                pairs,
+                layer.entries,
+                bm,
+                ws.counts,
+                ws.cursor,
+                ws.offsets,
+                ws.tile_expert,
+                ws.tile_row,
+                ws.num_tiles,
+                ws.pair_row,
+            )?;
             fk::gather(s, ws.xn, ws.pair_row, pairs, slots, ws.xs)?;
             let gemm = |tb: Table, x: u64, y: u64, n: usize, kdim: usize| {
-                k::moe_nvfp4_gemm(s, x, tb.0, tb.1, tb.2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, max_tiles, y, n, kdim)
+                k::moe_nvfp4_gemm(
+                    s,
+                    x,
+                    tb.0,
+                    tb.1,
+                    tb.2,
+                    ws.offsets,
+                    ws.tile_expert,
+                    ws.tile_row,
+                    ws.num_tiles,
+                    max_tiles,
+                    y,
+                    n,
+                    kdim,
+                )
             };
             gemm(layer.gate, ws.xs, ws.yg, EW, D)?;
             gemm(layer.up, ws.xs, ws.yu, EW, D)?;
@@ -692,17 +1077,39 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
     }
     // Final norm and LM head.
     let rows = if all_logits { t } else { 1 };
-    ensure!(rows <= ws.logit_rows, "{rows} logit rows requested, workspace holds {}", ws.logit_rows);
+    ensure!(
+        rows <= ws.logit_rows,
+        "{rows} logit rows requested, workspace holds {}",
+        ws.logit_rows
+    );
     let first = t - rows;
     let mut done = 0;
     while done < rows {
         let m = (rows - done).min(fk::gemv_max_m());
         let h = ws.h + ((first + done) * D * 4) as u64;
         if m == 1 && quench6k_cuda::variants::get("flint.fuse_norm", 1) != 0 {
-            fk::gemv(s, h, Some(model.out_norm), 1, &[model.lm_head], ws.logits + (done * VOCAB * 4) as u64, VOCAB, false)?;
+            fk::gemv(
+                s,
+                h,
+                Some(model.out_norm),
+                1,
+                &[model.lm_head],
+                ws.logits + (done * VOCAB * 4) as u64,
+                VOCAB,
+                false,
+            )?;
         } else {
             fk::rmsnorm(s, h, model.out_norm, EPS, ws.xn, m)?;
-            fk::gemv(s, ws.xn, None, m, &[model.lm_head], ws.logits + (done * VOCAB * 4) as u64, VOCAB, false)?;
+            fk::gemv(
+                s,
+                ws.xn,
+                None,
+                m,
+                &[model.lm_head],
+                ws.logits + (done * VOCAB * 4) as u64,
+                VOCAB,
+                false,
+            )?;
         }
         done += m;
     }
@@ -711,17 +1118,32 @@ fn body(model: &FlintModel, ws: &Workspace, seq: &FlintSeq, t: usize, start: Opt
 
 /// Greedy next token of each of the `rows` logit rows.
 pub fn argmax(ws: &Workspace, rows: usize, s: &Stream) -> Result<Vec<i32>> {
-    k::argmax(s, ws.logits, rows, VOCAB, VOCAB, ws.argmax_scratch, ws.argmax_out)?;
+    k::argmax(
+        s,
+        ws.logits,
+        rows,
+        VOCAB,
+        VOCAB,
+        ws.argmax_scratch,
+        ws.argmax_out,
+    )?;
     s.download::<i32>(ws.argmax_out, rows)
 }
 
 /// Prefills `prompt` beyond the reusable prefix in chunks; logits of the last token are left in `ws`.
-pub fn prefill(model: &FlintModel, ws: &Workspace, seq: &mut FlintSeq, prompt: &[i32], s: &Stream) -> Result<usize> {
+pub fn prefill(
+    model: &FlintModel,
+    ws: &Workspace,
+    seq: &mut FlintSeq,
+    prompt: &[i32],
+    s: &Stream,
+) -> Result<usize> {
     let keep = seq.rewind(prompt, s)?;
     let mut at = keep;
     while at < prompt.len() {
         let end = (at + MAX_CHUNK).min(prompt.len());
-        forward(model, ws, seq, &prompt[at..end], false, s).with_context(|| format!("prefill chunk at {at}"))?;
+        forward(model, ws, seq, &prompt[at..end], false, s)
+            .with_context(|| format!("prefill chunk at {at}"))?;
         at = end;
     }
     Ok(keep)

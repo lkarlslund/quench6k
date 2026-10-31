@@ -12,9 +12,20 @@ use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 
 fn tool(name: &str) -> PathBuf {
-    let home = ["CUDA_HOME", "CUDA_PATH"].iter().find_map(|v| std::env::var(v).ok()).unwrap_or_else(|| "/opt/cuda".into());
-    let path = Path::new(&home).join("bin").join(if cfg!(windows) { format!("{name}.exe") } else { name.to_string() });
-    if path.exists() { path } else { PathBuf::from(name) }
+    let home = ["CUDA_HOME", "CUDA_PATH"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok())
+        .unwrap_or_else(|| "/opt/cuda".into());
+    let path = Path::new(&home).join("bin").join(if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    });
+    if path.exists() {
+        path
+    } else {
+        PathBuf::from(name)
+    }
 }
 
 /// One kernel: its demangled name and its instructions (opcode and operands, predicate included).
@@ -27,14 +38,22 @@ impl Function {
     /// Local-memory loads and stores: register spills (or a local array the compiler could not keep in
     /// registers).
     pub fn spills(&self) -> (usize, usize) {
-        let count = |p: &str| self.code.iter().filter(|i| opcode(i).starts_with(p)).count();
+        let count = |p: &str| {
+            self.code
+                .iter()
+                .filter(|i| opcode(i).starts_with(p))
+                .count()
+        };
         (count("LDL"), count("STL"))
     }
 }
 
 /// The opcode of an instruction: its first word after the predicate ("@P0", "@!PT").
 pub fn opcode(instr: &str) -> &str {
-    instr.split_whitespace().find(|w| !w.starts_with('@')).unwrap_or("")
+    instr
+        .split_whitespace()
+        .find(|w| !w.starts_with('@'))
+        .unwrap_or("")
 }
 
 /// Kernels from the cubins whose file name contains `file` (the kernel source name, "gemv" for
@@ -44,16 +63,39 @@ pub fn functions(binary: &Path, file: &str, kernel: Option<&Regex>) -> Result<Ve
     let dir = std::env::temp_dir().join(format!("quench6k-sass-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let result = (|| {
-        let out = Command::new(tool("cuobjdump")).arg("-xelf").arg(if file.is_empty() { "all" } else { file }).arg(binary).current_dir(&dir).output()
+        let out = Command::new(tool("cuobjdump"))
+            .arg("-xelf")
+            .arg(if file.is_empty() { "all" } else { file })
+            .arg(binary)
+            .current_dir(&dir)
+            .output()
             .context("running cuobjdump (CUDA toolkit)")?;
-        ensure!(out.status.success(), "cuobjdump -xelf: {}", String::from_utf8_lossy(&out.stderr));
-        let mut cubins: Vec<PathBuf> = std::fs::read_dir(&dir)?.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>()?;
+        ensure!(
+            out.status.success(),
+            "cuobjdump -xelf: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut cubins: Vec<PathBuf> = std::fs::read_dir(&dir)?
+            .map(|e| e.map(|e| e.path()))
+            .collect::<Result<_, _>>()?;
         cubins.sort();
-        ensure!(!cubins.is_empty(), "no cubin in {} matches {file:?}", binary.display());
+        ensure!(
+            !cubins.is_empty(),
+            "no cubin in {} matches {file:?}",
+            binary.display()
+        );
         let mut funcs = Vec::new();
         for cubin in &cubins {
-            let out = Command::new(tool("cuobjdump")).arg("-sass").arg(cubin).output()?;
-            ensure!(out.status.success(), "cuobjdump -sass {}: {}", cubin.display(), String::from_utf8_lossy(&out.stderr));
+            let out = Command::new(tool("cuobjdump"))
+                .arg("-sass")
+                .arg(cubin)
+                .output()?;
+            ensure!(
+                out.status.success(),
+                "cuobjdump -sass {}: {}",
+                cubin.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
             parse(&String::from_utf8_lossy(&out.stdout), &mut funcs);
         }
         demangle(&mut funcs)?;
@@ -71,7 +113,10 @@ fn parse(text: &str, funcs: &mut Vec<Function>) {
     for line in text.lines() {
         let t = line.trim();
         if let Some(name) = t.strip_prefix("Function : ") {
-            funcs.push(Function { name: name.trim().to_string(), code: Vec::new() });
+            funcs.push(Function {
+                name: name.trim().to_string(),
+                code: Vec::new(),
+            });
         } else if let (Some(f), Some(rest)) = (funcs.last_mut(), t.strip_prefix("/*")) {
             // "/*0090*/ INSTR ;" and the encoding-only continuation lines "/* 0x... */".
             if let Some((addr, instr)) = rest.split_once("*/")
@@ -87,7 +132,11 @@ fn parse(text: &str, funcs: &mut Vec<Function>) {
 }
 
 fn demangle(funcs: &mut [Function]) -> Result<()> {
-    let mut child = match Command::new(tool("cu++filt")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn() {
+    let mut child = match Command::new(tool("cu++filt"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
         Ok(c) => c,
         Err(_) => return Ok(()), // keep the mangled names
     };
@@ -117,20 +166,46 @@ pub struct Check {
 impl Check {
     pub fn parse(spec: &str) -> Result<Self> {
         let (file, rest) = spec.split_once('/').context("expected FILE/KERNEL=INSTR")?;
-        let (kernel, expect) = rest.rsplit_once('=').context("expected FILE/KERNEL=INSTR")?;
-        Ok(Self { spec: spec.to_string(), file: file.to_string(), kernel: Regex::new(kernel)?, expect: Regex::new(expect)? })
+        let (kernel, expect) = rest
+            .rsplit_once('=')
+            .context("expected FILE/KERNEL=INSTR")?;
+        Ok(Self {
+            spec: spec.to_string(),
+            file: file.to_string(),
+            kernel: Regex::new(kernel)?,
+            expect: Regex::new(expect)?,
+        })
     }
 
     /// One result per matching kernel.
     pub fn run(&self, binary: &Path) -> Result<Vec<Found>> {
         let funcs = functions(binary, &self.file, Some(&self.kernel))?;
         if funcs.is_empty() {
-            bail!("{}: no kernel in {} matches {}", self.spec, self.file, self.kernel);
+            bail!(
+                "{}: no kernel in {} matches {}",
+                self.spec,
+                self.file,
+                self.kernel
+            );
         }
-        Ok(funcs.iter().map(|f| {
-            let hits: Vec<usize> = f.code.iter().enumerate().filter(|(_, i)| self.expect.is_match(i)).map(|(n, _)| n).collect();
-            Found { name: f.name.clone(), instrs: f.code.len(), hits: hits.len(), first: hits.first().copied() }
-        }).collect())
+        Ok(funcs
+            .iter()
+            .map(|f| {
+                let hits: Vec<usize> = f
+                    .code
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, i)| self.expect.is_match(i))
+                    .map(|(n, _)| n)
+                    .collect();
+                Found {
+                    name: f.name.clone(),
+                    instrs: f.code.len(),
+                    hits: hits.len(),
+                    first: hits.first().copied(),
+                }
+            })
+            .collect())
     }
 }
 
@@ -144,7 +219,13 @@ pub struct Found {
 }
 
 /// `quench6k sass`: list kernels (instructions, spills), opcode counts, and FILE/KERNEL=INSTR checks.
-pub fn run(binary: Option<&Path>, file: &str, kernel: Option<&str>, top: usize, checks: &[String]) -> Result<()> {
+pub fn run(
+    binary: Option<&Path>,
+    file: &str,
+    kernel: Option<&str>,
+    top: usize,
+    checks: &[String],
+) -> Result<()> {
     let exe = std::env::current_exe()?;
     let binary = binary.unwrap_or(&exe);
     let mut failed = 0;
@@ -175,11 +256,21 @@ pub fn run(binary: Option<&Path>, file: &str, kernel: Option<&str>, top: usize, 
         let check = Check::parse(spec)?;
         println!("{spec}");
         for k in check.run(binary)? {
-            let at = k.first.map_or(String::new(), |i| format!(", first at {i} of {}", k.instrs));
-            println!("  {:<8} {:>4} match(es){at}  {}", if k.hits > 0 { "present" } else { "ABSENT" }, k.hits, k.name);
+            let at = k
+                .first
+                .map_or(String::new(), |i| format!(", first at {i} of {}", k.instrs));
+            println!(
+                "  {:<8} {:>4} match(es){at}  {}",
+                if k.hits > 0 { "present" } else { "ABSENT" },
+                k.hits,
+                k.name
+            );
             failed += (k.hits == 0) as usize;
         }
     }
-    ensure!(failed == 0, "{failed} kernel(s) lack an expected instruction");
+    ensure!(
+        failed == 0,
+        "{failed} kernel(s) lack an expected instruction"
+    );
     Ok(())
 }

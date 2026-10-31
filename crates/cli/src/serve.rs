@@ -15,9 +15,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde_json::{Value, json};
 use quench6k_engine::model::Precision;
 use quench6k_engine::session::{Finish, GenParams, Progress, Session};
+use serde_json::{Value, json};
 use tokio::sync::mpsc as tmpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -32,6 +32,8 @@ pub struct ServeOptions {
     pub steer: crate::SteerArgs,
     /// With a steering pack: the name of the steered model (the base name is served unsteered).
     pub steered_name: Option<String>,
+    /// With an adapter: the name of the adapted model (the base name is served without it).
+    pub adapted_name: Option<String>,
     pub cache_host_gib: f64,
     pub cache_dir: Option<PathBuf>,
     pub cache_disk_gib: f64,
@@ -39,19 +41,27 @@ pub struct ServeOptions {
     pub chat_template: Option<PathBuf>,
     pub tool_retries: usize,
     pub default_max_tokens: usize,
+    /// Whether chat requests that do not say think (false: --no-thinking).
+    pub thinking: bool,
     /// Concurrent requests decoded together (1 or 2).
     pub slots: usize,
+    pub plan_tokens: usize,
     pub capture_dir: Option<PathBuf>,
     pub vision: bool,
     pub image_max_pixels: usize,
     pub video_max_frames: usize,
 }
 
-/// Identity of the served model and numerics for stored contexts: config.json plus the profile.
+/// Identity of the served model and numerics for stored contexts: config.json (and an overlay's
+/// manifest) plus the profile.
 pub fn model_id(model_dir: &std::path::Path) -> String {
-    let config = std::fs::read(model_dir.join("config.json")).unwrap_or_default();
+    let config = quench6k_engine::checkpoint::identity(model_dir);
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    let kv: &[u8] = if quench6k_engine::forward::KV_FP8.load(std::sync::atomic::Ordering::Relaxed) { b"/kv8" } else { b"" };
+    let kv: &[u8] = if quench6k_engine::forward::KV_FP8.load(std::sync::atomic::Ordering::Relaxed) {
+        b"/kv8"
+    } else {
+        b""
+    };
     // "squash" is the project's former name, kept so stored contexts stay valid.
     for b in config.iter().chain(b"int8g/squash-1".iter()).chain(kv) {
         h ^= *b as u64;
@@ -89,12 +99,14 @@ enum Msg {
 /// Counters and gauges for `/metrics`, per slot where it matters.
 #[derive(Default)]
 struct Metrics {
-    generations: [AtomicU64; 2],
-    prompt_tokens: [AtomicU64; 2],
-    cached_tokens: [AtomicU64; 2],
-    generated_tokens: [AtomicU64; 2],
-    prefill_micros: [AtomicU64; 2],
-    decode_micros: [AtomicU64; 2],
+    generations: Vec<AtomicU64>,
+    prompt_tokens: Vec<AtomicU64>,
+    cached_tokens: Vec<AtomicU64>,
+    generated_tokens: Vec<AtomicU64>,
+    prefill_micros: Vec<AtomicU64>,
+    decode_micros: Vec<AtomicU64>,
+    /// Attention-cache memory mapped per slot (bytes).
+    kv_bytes: Vec<AtomicU64>,
     errors: AtomicU64,
     /// Requests waiting for a slot, and requests running.
     queued: AtomicU64,
@@ -102,8 +114,34 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn done(&self, slot: usize, prompt: usize, cached: usize, generated: usize, prefill: f64, decode: f64) {
-        let add = |c: &[AtomicU64; 2], v: u64| c[slot.min(1)].fetch_add(v, Ordering::Relaxed);
+    fn new(slots: usize) -> Self {
+        let per = || (0..slots).map(|_| AtomicU64::new(0)).collect();
+        Self {
+            generations: per(),
+            prompt_tokens: per(),
+            cached_tokens: per(),
+            generated_tokens: per(),
+            prefill_micros: per(),
+            decode_micros: per(),
+            kv_bytes: per(),
+            ..Default::default()
+        }
+    }
+
+    fn done(
+        &self,
+        slot: usize,
+        prompt: usize,
+        cached: usize,
+        generated: usize,
+        prefill: f64,
+        decode: f64,
+    ) {
+        let add = |c: &[AtomicU64], v: u64| {
+            if let Some(c) = c.get(slot) {
+                c.fetch_add(v, Ordering::Relaxed);
+            }
+        };
         add(&self.generations, 1);
         add(&self.prompt_tokens, prompt as u64);
         add(&self.cached_tokens, cached as u64);
@@ -116,23 +154,83 @@ impl Metrics {
     fn render(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
-        let per_slot: [(&str, &str, &[AtomicU64; 2], f64); 6] = [
-            ("generations_total", "Finished generations (a tool-call retry counts again)", &self.generations, 1.0),
-            ("prompt_tokens_total", "Prompt tokens", &self.prompt_tokens, 1.0),
-            ("prompt_tokens_cached_total", "Prompt tokens served from the context cache", &self.cached_tokens, 1.0),
-            ("generation_tokens_total", "Generated tokens", &self.generated_tokens, 1.0),
-            ("prefill_seconds_total", "Time in prefill", &self.prefill_micros, 1e-6),
-            ("decode_seconds_total", "Time decoding", &self.decode_micros, 1e-6),
+        let per_slot: [(&str, &str, &[AtomicU64], f64); 6] = [
+            (
+                "generations_total",
+                "Finished generations (a tool-call retry counts again)",
+                &self.generations,
+                1.0,
+            ),
+            (
+                "prompt_tokens_total",
+                "Prompt tokens",
+                &self.prompt_tokens,
+                1.0,
+            ),
+            (
+                "prompt_tokens_cached_total",
+                "Prompt tokens served from the context cache",
+                &self.cached_tokens,
+                1.0,
+            ),
+            (
+                "generation_tokens_total",
+                "Generated tokens",
+                &self.generated_tokens,
+                1.0,
+            ),
+            (
+                "prefill_seconds_total",
+                "Time in prefill",
+                &self.prefill_micros,
+                1e-6,
+            ),
+            (
+                "decode_seconds_total",
+                "Time decoding",
+                &self.decode_micros,
+                1e-6,
+            ),
         ];
         for (name, help, c, scale) in per_slot {
-            let _ = writeln!(out, "# HELP quench6k_{name} {help}.\n# TYPE quench6k_{name} counter");
+            let _ = writeln!(
+                out,
+                "# HELP quench6k_{name} {help}.\n# TYPE quench6k_{name} counter"
+            );
             for (slot, v) in c.iter().enumerate() {
-                let _ = writeln!(out, "quench6k_{name}{{slot=\"{slot}\"}} {}", v.load(Ordering::Relaxed) as f64 * scale);
+                let _ = writeln!(
+                    out,
+                    "quench6k_{name}{{slot=\"{slot}\"}} {}",
+                    v.load(Ordering::Relaxed) as f64 * scale
+                );
             }
         }
-        let _ = writeln!(out, "# HELP quench6k_errors_total Generations that failed.\n# TYPE quench6k_errors_total counter\nquench6k_errors_total {}", self.errors.load(Ordering::Relaxed));
-        let _ = writeln!(out, "# HELP quench6k_requests_waiting Requests waiting for a slot.\n# TYPE quench6k_requests_waiting gauge\nquench6k_requests_waiting {}", self.queued.load(Ordering::Relaxed));
-        let _ = writeln!(out, "# HELP quench6k_requests_running Requests prefilling or decoding.\n# TYPE quench6k_requests_running gauge\nquench6k_requests_running {}", self.running.load(Ordering::Relaxed));
+        let _ = writeln!(
+            out,
+            "# HELP quench6k_kv_cache_bytes Attention-cache device memory in use.\n# TYPE quench6k_kv_cache_bytes gauge"
+        );
+        for (slot, v) in self.kv_bytes.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "quench6k_kv_cache_bytes{{slot=\"{slot}\"}} {}",
+                v.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP quench6k_errors_total Generations that failed.\n# TYPE quench6k_errors_total counter\nquench6k_errors_total {}",
+            self.errors.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP quench6k_requests_waiting Requests waiting for a slot.\n# TYPE quench6k_requests_waiting gauge\nquench6k_requests_waiting {}",
+            self.queued.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP quench6k_requests_running Requests prefilling or decoding.\n# TYPE quench6k_requests_running gauge\nquench6k_requests_running {}",
+            self.running.load(Ordering::Relaxed)
+        );
         out
     }
 }
@@ -147,8 +245,12 @@ struct App {
     steering: bool,
     /// The steered model's name and strength (with a pack loaded).
     steered: Option<(String, f32)>,
+    /// The adapted model's name (with an adapter loaded).
+    adapted: Option<String>,
     tool_retries: usize,
     default_max_tokens: usize,
+    /// The server's thinking default (`--no-thinking`: false), for requests that do not choose.
+    thinking: bool,
     tool_call_token: Option<i32>,
     capture_dir: Option<PathBuf>,
     model_id: String,
@@ -166,19 +268,35 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     let tool_call_token = chat.token_id("<tool_call>");
     let (jobs_tx, jobs_rx) = mpsc::channel::<Work>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<f32>>();
-    let (model_dir, context, drafts, steer, slots) = (opts.model.clone(), opts.context, opts.drafts, opts.steer.clone(), opts.slots);
+    let (model_dir, context, drafts, steer, slots, plan_tokens) = (
+        opts.model.clone(),
+        opts.context,
+        opts.drafts,
+        opts.steer.clone(),
+        opts.slots,
+        opts.plan_tokens,
+    );
     let store = quench6k_engine::context_store::StoreOptions {
         host_bytes: (opts.cache_host_gib * 1073741824.0) as usize,
         dir: opts.cache_dir.clone(),
         disk_bytes: (opts.cache_disk_gib * 1073741824.0) as usize,
-        max_age: opts.cache_max_age_days.map(|d| std::time::Duration::from_secs_f64(d * 86400.0)),
+        max_age: opts
+            .cache_max_age_days
+            .map(|d| std::time::Duration::from_secs_f64(d * 86400.0)),
         model_id: model_id(&opts.model),
     };
     let steering = steer.steering.is_some();
     let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model);
-    anyhow::ensure!(!(flint && steering), "steering packs are not supported for Flint");
+    anyhow::ensure!(
+        !(flint && steering),
+        "steering packs are not supported for Flint"
+    );
+    anyhow::ensure!(
+        !(flint && steer.adapter.is_some()),
+        "adapters are not supported for Flint"
+    );
     let vision = opts.vision && !flint;
-    let metrics = Arc::new(Metrics::default());
+    let metrics = Arc::new(Metrics::new(if flint { 1 } else { slots }));
     let worker_metrics = metrics.clone();
     std::thread::spawn(move || {
         let metrics = worker_metrics;
@@ -198,11 +316,19 @@ pub fn run(opts: ServeOptions) -> Result<()> {
             let (mut model, stream) = crate::load(&model_dir, Precision::Int8Group, true)?;
             let strength = steer.attach(&mut model, &stream)?;
             let mut session = Session::new(&model, &stream, context, 8192, drafts, store)?;
+            session.set_plan_tokens(plan_tokens);
             if vision {
                 let ckpt = quench6k_engine::checkpoint::Checkpoint::open(&model_dir)?;
-                session.set_vision(quench6k_engine::vision::VisionModel::load(&ckpt, quench6k_engine::loader::LoadOptions::default(), &stream)?);
+                session.set_vision(quench6k_engine::vision::VisionModel::load(
+                    &ckpt,
+                    quench6k_engine::loader::LoadOptions::default(),
+                    &stream,
+                )?);
             }
-            println!("context store: {} stored contexts", session.stored_contexts());
+            println!(
+                "context store: {} stored contexts",
+                session.stored_contexts()
+            );
             Ok((model, stream, session, strength))
         })();
         let (model, stream, mut session) = match setup {
@@ -215,21 +341,57 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                 return;
             }
         };
-        if slots > 1 {
-            if let Err(e) = session.enable_second_slot(&model, &stream) {
-                eprintln!("second slot unavailable: {e:#}");
-            }
+        if let Err(e) = session.add_slots(&model, &stream, slots) {
+            eprintln!("{} of {slots} slots: {e:#}", session.slots());
         }
         schedule(&model, &stream, &mut session, &jobs_rx, &metrics);
     });
     let _ = ready_rx.recv().context("worker thread")??;
     // With a pack, the base name runs unsteered and the steered name applies --strength (default 1).
-    let steered = steering.then(|| (opts.steered_name.clone().unwrap_or_else(|| format!("{}-steered", opts.name)), opts.steer.strength.unwrap_or(1.0)));
+    let steered = steering.then(|| {
+        (
+            opts.steered_name
+                .clone()
+                .unwrap_or_else(|| format!("{}-steered", opts.name)),
+            opts.steer.strength.unwrap_or(1.0),
+        )
+    });
     let default_strength = 0.0;
-    if let Some((name, strength)) = &steered {
-        println!("models: {} (unsteered), {name} (steering strength {strength})", opts.name);
+    let adapted = opts.steer.adapter.is_some().then(|| {
+        opts.adapted_name
+            .clone()
+            .unwrap_or_else(|| format!("{}-adapted", opts.name))
+    });
+    if let Some(name) = &adapted {
+        println!("models: {} (base), {name} (adapter)", opts.name);
     }
-    let app = Arc::new(App { chat, metrics, jobs: jobs_tx.clone(), name: opts.name, default_strength, steering, steered, tool_retries: opts.tool_retries, default_max_tokens: opts.default_max_tokens, tool_call_token, capture_dir: opts.capture_dir.clone(), model_id: model_id(&opts.model), context: opts.context, started: now(), vision, image_max_pixels: opts.image_max_pixels, video_max_frames: opts.video_max_frames });
+    if let Some((name, strength)) = &steered {
+        println!(
+            "models: {} (unsteered), {name} (steering strength {strength})",
+            opts.name
+        );
+    }
+    let app = Arc::new(App {
+        chat,
+        metrics,
+        jobs: jobs_tx.clone(),
+        name: opts.name,
+        default_strength,
+        steering,
+        steered,
+        adapted,
+        tool_retries: opts.tool_retries,
+        default_max_tokens: opts.default_max_tokens,
+        thinking: opts.thinking,
+        tool_call_token,
+        capture_dir: opts.capture_dir.clone(),
+        model_id: model_id(&opts.model),
+        context: opts.context,
+        started: now(),
+        vision,
+        image_max_pixels: opts.image_max_pixels,
+        video_max_frames: opts.video_max_frames,
+    });
     let router = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -248,7 +410,11 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(opts.listen).await?;
         println!("serving on http://{}", opts.listen);
-        axum::serve(listener, router).with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; }).await?;
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await?;
         // Keep stored contexts across the restart.
         let (ack_tx, ack_rx) = mpsc::channel();
         if jobs_tx.send(Work::Persist(ack_tx)).is_ok() {
@@ -265,7 +431,13 @@ pub fn run(opts: ServeOptions) -> Result<()> {
 
 /// The GPU worker: admits queued requests into free slots and steps the running ones, one alone
 /// (speculatively when it started alone) or both batched.
-fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, session: &mut Session, jobs: &mpsc::Receiver<Work>, metrics: &Metrics) {
+fn schedule(
+    model: &quench6k_engine::model::Model,
+    s: &quench6k_cuda::Stream,
+    session: &mut Session,
+    jobs: &mpsc::Receiver<Work>,
+    metrics: &Metrics,
+) {
     use quench6k_engine::session::Run;
     struct Active {
         run: Run,
@@ -294,11 +466,14 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
     // Completes a finished run: writes its capture, then reports.
     let complete = |a: Active, f: Finish, session: &mut Session| {
         if let Some((path, meta)) = &a.capture {
-            let result = session.finish_capture(model, s, &a.run).and_then(|c| match c {
-                Some(c) => write_capture(path, meta, &a.generated, &c),
-                None => Ok(()),
-            });
+            let result = session
+                .finish_capture(model, s, &a.run)
+                .and_then(|c| match c {
+                    Some(c) => write_capture(path, meta, &a.generated, &c),
+                    None => Ok(()),
+                });
             if let Err(e) = result {
+                session.end(a.run.slot);
                 let _ = a.tx.send(Msg::Error(format!("capture: {e:#}")));
                 return;
             }
@@ -307,22 +482,49 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
         let n = a.generated.len();
         metrics.done(a.run.slot, a.prompt, a.reused, n, a.prefill, secs);
         let (rounds, accepted) = session.spec_stats(a.run.slot);
-        let mtp = if a.run.is_spec() && rounds > 0 { format!(", MTP {:.2} tokens/round", (rounds + accepted) as f64 / rounds as f64) } else { String::new() };
-        eprintln!("done: slot {}, prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s){mtp}, {:?}",
-                  a.run.slot, a.prompt, a.reused, a.prefill, (a.prompt - a.reused) as f64 / a.prefill.max(1e-9), n, secs,
-                  n.saturating_sub(1) as f64 / secs.max(1e-9), f);
+        let mtp = if a.run.is_spec() && rounds > 0 {
+            format!(
+                ", MTP {:.2} tokens/round",
+                (rounds + accepted) as f64 / rounds as f64
+            )
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "done: slot {}, prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s){mtp}, {:?}",
+            a.run.slot,
+            a.prompt,
+            a.reused,
+            a.prefill,
+            (a.prompt - a.reused) as f64 / a.prefill.max(1e-9),
+            n,
+            secs,
+            n.saturating_sub(1) as f64 / secs.max(1e-9),
+            f
+        );
         if let Some(path) = std::env::var_os("QUENCH6K_TRACE") {
             use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                let _ = writeln!(file, "{}", json!({"slot": a.run.slot, "finish": format!("{f:?}"), "generated": a.generated}));
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(
+                    file,
+                    "{}",
+                    json!({"slot": a.run.slot, "finish": format!("{f:?}"), "generated": a.generated})
+                );
             }
         }
+        session.end(a.run.slot);
         let _ = a.tx.send(Msg::Done(f, a.reused));
     };
-    let nslots = if session.has_second_slot() { 2 } else { 1 };
-    let mut slots: [Option<Active>; 2] = [None, None];
+    let nslots = session.slots();
+    let mut slots: Vec<Option<Active>> = (0..nslots).map(|_| None).collect();
     let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
-    let take = |w: Work, queue: &mut std::collections::VecDeque<Job>, session: &mut Session| match w {
+    let mut waiting_for_memory = false;
+    let take = |w: Work, queue: &mut std::collections::VecDeque<Job>, session: &mut Session| match w
+    {
         Work::Generate(job) => queue.push_back(job),
         Work::Persist(ack) => {
             if let Err(e) = session.persist() {
@@ -333,7 +535,9 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
     };
     loop {
         metrics.queued.store(queue.len() as u64, Ordering::Relaxed);
-        metrics.running.store(slots.iter().flatten().count() as u64, Ordering::Relaxed);
+        metrics
+            .running
+            .store(slots.iter().flatten().count() as u64, Ordering::Relaxed);
         if slots.iter().all(Option::is_none) && queue.is_empty() {
             match jobs.recv() {
                 Ok(w) => take(w, &mut queue, session),
@@ -346,24 +550,57 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
         // Admit queued requests into free slots: the one whose GPU cache holds the most of the prompt,
         // else the one holding the shortest context (the cheapest to stash and overwrite).
         while let Some(job) = queue.front() {
-            let free = (0..nslots).filter(|&i| slots[i].is_none()).map(|i| {
-                let (reusable, held) = session.cached_prefix(i, &job.ids, &job.params);
-                (reusable, std::cmp::Reverse(held), std::cmp::Reverse(i))
-            }).max();
-            let Some((_, _, std::cmp::Reverse(free))) = free else { break };
+            let free = (0..nslots)
+                .filter(|&i| slots[i].is_none())
+                .map(|i| {
+                    let (reusable, held) = session.cached_prefix(i, &job.ids, &job.params);
+                    (reusable, std::cmp::Reverse(held), std::cmp::Reverse(i))
+                })
+                .max();
+            let Some((_, _, std::cmp::Reverse(free))) = free else {
+                break;
+            };
+            // Memory planning: a request whose plan does not fit next to the running ones waits.
+            if !session.admits(free, job.ids.len(), job.params.max_tokens) {
+                if !waiting_for_memory {
+                    eprintln!(
+                        "request of {} prompt tokens waits for attention-cache memory",
+                        job.ids.len()
+                    );
+                    waiting_for_memory = true;
+                }
+                break;
+            }
+            waiting_for_memory = false;
             let job = queue.pop_front().unwrap();
-            // Both slots decode speculatively, together in pair rounds when both are busy (a request
-            // with plain decoding makes the other switch to batched plain steps; see Session::step).
+            // Requests decode speculatively, together in group rounds when several are running (requests
+            // with plain decoding take batched plain steps; see Session::step).
             let speculate = job.mtp;
             let t0 = std::time::Instant::now();
             match session.begin(model, s, free, &job.ids, &job.params, speculate) {
                 Ok((run, toks)) => {
-                    let mut a = Active { run, tx: job.tx, reused: session.reused(free), capture: job.capture, generated: Vec::new(),
-                                         prompt: job.ids.len(), prefill: t0.elapsed().as_secs_f64(), decode_start: std::time::Instant::now() };
+                    let mut a = Active {
+                        run,
+                        tx: job.tx,
+                        reused: session.reused(free),
+                        capture: job.capture,
+                        generated: Vec::new(),
+                        prompt: job.ids.len(),
+                        prefill: t0.elapsed().as_secs_f64(),
+                        decode_start: std::time::Instant::now(),
+                    };
                     if let Some(path) = std::env::var_os("QUENCH6K_TRACE") {
                         use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                            let _ = writeln!(f, "{}", json!({"slot": free, "reused": a.reused, "ids": job.ids}));
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                        {
+                            let _ = writeln!(
+                                f,
+                                "{}",
+                                json!({"slot": free, "reused": a.reused, "ids": job.ids})
+                            );
                         }
                     }
                     match emit(&mut a, &toks) {
@@ -372,18 +609,36 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
                     }
                 }
                 Err(e) => {
+                    session.end(free);
                     let _ = job.tx.send(Msg::Error(format!("{e:#}")));
                 }
             }
         }
         metrics.queued.store(queue.len() as u64, Ordering::Relaxed);
-        metrics.running.store(slots.iter().flatten().count() as u64, Ordering::Relaxed);
-        // Step the running requests.
-        let result = match &mut slots {
-            [Some(a), Some(b)] => session.step(model, s, &mut [&mut a.run, &mut b.run]),
-            [Some(a), None] | [None, Some(a)] => session.step(model, s, &mut [&mut a.run]),
-            [None, None] => continue,
-        };
+        metrics
+            .running
+            .store(slots.iter().flatten().count() as u64, Ordering::Relaxed);
+        // Memory for each running request's next step; a request that cannot get it ends with an error.
+        for slot in slots.iter_mut() {
+            if let Some(a) = slot
+                && let Err(e) = session.reserve(&a.run)
+            {
+                let a = slot.take().unwrap();
+                session.end(a.run.slot);
+                let _ = a.tx.send(Msg::Error(format!("{e:#}")));
+            }
+        }
+        for (v, b) in metrics.kv_bytes.iter().zip(session.kv_bytes()) {
+            v.store(b as u64, Ordering::Relaxed);
+        }
+        // Step the running requests together.
+        let mut runs: Vec<&mut quench6k_engine::session::Run> =
+            slots.iter_mut().flatten().map(|a| &mut a.run).collect();
+        if runs.is_empty() {
+            continue;
+        }
+        let result = session.step(model, s, &mut runs);
+        drop(runs);
         match result {
             Ok(toks) => {
                 let mut k = 0;
@@ -400,6 +655,7 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
             Err(e) => {
                 for slot in slots.iter_mut() {
                     if let Some(a) = slot.take() {
+                        session.end(a.run.slot);
                         let _ = a.tx.send(Msg::Error(format!("{e:#}")));
                     }
                 }
@@ -410,9 +666,21 @@ fn schedule(model: &quench6k_engine::model::Model, s: &quench6k_cuda::Stream, se
 
 /// The GPU worker for Flint checkpoints: one sequence, requests in turn (prefix reuse across requests),
 /// sampling on the host from the top candidates.
-fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda::Stream, context: usize, jobs: &mpsc::Receiver<Work>, metrics: &Metrics) {
+fn schedule_flint(
+    model: &quench6k_engine::flint::FlintModel,
+    s: &quench6k_cuda::Stream,
+    context: usize,
+    jobs: &mpsc::Receiver<Work>,
+    metrics: &Metrics,
+) {
     use quench6k_engine::flint as fl;
-    let setup = || -> Result<_> { Ok((fl::Workspace::new(fl::MAX_STEP)?, fl::FlintSeq::new(model, context)?, crate::flint::Sampler::new()?)) };
+    let setup = || -> Result<_> {
+        Ok((
+            fl::Workspace::new(fl::MAX_STEP)?,
+            fl::FlintSeq::new(model, context)?,
+            crate::flint::Sampler::new()?,
+        ))
+    };
     let (mut ws, mut seq, mut sampler) = match setup() {
         Ok(v) => v,
         Err(e) => {
@@ -430,7 +698,10 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
         };
         if job.ids.len() >= context {
             // Rejected before touching the cached sequence.
-            let _ = job.tx.send(Msg::Error(format!("prompt of {} tokens exceeds the context of {context}", job.ids.len())));
+            let _ = job.tx.send(Msg::Error(format!(
+                "prompt of {} tokens exceeds the context of {context}",
+                job.ids.len()
+            )));
             continue;
         }
         let t0 = std::time::Instant::now();
@@ -459,17 +730,18 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
             let (mut drafted, mut accepted, mut steps) = (0usize, 0usize, 0usize);
             let t1 = std::time::Instant::now();
             // Emits a token; Some when the run ends.
-            let emit = |tok: i32, generated: &mut Vec<i32>, hist: &mut Vec<i32>| -> Option<Finish> {
-                generated.push(tok);
-                hist.push(tok);
-                if job.tx.send(Msg::Token(tok)).is_err() {
-                    return Some(Finish::Cancelled);
-                }
-                if p.stop_tokens.contains(&tok) {
-                    return Some(Finish::Stop);
-                }
-                (generated.len() >= budget).then_some(Finish::Length)
-            };
+            let emit =
+                |tok: i32, generated: &mut Vec<i32>, hist: &mut Vec<i32>| -> Option<Finish> {
+                    generated.push(tok);
+                    hist.push(tok);
+                    if job.tx.send(Msg::Token(tok)).is_err() {
+                        return Some(Finish::Cancelled);
+                    }
+                    if p.stop_tokens.contains(&tok) {
+                        return Some(Finish::Stop);
+                    }
+                    (generated.len() >= budget).then_some(Finish::Length)
+                };
             sampler.fetch(s, ws.logits, 1, fl::VOCAB, p)?;
             let first = sampler.pick(0, p, &generated);
             let mut done = emit(first, &mut generated, &mut hist);
@@ -477,9 +749,21 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
             // Draft length follows the request's recent acceptance rate (drafts that fail cost a larger step).
             let mut rate = 0.5f64;
             while done.is_none() {
-                let cap = if rate < 0.15 { 1 } else if rate < 0.35 { 2 } else if rate < 0.6 { 4 } else { fl::MAX_STEP - 1 };
+                let cap = if rate < 0.15 {
+                    1
+                } else if rate < 0.35 {
+                    2
+                } else if rate < 0.6 {
+                    4
+                } else {
+                    fl::MAX_STEP - 1
+                };
                 let room = cap.min(budget - generated.len());
-                let draft = if lookup { crate::flint::lookup_draft(&hist, room) } else { Vec::new() };
+                let draft = if lookup {
+                    crate::flint::lookup_draft(&hist, room)
+                } else {
+                    Vec::new()
+                };
                 let mut toks = Vec::with_capacity(draft.len() + 1);
                 toks.push(pending);
                 toks.extend_from_slice(&draft);
@@ -507,11 +791,26 @@ fn schedule_flint(model: &quench6k_engine::flint::FlintModel, s: &quench6k_cuda:
                 seq.tokens.truncate(before + 1 + j);
             }
             let finish = done.unwrap();
-            let spec_note = if lookup && steps > 0 { format!(", lookup {accepted}/{drafted} drafts accepted, {:.2} tokens/step", generated.len().saturating_sub(1) as f64 / steps as f64) } else { String::new() };
+            let spec_note = if lookup && steps > 0 {
+                format!(
+                    ", lookup {accepted}/{drafted} drafts accepted, {:.2} tokens/step",
+                    generated.len().saturating_sub(1) as f64 / steps as f64
+                )
+            } else {
+                String::new()
+            };
             let secs = t1.elapsed().as_secs_f64();
-            eprintln!("done: prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s){spec_note}, {:?}",
-                      job.ids.len(), reused, prefill, (job.ids.len() - reused) as f64 / prefill.max(1e-9), generated.len(), secs,
-                      generated.len().saturating_sub(1) as f64 / secs.max(1e-9), finish);
+            eprintln!(
+                "done: prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s){spec_note}, {:?}",
+                job.ids.len(),
+                reused,
+                prefill,
+                (job.ids.len() - reused) as f64 / prefill.max(1e-9),
+                generated.len(),
+                secs,
+                generated.len().saturating_sub(1) as f64 / secs.max(1e-9),
+                finish
+            );
             Ok((finish, reused, generated.len(), prefill, secs))
         })();
         metrics.running.store(0, Ordering::Relaxed);
@@ -533,9 +832,12 @@ async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
-/// The served model names: the base model, and the steered one with a pack loaded.
+/// The served model names: the base model, the steered one with a pack loaded, and the adapted one
+/// with an adapter loaded.
 fn model_names(app: &App) -> impl Iterator<Item = &str> {
-    std::iter::once(app.name.as_str()).chain(app.steered.as_ref().map(|(name, _)| name.as_str()))
+    std::iter::once(app.name.as_str())
+        .chain(app.steered.as_ref().map(|(name, _)| name.as_str()))
+        .chain(app.adapted.as_deref())
 }
 
 /// A model object with its context limit under vLLM's (`max_model_len`) and OpenRouter's
@@ -546,14 +848,20 @@ fn model_object(app: &App, name: &str) -> Value {
 }
 
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
-    let data: Vec<Value> = model_names(&app).map(|name| model_object(&app, name)).collect();
+    let data: Vec<Value> = model_names(&app)
+        .map(|name| model_object(&app, name))
+        .collect();
     Json(json!({"object": "list", "data": data}))
 }
 
 async fn model(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
     match model_names(&app).find(|&name| name == id) {
         Some(name) => Json(model_object(&app, name)).into_response(),
-        None => ApiError { code: Some("model_not_found"), ..error(StatusCode::NOT_FOUND, format!("model '{id}' not found")) }.into_response(),
+        None => ApiError {
+            code: Some("model_not_found"),
+            ..error(StatusCode::NOT_FOUND, format!("model '{id}' not found"))
+        }
+        .into_response(),
     }
 }
 
@@ -565,13 +873,25 @@ struct ApiError {
 }
 
 fn error(status: StatusCode, msg: impl Into<String>) -> ApiError {
-    ApiError { status, code: None, message: msg.into() }
+    ApiError {
+        status,
+        code: None,
+        message: msg.into(),
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let kind = if self.status.is_server_error() { "server_error" } else { "invalid_request_error" };
-        (self.status, Json(json!({"error": {"message": self.message, "type": kind, "code": self.code}}))).into_response()
+        let kind = if self.status.is_server_error() {
+            "server_error"
+        } else {
+            "invalid_request_error"
+        };
+        (
+            self.status,
+            Json(json!({"error": {"message": self.message, "type": kind, "code": self.code}})),
+        )
+            .into_response()
     }
 }
 
@@ -582,7 +902,11 @@ impl ApiError {
             s if s.is_server_error() => "api_error",
             _ => "invalid_request_error",
         };
-        (self.status, Json(json!({"type": "error", "error": {"type": kind, "message": self.message}}))).into_response()
+        (
+            self.status,
+            Json(json!({"type": "error", "error": {"type": kind, "message": self.message}})),
+        )
+            .into_response()
     }
 }
 
@@ -591,12 +915,22 @@ fn check_context(app: &App, p: &Prepared) -> Result<(), ApiError> {
     if p.ids.len() < app.context {
         return Ok(());
     }
-    let msg = format!("prompt of {} tokens exceeds the context of {} tokens", p.ids.len(), app.context);
-    Err(ApiError { code: Some("context_length_exceeded"), ..error(StatusCode::BAD_REQUEST, msg) })
+    let msg = format!(
+        "prompt of {} tokens exceeds the context of {} tokens",
+        p.ids.len(),
+        app.context
+    );
+    Err(ApiError {
+        code: Some("context_length_exceeded"),
+        ..error(StatusCode::BAD_REQUEST, msg)
+    })
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// A suffix for response and tool-call ids that is unique for the server's life: clients
@@ -605,8 +939,14 @@ fn now() -> u64 {
 /// one call "[Tool use interrupted]").
 fn unique_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
-    format!("{nanos:x}{:06x}", NEXT.fetch_add(1, Ordering::Relaxed) & 0xff_ffff)
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!(
+        "{nanos:x}{:06x}",
+        NEXT.fetch_add(1, Ordering::Relaxed) & 0xff_ffff
+    )
 }
 
 /// What the request asks for, after rendering and tokenizing.
@@ -626,12 +966,22 @@ struct Prepared {
 }
 
 fn prepare(app: &App, req: &Value) -> Result<Prepared, ApiError> {
-    let tools = req.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty())).cloned();
+    let tools = req
+        .get("tools")
+        .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
+        .cloned();
     let (mut ids, images, mut thinking) = render_chat(app, req, tools.as_ref())?;
     // Debugging: "prompt_ids" replays a traced prompt (text-only) in place of the rendered messages.
     if let Some(raw) = req.get("prompt_ids").and_then(Value::as_array) {
-        ids = raw.iter().filter_map(Value::as_i64).map(|v| v as i32).collect();
-        let tail = app.chat.decode(&ids[ids.len().saturating_sub(4)..], false).unwrap_or_default();
+        ids = raw
+            .iter()
+            .filter_map(Value::as_i64)
+            .map(|v| v as i32)
+            .collect();
+        let tail = app
+            .chat
+            .decode(&ids[ids.len().saturating_sub(4)..], false)
+            .unwrap_or_default();
         thinking = tail.ends_with("<think>\n");
     }
     prepare_ids(app, req, ids, images, thinking, tools)
@@ -649,68 +999,172 @@ fn reasoning(enable_thinking: Option<bool>, effort: Option<&str>) -> (Option<boo
     }
 }
 
+/// The request's enable_thinking, or else the server's default (`--no-thinking`: off), which applies
+/// only to requests that set no reasoning effort either.
+fn thinking_choice(server: bool, request: Option<bool>, effort: Option<&str>) -> Option<bool> {
+    request.or((!server && effort.is_none()).then_some(false))
+}
+
 /// `messages` through the chat template: the prompt's tokens (media expanded), its media, and whether
 /// the prompt opens a reasoning block.
-fn render_chat(app: &App, req: &Value, tools: Option<&Value>) -> Result<(Vec<i32>, Media, bool), ApiError> {
-    let messages = req.get("messages").filter(|m| m.is_array()).ok_or_else(|| error(StatusCode::BAD_REQUEST, "messages must be an array"))?;
-    let kwargs = req.get("chat_template_kwargs").cloned().unwrap_or(Value::Null);
+fn render_chat(
+    app: &App,
+    req: &Value,
+    tools: Option<&Value>,
+) -> Result<(Vec<i32>, Media, bool), ApiError> {
+    let messages = req
+        .get("messages")
+        .filter(|m| m.is_array())
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "messages must be an array"))?;
+    let kwargs = req
+        .get("chat_template_kwargs")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let effort = kwargs
+        .get("reasoning_effort")
+        .or_else(|| req.get("reasoning_effort"))
+        .and_then(Value::as_str);
     let (enable_thinking, effort) = reasoning(
-        kwargs.get("enable_thinking").and_then(Value::as_bool),
-        kwargs.get("reasoning_effort").or_else(|| req.get("reasoning_effort")).and_then(Value::as_str),
+        thinking_choice(
+            app.thinking,
+            kwargs.get("enable_thinking").and_then(Value::as_bool),
+            effort,
+        ),
+        effort,
     );
     let t0 = std::time::Instant::now();
     let (messages, images, videos) = extract_images(app, messages)?;
-    let text = app.chat.render(&messages, tools, enable_thinking, effort).map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
+    let text = app
+        .chat
+        .render(&messages, tools, enable_thinking, effort)
+        .map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
     let thinking = text.ends_with("<think>\n");
     let t1 = std::time::Instant::now();
-    let ids = app.chat.encode(&text).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let ids = app
+        .chat
+        .encode(&text)
+        .map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if std::env::var_os("QUENCH6K_TIMING").is_some() {
-        eprintln!("prepare: render {:.1} ms, encode {:.1} ms ({} tokens)", (t1 - t0).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3, ids.len());
+        eprintln!(
+            "prepare: render {:.1} ms, encode {:.1} ms ({} tokens)",
+            (t1 - t0).as_secs_f64() * 1e3,
+            t1.elapsed().as_secs_f64() * 1e3,
+            ids.len()
+        );
     }
-    let (ids, images) = app.chat.expand_media(&ids, images, videos).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let (ids, images) = app
+        .chat
+        .expand_media(&ids, images, videos)
+        .map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok((ids, images, thinking))
 }
 
 /// A raw prompt's tokens: a string (special tokens included as text) or a list of token ids.
 fn raw_ids(app: &App, prompt: Option<&Value>) -> Result<Vec<i32>, ApiError> {
     match prompt {
-        Some(Value::String(text)) => app.chat.encode(text).map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}"))),
+        Some(Value::String(text)) => app
+            .chat
+            .encode(text)
+            .map_err(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}"))),
         Some(Value::Array(a)) if a.len() == 1 && a[0].is_string() => raw_ids(app, a.first()),
-        Some(Value::Array(a)) if a.iter().all(Value::is_i64) => Ok(a.iter().filter_map(Value::as_i64).map(|v| v as i32).collect()),
+        Some(Value::Array(a)) if a.iter().all(Value::is_i64) => Ok(a
+            .iter()
+            .filter_map(Value::as_i64)
+            .map(|v| v as i32)
+            .collect()),
         Some(Value::Array(a)) if a.len() == 1 && a[0].is_array() => raw_ids(app, a.first()),
-        _ => Err(error(StatusCode::BAD_REQUEST, "prompt must be a string or a list of token ids (one prompt per request)")),
+        _ => Err(error(
+            StatusCode::BAD_REQUEST,
+            "prompt must be a string or a list of token ids (one prompt per request)",
+        )),
     }
 }
 
 /// Sampling and request options common to the chat and raw completion endpoints.
-fn prepare_ids(app: &App, req: &Value, ids: Vec<i32>, images: Media, thinking: bool, tools: Option<Value>) -> Result<Prepared, ApiError> {
+fn prepare_ids(
+    app: &App,
+    req: &Value,
+    ids: Vec<i32>,
+    images: Media,
+    thinking: bool,
+    tools: Option<Value>,
+) -> Result<Prepared, ApiError> {
     if ids.is_empty() {
         return Err(error(StatusCode::BAD_REQUEST, "empty prompt"));
     }
     if req.get("n").and_then(Value::as_u64).is_some_and(|n| n != 1) {
         return Err(error(StatusCode::BAD_REQUEST, "n must be 1"));
     }
-    let max_tokens = req.get("max_completion_tokens").or_else(|| req.get("max_tokens")).and_then(Value::as_u64).map_or(app.default_max_tokens, |n| n as usize);
-    let temperature = req.get("temperature").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    let max_tokens = req
+        .get("max_completion_tokens")
+        .or_else(|| req.get("max_tokens"))
+        .and_then(Value::as_u64)
+        .map_or(app.default_max_tokens, |n| n as usize);
+    let temperature = req
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0) as f32;
     let top_p = req.get("top_p").and_then(Value::as_f64).unwrap_or(0.95) as f32;
     let top_k = req.get("top_k").and_then(Value::as_u64).unwrap_or(20) as usize;
-    let min_p = req.get("min_p").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
-    let presence_penalty = req.get("presence_penalty").and_then(Value::as_f64).unwrap_or(0.0).clamp(-2.0, 2.0) as f32;
-    let repetition_penalty = req.get("repetition_penalty").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    let min_p = req
+        .get("min_p")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0) as f32;
+    let presence_penalty = req
+        .get("presence_penalty")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .clamp(-2.0, 2.0) as f32;
+    let repetition_penalty = req
+        .get("repetition_penalty")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0) as f32;
     if !(repetition_penalty > 0.0 && repetition_penalty.is_finite()) {
-        return Err(error(StatusCode::BAD_REQUEST, "repetition_penalty must be positive"));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "repetition_penalty must be positive",
+        ));
     }
-    let seed = req.get("seed").and_then(Value::as_u64).unwrap_or_else(|| now() ^ 0x5eed);
+    let seed = req
+        .get("seed")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| now() ^ 0x5eed);
     let stops = match req.get("stop") {
         Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
         _ => Vec::new(),
     };
-    // The requested model: the steered one, or else the base model (any other name).
-    let steered = app.steered.as_ref().filter(|(name, _)| req.get("model").and_then(Value::as_str) == Some(name.as_str()));
-    let model = steered.map_or_else(|| app.name.clone(), |(name, _)| name.clone());
-    let steering_strength = match req.get("steering").and_then(|s| s.get("steering_strength")).and_then(Value::as_f64) {
-        Some(_) if !app.steering => return Err(error(StatusCode::BAD_REQUEST, "steering requested but no pack is loaded")),
+    // The requested model: the steered one, the adapted one, or else the base model (any other name).
+    let requested = req.get("model").and_then(Value::as_str);
+    let steered = app
+        .steered
+        .as_ref()
+        .filter(|(name, _)| requested == Some(name.as_str()));
+    let adapted = app
+        .adapted
+        .as_ref()
+        .filter(|name| requested == Some(name.as_str()));
+    let model = steered
+        .map(|(name, _)| name)
+        .or(adapted)
+        .unwrap_or(&app.name)
+        .clone();
+    let adapter_scale = if adapted.is_some() { 1.0 } else { 0.0 };
+    let steering_strength = match req
+        .get("steering")
+        .and_then(|s| s.get("steering_strength"))
+        .and_then(Value::as_f64)
+    {
+        Some(_) if !app.steering => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "steering requested but no pack is loaded",
+            ));
+        }
         Some(a) => a as f32,
         None => steered.map_or(app.default_strength, |(_, strength)| *strength),
     };
@@ -718,56 +1172,151 @@ fn prepare_ids(app: &App, req: &Value, ids: Vec<i32>, images: Media, thinking: b
         None | Some(Value::Null) => None,
         Some(c) => {
             let name = c.get("name").and_then(Value::as_str).unwrap_or("");
-            if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") || name.starts_with('.') {
-                return Err(error(StatusCode::BAD_REQUEST, "capture.name must be a plain file name"));
+            if name.is_empty()
+                || name.contains('/')
+                || name.contains('\\')
+                || name.contains("..")
+                || name.starts_with('.')
+            {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "capture.name must be a plain file name",
+                ));
             }
-            let Some(dir) = &app.capture_dir else { return Err(error(StatusCode::BAD_REQUEST, "capture requested but the server has no --capture-dir")) };
+            let Some(dir) = &app.capture_dir else {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "capture requested but the server has no --capture-dir",
+                ));
+            };
             let meta = json!({"engine": "quench6k", "model_id": app.model_id, "prompt_ids": ids, "temperature": temperature, "top_p": top_p,
                               "top_k": top_k, "min_p": min_p, "presence_penalty": presence_penalty, "repetition_penalty": repetition_penalty, "seed": seed, "steering_strength": steering_strength, "request": c});
             Some((dir.join(format!("{name}.safetensors")), meta))
         }
     };
-    let params = GenParams { max_tokens, temperature, top_p, top_k, min_p, presence_penalty, repetition_penalty, seed, stop_tokens: app.chat.stop_tokens.clone(), steering_strength, boundaries: app.chat.boundaries(&ids), capture: capture.is_some(), images, progress: None };
+    let params = GenParams {
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        presence_penalty,
+        repetition_penalty,
+        seed,
+        stop_tokens: app.chat.stop_tokens.clone(),
+        steering_strength,
+        adapter_scale,
+        boundaries: app.chat.boundaries(&ids),
+        capture: capture.is_some(),
+        images,
+        progress: None,
+    };
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let progress = stream && req.get("return_progress").and_then(Value::as_bool).unwrap_or(false);
+    let progress = stream
+        && req
+            .get("return_progress")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let mtp = req.get("mtp").and_then(Value::as_bool).unwrap_or(true);
-    Ok(Prepared { capture, ids, params, stops, thinking, tools, stream, progress, mtp, model })
+    Ok(Prepared {
+        capture,
+        ids,
+        params,
+        stops,
+        thinking,
+        tools,
+        stream,
+        progress,
+        mtp,
+        model,
+    })
 }
 
 /// Splits generated text into (reasoning, content, tool calls).
 /// Replaces image and video parts of message contents (OpenAI-style `image_url` / `video_url` with
 /// a data URL) by template placeholders and preprocesses them, in order.
 #[allow(clippy::type_complexity)]
-fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<quench6k_engine::vision::VisionInput>, Vec<quench6k_engine::vision::VideoClip>), ApiError> {
+fn extract_images(
+    app: &App,
+    messages: &Value,
+) -> Result<
+    (
+        Value,
+        Vec<quench6k_engine::vision::VisionInput>,
+        Vec<quench6k_engine::vision::VideoClip>,
+    ),
+    ApiError,
+> {
     use base64::Engine;
     let mut out = messages.clone();
     let (mut images, mut videos) = (Vec::new(), Vec::new());
     for m in out.as_array_mut().into_iter().flatten() {
-        let Some(parts) = m.get_mut("content").and_then(Value::as_array_mut) else { continue };
+        let Some(parts) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
         for part in parts.iter_mut() {
-            let kind = part.get("type").and_then(Value::as_str).unwrap_or("").to_owned();
+            let kind = part
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
             let url = match kind.as_str() {
-                "image_url" | "video_url" => part.get(kind.as_str()).and_then(|u| u.get("url").or(Some(u))).and_then(Value::as_str).map(str::to_owned),
-                "image" | "video" => part.get(kind.as_str()).and_then(Value::as_str).map(str::to_owned),
+                "image_url" | "video_url" => part
+                    .get(kind.as_str())
+                    .and_then(|u| u.get("url").or(Some(u)))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                "image" | "video" => part
+                    .get(kind.as_str())
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 _ => continue,
             };
             if !app.vision {
-                return Err(error(StatusCode::BAD_REQUEST, "this server has no vision tower (started with --no-vision)"));
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "this server has no vision tower (started with --no-vision)",
+                ));
             }
-            let url = url.ok_or_else(|| error(StatusCode::BAD_REQUEST, "image part without a URL"))?;
-            let data = url.strip_prefix("data:").and_then(|r| r.split_once(";base64,")).map(|(_, d)| d)
-                .ok_or_else(|| error(StatusCode::BAD_REQUEST, "images must be data URLs (data:<type>;base64,...)"))?;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|e| error(StatusCode::BAD_REQUEST, format!("media base64: {e}")))?;
+            let url =
+                url.ok_or_else(|| error(StatusCode::BAD_REQUEST, "image part without a URL"))?;
+            let data = url
+                .strip_prefix("data:")
+                .and_then(|r| r.split_once(";base64,"))
+                .map(|(_, d)| d)
+                .ok_or_else(|| {
+                    error(
+                        StatusCode::BAD_REQUEST,
+                        "images must be data URLs (data:<type>;base64,...)",
+                    )
+                })?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data.trim())
+                .map_err(|e| error(StatusCode::BAD_REQUEST, format!("media base64: {e}")))?;
             if kind.starts_with("video") {
                 // ffmpeg reads the clip from a private temporary file.
-                let path = std::env::temp_dir().join(format!("quench6k-video-{}-{}", std::process::id(), now() ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9)));
-                std::fs::write(&path, &bytes).map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("video: {e}")))?;
-                let clip = quench6k_engine::vision::preprocess_video(&path, 4096, 25165824, app.video_max_frames);
+                let path = std::env::temp_dir().join(format!(
+                    "quench6k-video-{}-{}",
+                    std::process::id(),
+                    now() ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9)
+                ));
+                std::fs::write(&path, &bytes)
+                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("video: {e}")))?;
+                let clip = quench6k_engine::vision::preprocess_video(
+                    &path,
+                    4096,
+                    25165824,
+                    app.video_max_frames,
+                );
                 let _ = std::fs::remove_file(&path);
-                videos.push(clip.map_err(|e| error(StatusCode::BAD_REQUEST, format!("video: {e:#}")))?);
+                videos.push(
+                    clip.map_err(|e| error(StatusCode::BAD_REQUEST, format!("video: {e:#}")))?,
+                );
                 *part = json!({"type": "video"});
             } else {
-                let input = quench6k_engine::vision::preprocess_image(&bytes, 65536, app.image_max_pixels).map_err(|e| error(StatusCode::BAD_REQUEST, format!("image: {e:#}")))?;
+                let input =
+                    quench6k_engine::vision::preprocess_image(&bytes, 65536, app.image_max_pixels)
+                        .map_err(|e| error(StatusCode::BAD_REQUEST, format!("image: {e:#}")))?;
                 images.push(input);
                 *part = json!({"type": "image"});
             }
@@ -776,7 +1325,11 @@ fn extract_images(app: &App, messages: &Value) -> Result<(Value, Vec<quench6k_en
     Ok((out, images, videos))
 }
 
-fn parse_output(text: &str, thinking: bool, tools: Option<&Value>) -> (Option<String>, String, Vec<Value>) {
+fn parse_output(
+    text: &str,
+    thinking: bool,
+    tools: Option<&Value>,
+) -> (Option<String>, String, Vec<Value>) {
     // Models that decide per turn whether to reason (Flint) open their output with <think>.
     let (thinking, text) = match text.trim_start().strip_prefix("<think>") {
         Some(rest) if !thinking => (true, rest),
@@ -795,7 +1348,9 @@ fn parse_output(text: &str, thinking: bool, tools: Option<&Value>) -> (Option<St
     let mut cursor = content_end;
     while let Some(start) = rest[cursor..].find("<tool_call>") {
         let body_start = cursor + start + "<tool_call>".len();
-        let Some(end) = rest[body_start..].find("</tool_call>") else { break };
+        let Some(end) = rest[body_start..].find("</tool_call>") else {
+            break;
+        };
         if let Some(call) = parse_tool_call(&rest[body_start..body_start + end], tools) {
             calls.push(json!({"id": format!("call_{}_{}", unique_id(), calls.len()), "type": "function", "function": call}));
         }
@@ -804,7 +1359,11 @@ fn parse_output(text: &str, thinking: bool, tools: Option<&Value>) -> (Option<St
     // Leading whitespace after </think> is layout; trailing whitespace is kept (it can precede a stop
     // string) unless tool calls follow.
     let content = rest[..content_end].trim_start();
-    let content = if calls.is_empty() { content } else { content.trim_end() };
+    let content = if calls.is_empty() {
+        content
+    } else {
+        content.trim_end()
+    };
     (reasoning, content.to_string(), calls)
 }
 
@@ -825,12 +1384,19 @@ fn parse_tool_call(body: &str, tools: Option<&Value>) -> Option<Value> {
     }
     // Flint (GLM style): NAME<arg_key>ARG</arg_key><arg_value>value</arg_value>...
     if body.contains("<arg_key>") || (!body.contains("<function=") && !body.contains('<')) {
-        let name = body[..body.find('<').unwrap_or(body.len())].trim().to_string();
+        let name = body[..body.find('<').unwrap_or(body.len())]
+            .trim()
+            .to_string();
         if name.is_empty() {
             return None;
         }
         let schema = tools.and_then(|t| t.as_array()).and_then(|a| {
-            a.iter().find(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) == Some(name.as_str()))
+            a.iter().find(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    == Some(name.as_str())
+            })
         });
         let mut args = serde_json::Map::new();
         let mut cursor = 0;
@@ -840,7 +1406,9 @@ fn parse_tool_call(body: &str, tools: Option<&Value>) -> Option<Value> {
             let vs = body[ke..].find("<arg_value>")? + ke + "<arg_value>".len();
             let ve = body[vs..].find("</arg_value>")? + vs;
             let arg = body[ks..ke].trim().to_string();
-            let ty = schema.and_then(|s| s.pointer(&format!("/function/parameters/properties/{arg}/type"))).and_then(Value::as_str);
+            let ty = schema
+                .and_then(|s| s.pointer(&format!("/function/parameters/properties/{arg}/type")))
+                .and_then(Value::as_str);
             args.insert(arg, param_value(&body[vs..ve], ty));
             cursor = ve + "</arg_value>".len();
         }
@@ -850,7 +1418,12 @@ fn parse_tool_call(body: &str, tools: Option<&Value>) -> Option<Value> {
     let name_end = body[f..].find('>')? + f;
     let name = body[f..name_end].trim().to_string();
     let schema = tools.and_then(|t| t.as_array()).and_then(|a| {
-        a.iter().find(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) == Some(name.as_str()))
+        a.iter().find(|t| {
+            t.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                == Some(name.as_str())
+        })
     });
     let mut args = serde_json::Map::new();
     let mut cursor = name_end;
@@ -859,9 +1432,13 @@ fn parse_tool_call(body: &str, tools: Option<&Value>) -> Option<Value> {
         let pe = body[ps..].find('>')? + ps;
         let arg = body[ps..pe].trim().to_string();
         let ve = body[pe + 1..].find("</parameter>")? + pe + 1;
-        let raw = body[pe + 1..ve].strip_prefix('\n').unwrap_or(&body[pe + 1..ve]);
+        let raw = body[pe + 1..ve]
+            .strip_prefix('\n')
+            .unwrap_or(&body[pe + 1..ve]);
         let raw = raw.strip_suffix('\n').unwrap_or(raw);
-        let ty = schema.and_then(|s| s.pointer(&format!("/function/parameters/properties/{arg}/type"))).and_then(Value::as_str);
+        let ty = schema
+            .and_then(|s| s.pointer(&format!("/function/parameters/properties/{arg}/type")))
+            .and_then(Value::as_str);
         let value = param_value(raw, ty);
         args.insert(arg, value);
         cursor = ve + "</parameter>".len();
@@ -898,7 +1475,11 @@ async fn chat_completions(State(app): State<Arc<App>>, Json(req): Json<Value>) -
         Err(e) => return e.into_response(),
     };
     let id = format!("chatcmpl-{}", unique_id());
-    if p.stream { stream_response(app, p, id).await } else { full_response(app, p, id).await }
+    if p.stream {
+        stream_response(app, p, id).await
+    } else {
+        full_response(app, p, id).await
+    }
 }
 
 /// Appends `piece` to `text` and reports whether a stop string now occurs (text cut before it).
@@ -926,7 +1507,11 @@ async fn full_response(app: Arc<App>, p: Prepared, id: String) -> Response {
     if !calls.is_empty() {
         message["tool_calls"] = Value::Array(calls.clone());
     }
-    let reason = if seg.stopped { "stop" } else { finish_reason(finish, !calls.is_empty()) };
+    let reason = if seg.stopped {
+        "stop"
+    } else {
+        finish_reason(finish, !calls.is_empty())
+    };
     Json(json!({
         "id": id, "object": "chat.completion", "created": now(), "model": p.model,
         "choices": [{"index": 0, "message": message, "finish_reason": reason}],
@@ -975,7 +1560,15 @@ struct Segmenter {
 
 impl Segmenter {
     fn new(thinking: bool) -> Self {
-        Self { text: String::new(), sent: 0, thinking, in_reasoning: thinking, content_started: false, stopped: false, tool_bytes: 0 }
+        Self {
+            text: String::new(),
+            sent: 0,
+            thinking,
+            in_reasoning: thinking,
+            content_started: false,
+            stopped: false,
+            tool_bytes: 0,
+        }
     }
 
     fn feed(&mut self, piece: &str, stops: &[String]) -> Vec<Seg> {
@@ -1005,9 +1598,15 @@ impl Segmenter {
                 let tag = think_end(text).filter(|&(i, _)| i >= sent);
                 let (end, done) = match tag {
                     Some((i, _)) => (i, true),
-                    None => (text.len().saturating_sub("</thinking>".len()).max(sent), false),
+                    None => (
+                        text.len().saturating_sub("</thinking>".len()).max(sent),
+                        false,
+                    ),
                 };
-                let end = (sent..=end).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(sent);
+                let end = (sent..=end)
+                    .rev()
+                    .find(|&i| text.is_char_boundary(i))
+                    .unwrap_or(sent);
                 let end = sent + text[sent..end].trim_end().len();
                 if end > sent {
                     out.push(Seg::Reasoning(text[sent..end].to_string()));
@@ -1023,7 +1622,10 @@ impl Segmenter {
                     sent += text[sent..].len() - text[sent..].trim_start().len();
                 }
                 let end = text.len().saturating_sub("<tool_call>".len()).max(sent);
-                let end = (sent..=end).rev().find(|&i| text.is_char_boundary(i) && !text[i..].starts_with('<')).unwrap_or(sent);
+                let end = (sent..=end)
+                    .rev()
+                    .find(|&i| text.is_char_boundary(i) && !text[i..].starts_with('<'))
+                    .unwrap_or(sent);
                 let end = if self.stopped { text.len() } else { end };
                 if end > sent {
                     out.push(Seg::Content(text[sent..end].to_string()));
@@ -1049,17 +1651,30 @@ impl Segmenter {
             return None;
         }
         let text = &self.text;
-        let body = if self.thinking { think_end(text).map(|(_, j)| &text[j..]).unwrap_or("") } else { text.as_str() };
+        let body = if self.thinking {
+            think_end(text).map(|(_, j)| &text[j..]).unwrap_or("")
+        } else {
+            text.as_str()
+        };
         let lead = body.len() - body.trim_start().len();
         let body_start = text.len() - body.len() + lead;
         let shown = self.sent.saturating_sub(body_start).min(content.len());
-        (shown < content.len() && content.is_char_boundary(shown)).then(|| content[shown..].to_string())
+        (shown < content.len() && content.is_char_boundary(shown))
+            .then(|| content[shown..].to_string())
     }
 }
 
 /// Receives one generation job's tokens, feeding decoded text through the segmenter to `on_seg`;
 /// returns (tokens, finish, cached prompt tokens) or an error message.
-async fn drive(app: &App, rx: &mut tmpsc::UnboundedReceiver<Msg>, total_prompt: usize, stops: &[String], seg: &mut Segmenter, stream: &mut TextStream, on_seg: &mut impl FnMut(Seg)) -> Result<(usize, Finish, usize), String> {
+async fn drive(
+    app: &App,
+    rx: &mut tmpsc::UnboundedReceiver<Msg>,
+    total_prompt: usize,
+    stops: &[String],
+    seg: &mut Segmenter,
+    stream: &mut TextStream,
+    on_seg: &mut impl FnMut(Seg),
+) -> Result<(usize, Finish, usize), String> {
     let mut n = 0usize;
     let start = std::time::Instant::now();
     while let Some(msg) = rx.recv().await {
@@ -1077,7 +1692,12 @@ async fn drive(app: &App, rx: &mut tmpsc::UnboundedReceiver<Msg>, total_prompt: 
                     rx.close();
                 }
             }
-            Msg::Progress(done, cached) => on_seg(Seg::Prompt(done, total_prompt, cached, start.elapsed().as_millis() as u64)),
+            Msg::Progress(done, cached) => on_seg(Seg::Prompt(
+                done,
+                total_prompt,
+                cached,
+                start.elapsed().as_millis() as u64,
+            )),
             Msg::Done(f, c) => return Ok((n, f, c)),
             Msg::Error(e) => return Err(e),
         }
@@ -1089,7 +1709,11 @@ async fn drive(app: &App, rx: &mut tmpsc::UnboundedReceiver<Msg>, total_prompt: 
 /// the text before the first `<tool_call>` is kept and the call is regenerated from there (sampled, a
 /// new seed per attempt) up to `tool_retries` times, so a malformed call is retried instead of being
 /// returned as text. Returns (segmenter, generated tokens, finish, cached prompt tokens).
-async fn generate(app: &App, p: &Prepared, mut on_seg: impl FnMut(Seg)) -> Result<(Segmenter, usize, Finish, usize), String> {
+async fn generate(
+    app: &App,
+    p: &Prepared,
+    mut on_seg: impl FnMut(Seg),
+) -> Result<(Segmenter, usize, Finish, usize), String> {
     let mut seg = Segmenter::new(p.thinking);
     let mut stream = TextStream::default();
     let (mut total, mut cached_first) = (0usize, None);
@@ -1103,32 +1727,74 @@ async fn generate(app: &App, p: &Prepared, mut on_seg: impl FnMut(Seg)) -> Resul
                 let _ = ptx.send(Msg::Progress(done, cached));
             })));
         }
-        app.jobs.send(Work::Generate(Job { ids: ids.clone(), params: params.clone(), mtp: p.mtp, tx, capture: p.capture.clone() })).map_err(|_| "generation worker stopped".to_string())?;
-        let (n, finish, cached) = drive(app, &mut rx, ids.len(), &p.stops, &mut seg, &mut stream, &mut on_seg).await.inspect_err(|_| {
+        app.jobs
+            .send(Work::Generate(Job {
+                ids: ids.clone(),
+                params: params.clone(),
+                mtp: p.mtp,
+                tx,
+                capture: p.capture.clone(),
+            }))
+            .map_err(|_| "generation worker stopped".to_string())?;
+        let (n, finish, cached) = drive(
+            app,
+            &mut rx,
+            ids.len(),
+            &p.stops,
+            &mut seg,
+            &mut stream,
+            &mut on_seg,
+        )
+        .await
+        .inspect_err(|_| {
             app.metrics.errors.fetch_add(1, Ordering::Relaxed);
         })?;
         total += n;
         cached_first.get_or_insert(cached);
-        let (Some(tools), Some(tc)) = (p.tools.as_ref(), app.tool_call_token) else { return Ok((seg, total, finish, cached_first.unwrap_or(0))) };
-        let body = if seg.thinking { think_end(&seg.text).map(|(_, j)| &seg.text[j..]).unwrap_or("") } else { seg.text.as_str() };
+        let (Some(tools), Some(tc)) = (p.tools.as_ref(), app.tool_call_token) else {
+            return Ok((seg, total, finish, cached_first.unwrap_or(0)));
+        };
+        let body = if seg.thinking {
+            think_end(&seg.text)
+                .map(|(_, j)| &seg.text[j..])
+                .unwrap_or("")
+        } else {
+            seg.text.as_str()
+        };
         let problem = match validate_calls(body, tools) {
             // QUENCH6K_TEST_TOOL_RETRY: treat the first attempt's tool calls as invalid (exercises retries).
-            Ok(()) if attempt == 0 && body.contains("<tool_call>") && std::env::var_os("QUENCH6K_TEST_TOOL_RETRY").is_some() => Some("forced by QUENCH6K_TEST_TOOL_RETRY".to_string()),
+            Ok(())
+                if attempt == 0
+                    && body.contains("<tool_call>")
+                    && std::env::var_os("QUENCH6K_TEST_TOOL_RETRY").is_some() =>
+            {
+                Some("forced by QUENCH6K_TEST_TOOL_RETRY".to_string())
+            }
             Ok(()) => None,
             Err(e) => Some(e),
         };
-        let Some(problem) = problem else { return Ok((seg, total, finish, cached_first.unwrap_or(0))) };
+        let Some(problem) = problem else {
+            return Ok((seg, total, finish, cached_first.unwrap_or(0)));
+        };
         let generated = stream.ids().to_vec();
-        let Some(at) = generated.iter().position(|&t| t == tc) else { return Ok((seg, total, finish, cached_first.unwrap_or(0))) };
+        let Some(at) = generated.iter().position(|&t| t == tc) else {
+            return Ok((seg, total, finish, cached_first.unwrap_or(0)));
+        };
         if attempt == app.tool_retries || params.max_tokens <= n {
             eprintln!("tool call still invalid after {attempt} retries: {problem}");
             return Ok((seg, total, finish, cached_first.unwrap_or(0)));
         }
-        eprintln!("tool call invalid ({problem}); regenerating it (attempt {})", attempt + 1);
+        eprintln!(
+            "tool call invalid ({problem}); regenerating it (attempt {})",
+            attempt + 1
+        );
         // Rewind to just before the tool call and continue from there.
         let prefix = &generated[..at];
         // Everything generated before <tool_call> (reasoning included) stays as shown.
-        seg.text = app.chat.decode(prefix, true).map_err(|e| format!("{e:#}"))?;
+        seg.text = app
+            .chat
+            .decode(prefix, true)
+            .map_err(|e| format!("{e:#}"))?;
         seg.sent = seg.sent.min(seg.text.len());
         seg.stopped = false;
         stream = TextStream::after(&app.chat, prefix).map_err(|e| format!("{e:#}"))?;
@@ -1146,7 +1812,9 @@ fn validate_calls(body: &str, tools: &Value) -> Result<(), String> {
     let mut cursor = 0;
     while let Some(start) = body[cursor..].find("<tool_call>") {
         let b0 = cursor + start + "<tool_call>".len();
-        let end = body[b0..].find("</tool_call>").ok_or("unterminated <tool_call>")?;
+        let end = body[b0..]
+            .find("</tool_call>")
+            .ok_or("unterminated <tool_call>")?;
         let block = &body[b0..b0 + end];
         let call = parse_tool_call(block, Some(tools)).ok_or("unparsable tool call")?;
         if block.contains("<function=") && !block.contains("</function>") {
@@ -1155,19 +1823,37 @@ fn validate_calls(body: &str, tools: &Value) -> Result<(), String> {
         let name = call["name"].as_str().unwrap_or("");
         let schema = tools
             .as_array()
-            .and_then(|a| a.iter().find(|t| t.pointer("/function/name").and_then(Value::as_str) == Some(name)))
+            .and_then(|a| {
+                a.iter()
+                    .find(|t| t.pointer("/function/name").and_then(Value::as_str) == Some(name))
+            })
             .ok_or_else(|| format!("unknown function {name:?}"))?;
-        let args: Value = serde_json::from_str(call["arguments"].as_str().unwrap_or("{}")).map_err(|e| format!("arguments: {e}"))?;
+        let args: Value = serde_json::from_str(call["arguments"].as_str().unwrap_or("{}"))
+            .map_err(|e| format!("arguments: {e}"))?;
         let params = schema.pointer("/function/parameters");
-        for req in params.and_then(|p| p.get("required")).and_then(Value::as_array).into_iter().flatten() {
+        for req in params
+            .and_then(|p| p.get("required"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let r = req.as_str().unwrap_or("");
             if args.get(r).is_none() {
                 return Err(format!("{name}: missing required parameter {r:?}"));
             }
         }
-        if let Some(props) = params.and_then(|p| p.get("properties")).and_then(Value::as_object) {
+        if let Some(props) = params
+            .and_then(|p| p.get("properties"))
+            .and_then(Value::as_object)
+        {
             for (k, v) in args.as_object().into_iter().flatten() {
-                let Some(ty) = props.get(k).and_then(|p| p.get("type")).and_then(Value::as_str) else { continue };
+                let Some(ty) = props
+                    .get(k)
+                    .and_then(|p| p.get("type"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
                 let ok = match ty {
                     "string" => v.is_string(),
                     "integer" => v.is_i64() || v.is_u64(),
@@ -1221,7 +1907,9 @@ async fn stream_response(app: Arc<App>, p: Prepared, id: String) -> Response {
         let (seg, n, finish, cached) = match result {
             Ok(r) => r,
             Err(e) => {
-                let _ = out_tx.send(Ok(Event::default().data(json!({"error": {"message": e}}).to_string())));
+                let _ = out_tx.send(Ok(
+                    Event::default().data(json!({"error": {"message": e}}).to_string())
+                ));
                 return;
             }
         };
@@ -1234,7 +1922,11 @@ async fn stream_response(app: Arc<App>, p: Prepared, id: String) -> Response {
             let deltas: Vec<Value> = calls.iter().enumerate().map(|(i, c)| json!({"index": i, "id": c["id"], "type": "function", "function": c["function"]})).collect();
             let _ = out_tx.send(chunk(json!({"tool_calls": deltas}), None));
         }
-        let reason = if seg.stopped { "stop" } else { finish_reason(finish, !calls.is_empty()) };
+        let reason = if seg.stopped {
+            "stop"
+        } else {
+            finish_reason(finish, !calls.is_empty())
+        };
         let mut last = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": p.model,
                               "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]});
         last["usage"] = json!({"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n,
@@ -1242,7 +1934,9 @@ async fn stream_response(app: Arc<App>, p: Prepared, id: String) -> Response {
         let _ = out_tx.send(Ok(Event::default().data(last.to_string())));
         let _ = out_tx.send(Ok(Event::default().data("[DONE]")));
     });
-    Sse::new(UnboundedReceiverStream::new(out_rx)).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(UnboundedReceiverStream::new(out_rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 // ---- Anthropic Messages API ---------------------------------------------------------------------
@@ -1251,7 +1945,11 @@ async fn stream_response(app: Arc<App>, p: Prepared, id: String) -> Response {
 fn anthropic_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
-        Value::Array(blocks) => blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(""),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
         _ => String::new(),
     }
 }
@@ -1262,11 +1960,17 @@ fn from_anthropic(req: &Value) -> Value {
     if let Some(system) = req.get("system") {
         messages.push(json!({"role": "system", "content": anthropic_text(system)}));
     }
-    for m in req.get("messages").and_then(Value::as_array).into_iter().flatten() {
+    for m in req
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
         match m.get("content") {
             Some(Value::Array(blocks)) => {
-                let (mut text, mut reasoning, mut calls) = (String::new(), String::new(), Vec::new());
+                let (mut text, mut reasoning, mut calls) =
+                    (String::new(), String::new(), Vec::new());
                 // User content with images keeps its parts in order (OpenAI content-part form).
                 let mut parts: Vec<Value> = Vec::new();
                 for b in blocks {
@@ -1325,9 +2029,18 @@ fn from_anthropic(req: &Value) -> Value {
     // Claude Code sends `{"type": "adaptive"}` (newer) or `{"type": "enabled", ...}`; both turn
     // thinking on. Its effort (`output_config.effort`: low, medium, high, max) becomes the
     // template's reasoning effort through the same mapping as the OpenAI endpoint.
-    let thinking = matches!(req.get("thinking").and_then(|t| t.get("type")).and_then(Value::as_str), Some("enabled" | "adaptive"));
+    let thinking = matches!(
+        req.get("thinking")
+            .and_then(|t| t.get("type"))
+            .and_then(Value::as_str),
+        Some("enabled" | "adaptive")
+    );
     let mut kwargs = json!({"enable_thinking": thinking});
-    if let Some(effort) = req.get("output_config").and_then(|o| o.get("effort")).and_then(Value::as_str) {
+    if let Some(effort) = req
+        .get("output_config")
+        .and_then(|o| o.get("effort"))
+        .and_then(Value::as_str)
+    {
         kwargs["reasoning_effort"] = json!(if effort == "max" { "xhigh" } else { effort });
     }
     let mut out = json!({"messages": messages, "model": req.get("model").cloned().unwrap_or(Value::Null),
@@ -1335,7 +2048,17 @@ fn from_anthropic(req: &Value) -> Value {
     if !tools.is_empty() {
         out["tools"] = Value::Array(tools);
     }
-    for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("min_p", "min_p"), ("presence_penalty", "presence_penalty"), ("repetition_penalty", "repetition_penalty"), ("stop_sequences", "stop"), ("steering", "steering")] {
+    for (from, to) in [
+        ("max_tokens", "max_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("top_k", "top_k"),
+        ("min_p", "min_p"),
+        ("presence_penalty", "presence_penalty"),
+        ("repetition_penalty", "repetition_penalty"),
+        ("stop_sequences", "stop"),
+        ("steering", "steering"),
+    ] {
         if let Some(v) = req.get(from) {
             out[to] = v.clone();
         }
@@ -1399,16 +2122,30 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
         let mut emit = |reasoning: bool, text: String| {
             if open.map(|(_, r)| r) != Some(reasoning) {
                 if let Some((i, _)) = open {
-                    let _ = out_tx.send(ev("content_block_stop", json!({"type": "content_block_stop", "index": i})));
+                    let _ = out_tx.send(ev(
+                        "content_block_stop",
+                        json!({"type": "content_block_stop", "index": i}),
+                    ));
                 }
-                let block = if reasoning { json!({"type": "thinking", "thinking": ""}) } else { json!({"type": "text", "text": ""}) };
+                let block = if reasoning {
+                    json!({"type": "thinking", "thinking": ""})
+                } else {
+                    json!({"type": "text", "text": ""})
+                };
                 let _ = out_tx.send(ev("content_block_start", json!({"type": "content_block_start", "index": next_index, "content_block": block})));
                 open = Some((next_index, reasoning));
                 next_index += 1;
             }
             let i = open.unwrap().0;
-            let delta = if reasoning { json!({"type": "thinking_delta", "thinking": text}) } else { json!({"type": "text_delta", "text": text}) };
-            let _ = out_tx.send(ev("content_block_delta", json!({"type": "content_block_delta", "index": i, "delta": delta})));
+            let delta = if reasoning {
+                json!({"type": "thinking_delta", "thinking": text})
+            } else {
+                json!({"type": "text_delta", "text": text})
+            };
+            let _ = out_tx.send(ev(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": i, "delta": delta}),
+            ));
         };
         let result = generate(&app, &p, |s| match s {
             Seg::Reasoning(t) => emit(true, t),
@@ -1419,7 +2156,10 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
         let (seg, n, finish, cached) = match result {
             Ok(r) => r,
             Err(e) => {
-                let _ = out_tx.send(ev("error", json!({"type": "error", "error": {"type": "api_error", "message": e}})));
+                let _ = out_tx.send(ev(
+                    "error",
+                    json!({"type": "error", "error": {"type": "api_error", "message": e}}),
+                ));
                 return;
             }
         };
@@ -1428,39 +2168,60 @@ async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
             emit(false, t);
         }
         if let Some((i, _)) = open {
-            let _ = out_tx.send(ev("content_block_stop", json!({"type": "content_block_stop", "index": i})));
+            let _ = out_tx.send(ev(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": i}),
+            ));
         }
         for (k, block) in tool_use_blocks(&calls).into_iter().enumerate() {
             let i = next_index + k;
             let input = block["input"].to_string();
             let mut start = block.clone();
             start["input"] = json!({});
-            let _ = out_tx.send(ev("content_block_start", json!({"type": "content_block_start", "index": i, "content_block": start})));
+            let _ = out_tx.send(ev(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": i, "content_block": start}),
+            ));
             let _ = out_tx.send(ev("content_block_delta", json!({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": input}})));
-            let _ = out_tx.send(ev("content_block_stop", json!({"type": "content_block_stop", "index": i})));
+            let _ = out_tx.send(ev(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": i}),
+            ));
         }
         let _ = out_tx.send(ev("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": stop_reason(finish, seg.stopped, !calls.is_empty()), "stop_sequence": Value::Null},
                                                         "usage": {"input_tokens": prompt_tokens - cached, "cache_read_input_tokens": cached, "output_tokens": n}})));
         let _ = out_tx.send(ev("message_stop", json!({"type": "message_stop"})));
     });
-    Sse::new(UnboundedReceiverStream::new(out_rx)).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(UnboundedReceiverStream::new(out_rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 async fn metrics_text(State(app): State<Arc<App>>) -> Response {
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], app.metrics.render()).into_response()
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        app.metrics.render(),
+    )
+        .into_response()
 }
 
 /// `/tokenize` (vLLM and llama.cpp): the tokens of `messages` through the chat template (media
 /// expanded), or of a raw `prompt` / `content` string.
 async fn tokenize(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
     let ids = if req.get("messages").is_some() {
-        let tools = req.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty()));
+        let tools = req
+            .get("tools")
+            .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()));
         render_chat(&app, &req, tools).map(|(ids, _, _)| ids)
     } else {
         raw_ids(&app, req.get("prompt").or_else(|| req.get("content")))
     };
     match ids {
-        Ok(ids) => Json(json!({"tokens": ids, "count": ids.len(), "max_model_len": app.context})).into_response(),
+        Ok(ids) => Json(json!({"tokens": ids, "count": ids.len(), "max_model_len": app.context}))
+            .into_response(),
         Err(e) => e.into_response(),
     }
 }
@@ -1468,8 +2229,16 @@ async fn tokenize(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
 /// `/detokenize`: the text of `tokens` (special tokens included), as vLLM's `prompt` and llama.cpp's
 /// `content`.
 async fn detokenize(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
-    let Some(ids) = req.get("tokens").and_then(Value::as_array).and_then(|a| a.iter().map(|v| v.as_i64().map(|v| v as i32)).collect::<Option<Vec<i32>>>()) else {
-        return error(StatusCode::BAD_REQUEST, "tokens must be a list of token ids").into_response();
+    let Some(ids) = req.get("tokens").and_then(Value::as_array).and_then(|a| {
+        a.iter()
+            .map(|v| v.as_i64().map(|v| v as i32))
+            .collect::<Option<Vec<i32>>>()
+    }) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "tokens must be a list of token ids",
+        )
+        .into_response();
     };
     match app.chat.decode(&ids, false) {
         Ok(text) => Json(json!({"prompt": text, "content": text})).into_response(),
@@ -1479,19 +2248,45 @@ async fn detokenize(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Resp
 
 /// `/v1/completions`: a raw prompt (no chat template, no reasoning or tool-call parsing).
 async fn completions(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
-    if req.get("logprobs").is_some_and(|v| !v.is_null() && v != &json!(false)) || req.get("echo").and_then(Value::as_bool) == Some(true) {
-        return error(StatusCode::BAD_REQUEST, "logprobs and echo are not supported").into_response();
+    if req
+        .get("logprobs")
+        .is_some_and(|v| !v.is_null() && v != &json!(false))
+        || req.get("echo").and_then(Value::as_bool) == Some(true)
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "logprobs and echo are not supported",
+        )
+        .into_response();
     }
-    let p = match raw_ids(&app, req.get("prompt")).and_then(|ids| prepare_ids(&app, &req, ids, Vec::new(), false, None)).and_then(|p| check_context(&app, &p).map(|()| p)) {
+    let p = match raw_ids(&app, req.get("prompt"))
+        .and_then(|ids| prepare_ids(&app, &req, ids, Vec::new(), false, None))
+        .and_then(|p| check_context(&app, &p).map(|()| p))
+    {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let (id, created, model, prompt_tokens) = (format!("cmpl-{}", unique_id()), now(), p.model.clone(), p.ids.len());
-    let body = move |text: &str, finish: Option<&str>| json!({"id": id, "object": "text_completion", "created": created, "model": model,
-                                                             "choices": [{"index": 0, "text": text, "logprobs": Value::Null, "finish_reason": finish}]});
-    let usage = move |n: usize, cached: usize| json!({"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n,
-                                                       "prompt_tokens_details": {"cached_tokens": cached}});
-    let reason = |finish: Finish, stopped: bool| if stopped { "stop" } else { finish_reason(finish, false) };
+    let (id, created, model, prompt_tokens) = (
+        format!("cmpl-{}", unique_id()),
+        now(),
+        p.model.clone(),
+        p.ids.len(),
+    );
+    let body = move |text: &str, finish: Option<&str>| {
+        json!({"id": id, "object": "text_completion", "created": created, "model": model,
+                                                             "choices": [{"index": 0, "text": text, "logprobs": Value::Null, "finish_reason": finish}]})
+    };
+    let usage = move |n: usize, cached: usize| {
+        json!({"prompt_tokens": prompt_tokens, "completion_tokens": n, "total_tokens": prompt_tokens + n,
+                                                       "prompt_tokens_details": {"cached_tokens": cached}})
+    };
+    let reason = |finish: Finish, stopped: bool| {
+        if stopped {
+            "stop"
+        } else {
+            finish_reason(finish, false)
+        }
+    };
     if !p.stream {
         return match generate_raw(&app, &p, |_| {}).await {
             Ok((text, n, finish, cached, stopped)) => {
@@ -1521,16 +2316,35 @@ async fn completions(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Res
             }
         }
     });
-    Sse::new(UnboundedReceiverStream::new(out_rx)).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(UnboundedReceiverStream::new(out_rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Runs a prepared request without chat parsing, passing decoded text to `on_text` as it is final
 /// (text that may begin a stop string waits). Returns (text cut at a stop string, generated tokens,
 /// finish, cached prompt tokens, whether a stop string ended it).
-async fn generate_raw(app: &App, p: &Prepared, mut on_text: impl FnMut(String)) -> Result<(String, usize, Finish, usize, bool), String> {
+async fn generate_raw(
+    app: &App,
+    p: &Prepared,
+    mut on_text: impl FnMut(String),
+) -> Result<(String, usize, Finish, usize, bool), String> {
     let (tx, mut rx) = tmpsc::unbounded_channel();
-    app.jobs.send(Work::Generate(Job { ids: p.ids.clone(), params: p.params.clone(), mtp: p.mtp, tx, capture: p.capture.clone() })).map_err(|_| "generation worker stopped".to_string())?;
-    let hold = p.stops.iter().map(|s| s.len().saturating_sub(1)).max().unwrap_or(0);
+    app.jobs
+        .send(Work::Generate(Job {
+            ids: p.ids.clone(),
+            params: p.params.clone(),
+            mtp: p.mtp,
+            tx,
+            capture: p.capture.clone(),
+        }))
+        .map_err(|_| "generation worker stopped".to_string())?;
+    let hold = p
+        .stops
+        .iter()
+        .map(|s| s.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
     let mut stream = TextStream::default();
     let (mut text, mut sent, mut n, mut stopped) = (String::new(), 0usize, 0usize, false);
     let (mut finish, mut cached) = (Finish::Cancelled, 0);
@@ -1547,8 +2361,15 @@ async fn generate_raw(app: &App, p: &Prepared, mut on_text: impl FnMut(String)) 
                     stopped = true;
                     rx.close();
                 }
-                let end = if stopped { text.len() } else { text.len().saturating_sub(hold) };
-                let end = (sent..=end.max(sent)).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(sent);
+                let end = if stopped {
+                    text.len()
+                } else {
+                    text.len().saturating_sub(hold)
+                };
+                let end = (sent..=end.max(sent))
+                    .rev()
+                    .find(|&i| text.is_char_boundary(i))
+                    .unwrap_or(sent);
                 if end > sent {
                     on_text(text[sent..end].to_string());
                     sent = end;
@@ -1589,11 +2410,22 @@ mod tests {
     }
 
     #[test]
+    fn server_thinking_default() {
+        assert_eq!(thinking_choice(true, None, None), None);
+        assert_eq!(thinking_choice(false, None, None), Some(false));
+        assert_eq!(thinking_choice(false, Some(true), None), Some(true));
+        assert_eq!(thinking_choice(false, None, Some("low")), None);
+    }
+
+    #[test]
     fn openai_reasoning_efforts() {
         assert_eq!(reasoning(None, Some("none")), (Some(false), None));
         assert_eq!(reasoning(Some(true), Some("minimal")), (Some(false), None));
         assert_eq!(reasoning(None, Some("high")), (None, Some("xhigh")));
-        assert_eq!(reasoning(Some(true), Some("low")), (Some(true), Some("low")));
+        assert_eq!(
+            reasoning(Some(true), Some("low")),
+            (Some(true), Some("low"))
+        );
         assert_eq!(reasoning(Some(false), None), (Some(false), None));
     }
 
@@ -1609,10 +2441,17 @@ mod tests {
                          "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}});
         let out = from_anthropic(&req);
         assert_eq!(out["chat_template_kwargs"]["enable_thinking"], json!(true));
-        assert_eq!(out["chat_template_kwargs"]["reasoning_effort"], json!("high"));
+        assert_eq!(
+            out["chat_template_kwargs"]["reasoning_effort"],
+            json!("high")
+        );
         let off = from_anthropic(&json!({"model": "m", "messages": []}));
         assert_eq!(off["chat_template_kwargs"]["enable_thinking"], json!(false));
-        assert!(off["chat_template_kwargs"].get("reasoning_effort").is_none());
+        assert!(
+            off["chat_template_kwargs"]
+                .get("reasoning_effort")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1623,7 +2462,10 @@ mod tests {
         assert_eq!(c, "## Goal\nsummary");
         let mut seg = Segmenter::new(true);
         let mut streamed = String::new();
-        for piece in text.split_inclusive(' ').flat_map(|w| w.split_inclusive('\n')) {
+        for piece in text
+            .split_inclusive(' ')
+            .flat_map(|w| w.split_inclusive('\n'))
+        {
             for sg in seg.feed(piece, &[]) {
                 if let Seg::Content(t) = sg {
                     streamed.push_str(&t);
@@ -1645,13 +2487,29 @@ mod tests {
         let unterminated = "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>";
         assert!(validate_calls(unterminated, &tools()).is_err());
         let unknown = "<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
-        assert!(validate_calls(unknown, &tools()).unwrap_err().contains("unknown function"));
+        assert!(
+            validate_calls(unknown, &tools())
+                .unwrap_err()
+                .contains("unknown function")
+        );
         let missing = "<tool_call>\n<function=get_weather>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
-        assert!(validate_calls(missing, &tools()).unwrap_err().contains("missing required"));
+        assert!(
+            validate_calls(missing, &tools())
+                .unwrap_err()
+                .contains("missing required")
+        );
         let mistyped = "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n<parameter=days>\nthree\n</parameter>\n</function>\n</tool_call>";
-        assert!(validate_calls(mistyped, &tools()).unwrap_err().contains("not a integer"));
+        assert!(
+            validate_calls(mistyped, &tools())
+                .unwrap_err()
+                .contains("not a integer")
+        );
         let json_style = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n</tool_call>";
-        assert!(validate_calls(json_style, &tools()).is_ok(), "{:?}", validate_calls(json_style, &tools()));
+        assert!(
+            validate_calls(json_style, &tools()).is_ok(),
+            "{:?}",
+            validate_calls(json_style, &tools())
+        );
     }
 
     /// Flint: GLM-style calls and reasoning the model opens itself.
@@ -1659,15 +2517,34 @@ mod tests {
     fn flint_output() {
         let call = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>";
         assert!(validate_calls(call, &tools()).is_ok());
-        let (reasoning, content, calls) = parse_output(&format!("<think>Need the tool.</think>Checking.{call}"), false, Some(&tools()));
+        let (reasoning, content, calls) = parse_output(
+            &format!("<think>Need the tool.</think>Checking.{call}"),
+            false,
+            Some(&tools()),
+        );
         assert_eq!(reasoning.as_deref(), Some("Need the tool."));
         assert_eq!(content, "Checking.");
-        assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"Oslo\",\"days\":3}");
-        assert!(validate_calls("<tool_call>get_weather<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>", &tools()).is_err());
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            "{\"city\":\"Oslo\",\"days\":3}"
+        );
+        assert!(
+            validate_calls(
+                "<tool_call>get_weather<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+                &tools()
+            )
+            .is_err()
+        );
         // Streaming: the <think> opening is held until known, then reasoning and content separate.
         let mut seg = Segmenter::new(false);
         let mut out = String::new();
-        for piece in ["<th", "ink>", "plan", "</think>", "\n\nThe answer is forty-two."] {
+        for piece in [
+            "<th",
+            "ink>",
+            "plan",
+            "</think>",
+            "\n\nThe answer is forty-two.",
+        ] {
             for s in seg.feed(piece, &[]) {
                 match s {
                     Seg::Reasoning(r) => out += &format!("R[{r}]"),
@@ -1686,7 +2563,12 @@ mod tests {
             "properties": {"cmd": {"type": "string"}, "login": {"type": "boolean"}}, "required": ["cmd"]}}}]);
         let call = "<tool_call>\n<function=exec_command>\n<parameter=cmd>\nwc -l False\n</parameter>\n<parameter=login>\nFalse\n</parameter>\n</function>\n</tool_call>";
         assert!(validate_calls(call, &tools).is_ok());
-        let args: Value = serde_json::from_str(parse_tool_call(&call[11..call.len() - 12], Some(&tools)).unwrap()["arguments"].as_str().unwrap()).unwrap();
+        let args: Value = serde_json::from_str(
+            parse_tool_call(&call[11..call.len() - 12], Some(&tools)).unwrap()["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(args, json!({"cmd": "wc -l False", "login": false}));
         assert_eq!(param_value("TRUE", Some("boolean")), json!(true));
         assert_eq!(param_value("None", Some("integer")), Value::Null);
@@ -1698,20 +2580,54 @@ mod tests {
 /// (premix F32 [4, 2560], mix BF16 [2560], block F32 [2560], moe F32 [2560], router_logits F32 [512],
 /// router_top_ids I32 [10], router_top_weights F32 [10]), `top_ids.{site}` / `top_logprobs.{site}` [20],
 /// and JSON metadata (request, prompt and completion ids, positions, fire count).
-fn write_capture(path: &std::path::Path, meta: &Value, generated: &[i32], c: &quench6k_engine::session::CaptureResult) -> Result<()> {
+fn write_capture(
+    path: &std::path::Path,
+    meta: &Value,
+    generated: &[i32],
+    c: &quench6k_engine::session::CaptureResult,
+) -> Result<()> {
     use quench6k_engine::forward::CaptureLayout as L;
     let fields: [(&str, &str, usize, Vec<usize>, usize); 7] = [
-        ("premix", "F32", L::PREMIX, vec![4, 2560], L::MIX - L::PREMIX),
+        (
+            "premix",
+            "F32",
+            L::PREMIX,
+            vec![4, 2560],
+            L::MIX - L::PREMIX,
+        ),
         ("mix", "BF16", L::MIX, vec![2560], L::BLOCK - L::MIX),
         ("block", "F32", L::BLOCK, vec![2560], L::MOE - L::BLOCK),
         ("moe", "F32", L::MOE, vec![2560], L::ROUTER - L::MOE),
-        ("router_logits", "F32", L::ROUTER, vec![512], L::TOP_I - L::ROUTER),
-        ("router_top_ids", "I32", L::TOP_I, vec![10], L::TOP_W - L::TOP_I),
-        ("router_top_weights", "F32", L::TOP_W, vec![10], L::BYTES - L::TOP_W),
+        (
+            "router_logits",
+            "F32",
+            L::ROUTER,
+            vec![512],
+            L::TOP_I - L::ROUTER,
+        ),
+        (
+            "router_top_ids",
+            "I32",
+            L::TOP_I,
+            vec![10],
+            L::TOP_W - L::TOP_I,
+        ),
+        (
+            "router_top_weights",
+            "F32",
+            L::TOP_W,
+            vec![10],
+            L::BYTES - L::TOP_W,
+        ),
     ];
     let mut header = serde_json::Map::new();
     let mut data: Vec<u8> = Vec::new();
-    let add = |name: String, dtype: &str, shape: Vec<usize>, bytes: &[u8], header: &mut serde_json::Map<String, Value>, data: &mut Vec<u8>| {
+    let add = |name: String,
+               dtype: &str,
+               shape: Vec<usize>,
+               bytes: &[u8],
+               header: &mut serde_json::Map<String, Value>,
+               data: &mut Vec<u8>| {
         header.insert(name, json!({"dtype": dtype, "shape": shape, "data_offsets": [data.len(), data.len() + bytes.len()]}));
         data.extend_from_slice(bytes);
     };
@@ -1720,19 +2636,52 @@ fn write_capture(path: &std::path::Path, meta: &Value, generated: &[i32], c: &qu
         for l in 0..layers {
             let rec = &site.records[l * L::BYTES..(l + 1) * L::BYTES];
             for (name, dtype, off, shape, len) in &fields {
-                add(format!("layers.{l}.{name}.{}", site.name), dtype, shape.clone(), &rec[*off..off + len], &mut header, &mut data);
+                add(
+                    format!("layers.{l}.{name}.{}", site.name),
+                    dtype,
+                    shape.clone(),
+                    &rec[*off..off + len],
+                    &mut header,
+                    &mut data,
+                );
             }
         }
         let ids: Vec<u8> = site.top_ids.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let lps: Vec<u8> = site.top_logprobs.iter().flat_map(|v| v.to_le_bytes()).collect();
-        add(format!("top_ids.{}", site.name), "I32", vec![site.top_ids.len()], &ids, &mut header, &mut data);
-        add(format!("top_logprobs.{}", site.name), "F32", vec![site.top_logprobs.len()], &lps, &mut header, &mut data);
+        let lps: Vec<u8> = site
+            .top_logprobs
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        add(
+            format!("top_ids.{}", site.name),
+            "I32",
+            vec![site.top_ids.len()],
+            &ids,
+            &mut header,
+            &mut data,
+        );
+        add(
+            format!("top_logprobs.{}", site.name),
+            "F32",
+            vec![site.top_logprobs.len()],
+            &lps,
+            &mut header,
+            &mut data,
+        );
     }
     let mut m = meta.clone();
     m["completion_ids"] = json!(generated);
-    m["sites"] = Value::Array(c.sites.iter().map(|s| json!({"site": s.name, "position": s.position, "token": s.token})).collect());
+    m["sites"] = Value::Array(
+        c.sites
+            .iter()
+            .map(|s| json!({"site": s.name, "position": s.position, "token": s.token}))
+            .collect(),
+    );
     m["fire_count"] = json!(layers * c.sites.len());
-    header.insert("__metadata__".into(), json!({"quench6k.capture": m.to_string()}));
+    header.insert(
+        "__metadata__".into(),
+        json!({"quench6k.capture": m.to_string()}),
+    );
     let mut h = Value::Object(header).to_string().into_bytes();
     while h.len() % 8 != 0 {
         h.push(b' ');

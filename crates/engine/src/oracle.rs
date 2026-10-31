@@ -30,15 +30,44 @@ pub struct Distributions {
 
 impl Distributions {
     pub fn load(stem: &Path) -> Result<Self> {
-        let meta: DistributionMeta = serde_json::from_slice(&std::fs::read(stem.with_extension("json")).with_context(|| format!("reading {}.json", stem.display()))?)?;
-        ensure!(meta.format == "oracle.distributions/1", "{}: unsupported format {}", stem.display(), meta.format);
-        let raw = std::fs::read(stem.with_extension("bin")).with_context(|| format!("reading {}.bin", stem.display()))?;
+        let meta: DistributionMeta = serde_json::from_slice(
+            &std::fs::read(stem.with_extension("json"))
+                .with_context(|| format!("reading {}.json", stem.display()))?,
+        )?;
+        ensure!(
+            meta.format == "oracle.distributions/1",
+            "{}: unsupported format {}",
+            stem.display(),
+            meta.format
+        );
+        let raw = std::fs::read(stem.with_extension("bin"))
+            .with_context(|| format!("reading {}.bin", stem.display()))?;
         let (p, k) = (meta.positions, meta.top_k);
-        ensure!(raw.len() == 4 * (2 * p + 2 * p * k), "{}.bin has {} bytes, expected {}", stem.display(), raw.len(), 4 * (2 * p + 2 * p * k));
+        ensure!(
+            raw.len() == 4 * (2 * p + 2 * p * k),
+            "{}.bin has {} bytes, expected {}",
+            stem.display(),
+            raw.len(),
+            4 * (2 * p + 2 * p * k)
+        );
         let words: Vec<[u8; 4]> = raw.chunks_exact(4).map(|c| c.try_into().unwrap()).collect();
-        let f = |r: std::ops::Range<usize>| words[r].iter().map(|w| f32::from_le_bytes(*w)).collect::<Vec<_>>();
-        let top_ids = words[2 * p..2 * p + p * k].iter().map(|w| i32::from_le_bytes(*w)).collect();
-        Ok(Self { lse: f(0..p), target: f(p..2 * p), top_ids, top_logits: f(2 * p + p * k..2 * p + 2 * p * k), meta })
+        let f = |r: std::ops::Range<usize>| {
+            words[r]
+                .iter()
+                .map(|w| f32::from_le_bytes(*w))
+                .collect::<Vec<_>>()
+        };
+        let top_ids = words[2 * p..2 * p + p * k]
+            .iter()
+            .map(|w| i32::from_le_bytes(*w))
+            .collect();
+        Ok(Self {
+            lse: f(0..p),
+            target: f(p..2 * p),
+            top_ids,
+            top_logits: f(2 * p + p * k..2 * p + 2 * p * k),
+            meta,
+        })
     }
 
     pub fn save(&self, stem: &Path) -> Result<()> {
@@ -53,13 +82,20 @@ impl Distributions {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         std::fs::write(stem.with_extension("bin"), bytes)?;
-        std::fs::write(stem.with_extension("json"), serde_json::to_string_pretty(&self.meta)? + "\n")?;
+        std::fs::write(
+            stem.with_extension("json"),
+            serde_json::to_string_pretty(&self.meta)? + "\n",
+        )?;
         Ok(())
     }
 
     /// Log-probability of the sequence token at each position.
     pub fn logprob(&self) -> Vec<f64> {
-        self.target.iter().zip(&self.lse).map(|(t, l)| (*t as f64) - (*l as f64)).collect()
+        self.target
+            .iter()
+            .zip(&self.lse)
+            .map(|(t, l)| (*t as f64) - (*l as f64))
+            .collect()
     }
 
     pub fn top1(&self, position: usize) -> i32 {
@@ -86,7 +122,11 @@ pub fn spread(a: &[f64], b: &[f64]) -> Spread {
     let rank = 0.99 * (d.len() - 1) as f64;
     let (lo, hi) = (rank.floor() as usize, rank.ceil() as usize);
     let p99 = d[lo] + (d[hi] - d[lo]) * (rank - lo as f64);
-    Spread { mean, p99, max: *d.last().unwrap() }
+    Spread {
+        mean,
+        p99,
+        max: *d.last().unwrap(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -114,7 +154,12 @@ pub fn gate(fixture: &Path, candidate: &Distributions) -> Result<FixtureVerdict>
     let a = Distributions::load(&fixture.join("llama-w4a4"))?;
     let b = Distributions::load(&fixture.join("llama-q8"))?;
     let p = a.meta.positions;
-    ensure!(b.meta.positions == p && candidate.meta.positions == p, "position counts differ: A {p}, B {}, candidate {}", b.meta.positions, candidate.meta.positions);
+    ensure!(
+        b.meta.positions == p && candidate.meta.positions == p,
+        "position counts differ: A {p}, B {}, candidate {}",
+        b.meta.positions,
+        candidate.meta.positions
+    );
     let (la, lb, lc) = (a.logprob(), b.logprob(), candidate.logprob());
     let split = a.meta.prompt_len.saturating_sub(1).min(p);
     let mut regions = Vec::new();
@@ -129,16 +174,37 @@ pub fn gate(fixture: &Path, candidate: &Distributions) -> Result<FixtureVerdict>
         let bound_mean = (2.0 * floor.mean).max(0.01);
         let bound_p99 = (2.0 * floor.p99).max(0.05);
         let pass = vs_a.mean.min(vs_b.mean) <= bound_mean && vs_a.p99.min(vs_b.p99) <= bound_p99;
-        let agree = r.clone().filter(|&i| candidate.top1(i) == a.top1(i)).count() as f64 / r.len() as f64;
-        regions.push(RegionVerdict { region, positions: r.len(), floor, vs_a, vs_b, bound_mean, bound_p99, top1_agree_a: agree, pass });
+        let agree = r
+            .clone()
+            .filter(|&i| candidate.top1(i) == a.top1(i))
+            .count() as f64
+            / r.len() as f64;
+        regions.push(RegionVerdict {
+            region,
+            positions: r.len(),
+            floor,
+            vs_a,
+            vs_b,
+            bound_mean,
+            bound_p99,
+            top1_agree_a: agree,
+            pass,
+        });
     }
     let pass = regions.iter().all(|r| r.pass);
-    Ok(FixtureVerdict { fixture: fixture.file_name().unwrap().to_string_lossy().into_owned(), regions, pass })
+    Ok(FixtureVerdict {
+        fixture: fixture.file_name().unwrap().to_string_lossy().into_owned(),
+        regions,
+        pass,
+    })
 }
 
 /// The fixture directories under `root` (each with a `sequence.json`).
 pub fn fixtures(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root)?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.join("sequence.json").exists()).collect();
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.join("sequence.json").exists())
+        .collect();
     dirs.sort();
     Ok(dirs)
 }
