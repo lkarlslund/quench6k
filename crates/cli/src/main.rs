@@ -282,6 +282,10 @@ enum Command {
         /// request starts only when its prompt plus this fits next to the running requests' plans.
         #[arg(long, default_value_t = quench6k_engine::session::DEFAULT_PLAN_TOKENS)]
         plan_tokens: usize,
+        /// Share of GPU time a prompt's prefill gets while other requests decode (0 to 1; 1: the
+        /// prefill runs through, pausing them).
+        #[arg(long, default_value_t = 0.5)]
+        prefill_share: f64,
         /// Directory for activation captures requested per request ("capture": {"name": ...}).
         #[arg(long)]
         capture_dir: Option<PathBuf>,
@@ -634,6 +638,7 @@ fn main() -> Result<()> {
             no_thinking,
             slots,
             plan_tokens,
+            prefill_share,
             capture_dir,
             no_vision,
             image_max_pixels,
@@ -657,6 +662,7 @@ fn main() -> Result<()> {
             thinking: !no_thinking,
             slots,
             plan_tokens,
+            prefill_share,
             capture_dir,
             vision: !no_vision,
             image_max_pixels,

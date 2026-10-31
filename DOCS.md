@@ -24,6 +24,14 @@ other tensor in BF16; the PLE n-gram table may be BF16 or FP8 E4M3 with a scale 
 
 Not supported: quantized attention or shared experts, compressed-tensors exports, GGUF.
 
+Keep the PLE n-gram table's files (Swift: 92 GiB of BF16 in `embedding-model-*.safetensors`) on
+storage without filesystem compression. The table is memory-mapped and gathered on the host, 16 random
+rows per token, and most of it is never in the page cache; on a compressed file (btrfs
+`compress=zstd`, for example) every row read decompresses a whole extent (measured: 600 µs per row,
+prefill 4.2K instead of 10.7K tokens/s). Check with `filefrag -v FILE | grep -c encoded` (must be 0);
+to rewrite a file uncompressed on btrfs, create the copy with `chattr +m` set before writing to it
+(`cp --reflink=never`), then replace the original.
+
 ## Server options
 
 | Option | Default | |
@@ -34,6 +42,7 @@ Not supported: quantized attention or shared experts, compressed-tensors exports
 | `--context N` | 65536 | Longest prompt + completion, per slot |
 | `--slots N` | 2 | Concurrent requests (1 to 8), each keeping its conversation on the GPU |
 | `--plan-tokens N` | 16384 | Completion tokens a request's memory plan counts on (see below) |
+| `--prefill-share F` | 0.5 | Share of GPU time a new prompt's prefill gets while other requests decode (1: they pause) |
 | `--kv bf16\|fp8` | `bf16` | Attention KV cache format (global flag, before `serve`); FP8 halves its memory |
 | `--drafts N` | 6 | Longest speculative draft; each round picks 1..N |
 | `--default-max-tokens N` | 65536 | Completion limit when a request sets none |
@@ -129,9 +138,15 @@ Penalties are applied in the verification step, so they keep this property.
 Concurrent requests decode speculatively together: each drafter runs, then one batched verification
 step covers every request's drafts, and each request accepts and samples on its own. They draft the
 same length per round, chosen per number of running requests (more requests verify more rows per
-draft token, so they draft shorter; at most 16 rows are verified, so that the step uses the decoding
-kernels and greedy output stays identical: 7 drafts for 2 requests, 3 for 4, 1 for 5 to 8). Requests with plain decoding (`"mtp": false`, capture) take
-batched plain steps alongside. A new request's prefill pauses the others while it runs.
+draft token, so they draft shorter; at most 32 rows are verified, in 16-row slices of the decoding
+kernels, so greedy output stays identical: up to 6 drafts for 2 to 4 requests, 5 for 5, 4 for 6, 3
+for 7 and 8). Requests with plain decoding (`"mtp": false`, capture) take batched plain steps
+alongside.
+
+A new request's prompt is prefilled in slices of 4096 tokens that take turns with the running
+requests' steps, by time (`--prefill-share`): the running requests keep decoding at about half speed
+instead of pausing, and the prefill takes up to twice as long. A request alone prefills in full
+chunks.
 
 `--dflash DIR` (any command that decodes speculatively) drafts with the
 [DFlash 2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) block drafter instead of the MTP

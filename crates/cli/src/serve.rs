@@ -46,6 +46,7 @@ pub struct ServeOptions {
     /// Concurrent requests decoded together (1 or 2).
     pub slots: usize,
     pub plan_tokens: usize,
+    pub prefill_share: f64,
     pub capture_dir: Option<PathBuf>,
     pub vision: bool,
     pub image_max_pixels: usize,
@@ -268,13 +269,14 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     let tool_call_token = chat.token_id("<tool_call>");
     let (jobs_tx, jobs_rx) = mpsc::channel::<Work>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<f32>>();
-    let (model_dir, context, drafts, steer, slots, plan_tokens) = (
+    let (model_dir, context, drafts, steer, slots, plan_tokens, prefill_share) = (
         opts.model.clone(),
         opts.context,
         opts.drafts,
         opts.steer.clone(),
         opts.slots,
         opts.plan_tokens,
+        opts.prefill_share.clamp(0.05, 1.0),
     );
     let store = quench6k_engine::context_store::StoreOptions {
         host_bytes: (opts.cache_host_gib * 1073741824.0) as usize,
@@ -344,7 +346,14 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         if let Err(e) = session.add_slots(&model, &stream, slots) {
             eprintln!("{} of {slots} slots: {e:#}", session.slots());
         }
-        schedule(&model, &stream, &mut session, &jobs_rx, &metrics);
+        schedule(
+            &model,
+            &stream,
+            &mut session,
+            &jobs_rx,
+            &metrics,
+            prefill_share,
+        );
     });
     let _ = ready_rx.recv().context("worker thread")??;
     // With a pack, the base name runs unsteered and the steered name applies --strength (default 1).
@@ -431,12 +440,16 @@ pub fn run(opts: ServeOptions) -> Result<()> {
 
 /// The GPU worker: admits queued requests into free slots and steps the running ones, one alone
 /// (speculatively when it started alone) or both batched.
+/// Prompt tokens per prefill slice while other requests decode (about 0.3 s).
+const PREFILL_SLICE: usize = 4096;
+
 fn schedule(
     model: &quench6k_engine::model::Model,
     s: &quench6k_cuda::Stream,
     session: &mut Session,
     jobs: &mpsc::Receiver<Work>,
     metrics: &Metrics,
+    prefill_share: f64,
 ) {
     use quench6k_engine::session::Run;
     struct Active {
@@ -449,6 +462,15 @@ fn schedule(
         prompt: usize,
         prefill: f64,
         decode_start: std::time::Instant,
+    }
+    /// A request whose prompt is being prefilled, in slices between the running requests' steps.
+    struct Pending {
+        pf: quench6k_engine::session::Prefill,
+        tx: tmpsc::UnboundedSender<Msg>,
+        capture: Option<(PathBuf, Value)>,
+        prompt: usize,
+        /// Seconds spent computing the prompt.
+        secs: f64,
     }
     // Sends tokens; Some when the run is over (Cancelled when the client went away).
     fn emit(a: &mut Active, toks: &[i32]) -> Option<Finish> {
@@ -523,6 +545,9 @@ fn schedule(
     let mut slots: Vec<Option<Active>> = (0..nslots).map(|_| None).collect();
     let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
     let mut waiting_for_memory = false;
+    let mut prefilling: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
+    // Decode time owed to the running requests for the prefill time spent (see --prefill-share).
+    let mut decode_credit = 0.0f64;
     let take = |w: Work, queue: &mut std::collections::VecDeque<Job>, session: &mut Session| match w
     {
         Work::Generate(job) => queue.push_back(job),
@@ -535,10 +560,11 @@ fn schedule(
     };
     loop {
         metrics.queued.store(queue.len() as u64, Ordering::Relaxed);
-        metrics
-            .running
-            .store(slots.iter().flatten().count() as u64, Ordering::Relaxed);
-        if slots.iter().all(Option::is_none) && queue.is_empty() {
+        metrics.running.store(
+            (slots.iter().flatten().count() + prefilling.len()) as u64,
+            Ordering::Relaxed,
+        );
+        if slots.iter().all(Option::is_none) && queue.is_empty() && prefilling.is_empty() {
             match jobs.recv() {
                 Ok(w) => take(w, &mut queue, session),
                 Err(_) => return,
@@ -551,7 +577,7 @@ fn schedule(
         // else the one holding the shortest context (the cheapest to stash and overwrite).
         while let Some(job) = queue.front() {
             let free = (0..nslots)
-                .filter(|&i| slots[i].is_none())
+                .filter(|&i| slots[i].is_none() && !prefilling.iter().any(|p| p.pf.slot() == i))
                 .map(|i| {
                     let (reusable, held) = session.cached_prefix(i, &job.ids, &job.params);
                     (reusable, std::cmp::Reverse(held), std::cmp::Reverse(i))
@@ -577,18 +603,8 @@ fn schedule(
             // with plain decoding take batched plain steps; see Session::step).
             let speculate = job.mtp;
             let t0 = std::time::Instant::now();
-            match session.begin(model, s, free, &job.ids, &job.params, speculate) {
-                Ok((run, toks)) => {
-                    let mut a = Active {
-                        run,
-                        tx: job.tx,
-                        reused: session.reused(free),
-                        capture: job.capture,
-                        generated: Vec::new(),
-                        prompt: job.ids.len(),
-                        prefill: t0.elapsed().as_secs_f64(),
-                        decode_start: std::time::Instant::now(),
-                    };
+            match session.start(s, free, &job.ids, &job.params, speculate) {
+                Ok(pf) => {
                     if let Some(path) = std::env::var_os("QUENCH6K_TRACE") {
                         use std::io::Write;
                         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -599,20 +615,85 @@ fn schedule(
                             let _ = writeln!(
                                 f,
                                 "{}",
-                                json!({"slot": free, "reused": a.reused, "ids": job.ids})
+                                json!({"slot": free, "reused": pf.reused(), "ids": job.ids})
                             );
                         }
                     }
-                    match emit(&mut a, &toks) {
-                        Some(f) => complete(a, f, session),
-                        None => slots[free] = Some(a),
-                    }
+                    prefilling.push_back(Pending {
+                        pf,
+                        tx: job.tx,
+                        capture: job.capture,
+                        prompt: job.ids.len(),
+                        secs: t0.elapsed().as_secs_f64(),
+                    });
                 }
                 Err(e) => {
                     session.end(free);
                     let _ = job.tx.send(Msg::Error(format!("{e:#}")));
                 }
             }
+        }
+        // Prefill the oldest pending request: alone in full chunks, else in slices taking turns with
+        // the running requests' steps by time (--prefill-share), so running requests keep decoding.
+        let running = slots.iter().any(Option::is_some);
+        if !running || prefilling.is_empty() {
+            decode_credit = 0.0;
+        }
+        if let Some(p) = prefilling.front_mut()
+            && (!running || decode_credit <= 0.0)
+        {
+            if p.tx.is_closed() {
+                let p = prefilling.pop_front().unwrap();
+                session.end(p.pf.slot());
+                continue;
+            }
+            let t = std::time::Instant::now();
+            let r = session.advance(
+                model,
+                s,
+                &mut p.pf,
+                if running { PREFILL_SLICE } else { usize::MAX },
+            );
+            let secs = t.elapsed().as_secs_f64();
+            p.secs += secs;
+            if running {
+                decode_credit += secs * (1.0 - prefill_share) / prefill_share;
+            }
+            match r {
+                Ok(false) => {}
+                Ok(true) => {
+                    let p = prefilling.pop_front().unwrap();
+                    let (slot, reused) = (p.pf.slot(), p.pf.reused());
+                    match session.finish(model, s, p.pf) {
+                        Ok((run, toks)) => {
+                            let mut a = Active {
+                                run,
+                                tx: p.tx,
+                                reused,
+                                capture: p.capture,
+                                generated: Vec::new(),
+                                prompt: p.prompt,
+                                prefill: p.secs,
+                                decode_start: std::time::Instant::now(),
+                            };
+                            match emit(&mut a, &toks) {
+                                Some(f) => complete(a, f, session),
+                                None => slots[slot] = Some(a),
+                            }
+                        }
+                        Err(e) => {
+                            session.end(slot);
+                            let _ = p.tx.send(Msg::Error(format!("{e:#}")));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let p = prefilling.pop_front().unwrap();
+                    session.end(p.pf.slot());
+                    let _ = p.tx.send(Msg::Error(format!("{e:#}")));
+                }
+            }
+            continue;
         }
         metrics.queued.store(queue.len() as u64, Ordering::Relaxed);
         metrics
@@ -637,8 +718,10 @@ fn schedule(
         if runs.is_empty() {
             continue;
         }
+        let t = std::time::Instant::now();
         let result = session.step(model, s, &mut runs);
         drop(runs);
+        decode_credit -= t.elapsed().as_secs_f64();
         match result {
             Ok(toks) => {
                 let mut k = 0;

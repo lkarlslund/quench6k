@@ -98,6 +98,7 @@ impl SpecDecoder {
             s,
             prompt,
             0,
+            prompt.len(),
             chunk,
             &[],
             |_, _, _| Ok(()),
@@ -127,6 +128,7 @@ impl SpecDecoder {
             s,
             prompt,
             0,
+            prompt.len(),
             chunk,
             pauses,
             |_, _, _| Ok(()),
@@ -134,10 +136,12 @@ impl SpecDecoder {
         )
     }
 
-    /// Prefills `prompt[start..]` into `state`, which already holds `prompt[..start]` (target and MTP
-    /// caches, recurrent state, and the pending row: see `pending_addr`). At each position in
+    /// Prefills `prompt[start..stop]` into `state`, which already holds `prompt[..start]` (target and
+    /// MTP caches, recurrent state, and the pending row: see `pending_addr`). At each position in
     /// `pauses` (ascending, in start..len) the chunking breaks and `at_pause(state, pos, pending)` runs.
-    /// `progress(pos)` is called when the prompt up to `pos` has been computed (after each chunk).
+    /// `progress(pos)` is called when the prompt up to `pos` has been computed (after each chunk). A
+    /// prefill may run in several calls (each `start` the previous `stop`); the call that reaches the
+    /// prompt's end positions the decoder on the target's next token.
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_from(
         &mut self,
@@ -147,12 +151,13 @@ impl SpecDecoder {
         s: &Stream,
         prompt: &[i32],
         start: usize,
+        stop: usize,
         chunk: usize,
         pauses: &[usize],
         mut at_pause: impl FnMut(&SequenceState, usize, u64) -> Result<()>,
         progress: Option<&(dyn Fn(usize) + Send + Sync)>,
     ) -> Result<()> {
-        ensure!(start < prompt.len(), "nothing to prefill");
+        ensure!(start < stop && stop <= prompt.len(), "nothing to prefill");
         ensure!(
             state.len() == start,
             "state holds {} tokens, expected {start}",
@@ -171,8 +176,8 @@ impl SpecDecoder {
             ensure!(ws.dflash.is_some(), "workspace without DFlash scratch");
             st.set_lo(s, lo)?;
         }
-        while c0 < prompt.len() {
-            let mut end = (c0 + chunk).min(prompt.len());
+        while c0 < stop {
+            let mut end = (c0 + chunk).min(stop);
             if let Some(&p) = pause.peek() {
                 end = end.min(p);
             }
@@ -229,6 +234,9 @@ impl SpecDecoder {
             c0 = end;
         }
         s.synchronize()?;
+        if stop < prompt.len() {
+            return Ok(());
+        }
         self.next = next;
         self.catch_up.clear();
         self.rounds = 0;
@@ -986,7 +994,7 @@ pub const MAX_GROUP: usize = forward::MAX_SEGMENTS;
 /// of sequences and any row count runs without its own graph), then each sequence's tail (head,
 /// sampling, acceptance). All sequences draft the same length, chosen by a policy per group size fed
 /// with every sequence's acceptance: larger groups verify more rows per draft token, so they settle on
-/// shorter drafts (and at most [`GroupRounds::max_rows`] rows are verified: 16 / k - 1 drafts each).
+/// shorter drafts (and at most [`GroupRounds::max_rows`] rows are verified: 32 / k - 1 drafts each).
 pub struct GroupRounds {
     /// Indexed by group size.
     policies: Vec<DraftPolicy>,
@@ -1019,9 +1027,9 @@ impl GroupRounds {
         })
     }
 
-    /// Verified rows a group round stays within (the decode kernels' batch limit).
+    /// Verified rows a group round stays within (batched steps use the decoding kernels up to them).
     pub fn max_rows() -> usize {
-        quench6k_cuda::kernels::gemv_max_m()
+        forward::BATCH_SMALL_ROWS
     }
 
     /// One round of every member; returns each one's committed tokens.

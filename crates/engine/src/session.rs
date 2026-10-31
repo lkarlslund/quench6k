@@ -211,6 +211,8 @@ struct Lane {
     used: std::time::Instant,
     /// Positions planned for the running request (prompt and expected completion; 0 when idle).
     planned: usize,
+    /// Positions a prefill in progress will write (its mapped memory is not trimmed below them).
+    floor: usize,
 }
 
 impl Lane {
@@ -251,6 +253,7 @@ impl Lane {
             busy: false,
             used: std::time::Instant::now(),
             planned: 0,
+            floor: 0,
         })
     }
 
@@ -506,6 +509,42 @@ const SNAPSHOT_HEADROOM: usize = 1 << 30;
 /// about 1/8 of itself.
 const PERIODIC_SNAPSHOTS: usize = 8;
 
+/// Where a slot's prefill stands: the prompt's cache key, where it started (the reused prefix), how
+/// far it is computed, and the positions to snapshot at.
+struct PrefillPlan {
+    key: Vec<i32>,
+    start: usize,
+    pos: usize,
+    pauses: Vec<usize>,
+    periodic: Vec<usize>,
+}
+
+/// A request whose prompt is being prefilled ([`Session::start`]); [`Session::advance`] computes it
+/// in slices, so running requests keep decoding in between, and [`Session::finish`] turns it into a
+/// running [`Run`].
+pub struct Prefill {
+    run: Run,
+    prompt: Vec<i32>,
+    plan: PrefillPlan,
+    speculate: bool,
+}
+
+impl Prefill {
+    pub fn slot(&self) -> usize {
+        self.run.slot
+    }
+
+    /// Prompt tokens served from the cache.
+    pub fn reused(&self) -> usize {
+        self.plan.start
+    }
+
+    /// Prompt tokens still to compute.
+    pub fn remaining(&self) -> usize {
+        self.prompt.len() - self.plan.pos
+    }
+}
+
 /// Completion tokens a request's memory plan counts on by default (more than 99.9% of completions in
 /// the served traffic).
 pub const DEFAULT_PLAN_TOKENS: usize = 16384;
@@ -755,6 +794,7 @@ impl Session {
         if let Some(lane) = self.lanes.get_mut(slot) {
             lane.busy = false;
             lane.planned = 0;
+            lane.floor = 0;
             lane.used = std::time::Instant::now();
         }
     }
@@ -859,7 +899,7 @@ impl Session {
             .enumerate()
             .filter(|(i, _)| *i != keep)
         {
-            let held = lane.kv_tokens.len().max(lane.state.len());
+            let held = lane.kv_tokens.len().max(lane.state.len()).max(lane.floor);
             lane.state
                 .trim_kv(held)
                 .with_context(|| format!("trimming slot {i}"))?;
@@ -941,6 +981,21 @@ impl Session {
         p: &GenParams,
         speculate: bool,
     ) -> Result<(Run, Vec<i32>)> {
+        let mut pf = self.start(s, slot, prompt, p, speculate)?;
+        self.advance(model, s, &mut pf, usize::MAX)?;
+        self.finish(model, s, pf)
+    }
+
+    /// Starts a request on `slot`: positions the slot on its best cached prefix (from the GPU or the
+    /// store) and plans the prefill, which [`advance`](Self::advance) then computes.
+    pub fn start(
+        &mut self,
+        s: &Stream,
+        slot: usize,
+        prompt: &[i32],
+        p: &GenParams,
+        speculate: bool,
+    ) -> Result<Prefill> {
         ensure!(!prompt.is_empty(), "empty prompt");
         ensure!(slot < self.lanes.len(), "no slot {slot}");
         ensure!(
@@ -950,7 +1005,7 @@ impl Session {
             self.capacity
         );
         let budget = p.max_tokens.min(self.capacity - prompt.len());
-        let mut run = Run {
+        let run = Run {
             slot,
             params: p.clone(),
             produced: 0,
@@ -959,27 +1014,17 @@ impl Session {
             rng: Rng::new(p.seed),
             budget,
         };
+        self.prompt_site = None;
         self.lanes[slot].busy = true;
         self.lanes[slot].used = std::time::Instant::now();
         self.lanes[slot].planned = self.plan_positions(prompt.len(), p.max_tokens);
-        let speculate = speculate && !p.capture;
-        self.prompt_site = None;
-        let capture = if p.capture {
-            Some(forward::CaptureTarget {
-                pos: prompt.len() - 1,
-                buf: self.capture_buf()?,
-            })
-        } else {
-            None
-        };
+        self.lanes[slot].floor = prompt.len() + 2 * (self.lanes[slot].dec.drafts + 2);
         let lane = &mut self.lanes[slot];
         lane.state.reset(s)?;
         lane.state.set_steering_strength(s, p.steering_strength)?;
         lane.state.set_adapter_scale(s, p.adapter_scale)?;
         lane.pen.reset(s, p, prompt)?;
-        self.ws.capture = capture;
-        let r = self.prefill(
-            model,
+        let plan = self.prefill_setup(
             s,
             slot,
             prompt,
@@ -987,30 +1032,103 @@ impl Session {
             &p.boundaries,
             p.variant(),
             p.progress.as_ref(),
+        )?;
+        Ok(Prefill {
+            run,
+            prompt: prompt.to_vec(),
+            plan,
+            speculate: speculate && !p.capture,
+        })
+    }
+
+    /// Computes about `tokens` more of `pf`'s prompt, in chunks of at most `tokens` (a capture request
+    /// computes it all at once). Returns whether the prompt is complete.
+    pub fn advance(
+        &mut self,
+        model: &Model,
+        s: &Stream,
+        pf: &mut Prefill,
+        tokens: usize,
+    ) -> Result<bool> {
+        let slot = pf.run.slot;
+        let capture = if pf.run.params.capture {
+            Some(forward::CaptureTarget {
+                pos: pf.prompt.len() - 1,
+                buf: self.capture_buf()?,
+            })
+        } else {
+            None
+        };
+        let len = pf.prompt.len();
+        let chunk = self.chunk.min(tokens.max(1));
+        let stop = if capture.is_some() || self.lanes[slot].dec.dflash.is_some() {
+            len
+        } else {
+            // Whole chunks, cut as one prefill with this chunk size cuts them (breaking at the snapshot
+            // positions).
+            let mut stop = pf.plan.pos;
+            while stop < len && stop - pf.plan.pos < tokens {
+                let mut end = (stop + chunk).min(len);
+                if let Some(&p) = pf.plan.pauses.iter().find(|&&p| p > stop && p < len) {
+                    end = end.min(p);
+                }
+                stop = end;
+            }
+            stop
+        };
+        self.ws.capture = capture;
+        let progress = pf.run.params.progress.clone();
+        let chunk = if capture.is_some() || self.lanes[slot].dec.dflash.is_some() {
+            self.chunk
+        } else {
+            chunk
+        };
+        let r = self.prefill_advance(
+            model,
+            s,
+            slot,
+            &pf.prompt,
+            &mut pf.plan,
+            stop,
+            chunk,
+            progress.as_ref(),
         );
         self.ws.capture = None;
         r?;
-        let logits = self.lanes[slot].dec.last_logits_addr();
         if let Some(c) = capture {
+            let logits = self.lanes[slot].dec.last_logits_addr();
             self.prompt_site =
-                Some(self.read_site(s, "prompt_last", c.buf, c.pos, prompt[c.pos], logits)?);
+                Some(self.read_site(s, "prompt_last", c.buf, c.pos, pf.prompt[c.pos], logits)?);
         }
+        Ok(pf.remaining() == 0)
+    }
+
+    /// Turns a completed prefill into a running request; returns it with the tokens to emit now
+    /// (none for a speculative run, whose first round emits).
+    pub fn finish(&mut self, _model: &Model, s: &Stream, pf: Prefill) -> Result<(Run, Vec<i32>)> {
+        ensure!(pf.remaining() == 0, "prefill not complete");
+        let Prefill {
+            mut run, speculate, ..
+        } = pf;
+        let (slot, p) = (run.slot, run.params.clone());
+        self.lanes[slot].floor = 0;
+        let logits = self.lanes[slot].dec.last_logits_addr();
         let sampled = p.temperature > 0.0 || self.lanes[slot].pen.active;
         if speculate {
             // Sampled (or penalized) runs draw the first token here; the first round commits it.
             if sampled {
-                let tok = self.sample(s, logits, p, &self.lanes[slot].pen, &mut run.rng)?;
+                let tok = self.sample(s, logits, &p, &self.lanes[slot].pen, &mut run.rng)?;
                 self.lanes[slot].dec.next = tok;
             }
             let lane = &mut self.lanes[slot];
-            lane.spec.set_sampling(s, sampling(p, lane.pen.active))?;
+            lane.spec.set_sampling(s, sampling(&p, lane.pen.active))?;
             lane.spec.penalized = lane.pen.active;
             lane.spec.restart(&lane.state, &lane.dec, s)?;
             run.spec = true;
             return Ok((run, Vec::new()));
         }
         let tok = if sampled {
-            self.sample(s, logits, p, &self.lanes[slot].pen, &mut run.rng)?
+            self.sample(s, logits, &p, &self.lanes[slot].pen, &mut run.rng)?
         } else {
             self.lanes[slot].dec.next
         };
@@ -1240,6 +1358,33 @@ impl Session {
         variant: (f32, f32),
         progress: Option<&Progress>,
     ) -> Result<()> {
+        let mut plan =
+            self.prefill_setup(s, slot, prompt, images, boundaries, variant, progress)?;
+        self.prefill_advance(
+            model,
+            s,
+            slot,
+            prompt,
+            &mut plan,
+            prompt.len(),
+            self.chunk,
+            progress,
+        )
+    }
+
+    /// The first part of [`prefill`](Self::prefill): positions the slot on its best cached prefix
+    /// and plans the snapshots. Returns the plan for [`prefill_advance`](Self::prefill_advance).
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_setup(
+        &mut self,
+        s: &Stream,
+        slot: usize,
+        prompt: &[i32],
+        images: &[std::sync::Arc<ImageInput>],
+        boundaries: &[usize],
+        variant: (f32, f32),
+        progress: Option<&Progress>,
+    ) -> Result<PrefillPlan> {
         // Memory for the whole prompt (a stored context loaded below is a prefix of it).
         self.ensure_kv(slot, prompt.len() + 2 * (self.lanes[slot].dec.drafts + 2))?;
         // State is never reused across model variants: a slot holding another variant's conversation
@@ -1309,7 +1454,6 @@ impl Session {
         if let Some(f) = progress {
             (f.0)(start, start);
         }
-        let report = progress.map(|f| move |pos: usize| (f.0)(pos, start));
         let mut pauses: Vec<usize> = boundaries
             .iter()
             .copied()
@@ -1334,21 +1478,54 @@ impl Session {
         pauses.extend(&periodic);
         pauses.sort_unstable();
         pauses.dedup();
+        // The cache holds the prompt as far as it is computed.
+        lane.kv_tokens = key[..start].to_vec();
+        Ok(PrefillPlan {
+            key,
+            start,
+            pos: start,
+            pauses,
+            periodic,
+        })
+    }
+
+    /// Prefills `plan`'s prompt from where it stands up to `stop` (the whole prompt at its end),
+    /// taking the planned snapshots on the way.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_advance(
+        &mut self,
+        model: &Model,
+        s: &Stream,
+        slot: usize,
+        prompt: &[i32],
+        plan: &mut PrefillPlan,
+        stop: usize,
+        chunk: usize,
+        progress: Option<&Progress>,
+    ) -> Result<()> {
+        let stop = stop.min(prompt.len());
+        if stop <= plan.pos {
+            return Ok(());
+        }
+        let (start, pos0) = (plan.start, plan.pos);
+        let report = progress.map(|f| move |pos: usize| (f.0)(pos, start));
+        let (pauses, periodic) = (&plan.pauses, &plan.periodic);
         // Snapshots stay out of memory the running requests' plans count on.
         let headroom = SNAPSHOT_HEADROOM + self.outstanding_bytes();
         let lane = &mut self.lanes[slot];
         let snapshots = &mut lane.snapshots;
-        let (dec, state, ws, chunk) = (&mut lane.dec, &mut lane.state, &mut self.ws, self.chunk);
-        with_ple_warm(model, prompt, start, || {
+        let (dec, state, ws) = (&mut lane.dec, &mut lane.state, &mut self.ws);
+        with_ple_warm(model, &prompt[..stop], pos0, || {
             dec.prefill_from(
                 model,
                 state,
                 ws,
                 s,
                 prompt,
-                start,
+                pos0,
+                stop,
                 chunk,
-                &pauses,
+                pauses,
                 |state, pos, pending| {
                     // Recycle the oldest periodic snapshot first, then the oldest. Snapshots only speed up later
                     // prompts: when device memory is short, an older one is recycled, or none is taken.
@@ -1389,7 +1566,8 @@ impl Session {
                 report.as_ref().map(|f| f as &(dyn Fn(usize) + Send + Sync)),
             )
         })?;
-        self.lanes[slot].kv_tokens = key;
+        self.lanes[slot].kv_tokens = plan.key[..stop].to_vec();
+        plan.pos = stop;
         Ok(())
     }
 

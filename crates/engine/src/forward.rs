@@ -859,22 +859,34 @@ fn hyper_connection_small(
     let down = weight(&hc.down.parts[0].0);
     let inject = hc.injects.then(|| weight(&hc.down.parts[1].0));
     let (y, inj_prev) = pending.unwrap_or((0, ws.inj));
-    k::hc_small(
-        s,
-        ws.h,
-        t,
-        y,
-        inj_prev,
-        down,
-        inject,
-        weight(&hc.up),
-        hc.norm,
-        ws.hc_scratch,
-        ws.low_bf,
-        ws.hc_r,
-        inj_out,
-        out,
-    )
+    // Larger batches in slices of the kernel's 16 rows (rows are independent).
+    let m = k::gemv_max_m();
+    for r0 in (0..t).step_by(m) {
+        let at = |base: u64, row_bytes: usize| {
+            if base == 0 {
+                0
+            } else {
+                base + (r0 * row_bytes) as u64
+            }
+        };
+        k::hc_small(
+            s,
+            at(ws.h, H * 4),
+            m.min(t - r0),
+            at(y, D * 4),
+            at(inj_prev, S * 4),
+            down,
+            inject,
+            weight(&hc.up),
+            hc.norm,
+            ws.hc_scratch,
+            ws.low_bf,
+            ws.hc_r,
+            at(inj_out, S * 4),
+            at(out, D * 2),
+        )?;
+    }
+    Ok(())
 }
 
 /// PLE row indices of the token at position `p` given the full token history (SPEC §8.1).
@@ -976,6 +988,9 @@ struct StepLayout {
     ple: usize,
     bytes: usize,
 }
+
+/// Rows up to which batched steps take the small-batch (decoding) kernels.
+pub const BATCH_SMALL_ROWS: usize = 32;
 
 /// The most sequences a batched step takes (the step block's header holds each one's start).
 pub const MAX_SEGMENTS: usize = 8;
@@ -1272,6 +1287,7 @@ pub fn forward_segments(
         ws,
         s,
         t,
+        small: t <= BATCH_SMALL_ROWS,
         start: ws.step,
         pos3: 0,
         capacity: segs[0].state.capacity,
@@ -1572,6 +1588,7 @@ pub fn forward_part(
         ws,
         s,
         t,
+        small: t <= k::gemv_max_m(),
         start: ws.step,
         pos3: state.pos3.addr(),
         capacity: state.capacity,
@@ -1716,6 +1733,9 @@ struct LayerCtx<'a> {
     ws: &'a Workspace,
     s: &'a Stream,
     t: usize,
+    /// The step takes the small-batch kernels (HyperConnection and MoE in slices of at most 16 rows),
+    /// whose arithmetic per row is that of decoding.
+    small: bool,
     /// Device i32: position of the step's first token.
     start: u64,
     pos3: u64,
@@ -1839,7 +1859,7 @@ fn final_mixer(
     mut prof: Option<&mut Profiler>,
 ) -> Result<()> {
     let (ws, s, t) = (ctx.ws, ctx.s, ctx.t);
-    if t <= k::gemv_max_m() {
+    if ctx.small {
         op!(
             prof,
             "hc_small",
@@ -1883,7 +1903,7 @@ fn layer_forward(
     mut prof: Option<&mut Profiler>,
 ) -> Result<()> {
     let (ws, s, t, start, pos3) = (ctx.ws, ctx.s, ctx.t, ctx.start, ctx.pos3);
-    let small = t <= k::gemv_max_m();
+    let small = ctx.small;
     // DFlash features: the completed output of a tapped layer is this layer's residual input.
     if let Some(tp) = ctx.taps.filter(|tp| tp.rows > 0)
         && let Some(j) = crate::dflash::TAPS.iter().position(|&l| l + 1 == index)
@@ -2568,7 +2588,7 @@ fn finish_layer(
     rec: Option<(u64, usize)>,
 ) -> Result<()> {
     let (ws, s, t) = (ctx.ws, ctx.s, ctx.t);
-    let small = t <= k::gemv_max_m();
+    let small = ctx.small;
     if small {
         op!(
             prof,
@@ -2604,11 +2624,13 @@ fn finish_layer(
     let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
     // Small batches: the shared expert's SwiGLU and down projection depend only on the projection, so
     // they run on a side stream while the routing (one block) and the routed experts run.
-    let side = t > 1
-        && t <= k::moe_small_tokens()
-        && quench6k_cuda::variants::get("moe.shared_side", 1) != 0;
+    // Batched steps of up to BATCH_SMALL_ROWS rows route and run the experts in slices of the small
+    // kernels' rows (each slice's expert outputs and pair indices at its own offsets).
+    let small_moe = t <= k::moe_small_tokens() || ctx.small;
+    let slice = k::moe_small_tokens();
+    let side = t > 1 && small_moe && quench6k_cuda::variants::get("moe.shared_side", 1) != 0;
     // FP4 prefill: the routed experts' down projection is written in BF16 (QUENCH6K_YD_BF16=0: FP32).
-    let yd_bf16 = t > k::moe_small_tokens()
+    let yd_bf16 = !small_moe
         && matches!(fp4_mode(), 1 | 3)
         && std::env::var("QUENCH6K_YD_BF16").map_or(true, |v| v != "0");
     if t == 1 {
@@ -2630,8 +2652,7 @@ fn finish_layer(
                 ws.yd
             )
         );
-    } else if t <= k::moe_small_tokens() {
-        let max_active = (t * TOP_K).min(EXPERTS);
+    } else if small_moe {
         if side {
             ws.moe_fork.record(s)?;
             ws.moe_side.wait(&ws.moe_fork)?;
@@ -2650,58 +2671,63 @@ fn finish_layer(
             );
             ws.moe_join.record(ss)?;
         }
-        op!(
-            prof,
-            "moe_route_small",
-            s,
-            k::moe_route_small(
+        for r0 in (0..t).step_by(slice) {
+            let ts = slice.min(t - r0);
+            let max_active = (ts * TOP_K).min(EXPERTS);
+            let pairs = (r0 * TOP_K * 4) as u64;
+            op!(
+                prof,
+                "moe_route_small",
                 s,
-                col(0),
-                ld,
-                t,
-                ws.top_i,
-                ws.top_w,
-                ws.offsets,
-                ws.pair_row,
-                ws.row_token,
-                ws.active,
-                ws.num_active
-            )
-        );
-        op!(
-            prof,
-            "experts gate_up",
-            s,
-            k::moe_gate_up_small(
+                k::moe_route_small(
+                    s,
+                    col(0) + (r0 * ld * 4) as u64,
+                    ld,
+                    ts,
+                    ws.top_i + pairs,
+                    ws.top_w + pairs,
+                    ws.offsets,
+                    ws.pair_row + pairs,
+                    ws.row_token,
+                    ws.active,
+                    ws.num_active
+                )
+            );
+            op!(
+                prof,
+                "experts gate_up",
                 s,
-                ws.m,
-                ws.row_token,
-                tables(&moe.gate),
-                tables(&moe.up),
-                ws.offsets,
-                ws.active,
-                ws.num_active,
-                max_active,
-                t,
-                ws.act
-            )
-        );
-        op!(
-            prof,
-            "experts down",
-            s,
-            k::moe_down_small(
+                k::moe_gate_up_small(
+                    s,
+                    ws.m + (r0 * D * 2) as u64,
+                    ws.row_token,
+                    tables(&moe.gate),
+                    tables(&moe.up),
+                    ws.offsets,
+                    ws.active,
+                    ws.num_active,
+                    max_active,
+                    ts,
+                    ws.act
+                )
+            );
+            op!(
+                prof,
+                "experts down",
                 s,
-                ws.act,
-                tables(&moe.down),
-                ws.offsets,
-                ws.active,
-                ws.num_active,
-                max_active,
-                t,
-                ws.yd
-            )
-        );
+                k::moe_down_small(
+                    s,
+                    ws.act,
+                    tables(&moe.down),
+                    ws.offsets,
+                    ws.active,
+                    ws.num_active,
+                    max_active,
+                    ts,
+                    ws.yd + (r0 * TOP_K * D * 4) as u64
+                )
+            );
+        }
     } else {
         op!(
             prof,
@@ -2949,12 +2975,27 @@ fn finish_layer(
                 k::moe_combine_bf16(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t)
             );
         } else {
-            op!(
-                prof,
-                "moe_combine",
-                s,
-                k::moe_combine(s, ws.yd, ws.pair_row, ws.top_w, col(3), ld, ws.sh, ws.y, t)
-            );
+            // Per slice of the small kernels (pair indices are relative to the slice's outputs).
+            let step = if small_moe { slice } else { t };
+            for r0 in (0..t).step_by(step) {
+                let pairs = (r0 * TOP_K * 4) as u64;
+                op!(
+                    prof,
+                    "moe_combine",
+                    s,
+                    k::moe_combine(
+                        s,
+                        ws.yd + (r0 * TOP_K * D * 4) as u64,
+                        ws.pair_row + pairs,
+                        ws.top_w + pairs,
+                        col(3) + (r0 * ld * 4) as u64,
+                        ld,
+                        ws.sh + (r0 * D * 4) as u64,
+                        ws.y + (r0 * D * 4) as u64,
+                        step.min(t - r0)
+                    )
+                );
+            }
         }
     }
     if let Some((buf, row)) = rec {
@@ -3098,6 +3139,7 @@ pub fn forward_mtp_staged(
         ws,
         s,
         t,
+        small: t <= k::gemv_max_m(),
         start,
         pos3: state.pos3.addr(),
         capacity: state.capacity,
