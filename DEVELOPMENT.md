@@ -23,6 +23,17 @@ cargo test --release
 Kernel tests (`cargo test -p quench6k-cuda --test kernels`) compare every kernel with a CPU
 implementation and need the GPU's memory: stop a running server first.
 
+The growable KV-cache regression also needs a GPU (it is ignored by the default test run):
+
+```
+cargo test --release -p quench6k-engine kv_growth_ -- --ignored --test-threads=1
+```
+
+It checks that an interrupted mapping operation cannot leave an unbacked V cache hidden by the
+other buffers' mapped lengths, for BF16 and FP8, target and drafter caches, and full capacity. It also
+recreates a short FP8 V mapping at the 119K-token range and writes past its former backed end after
+repairing the mapping.
+
 ## Correctness
 
 The engine runs a quantized model, so the bar is statistical: on every oracle fixture, quench6k may

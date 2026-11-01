@@ -628,6 +628,7 @@ fn schedule(
                     });
                 }
                 Err(e) => {
+                    eprintln!("starting slot {free}, prompt {}: {e:#}", job.ids.len());
                     session.end(free);
                     let _ = job.tx.send(Msg::Error(format!("{e:#}")));
                 }
@@ -682,6 +683,10 @@ fn schedule(
                             }
                         }
                         Err(e) => {
+                            eprintln!(
+                                "finishing prefill of slot {slot}, prompt {}: {e:#}",
+                                p.prompt
+                            );
                             session.end(slot);
                             let _ = p.tx.send(Msg::Error(format!("{e:#}")));
                         }
@@ -689,6 +694,12 @@ fn schedule(
                 }
                 Err(e) => {
                     let p = prefilling.pop_front().unwrap();
+                    eprintln!(
+                        "prefilling slot {}, prompt {}, {} tokens remaining: {e:#}",
+                        p.pf.slot(),
+                        p.prompt,
+                        p.pf.remaining()
+                    );
                     session.end(p.pf.slot());
                     let _ = p.tx.send(Msg::Error(format!("{e:#}")));
                 }
@@ -705,6 +716,12 @@ fn schedule(
                 && let Err(e) = session.reserve(&a.run)
             {
                 let a = slot.take().unwrap();
+                eprintln!(
+                    "reserving KV for slot {}, prompt {}, {} generated: {e:#}",
+                    a.run.slot,
+                    a.prompt,
+                    a.generated.len()
+                );
                 session.end(a.run.slot);
                 let _ = a.tx.send(Msg::Error(format!("{e:#}")));
             }
@@ -736,6 +753,12 @@ fn schedule(
                 }
             }
             Err(e) => {
+                let active: Vec<_> = slots
+                    .iter()
+                    .flatten()
+                    .map(|a| (a.run.slot, a.prompt, a.generated.len()))
+                    .collect();
+                eprintln!("GPU decode step failed (slot, prompt, generated) {active:?}: {e:#}");
                 for slot in slots.iter_mut() {
                     if let Some(a) = slot.take() {
                         session.end(a.run.slot);

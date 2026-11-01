@@ -1,6 +1,6 @@
 //! Eager forward pass of the text model over a chunk of new tokens for one sequence.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use quench6k_cuda::{DeviceBuffer, Event, PinnedBuffer, Stream, VmBuffer, kernels as k};
 
 use crate::profile::Profiler;
@@ -254,13 +254,15 @@ impl SequenceState {
         self.tokens.len()
     }
 
-    /// Positions whose attention-cache memory is mapped (all caches map the same positions).
+    /// Positions backed in every attention-cache buffer. Growth can fail between buffers, so their
+    /// mapped lengths need not agree until a later successful ensure_kv.
     pub fn kv_positions(&self) -> usize {
         self.mtp_qsa
             .iter()
             .chain(self.qsa.iter().flatten())
             .map(|c| {
                 (c.k.mapped() / kv_row_bytes(c.fp8))
+                    .min(c.v.mapped() / kv_row_bytes(c.fp8))
                     .min(c.raw.mapped() / (INDEX_DIM * 2))
                     .min(c.pooled.mapped() * 4 / (INDEX_DIM * 2))
             })
@@ -298,9 +300,18 @@ impl SequenceState {
             return Ok(());
         }
         let want = (positions + KV_MARGIN).min(self.capacity);
-        for c in self.mtp_qsa.iter_mut().chain(self.qsa.iter_mut().flatten()) {
-            for (b, per) in c.parts() {
-                b.map_to((want as f64 * per).ceil() as usize)?;
+        for (cache, c) in self
+            .mtp_qsa
+            .iter_mut()
+            .chain(self.qsa.iter_mut().flatten())
+            .enumerate()
+        {
+            for (name, (b, per)) in ["K", "V", "raw", "pooled"].into_iter().zip(c.parts()) {
+                let bytes = (want as f64 * per).ceil() as usize;
+                b.map_to(bytes).with_context(|| format!(
+                    "KV cache {cache} {name} at {:#x}: {} mapped bytes, {bytes} required for {want} positions",
+                    b.addr(), b.mapped()
+                ))?;
             }
         }
         Ok(())
@@ -3516,4 +3527,104 @@ pub fn head_stats(
             .extend(s.download::<f32>(hw.top_logits.addr(), n * top_k)?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn kv_growth_repairs_short_value_cache_at_119k() -> Result<()> {
+        quench6k_cuda::set_device(0)?;
+        let mut state = SequenceState::growable(262144, true)?;
+        state.qsa.clear();
+        // Reproduce the mapping layout left when K grows from 62 to 64 MiB but V's
+        // allocation fails. The index buffers still cover at least 122880 positions.
+        let cap = state.capacity;
+        let mut cache = QsaCache {
+            k: VmBuffer::reserve(cap * kv_row_bytes(true))?,
+            v: VmBuffer::reserve(cap * kv_row_bytes(true))?,
+            raw: VmBuffer::reserve(cap * INDEX_DIM * 2)?,
+            pooled: VmBuffer::reserve(cap / 4 * INDEX_DIM * 2)?,
+            fp8: true,
+        };
+        cache.k.map_to(64 << 20)?;
+        cache.v.map_to(62 << 20)?;
+        cache.raw.map_to(30 << 20)?;
+        cache.pooled.map_to(8 << 20)?;
+        let backed = cache.v.mapped() / kv_row_bytes(true);
+        state.mtp_qsa = Some(cache);
+        // The old check returned early here, leaving V unbacked beyond position 119506.
+        state.ensure_kv(119094)?;
+        let cache = state.mtp_qsa.as_ref().unwrap();
+        let write_pos = backed.max(119094);
+        let stream = Stream::new()?;
+        let qg = DeviceBuffer::zeroed(QSA_HEADS * 2 * QSA_DIM * 4)?;
+        let kv = DeviceBuffer::zeroed(2 * QSA_KV * QSA_DIM * 4)?;
+        let norm = DeviceBuffer::zeroed(QSA_DIM * 2)?;
+        let q = DeviceBuffer::new(QSA_HEADS * QSA_DIM * 4)?;
+        let start = DeviceBuffer::new(4)?;
+        stream.upload(&start, &[write_pos as i32])?;
+        stream.memset(state.pos3.addr() + (write_pos * 3 * 4) as u64, 0, 3 * 4)?;
+        // Use the production kernel, including its FP8 scale writes, at the formerly unbacked row.
+        k::qsa_qkv_prep(
+            &stream,
+            qg.addr(),
+            kv.addr(),
+            QSA_HEADS * 2 * QSA_DIM,
+            norm.addr(),
+            norm.addr(),
+            q.addr(),
+            cache.k.addr(),
+            cache.v.addr(),
+            state.pos3.addr(),
+            start.addr(),
+            1,
+            true,
+        )?;
+        stream.synchronize()
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn kv_growth_repairs_partially_mapped_value_cache() -> Result<()> {
+        quench6k_cuda::set_device(0)?;
+        for fp8 in [false, true] {
+            let old = KV_FP8.swap(fp8, std::sync::atomic::Ordering::Relaxed);
+            let state = SequenceState::growable(32768, true);
+            KV_FP8.store(old, std::sync::atomic::Ordering::Relaxed);
+            let mut state = state?;
+            let stream = Stream::new()?;
+            for positions in [1, state.capacity] {
+                state.ensure_kv(positions)?;
+                // Growth maps K before V. An allocation failure can leave V shorter than K,
+                // while raw/pooled buffers already cover more positions due to page rounding.
+                // Exercise both the drafter's and the target's cache, including full capacity.
+                for target in [false, true] {
+                    let cache = if target {
+                        state.qsa.iter_mut().flatten().next().unwrap()
+                    } else {
+                        state.mtp_qsa.as_mut().unwrap()
+                    };
+                    cache.v.unmap_to(0)?;
+                    assert_eq!(
+                        state.kv_positions(),
+                        0,
+                        "unmapped V must prevent cache reuse"
+                    );
+                    state.ensure_kv(positions)?;
+                    assert!(state.kv_positions() >= positions);
+                    let cache = if target {
+                        state.qsa.iter().flatten().next().unwrap()
+                    } else {
+                        state.mtp_qsa.as_ref().unwrap()
+                    };
+                    stream.memset(cache.v.addr(), 0, positions * kv_row_bytes(cache.fp8))?;
+                    stream.synchronize()?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
