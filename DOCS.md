@@ -81,11 +81,26 @@ than its plan grows into free memory; only if none is left does it fail.
   ECharts are vendored into the binary; the browser needs no external assets. The vertically aligned
   prefill, generation and activity plots share their cursor and pan/zoom window. Scroll or use the
   range slider to inspect history; Live returns to the moving view.
-- `GET /stats`: dashboard JSON, including up to one hour of one-second samples held in server memory.
-  `?since=TIMESTAMP` returns only samples newer than that Unix timestamp in milliseconds. History is
-  collected even with no browser open and resets when the server restarts. Throughput uses wall-clock
-  sampling intervals and includes in-flight generations; prompt/output counts per slot describe its
-  current or most recent request. Prompt text and generated content are never included.
+- `GET /stats`: dashboard JSON with one-second live samples and durable minute history, collected
+  without a browser open. `?range=SECONDS` selects up to the retention limit (default 3600).
+  `?since=TIMESTAMP` filters samples newer than that Unix timestamp in milliseconds; incremental
+  requests are intended for live ranges. Long ranges are downsampled to about 1800 points: throughput
+  averages, peak concurrency/queue/KV memory, summed request and token counts. `sample_interval_ms`
+  describes the long-range resolution; live responses can include archived minute data before their
+  in-memory samples. Pan, zoom and hover remain linked between charts; tooltips omit zero-rate slots.
+  The usage table totals the visible samples, including a zoomed range, at sample boundaries.
+  `totals` persist across restarts; `session_totals` cover the current process. `requests` counts
+  JSON generation HTTP requests, including rejected requests; `generations` counts completed attempts
+  (tool-call retries count again). Input/prompt and cached token counts cover completed attempts;
+  output and uncached prefill tokens include in-flight work. No prompt text or output content is stored.
+  Statistics use embedded tsink with a 32 MiB engine memory budget and durable WAL writes. Configure
+  `--stats-dir` (default `$XDG_STATE_HOME/quench6k/stats`, or `~/.local/state/quench6k/stats`) and
+  `--stats-retention-days` (default 31). Use a distinct directory for each server. Minute aggregates
+  are immutable; the current minute and cumulative totals are checkpointed atomically every sample
+  and on graceful shutdown. Abrupt termination can lose activity since the last checkpoint (normally
+  about one second). Lifetime totals remain after graph retention expires. Persistence failures are
+  logged and shown in the dashboard as `server.storage_error`. Disk work runs outside inference and
+  history locks; concurrent historical scans are limited to two.
 - `GET /health`: `{"status": "ok"}` once the model is loaded.
 - `GET /v1/models`, `GET /v1/models/{id}`: the served model names, each with its context limit in
   `max_model_len` (as vLLM) and `context_length` (as OpenRouter): `--context`.

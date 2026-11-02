@@ -260,6 +260,12 @@ enum Command {
         /// Deletes stored contexts in --cache-dir unused for this many days.
         #[arg(long)]
         cache_max_age_days: Option<f64>,
+        /// Durable dashboard statistics directory (default: $XDG_STATE_HOME/quench6k/stats).
+        #[arg(long)]
+        stats_dir: Option<PathBuf>,
+        /// Days of minute-resolution performance history to retain.
+        #[arg(long, default_value_t = 31, value_parser = clap::value_parser!(u32).range(1..=3660))]
+        stats_retention_days: u32,
         /// Chat template file overriding the model's chat_template.jinja.
         #[arg(long)]
         chat_template: Option<PathBuf>,
@@ -632,6 +638,8 @@ fn main() -> Result<()> {
             cache_dir,
             cache_disk_gib,
             cache_max_age_days,
+            stats_dir,
+            stats_retention_days,
             chat_template,
             tool_retries,
             default_max_tokens,
@@ -656,6 +664,8 @@ fn main() -> Result<()> {
             cache_dir,
             cache_disk_gib,
             cache_max_age_days,
+            stats_dir,
+            stats_retention_days,
             chat_template,
             tool_retries,
             default_max_tokens,

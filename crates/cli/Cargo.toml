@@ -24,3 +24,5 @@ tokio-stream = "0.1"
 axum = "0.8"
 base64 = "0.22"
 regex = "1"
+
+tsink = "=0.10.2"

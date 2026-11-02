@@ -30,8 +30,12 @@ where the engine is busy.
 
 ![quench6k dashboard showing live statistics and aligned, stacked prefill and token-generation graphs](docs/images/dashboard.png)
 
-The server retains one hour of one-second samples, even without a browser open; history resets on
-restart. Alpine.js and ECharts are vendored into the binary, with no CDN or frontend build step.
+The server records one-second live samples and retains 31 days of minute history on disk using
+embedded [tsink](https://github.com/aidlx/tsink). History and cumulative request/input/output token
+totals survive restarts. Choose 5m through 31d ranges; long views show average throughput and peak
+concurrency. Usage totals cover the visible range and all recorded time. Idle slots are omitted from
+hover highlights, and chart series adapt to the configured slot count. Alpine.js and ECharts are vendored into the binary, with no CDN or frontend
+build step.
 Raw data is available at `/stats` and `/metrics` ([API details](DOCS.md#http-api)).
 
 ## Install

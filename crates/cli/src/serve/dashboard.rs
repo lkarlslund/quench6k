@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{App, Metrics, model_names};
+mod archive;
+pub(super) use archive::Archive;
+use archive::{Totals, Writer};
 
 const HISTORY_SECONDS: usize = 3600;
 const PHASES: [&str; 5] = ["idle", "prefill", "decode", "error", "unavailable"];
@@ -65,15 +68,19 @@ impl LiveSlot {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Sample {
     timestamp: u64,
+    #[serde(default)]
+    seconds: f64,
     output_tps: Vec<f64>,
     prefill_tps: Vec<f64>,
     kv_bytes: Vec<u64>,
     prefilling: usize,
     decoding: usize,
     queued: u64,
+    #[serde(default)]
+    totals: Totals,
 }
 
 #[derive(Default)]
@@ -81,6 +88,7 @@ pub(super) struct History {
     samples: VecDeque<Sample>,
     previous: Vec<(u64, u64)>,
     elapsed: f64,
+    totals: Totals,
 }
 
 impl History {
@@ -88,12 +96,14 @@ impl History {
         let dt = elapsed - self.elapsed;
         let mut sample = Sample {
             timestamp,
+            seconds: dt.max(0.0),
             output_tps: Vec::new(),
             prefill_tps: Vec::new(),
             kv_bytes: Vec::new(),
             prefilling: 0,
             decoding: 0,
             queued: metrics.queued.load(Ordering::Relaxed),
+            totals: Totals::default(),
         };
         let mut counters = Vec::with_capacity(metrics.live.len());
         for (i, slot) in metrics.live.iter().enumerate() {
@@ -120,6 +130,9 @@ impl History {
             }
             counters.push((output, prefill));
         }
+        let totals = Totals::read(metrics);
+        sample.totals = totals.difference(&self.totals);
+        self.totals = totals;
         self.previous = counters;
         self.elapsed = elapsed;
         self.samples.push_back(sample);
@@ -136,81 +149,174 @@ fn timestamp() -> u64 {
         .as_millis() as u64
 }
 
-pub(super) fn start(metrics: Arc<Metrics>) {
-    std::thread::Builder::new()
+pub(super) struct Sampler {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Sampler {
+    pub(super) fn stop(self) {
+        let _ = self.stop.send(());
+        let _ = self.thread.join();
+    }
+}
+
+pub(super) fn start(
+    metrics: Arc<Metrics>,
+    dir: Option<std::path::PathBuf>,
+    days: u32,
+) -> anyhow::Result<Sampler> {
+    let (archive, mut writer) = Writer::open(
+        match dir {
+            Some(dir) => dir,
+            None => archive::default_dir()?,
+        },
+        days,
+    )?;
+    let _ = metrics.archive.set(archive.clone());
+    let (stop, receive) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
         .name("dashboard-sampler".into())
         .spawn(move || {
             let epoch = Instant::now();
             loop {
-                // No locks are taken by the inference worker; only this thread and HTTP readers use history.
-                metrics
-                    .history
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .record(&metrics, timestamp(), epoch.elapsed().as_secs_f64());
-                std::thread::sleep(Duration::from_secs(1));
+                let elapsed = epoch.elapsed().as_secs_f64();
+                let (sample, totals, dt) = {
+                    // Inference only updates atomics; no disk I/O under the history lock.
+                    let mut history = metrics.history.lock().unwrap_or_else(|e| e.into_inner());
+                    let dt = (elapsed - history.elapsed).max(0.0);
+                    history.record(&metrics, timestamp(), elapsed);
+                    (
+                        history.samples.back().unwrap().clone(),
+                        history.totals.clone(),
+                        dt,
+                    )
+                };
+                let result = writer.record(&sample, &totals, dt);
+                archive.report(result);
+                match receive.recv_timeout(Duration::from_secs(1)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => break,
+                }
             }
-        })
-        .expect("dashboard sampler thread");
+            // Capture counters advanced since the last sample, then drain the minute and WAL.
+            let totals = Totals::read(&metrics);
+            let result = writer.finish(&totals);
+            archive.report(result);
+        })?;
+    Ok(Sampler { stop, thread })
 }
 
 #[derive(Default, Deserialize)]
 pub(super) struct Since {
     since: Option<u64>,
+    range: Option<u64>,
 }
 
 pub(super) async fn stats(State(app): State<Arc<App>>, Query(query): Query<Since>) -> Response {
     let metrics = &app.metrics;
-    let (samples, latest) = {
+    let now = timestamp();
+    let archive = metrics.archive.get().cloned();
+    let retention = archive
+        .as_ref()
+        .map_or(HISTORY_SECONDS as u64, |a| a.retention_seconds);
+    let range = query
+        .range
+        .unwrap_or(HISTORY_SECONDS as u64)
+        .clamp(60, retention);
+    let start = now.saturating_sub(range * 1000);
+    let (live, latest) = {
         let history = metrics.history.lock().unwrap_or_else(|e| e.into_inner());
-        let samples: Vec<_> = history
-            .samples
-            .iter()
-            .filter(|s| query.since.is_none_or(|since| s.timestamp > since))
-            .cloned()
-            .collect();
-        (samples, history.samples.back().cloned())
+        (
+            history
+                .samples
+                .iter()
+                .filter(|s| s.timestamp >= start)
+                .cloned()
+                .collect::<Vec<_>>(),
+            history.samples.back().cloned(),
+        )
     };
-    let slots: Vec<_> = metrics
-        .live
-        .iter()
-        .enumerate()
-        .map(|(i, slot)| {
-            let phase = slot.phase.load(Ordering::Relaxed).min(4) as usize;
-            json!({
-                "id": i, "phase": PHASES[phase],
-                "prompt_tokens": slot.prompt.load(Ordering::Relaxed),
-                "cached_tokens": slot.cached.load(Ordering::Relaxed),
-                "prefilled_tokens": slot.progress.load(Ordering::Relaxed),
-                "generated_tokens": slot.generated.load(Ordering::Relaxed),
-                "kv_bytes": metrics.kv_bytes[i].load(Ordering::Relaxed),
-                "output_tps": latest.as_ref().map_or(0.0, |s| s.output_tps[i]),
-                "prefill_tps": latest.as_ref().map_or(0.0, |s| s.prefill_tps[i]),
+    let resolution = if range <= HISTORY_SECONDS as u64 {
+        1000
+    } else {
+        ((range * 1000).div_ceil(1800 * 60000) * 60000).max(60000)
+    };
+    let mut samples = Vec::new();
+    if let Some(archive) = archive.clone() {
+        // Historical queries run off Tokio's reactor and are bounded to two concurrent scans.
+        let end = if resolution == 1000 {
+            live.first().map_or(now, |s| s.timestamp / 60000 * 60000)
+        } else {
+            now
+        };
+        let from = query
+            .since
+            .map_or(start, |s| start.max(s.saturating_add(1)));
+        if from < end {
+            let permit = match archive.queries.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "performance history queries busy",
+                    )
+                        .into_response();
+                }
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                archive.query(from, end, resolution.max(60000))
             })
+            .await;
+            match result {
+                Ok(Ok(stored)) => samples = stored,
+                other => {
+                    eprintln!("reading performance history: {other:?}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "cannot read performance history; see server logs",
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    if resolution == 1000 {
+        samples.extend(
+            live.into_iter()
+                .filter(|s| query.since.is_none_or(|since| s.timestamp > since)),
+        );
+    }
+    let slots: Vec<_> = metrics.live.iter().enumerate().map(|(i, slot)| {
+        let phase = slot.phase.load(Ordering::Relaxed).min(4) as usize;
+        json!({
+            "id": i, "phase": PHASES[phase],
+            "prompt_tokens": slot.prompt.load(Ordering::Relaxed),
+            "cached_tokens": slot.cached.load(Ordering::Relaxed),
+            "prefilled_tokens": slot.progress.load(Ordering::Relaxed),
+            "generated_tokens": slot.generated.load(Ordering::Relaxed),
+            "kv_bytes": metrics.kv_bytes[i].load(Ordering::Relaxed),
+            "output_tps": latest.as_ref().and_then(|s| s.output_tps.get(i)).copied().unwrap_or(0.0),
+            "prefill_tps": latest.as_ref().and_then(|s| s.prefill_tps.get(i)).copied().unwrap_or(0.0),
         })
-        .collect();
-    let sum = |values: &[AtomicU64]| {
-        values
-            .iter()
-            .map(|v| v.load(Ordering::Relaxed))
-            .sum::<u64>()
-    };
+    }).collect();
+    let session_totals = Totals::read(metrics);
+    let totals = archive
+        .as_ref()
+        .map_or_else(|| session_totals.clone(), |a| a.base.add(&session_totals));
     let value = json!({
         "server": {
             "name": app.name, "models": model_names(&app).collect::<Vec<_>>(),
             "started_at": app.started * 1000, "context": app.context,
-            "slots": metrics.live.len(), "history_seconds": HISTORY_SECONDS,
-            "sample_interval_ms": 1000, "kv_memory_available": !app.flint,
+            "slots": metrics.live.len(), "history_seconds": retention,
+            "sample_interval_ms": resolution, "kv_memory_available": !app.flint,
+            "stats_since": archive.as_ref().map(|a| a.since),
+            "storage_error": archive.as_ref().and_then(|a| a.error.lock().unwrap_or_else(|e| e.into_inner()).clone()),
             "kv_format": if quench6k_engine::forward::KV_FP8.load(Ordering::Relaxed) { "FP8" } else { "BF16" },
         },
-        "totals": {
-            "generations": sum(&metrics.generations),
-            "prompt_tokens": sum(&metrics.prompt_tokens), "cached_tokens": sum(&metrics.cached_tokens),
-            "generated_tokens": metrics.live.iter().map(|s| s.generated_total.load(Ordering::Relaxed)).sum::<u64>(),
-            "prefilled_tokens": metrics.live.iter().map(|s| s.prefilled_total.load(Ordering::Relaxed)).sum::<u64>(),
-            "errors": metrics.errors.load(Ordering::Relaxed),
-        },
-        "current": { "timestamp": timestamp(), "queued": metrics.queued.load(Ordering::Relaxed), "slots": slots },
+        "totals": totals, "session_totals": session_totals,
+        "current": { "timestamp": now, "queued": metrics.queued.load(Ordering::Relaxed), "slots": slots },
         "samples": samples,
     });
     ([(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()

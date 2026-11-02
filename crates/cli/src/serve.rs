@@ -40,12 +40,14 @@ pub struct ServeOptions {
     pub cache_dir: Option<PathBuf>,
     pub cache_disk_gib: f64,
     pub cache_max_age_days: Option<f64>,
+    pub stats_dir: Option<PathBuf>,
+    pub stats_retention_days: u32,
     pub chat_template: Option<PathBuf>,
     pub tool_retries: usize,
     pub default_max_tokens: usize,
     /// Whether chat requests that do not say think (false: --no-thinking).
     pub thinking: bool,
-    /// Concurrent requests decoded together (1 or 2).
+    /// Concurrent request slots.
     pub slots: usize,
     pub plan_tokens: usize,
     pub prefill_share: f64,
@@ -135,6 +137,8 @@ fn trace_record(record: impl FnOnce() -> Value) {
 struct Metrics {
     live: Vec<dashboard::LiveSlot>,
     history: Mutex<dashboard::History>,
+    archive: std::sync::OnceLock<Arc<dashboard::Archive>>,
+    requests: AtomicU64,
     generations: Vec<AtomicU64>,
     prompt_tokens: Vec<AtomicU64>,
     cached_tokens: Vec<AtomicU64>,
@@ -417,7 +421,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         );
     });
     let _ = ready_rx.recv().context("worker thread")??;
-    dashboard::start(metrics.clone());
+    let sampler = dashboard::start(metrics.clone(), opts.stats_dir, opts.stats_retention_days)?;
     // With a pack, the base name runs unsteered and the steered name applies --strength (default 1).
     let steered = steering.then(|| {
         (
@@ -495,6 +499,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         if jobs_tx.send(Work::Persist(ack_tx)).is_ok() {
             let _ = ack_rx.recv();
         }
+        sampler.stop();
         println!("stopped");
         // Exit without tearing down the GPU worker: destroying its CUDA graphs while the runtime
         // shuts down crashes, and the driver frees everything at exit anyway.
@@ -1646,6 +1651,7 @@ fn finish_reason(finish: Finish, tool_calls: bool) -> &'static str {
 }
 
 async fn chat_completions(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
+    app.metrics.requests.fetch_add(1, Ordering::Relaxed);
     let p = match prepare(&app, &req).and_then(|p| check_context(&app, &p).map(|()| p)) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -2258,6 +2264,7 @@ fn tool_use_blocks(calls: &[Value]) -> Vec<Value> {
 }
 
 async fn messages(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
+    app.metrics.requests.fetch_add(1, Ordering::Relaxed);
     let converted = from_anthropic(&req);
     let p = match prepare(&app, &converted).and_then(|p| check_context(&app, &p).map(|()| p)) {
         Ok(p) => p,
@@ -2423,6 +2430,7 @@ async fn detokenize(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Resp
 
 /// `/v1/completions`: a raw prompt (no chat template, no reasoning or tool-call parsing).
 async fn completions(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
+    app.metrics.requests.fetch_add(1, Ordering::Relaxed);
     if req
         .get("logprobs")
         .is_some_and(|v| !v.is_null() && v != &json!(false))
