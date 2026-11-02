@@ -1269,6 +1269,11 @@ impl Session {
         self.store.len()
     }
 
+    /// Advance background persistence without waiting for the disk writer.
+    pub fn poll_cache(&mut self) -> Result<()> {
+        self.store.poll()
+    }
+
     /// Writes host-tier contexts to the disk tier (persistence).
     pub fn persist(&mut self) -> Result<()> {
         for slot in 0..self.lanes.len() {
@@ -1316,7 +1321,9 @@ impl Session {
         let t2 = std::time::Instant::now();
         let pos = snap.pos;
         self.store.insert(tokens, &tag, buf)?;
-        if std::env::var_os("QUENCH6K_TIMING").is_some() {
+        if t0.elapsed() >= std::time::Duration::from_millis(100)
+            || std::env::var_os("QUENCH6K_TIMING").is_some()
+        {
             eprintln!(
                 "stash slot {slot}, {pos} tokens, {} MiB: alloc {:.3}s copy {:.3}s insert {:.3}s",
                 total >> 20,
@@ -1340,7 +1347,9 @@ impl Session {
             _ => DeviceBuffer::new(rec)?,
         };
         lane.snapshots.clear();
+        let t1 = std::time::Instant::now();
         let (tokens, data) = self.store.get(i)?;
+        let t2 = std::time::Instant::now();
         let kv = lane.kv_pieces(tokens.len());
         unsafe {
             s.copy_h2d(snap_buf.addr(), data.as_ptr(), rec)?;
@@ -1351,11 +1360,19 @@ impl Session {
             }
         }
         s.synchronize()?;
-        if std::env::var_os("QUENCH6K_TIMING").is_some() {
+        let t3 = std::time::Instant::now();
+        // get() protects its returned allocation until the GPU has consumed it.
+        self.store.trim_host()?;
+        if t0.elapsed() >= std::time::Duration::from_millis(100)
+            || std::env::var_os("QUENCH6K_TIMING").is_some()
+        {
             eprintln!(
-                "load {} tokens from the store into slot {slot}: {:.3}s",
+                "load {} tokens from the store into slot {slot}: setup {:.3}s host {:.3}s copy {:.3}s trim {:.3}s",
                 tokens.len(),
-                t0.elapsed().as_secs_f64()
+                (t1 - t0).as_secs_f64(),
+                (t2 - t1).as_secs_f64(),
+                (t3 - t2).as_secs_f64(),
+                t3.elapsed().as_secs_f64()
             );
         }
         lane.snapshots.push(Snapshot {

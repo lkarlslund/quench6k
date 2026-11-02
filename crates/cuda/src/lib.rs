@@ -1300,6 +1300,9 @@ pub struct PinnedBuffer {
 }
 
 unsafe impl Send for PinnedBuffer {}
+// Shared access only exposes immutable slices. Mutation requires &mut self or an unsafe raw-pointer
+// operation whose caller must enforce CUDA transfer lifetimes, just as for DeviceBuffer.
+unsafe impl Sync for PinnedBuffer {}
 
 impl PinnedBuffer {
     pub fn new(bytes: usize) -> Result<Self> {

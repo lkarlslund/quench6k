@@ -187,11 +187,19 @@ the text before it is kept. While a tool call is being generated, streaming clie
   (saved to the host tier first, so the next request of that conversation loads it from there).
 - When a request would overwrite a different conversation, that conversation's state is moved to
   pinned host memory (`--cache-host-gib`) and, with `--cache-dir`, to disk.
+- Host entries are persisted eagerly by a bounded background disk writer. Pending writes share their
+  host-tier buffers and count toward the host budget. If the writer cannot keep up, eviction applies
+  backpressure rather than growing an unbounded queue. Shutdown drains pending writes. Disk restores
+  also enforce the host budget; their transfer buffer is protected until the GPU has consumed it.
 - The disk tier keeps within `--cache-disk-gib` and `--cache-max-age-days` by deleting the least
   recently used contexts first (a file's modification time is its last use; reusing a context renews
   it). Files written for another model configuration count toward the limit and go first.
 - Stored contexts are keyed by their tokens (images by content) and are valid only for the model
   configuration (checkpoint, KV format) that wrote them.
+
+Cache operations taking at least 100 ms log allocation, transfer, disk-read/write or writer-wait
+timings. `QUENCH6K_TIMING=1` also logs shorter operations. Pinned-memory allocation and cache restores
+still run synchronously; background disk writes can overlap decoding.
 
 ## Steering and capture
 

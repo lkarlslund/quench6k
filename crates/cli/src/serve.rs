@@ -105,6 +105,31 @@ enum Msg {
     Error(String),
 }
 
+/// Keep diagnostic serialization from issuing one file write per token.
+fn write_trace_json(writer: impl std::io::Write, record: &Value) -> Result<()> {
+    use std::io::Write;
+    let mut writer = std::io::BufWriter::with_capacity(64 << 10, writer);
+    serde_json::to_writer(&mut writer, record)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn trace_record(record: impl FnOnce() -> Value) {
+    if let Some(path) = std::env::var_os("QUENCH6K_TRACE") {
+        let result = (|| -> Result<()> {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            write_trace_json(file, &record())
+        })();
+        if let Err(err) = result {
+            eprintln!("writing request trace: {err:#}");
+        }
+    }
+}
+
 /// Counters and gauges for `/metrics`, per slot where it matters.
 #[derive(Default)]
 struct Metrics {
@@ -570,20 +595,9 @@ fn schedule(
             n.saturating_sub(1) as f64 / secs.max(1e-9),
             f
         );
-        if let Some(path) = std::env::var_os("QUENCH6K_TRACE") {
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = writeln!(
-                    file,
-                    "{}",
-                    json!({"slot": a.run.slot, "finish": format!("{f:?}"), "generated": a.generated})
-                );
-            }
-        }
+        trace_record(
+            || json!({"slot": a.run.slot, "finish": format!("{f:?}"), "generated": a.generated}),
+        );
         end(session, a.run.slot, false);
         let _ = a.tx.send(Msg::Done(f, a.reused));
     };
@@ -606,14 +620,18 @@ fn schedule(
         }
     };
     loop {
+        if let Err(e) = session.poll_cache() {
+            eprintln!("background context persistence: {e:#}");
+        }
         metrics.running.store(
             (slots.iter().flatten().count() + prefilling.len()) as u64,
             Ordering::Relaxed,
         );
         if slots.iter().all(Option::is_none) && queue.is_empty() && prefilling.is_empty() {
-            match jobs.recv() {
+            match jobs.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(w) => take(w, &mut queue, session),
-                Err(_) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
         while let Ok(w) = jobs.try_recv() {
@@ -655,20 +673,7 @@ fn schedule(
             let t0 = std::time::Instant::now();
             match session.start(s, free, &job.ids, &job.params, speculate) {
                 Ok(pf) => {
-                    if let Some(path) = std::env::var_os("QUENCH6K_TRACE") {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(path)
-                        {
-                            let _ = writeln!(
-                                f,
-                                "{}",
-                                json!({"slot": free, "reused": pf.reused(), "ids": job.ids})
-                            );
-                        }
-                    }
+                    trace_record(|| json!({"slot": free, "reused": pf.reused(), "ids": job.ids}));
                     prefilling.push_back(Pending {
                         pf,
                         tx: job.tx,
@@ -2571,6 +2576,41 @@ async fn count_tokens(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trace_records_are_buffered_and_round_trip() {
+        struct Counted {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+        impl std::io::Write for Counted {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let record =
+            serde_json::json!({"slot": 2, "reused": 100, "ids": (0..100000).collect::<Vec<i32>>()});
+        let mut writer = Counted {
+            bytes: Vec::new(),
+            writes: 0,
+        };
+        super::write_trace_json(&mut writer, &record).unwrap();
+        assert!(
+            writer.writes < 32,
+            "trace output must use bulk writes, got {}",
+            writer.writes
+        );
+        assert_eq!(writer.bytes.last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&writer.bytes).unwrap(),
+            record
+        );
+    }
+
     use super::*;
 
     fn tools() -> Value {
