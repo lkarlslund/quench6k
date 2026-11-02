@@ -1,20 +1,38 @@
 # quench6k
 
-An inference engine for one model on one GPU: Qwen3.8 Flash-Next 125B-A6B in NVFP4 on an NVIDIA RTX
-PRO 6000 Blackwell (96 GB). Rust host code, hand-written CUDA kernels for `sm_120a`, weights loaded
-directly from the safetensors checkpoint ([supported checkpoints](DOCS.md#checkpoints)).
+A Rust/CUDA inference engine optimized for Qwen3.8 Flash-Next 125B-A6B in NVFP4 on a single NVIDIA
+RTX PRO 6000 Blackwell (96 GB). Rust host code, hand-written CUDA kernels for `sm_120a`, weights loaded
+directly from the safetensors checkpoint ([supported checkpoints](DOCS.md#checkpoints)). Also supports
+[Recursive Flint](#recursive-flint) 40B-A2.5B from its NVFP4 GGUF.
 
 [![Decode and prefill throughput by context length](bench/results.svg)](BENCHMARK.md)
 
 ## Features
 
-- OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) HTTP APIs: streaming, reasoning,
-  tool calls (validated and regenerated when malformed), images and video.
-- MTP speculative decoding with an adaptive draft length, for greedy and sampled requests.
-- Context up to 262,144 tokens; BF16 or FP8 KV cache.
-- Two concurrent requests.
+- OpenAI-compatible chat and text completions, and Anthropic Messages: streaming, reasoning and
+  tool calls validated against their schemas and regenerated when malformed.
+- Up to eight concurrent Qwen requests, with batched decoding, interleaved text prefill and
+  memory-aware admission. Flint serves one request at a time.
+- Adaptive MTP speculative decoding for greedy and sampled Qwen requests; optional DFlash 2 drafter.
+- Context up to 262,144 tokens per request; BF16 or FP8 KV cache.
+- Images and video for Qwen, with image content included in prefix-cache identity.
 - Context cache: snapshots on the GPU, a pinned host tier and a disk tier that survives restarts.
+- Rank-1 adapters served alongside the base model under a separate model name, sharing its weights.
 - Direction-removal steering packs with a per-request strength; activation capture.
+- [Built-in web dashboard](#dashboard), JSON statistics and per-slot Prometheus metrics.
+
+## Dashboard
+
+Open [http://localhost:8003/](http://localhost:8003/) after starting the server. Prefill and token
+generation are stacked by slot on vertically aligned plots, with linked cursors, pan, zoom and a
+shared range slider. Request activity, queue depth, prefix reuse and per-slot KV memory help show
+where the engine is busy.
+
+![quench6k dashboard showing live statistics and aligned, stacked prefill and token-generation graphs](docs/images/dashboard.png)
+
+The server retains one hour of one-second samples, even without a browser open; history resets on
+restart. Alpine.js and ECharts are vendored into the binary, with no CDN or frontend build step.
+Raw data is available at `/stats` and `/metrics` ([API details](DOCS.md#http-api)).
 
 ## Install
 
@@ -32,11 +50,14 @@ cargo build --release
 
 ```
 quench6k serve --model /path/to/Qwen3.8-Flash-Next-NVFP4 --listen 0.0.0.0:8003 \
-    --context 262144 --kv fp8 --cache-dir ~/.cache/quench6k
+    --context 262144 --slots 8 --kv fp8 --cache-dir ~/.cache/quench6k
 ```
 
 Loading takes about 30 s (72.7 GiB uploaded to the GPU). Keep the checkpoint on fast local storage:
 prefill reads per-layer embedding rows from it on demand.
+
+Slots share the available GPU memory: eight slots do not reserve eight full-size contexts. Requests
+wait when their memory plans cannot fit, and idle contexts move to the host/disk cache as needed.
 
 ```
 curl http://localhost:8003/v1/chat/completions -H 'content-type: application/json' \

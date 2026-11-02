@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Live inference performance and slot statistics for quench6k.">
+  <title>quench6k · Engine overview</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff8956'/%3E%3Cpath d='M9 10h14M9 16h10M9 22h6' stroke='%23111316' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/dashboard.css">
+  <script defer src="/assets/echarts.min.js"></script>
+  <script defer src="/assets/dashboard.js"></script>
+  <script defer src="/assets/alpine.min.js"></script>
+</head>
+<body x-data="dashboard">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="quench6k dashboard">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>quench<span class="brand-suffix">6k</span></span>
+    </a>
+    <span class="nav-label">ENGINE MONITOR</span>
+    <div class="topbar-right">
+      <span class="connection" :class="{ 'is-error': error, 'is-paused': paused }" role="status"><i></i><span x-text="connectionLabel">Connecting</span></span>
+      <a href="/metrics" class="text-link">Metrics <span aria-hidden="true">↗</span></a>
+    </div>
+  </header>
+
+  <main>
+    <section class="heading" aria-labelledby="page-title">
+      <div><p class="eyebrow">INFERENCE / TELEMETRY</p><h1 id="page-title">Engine overview<span class="heading-dot">.</span></h1>
+        <p class="model-name" x-text="server.name || 'Connecting to the engine…'"></p></div>
+      <div class="server-meta"><span class="tag" x-text="server.kv_format ? server.kv_format + ' KV' : '—'"></span><span class="tag" x-text="server.context ? compact(server.context) + ' context' : '—'"></span><span class="uptime" x-text="'Uptime ' + uptime"></span></div>
+    </section>
+
+    <div class="notice error-notice" role="alert" x-show="error" x-cloak>
+      <div><strong>Telemetry unavailable</strong><span x-text="error"></span><small x-text="lastUpdated ? 'Last update ' + clock(lastUpdated) + '. Showing retained data.' : 'Waiting for the first successful update.'"></small></div>
+      <button class="button" @click="retry()">Retry now</button>
+    </div>
+    <div class="notice" x-show="failedSlots" x-cloak><strong>Generation error reported</strong><span>See the server logs for details. Failed generations remain counted below.</span></div>
+
+    <section class="summary" aria-label="Current statistics">
+      <article class="stat"><div class="stat-label"><span class="mini-dot output-dot"></span>Generation</div><div class="stat-value"><span x-text="number(outputRate)">—</span><small>tok/s</small></div><p><span x-text="compact(totals.generated_tokens || 0)">0</span> tokens generated</p></article>
+      <article class="stat"><div class="stat-label"><span class="mini-dot prefill-dot"></span>Prefill</div><div class="stat-value"><span x-text="number(prefillRate)">—</span><small>tok/s</small></div><p><span x-text="compact(totals.prefilled_tokens || 0)">0</span> uncached tokens processed</p></article>
+      <article class="stat"><div class="stat-label">Active requests</div><div class="stat-value"><span x-text="active">—</span><small x-text="'/ ' + availableSlots + ' slots'">slots</small></div><p><span class="queue-count" :class="{ 'has-queue': queued > 0 }" x-text="queued">0</span> waiting for admission</p></article>
+      <article class="stat"><div class="stat-label">Prefix reuse</div><div class="stat-value"><span x-text="cacheRate">—</span><small>%</small></div><p>Across completed generations</p></article>
+    </section>
+
+    <section class="panel throughput-panel" aria-labelledby="throughput-title">
+      <div class="panel-heading"><div><div class="section-kicker">01 / PERFORMANCE</div><h2 id="throughput-title">Throughput</h2><p>Prefill and generation share a timeline. Each color is one slot.</p></div>
+        <div class="chart-controls"><div class="segmented" role="group" aria-label="Chart time range"><template x-for="option in ranges" :key="option.seconds"><button :class="{ selected: range === option.seconds }" :aria-pressed="range === option.seconds" @click="setRange(option.seconds)" x-text="option.label"></button></template></div><button class="button" x-show="zoomed" x-cloak @click="followLive()">↦ Live</button><button class="button pause-button" @click="togglePause()" :aria-pressed="paused" x-text="paused ? '▶ Resume' : 'Ⅱ Pause'">Ⅱ Pause</button></div>
+      </div>
+      <div class="slot-legend" role="group" aria-label="Toggle slots in throughput charts"><template x-for="slot in slots" :key="slot.id"><button :class="{ muted: hiddenSlots.includes(slot.id) }" :aria-pressed="!hiddenSlots.includes(slot.id)" @click="toggleSlot(slot.id)"><i :style="'background:' + colors[slot.id % colors.length]"></i><span x-text="'Slot ' + (slot.id + 1)"></span></button></template><span class="legend-hint">Click a slot to hide it</span></div>
+      <div class="pane-heading"><h3><span class="mini-dot prefill-dot"></span>Prefill <small>uncached input</small></h3><span><b x-text="number(prefillRate)">0</b> tok/s</span></div>
+      <div class="chart chart-throughput" x-ref="prefillChart" role="img" aria-label="Stacked prefill throughput, linked in time to the generation chart below"></div>
+      <div class="pane-heading pane-divider"><h3><span class="mini-dot output-dot"></span>Token generation <small>output</small></h3><span><b x-text="number(outputRate)">0</b> tok/s</span></div>
+      <div class="chart-wrap"><div class="chart chart-throughput chart-with-slider" x-ref="outputChart" role="img" aria-label="Stacked generation throughput, linked in time to the prefill chart above"></div><div class="empty-chart" x-show="!hasTraffic && !error"><strong>Ready for the next request</strong><span>Live throughput appears as requests run.</span></div></div>
+      <div class="timeline-help"><span>Scroll to zoom · drag to pan · linked cursor</span><span :class="{ 'inspection-label': zoomed }" x-text="zoomed ? 'Inspecting history · Live returns to now' : 'Following live activity'"></span></div>
+    </section>
+
+    <section class="panel activity-panel" aria-labelledby="requests-title"><div class="panel-heading"><div><div class="section-kicker">02 / CONCURRENCY</div><h2 id="requests-title">Request activity</h2><p>Same timeline: generating and prefilling are stacked; queued requests are dashed.</p></div><span class="unit">requests</span></div><div class="activity-legend"><span><i style="background:#65d5ab"></i>Generating</span><span><i style="background:#79adff"></i>Prefilling</span><span><i style="background:#ffc579"></i>Queued</span></div><div class="chart activity-chart" x-ref="activityChart" role="img" aria-label="Concurrent request counts, linked to the throughput timeline"></div></section>
+
+    <section class="panel slots-panel" aria-labelledby="slots-title"><div class="panel-heading"><div><div class="section-kicker">03 / SLOTS</div><h2 id="slots-title">Slot activity</h2></div><span class="unit" x-text="server.kv_memory_available === false ? 'KV memory unavailable for this model' : bytes(totalKv) + ' KV mapped'"></span></div>
+      <div class="table-scroll"><table><thead><tr><th>Slot</th><th>Status</th><th class="numeric">Output <span>tok/s</span></th><th class="numeric">Prefill <span>tok/s</span></th><th class="numeric">Prompt tokens</th><th class="numeric">Generated</th><th class="numeric">KV memory</th></tr></thead><tbody><template x-for="slot in slots" :key="slot.id"><tr><td><span class="slot-name"><i :style="'background:' + colors[slot.id % colors.length]"></i><span x-text="String(slot.id + 1).padStart(2, '0')"></span></span></td><td><span class="phase" :class="'phase-' + slot.phase"><i></i><span x-text="phaseName(slot.phase)"></span></span></td><td class="numeric" x-text="number(slot.output_tps)"></td><td class="numeric" x-text="number(slot.prefill_tps)"></td><td class="numeric"><span x-text="integer(slot.prompt_tokens)"></span><div class="prompt-detail" x-show="slot.prompt_tokens"><span x-text="slot.phase === 'prefill' ? Math.floor(100 * slot.prefilled_tokens / slot.prompt_tokens) + '% ready' : Math.round(100 * slot.cached_tokens / slot.prompt_tokens) + '% reused'"></span></div></td><td class="numeric" x-text="integer(slot.generated_tokens)"></td><td class="numeric kv-cell"><span x-text="server.kv_memory_available === false ? '—' : bytes(slot.kv_bytes)"></span><span class="kv-track" x-show="server.kv_memory_available !== false"><i :style="'width:' + (totalKv ? slot.kv_bytes / totalKv * 100 : 0) + '%;background:' + colors[slot.id % colors.length]"></i></span></td></tr></template></tbody></table></div>
+      <p class="table-note">Prompt and generated counts show the current request, or the last request while idle. KV memory includes retained contexts.</p>
+    </section>
+
+    <footer><div><span class="footer-dot"></span><span x-text="integer(totals.generations || 0) + ' completed generations'"></span><span class="footer-divider">/</span><span :class="{ 'error-text': totals.errors > 0 }" x-text="integer(totals.errors || 0) + ' failed'"></span></div><div><span x-text="paused ? 'Display paused · server history continues' : '1 s samples · 1 hour of server history'"></span><span class="footer-divider">/</span><span x-text="lastUpdated ? 'Updated ' + clock(lastUpdated) : 'Connecting…'"></span></div></footer>
+    <noscript><div class="notice">Enable JavaScript to view the dashboard. Raw statistics are available at <a href="/metrics">/metrics</a>.</div></noscript>
+  </main>
+</body>
+</html>

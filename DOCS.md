@@ -76,6 +76,16 @@ than its plan grows into free memory; only if none is left does it fail.
 
 ## HTTP API
 
+- `GET /`: embedded performance dashboard with stacked per-slot generation and uncached prefill
+  throughput, request concurrency, queue depth, prefix reuse and slot-level KV memory. Alpine.js and
+  ECharts are vendored into the binary; the browser needs no external assets. The vertically aligned
+  prefill, generation and activity plots share their cursor and pan/zoom window. Scroll or use the
+  range slider to inspect history; Live returns to the moving view.
+- `GET /stats`: dashboard JSON, including up to one hour of one-second samples held in server memory.
+  `?since=TIMESTAMP` returns only samples newer than that Unix timestamp in milliseconds. History is
+  collected even with no browser open and resets when the server restarts. Throughput uses wall-clock
+  sampling intervals and includes in-flight generations; prompt/output counts per slot describe its
+  current or most recent request. Prompt text and generated content are never included.
 - `GET /health`: `{"status": "ok"}` once the model is loaded.
 - `GET /v1/models`, `GET /v1/models/{id}`: the served model names, each with its context limit in
   `max_model_len` (as vLLM) and `context_length` (as OpenRouter): `--context`.

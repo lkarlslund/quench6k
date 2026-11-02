@@ -103,6 +103,7 @@ impl SpecDecoder {
             &[],
             |_, _, _| Ok(()),
             None,
+            None,
         )
     }
 
@@ -133,6 +134,7 @@ impl SpecDecoder {
             pauses,
             |_, _, _| Ok(()),
             progress,
+            None,
         )
     }
 
@@ -156,6 +158,7 @@ impl SpecDecoder {
         pauses: &[usize],
         mut at_pause: impl FnMut(&SequenceState, usize, u64) -> Result<()>,
         progress: Option<&(dyn Fn(usize) + Send + Sync)>,
+        observer: Option<&(dyn Fn(usize) + Send + Sync)>,
     ) -> Result<()> {
         ensure!(start < stop && stop <= prompt.len(), "nothing to prefill");
         ensure!(
@@ -199,6 +202,11 @@ impl SpecDecoder {
             let r = forward::forward(model, state, ws, s, c);
             ws.taps = None;
             r?;
+            // forward() has synchronized the target chunk. Telemetry does not need to wait for
+            // the drafter or add another synchronization to the normal prefill path.
+            if let Some(f) = observer {
+                f(end);
+            }
             if end == prompt.len() {
                 next = argmax_rows(model, &self.head, s, ws.out + ((t - 1) * D * 2) as u64, 1)?[0];
             }

@@ -5,7 +5,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -16,12 +16,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use quench6k_engine::model::Precision;
-use quench6k_engine::session::{Finish, GenParams, Progress, Session};
+use quench6k_engine::session::{Finish, GenParams, Progress, Session, prompt_key};
 use serde_json::{Value, json};
 use tokio::sync::mpsc as tmpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::chat::{Chat, TextStream};
+
+mod dashboard;
 
 pub struct ServeOptions {
     pub model: PathBuf,
@@ -72,7 +74,7 @@ pub fn model_id(model_dir: &std::path::Path) -> String {
 }
 
 enum Work {
-    Generate(Job),
+    Generate(QueuedJob),
     /// Write stored contexts to disk, then acknowledge.
     Persist(mpsc::Sender<()>),
 }
@@ -88,6 +90,12 @@ struct Job {
     capture: Option<(PathBuf, Value)>,
 }
 
+struct QueuedJob {
+    job: Job,
+    /// Pixel hashing happens once on the HTTP side, never in the decode/admission loop.
+    cache_key: Vec<i32>,
+}
+
 enum Msg {
     Token(i32),
     /// Prefill progress: (prompt tokens computed, of which served from cache).
@@ -100,6 +108,8 @@ enum Msg {
 /// Counters and gauges for `/metrics`, per slot where it matters.
 #[derive(Default)]
 struct Metrics {
+    live: Vec<dashboard::LiveSlot>,
+    history: Mutex<dashboard::History>,
     generations: Vec<AtomicU64>,
     prompt_tokens: Vec<AtomicU64>,
     cached_tokens: Vec<AtomicU64>,
@@ -118,6 +128,7 @@ impl Metrics {
     fn new(slots: usize) -> Self {
         let per = || (0..slots).map(|_| AtomicU64::new(0)).collect();
         Self {
+            live: (0..slots).map(|_| dashboard::LiveSlot::default()).collect(),
             generations: per(),
             prompt_tokens: per(),
             cached_tokens: per(),
@@ -237,6 +248,7 @@ impl Metrics {
 }
 
 struct App {
+    flint: bool,
     chat: Chat,
     metrics: Arc<Metrics>,
     jobs: mpsc::Sender<Work>,
@@ -262,6 +274,23 @@ struct App {
     vision: bool,
     image_max_pixels: usize,
     video_max_frames: usize,
+}
+
+impl App {
+    /// Count both the worker's local queue and requests still in its mailbox.
+    fn enqueue(&self, job: Job) -> std::result::Result<(), mpsc::SendError<Work>> {
+        let cache_key = if self.flint {
+            Vec::new()
+        } else {
+            prompt_key(&job.ids, &job.params.images)
+        };
+        self.metrics.queued.fetch_add(1, Ordering::Relaxed);
+        self.jobs
+            .send(Work::Generate(QueuedJob { job, cache_key }))
+            .inspect_err(|_| {
+                self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
+            })
+    }
 }
 
 pub fn run(opts: ServeOptions) -> Result<()> {
@@ -319,6 +348,10 @@ pub fn run(opts: ServeOptions) -> Result<()> {
             let strength = steer.attach(&mut model, &stream)?;
             let mut session = Session::new(&model, &stream, context, 8192, drafts, store)?;
             session.set_plan_tokens(plan_tokens);
+            let observer_metrics = metrics.clone();
+            session.set_prefill_observer(move |slot, done, cached| {
+                observer_metrics.live[slot].prefill(done, cached);
+            });
             if vision {
                 let ckpt = quench6k_engine::checkpoint::Checkpoint::open(&model_dir)?;
                 session.set_vision(quench6k_engine::vision::VisionModel::load(
@@ -346,6 +379,9 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         if let Err(e) = session.add_slots(&model, &stream, slots) {
             eprintln!("{} of {slots} slots: {e:#}", session.slots());
         }
+        for slot in &metrics.live[session.slots()..] {
+            slot.unavailable();
+        }
         schedule(
             &model,
             &stream,
@@ -356,6 +392,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         );
     });
     let _ = ready_rx.recv().context("worker thread")??;
+    dashboard::start(metrics.clone());
     // With a pack, the base name runs unsteered and the steered name applies --strength (default 1).
     let steered = steering.then(|| {
         (
@@ -381,6 +418,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         );
     }
     let app = Arc::new(App {
+        flint,
         chat,
         metrics,
         jobs: jobs_tx.clone(),
@@ -402,6 +440,9 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         video_max_frames: opts.video_max_frames,
     });
     let router = Router::new()
+        .route("/", get(dashboard::index))
+        .route("/assets/{file}", get(dashboard::asset))
+        .route("/stats", get(dashboard::stats))
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/models/{id}", get(model))
@@ -472,13 +513,18 @@ fn schedule(
         /// Seconds spent computing the prompt.
         secs: f64,
     }
+    let end = |session: &mut Session, slot: usize, failed: bool| {
+        metrics.live[slot].end(failed);
+        session.end(slot);
+    };
     // Sends tokens; Some when the run is over (Cancelled when the client went away).
-    fn emit(a: &mut Active, toks: &[i32]) -> Option<Finish> {
+    fn emit(a: &mut Active, toks: &[i32], metrics: &Metrics) -> Option<Finish> {
         for &t in toks {
             if a.tx.send(Msg::Token(t)).is_err() {
                 return Some(Finish::Cancelled);
             }
             a.generated.push(t);
+            metrics.live[a.run.slot].output();
             if let Some(f) = a.run.accept(t) {
                 return Some(f);
             }
@@ -495,7 +541,7 @@ fn schedule(
                     None => Ok(()),
                 });
             if let Err(e) = result {
-                session.end(a.run.slot);
+                end(session, a.run.slot, true);
                 let _ = a.tx.send(Msg::Error(format!("capture: {e:#}")));
                 return;
             }
@@ -538,18 +584,19 @@ fn schedule(
                 );
             }
         }
-        session.end(a.run.slot);
+        end(session, a.run.slot, false);
         let _ = a.tx.send(Msg::Done(f, a.reused));
     };
     let nslots = session.slots();
     let mut slots: Vec<Option<Active>> = (0..nslots).map(|_| None).collect();
-    let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
+    let mut queue: std::collections::VecDeque<QueuedJob> = std::collections::VecDeque::new();
     let mut waiting_for_memory = false;
     let mut prefilling: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
     // Decode time owed to the running requests for the prefill time spent (see --prefill-share).
     let mut decode_credit = 0.0f64;
-    let take = |w: Work, queue: &mut std::collections::VecDeque<Job>, session: &mut Session| match w
-    {
+    let take = |w: Work,
+                queue: &mut std::collections::VecDeque<QueuedJob>,
+                session: &mut Session| match w {
         Work::Generate(job) => queue.push_back(job),
         Work::Persist(ack) => {
             if let Err(e) = session.persist() {
@@ -559,7 +606,6 @@ fn schedule(
         }
     };
     loop {
-        metrics.queued.store(queue.len() as u64, Ordering::Relaxed);
         metrics.running.store(
             (slots.iter().flatten().count() + prefilling.len()) as u64,
             Ordering::Relaxed,
@@ -575,11 +621,13 @@ fn schedule(
         }
         // Admit queued requests into free slots: the one whose GPU cache holds the most of the prompt,
         // else the one holding the shortest context (the cheapest to stash and overwrite).
-        while let Some(job) = queue.front() {
+        while let Some(queued) = queue.front() {
+            let job = &queued.job;
             let free = (0..nslots)
                 .filter(|&i| slots[i].is_none() && !prefilling.iter().any(|p| p.pf.slot() == i))
                 .map(|i| {
-                    let (reusable, held) = session.cached_prefix(i, &job.ids, &job.params);
+                    let (reusable, held) =
+                        session.cached_prefix_key(i, &queued.cache_key, job.params.variant());
                     (reusable, std::cmp::Reverse(held), std::cmp::Reverse(i))
                 })
                 .max();
@@ -598,7 +646,9 @@ fn schedule(
                 break;
             }
             waiting_for_memory = false;
-            let job = queue.pop_front().unwrap();
+            let job = queue.pop_front().unwrap().job;
+            metrics.queued.fetch_sub(1, Ordering::Relaxed);
+            metrics.live[free].begin(job.ids.len());
             // Requests decode speculatively, together in group rounds when several are running (requests
             // with plain decoding take batched plain steps; see Session::step).
             let speculate = job.mtp;
@@ -629,10 +679,17 @@ fn schedule(
                 }
                 Err(e) => {
                     eprintln!("starting slot {free}, prompt {}: {e:#}", job.ids.len());
-                    session.end(free);
+                    end(session, free, true);
                     let _ = job.tx.send(Msg::Error(format!("{e:#}")));
                 }
             }
+        }
+        metrics.running.store(
+            (slots.iter().flatten().count() + prefilling.len()) as u64,
+            Ordering::Relaxed,
+        );
+        for (value, bytes) in metrics.kv_bytes.iter().zip(session.kv_bytes()) {
+            value.store(bytes as u64, Ordering::Relaxed);
         }
         // Prefill the oldest pending request: alone in full chunks, else in slices taking turns with
         // the running requests' steps by time (--prefill-share), so running requests keep decoding.
@@ -645,7 +702,7 @@ fn schedule(
         {
             if p.tx.is_closed() {
                 let p = prefilling.pop_front().unwrap();
-                session.end(p.pf.slot());
+                end(session, p.pf.slot(), false);
                 continue;
             }
             let t = std::time::Instant::now();
@@ -665,6 +722,7 @@ fn schedule(
                 Ok(true) => {
                     let p = prefilling.pop_front().unwrap();
                     let (slot, reused) = (p.pf.slot(), p.pf.reused());
+                    metrics.live[slot].decoding();
                     match session.finish(model, s, p.pf) {
                         Ok((run, toks)) => {
                             let mut a = Active {
@@ -677,7 +735,7 @@ fn schedule(
                                 prefill: p.secs,
                                 decode_start: std::time::Instant::now(),
                             };
-                            match emit(&mut a, &toks) {
+                            match emit(&mut a, &toks, metrics) {
                                 Some(f) => complete(a, f, session),
                                 None => slots[slot] = Some(a),
                             }
@@ -687,7 +745,7 @@ fn schedule(
                                 "finishing prefill of slot {slot}, prompt {}: {e:#}",
                                 p.prompt
                             );
-                            session.end(slot);
+                            end(session, slot, true);
                             let _ = p.tx.send(Msg::Error(format!("{e:#}")));
                         }
                     }
@@ -700,16 +758,16 @@ fn schedule(
                         p.prompt,
                         p.pf.remaining()
                     );
-                    session.end(p.pf.slot());
+                    end(session, p.pf.slot(), true);
                     let _ = p.tx.send(Msg::Error(format!("{e:#}")));
                 }
             }
             continue;
         }
-        metrics.queued.store(queue.len() as u64, Ordering::Relaxed);
-        metrics
-            .running
-            .store(slots.iter().flatten().count() as u64, Ordering::Relaxed);
+        metrics.running.store(
+            (slots.iter().flatten().count() + prefilling.len()) as u64,
+            Ordering::Relaxed,
+        );
         // Memory for each running request's next step; a request that cannot get it ends with an error.
         for slot in slots.iter_mut() {
             if let Some(a) = slot
@@ -722,7 +780,7 @@ fn schedule(
                     a.prompt,
                     a.generated.len()
                 );
-                session.end(a.run.slot);
+                end(session, a.run.slot, true);
                 let _ = a.tx.send(Msg::Error(format!("{e:#}")));
             }
         }
@@ -744,7 +802,7 @@ fn schedule(
                 let mut k = 0;
                 for slot in slots.iter_mut() {
                     if let Some(a) = slot {
-                        let done = emit(a, &toks[k]);
+                        let done = emit(a, &toks[k], metrics);
                         k += 1;
                         if let Some(f) = done {
                             complete(slot.take().unwrap(), f, session);
@@ -761,7 +819,7 @@ fn schedule(
                 eprintln!("GPU decode step failed (slot, prompt, generated) {active:?}: {e:#}");
                 for slot in slots.iter_mut() {
                     if let Some(a) = slot.take() {
-                        session.end(a.run.slot);
+                        end(session, a.run.slot, true);
                         let _ = a.tx.send(Msg::Error(format!("{e:#}")));
                     }
                 }
@@ -800,8 +858,9 @@ fn schedule_flint(
                 let _ = ack.send(());
                 continue;
             }
-            Work::Generate(job) => job,
+            Work::Generate(queued) => queued.job,
         };
+        metrics.queued.fetch_sub(1, Ordering::Relaxed);
         if job.ids.len() >= context {
             // Rejected before touching the cached sequence.
             let _ = job.tx.send(Msg::Error(format!(
@@ -810,16 +869,19 @@ fn schedule_flint(
             )));
             continue;
         }
+        metrics.live[0].begin(job.ids.len());
         let t0 = std::time::Instant::now();
         metrics.running.store(1, Ordering::Relaxed);
         let result = (|| -> Result<(Finish, usize, usize, f64, f64)> {
             let p = &job.params;
             let reused = seq.rewind(&job.ids, s)?;
+            metrics.live[0].prefill(reused, reused);
             let mut at = reused;
             while at < job.ids.len() {
                 let end = (at + fl::MAX_CHUNK).min(job.ids.len());
                 fl::forward(model, &ws, &mut seq, &job.ids[at..end], false, s)?;
                 at = end;
+                metrics.live[0].prefill(at, reused);
                 if let Some(cb) = &p.progress {
                     s.synchronize()?;
                     (cb.0)(at, reused);
@@ -827,6 +889,7 @@ fn schedule_flint(
             }
             seq.snapshot(model, s)?;
             let prefill = t0.elapsed().as_secs_f64();
+            metrics.live[0].decoding();
             let budget = p.max_tokens.min(context - job.ids.len()).max(1);
             // Speculation with prompt-lookup drafts (request field "mtp", default on): the tokens that
             // followed the latest earlier occurrence of the last few tokens are verified in one step.
@@ -839,6 +902,7 @@ fn schedule_flint(
             let emit =
                 |tok: i32, generated: &mut Vec<i32>, hist: &mut Vec<i32>| -> Option<Finish> {
                     generated.push(tok);
+                    metrics.live[0].output();
                     hist.push(tok);
                     if job.tx.send(Msg::Token(tok)).is_err() {
                         return Some(Finish::Cancelled);
@@ -920,6 +984,7 @@ fn schedule_flint(
             Ok((finish, reused, generated.len(), prefill, secs))
         })();
         metrics.running.store(0, Ordering::Relaxed);
+        metrics.live[0].end(result.is_err());
         match result {
             Ok((finish, reused, generated, prefill, decode)) => {
                 metrics.done(0, job.ids.len(), reused, generated, prefill, decode);
@@ -1833,15 +1898,14 @@ async fn generate(
                 let _ = ptx.send(Msg::Progress(done, cached));
             })));
         }
-        app.jobs
-            .send(Work::Generate(Job {
-                ids: ids.clone(),
-                params: params.clone(),
-                mtp: p.mtp,
-                tx,
-                capture: p.capture.clone(),
-            }))
-            .map_err(|_| "generation worker stopped".to_string())?;
+        app.enqueue(Job {
+            ids: ids.clone(),
+            params: params.clone(),
+            mtp: p.mtp,
+            tx,
+            capture: p.capture.clone(),
+        })
+        .map_err(|_| "generation worker stopped".to_string())?;
         let (n, finish, cached) = drive(
             app,
             &mut rx,
@@ -2436,15 +2500,14 @@ async fn generate_raw(
     mut on_text: impl FnMut(String),
 ) -> Result<(String, usize, Finish, usize, bool), String> {
     let (tx, mut rx) = tmpsc::unbounded_channel();
-    app.jobs
-        .send(Work::Generate(Job {
-            ids: p.ids.clone(),
-            params: p.params.clone(),
-            mtp: p.mtp,
-            tx,
-            capture: p.capture.clone(),
-        }))
-        .map_err(|_| "generation worker stopped".to_string())?;
+    app.enqueue(Job {
+        ids: p.ids.clone(),
+        params: p.params.clone(),
+        mtp: p.mtp,
+        tx,
+        capture: p.capture.clone(),
+    })
+    .map_err(|_| "generation worker stopped".to_string())?;
     let hold = p
         .stops
         .iter()

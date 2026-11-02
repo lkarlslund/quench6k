@@ -108,6 +108,12 @@ fn keyed(tokens: &[i32], marks: &[(usize, i32)]) -> Vec<i32> {
     v
 }
 
+/// Prepare a content-aware cache key once per request, before it reaches the GPU worker. In
+/// particular, do not hash a queued request's image pixels again on every admission attempt.
+pub fn prompt_key(tokens: &[i32], images: &[std::sync::Arc<ImageInput>]) -> Vec<i32> {
+    keyed(tokens, &image_marks(images))
+}
+
 impl std::fmt::Debug for ImageInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -183,6 +189,8 @@ pub struct Session {
     capture_buf: Option<DeviceBuffer>,
     prompt_site: Option<CaptureSite>,
     vision: Option<crate::vision::VisionModel>,
+    /// Lightweight telemetry after target prefill chunks, without extra device synchronization.
+    prefill_observer: Option<Box<dyn Fn(usize, usize, usize) + Send + Sync>>,
 }
 
 /// One slot's sequence: its state, decoder, graphs and penalty history, and its prefix cache (the
@@ -603,6 +611,7 @@ impl Session {
             capture_buf: None,
             prompt_site: None,
             vision: None,
+            prefill_observer: None,
         })
     }
 
@@ -804,6 +813,14 @@ impl Session {
         self.plan_tokens = tokens;
     }
 
+    /// Observe (slot, computed prompt positions, cached positions). The callback must not block.
+    pub fn set_prefill_observer(
+        &mut self,
+        observer: impl Fn(usize, usize, usize) + Send + Sync + 'static,
+    ) {
+        self.prefill_observer = Some(Box::new(observer));
+    }
+
     /// Positions a request's plan holds: its prompt and expected completion, plus the mapping margin.
     fn plan_positions(&self, prompt: usize, max_tokens: usize) -> usize {
         let budget = max_tokens.min(self.capacity.saturating_sub(prompt));
@@ -961,9 +978,20 @@ impl Session {
     /// and the length of the context it holds: a scheduler admits to the free slot with the most of
     /// the prompt, and otherwise overwrites the shortest context.
     pub fn cached_prefix(&self, slot: usize, prompt: &[i32], p: &GenParams) -> (usize, usize) {
+        self.cached_prefix_key(slot, &prompt_key(prompt, &p.images), p.variant())
+    }
+
+    /// As [`cached_prefix`](Self::cached_prefix), using an already prepared content-aware key.
+    /// This path never visits image pixels and is safe to repeat while a request waits for memory.
+    pub fn cached_prefix_key(
+        &self,
+        slot: usize,
+        key: &[i32],
+        variant: (f32, f32),
+    ) -> (usize, usize) {
         let lane = &self.lanes[slot];
-        let reusable = if lane.kv_variant == p.variant() {
-            lane.cached_prefix(&keyed(prompt, &image_marks(&p.images)))
+        let reusable = if lane.kv_variant == variant {
+            lane.cached_prefix(key)
         } else {
             0
         };
@@ -1454,6 +1482,9 @@ impl Session {
         if let Some(f) = progress {
             (f.0)(start, start);
         }
+        if let Some(f) = &self.prefill_observer {
+            f(slot, start, start);
+        }
         let mut pauses: Vec<usize> = boundaries
             .iter()
             .copied()
@@ -1509,6 +1540,10 @@ impl Session {
         }
         let (start, pos0) = (plan.start, plan.pos);
         let report = progress.map(|f| move |pos: usize| (f.0)(pos, start));
+        let observe = self
+            .prefill_observer
+            .as_ref()
+            .map(|f| move |pos: usize| f(slot, pos, start));
         let (pauses, periodic) = (&plan.pauses, &plan.periodic);
         // Snapshots stay out of memory the running requests' plans count on.
         let headroom = SNAPSHOT_HEADROOM + self.outstanding_bytes();
@@ -1564,6 +1599,9 @@ impl Session {
                     Ok(())
                 },
                 report.as_ref().map(|f| f as &(dyn Fn(usize) + Send + Sync)),
+                observe
+                    .as_ref()
+                    .map(|f| f as &(dyn Fn(usize) + Send + Sync)),
             )
         })?;
         self.lanes[slot].kv_tokens = plan.key[..stop].to_vec();
@@ -1797,5 +1835,34 @@ impl Rng {
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn prepared_keys_preserve_image_content_and_span_identity() {
+        let tokens = vec![10, 20, 30, 40, 50];
+        assert_eq!(prompt_key(&tokens, &[]), tokens);
+        let mut image = Arc::new(ImageInput {
+            starts: vec![1, 3],
+            input: crate::vision::VisionInput {
+                grid: [2, 2, 2],
+                pixels: vec![0.25, 0.5, 0.75],
+            },
+        });
+        let key = prompt_key(&tokens, std::slice::from_ref(&image));
+        assert_eq!((key[0], key[2], key[4]), (10, 30, 50));
+        assert!(key[1] < 0 && key[3] < 0);
+        assert_ne!(key[1], key[3], "temporal groups need distinct marks");
+        assert_eq!(key, prompt_key(&tokens, std::slice::from_ref(&image)));
+        // A prepared key owns its values; later requests with different pixels must get a new key.
+        Arc::get_mut(&mut image).unwrap().input.pixels[0] = 0.125;
+        let changed = prompt_key(&tokens, std::slice::from_ref(&image));
+        assert_ne!(key[1], changed[1]);
+        assert_ne!(key[3], changed[3]);
     }
 }
