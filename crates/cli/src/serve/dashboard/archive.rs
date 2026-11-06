@@ -112,6 +112,7 @@ pub(in super::super) struct Archive {
     db: Arc<dyn Storage>,
     _lock: std::fs::File,
     known_slots: std::sync::atomic::AtomicUsize,
+    background_errors: std::sync::atomic::AtomicU64,
     pub(super) base: Totals,
     pub since: u64,
     pub retention_seconds: u64,
@@ -180,6 +181,9 @@ impl Writer {
             .with_max_writers(1)
             .with_wal_size_limit(64 << 20)
             .with_wal_sync_mode(WalSyncMode::PerAppend)
+            // A failed flush or compaction pass is retried on the next pass; by default tsink
+            // instead refuses all later writes until it is reopened.
+            .with_background_fail_fast(false)
             .build()
             .context("open performance time-series database")?;
         let stored_slots = db
@@ -201,6 +205,7 @@ impl Writer {
             db,
             _lock: lock,
             known_slots: std::sync::atomic::AtomicUsize::new(known_slots),
+            background_errors: std::sync::atomic::AtomicU64::new(0),
             base: checkpoint.totals.clone(),
             since: checkpoint.since,
             retention_seconds,
@@ -242,6 +247,7 @@ impl Writer {
     }
 
     fn flush(&mut self) -> Result<()> {
+        self.archive.log_background_errors();
         if let Some(bucket) = &self.checkpoint.pending {
             self.archive.write(&bucket.sample())?;
         }
@@ -284,6 +290,22 @@ impl Archive {
                 *error = Some(message);
             }
             Ok(()) => *error = None,
+        }
+    }
+
+    /// tsink reports its flush and compaction failures only through `tracing`, which we don't
+    /// subscribe to.
+    fn log_background_errors(&self) {
+        let health = self.db.observability_snapshot().health;
+        let seen = self
+            .background_errors
+            .swap(health.background_errors_total, Ordering::Relaxed);
+        if health.background_errors_total > seen {
+            eprintln!(
+                "performance history storage: {} background errors, last: {}",
+                health.background_errors_total - seen,
+                health.last_background_error.as_deref().unwrap_or("?")
+            );
         }
     }
 
