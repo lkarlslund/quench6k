@@ -101,9 +101,10 @@
       <div class="body">
         <div class="form-row">
           <label>Atlas <select x-model="query.atlas"><template x-for="a in ready" :key="a.name"><option :value="a.name" x-text="a.name"></option></template></select></label>
-          <label>Baseline <select x-model="query.base"><option value="">none</option><template x-for="a in ready" :key="a.name"><option :value="a.name" x-text="a.name"></option></template></select></label>
+          <label>Baseline <select x-model="query.base" @change="baseChosen = true"><option value="">none</option><template x-for="a in ready" :key="a.name"><option :value="a.name" x-text="a.name"></option></template></select></label>
           <div class="segmented" role="group" aria-label="Rank by"><button :class="{ selected: query.by === 'mean' }" @click="query.by = 'mean'">Mean</button><button :class="{ selected: query.by === 'peak' }" @click="query.by = 'peak'">Peak</button></div>
           <label>Layer <input x-model="query.layer" size="3" placeholder="all"></label>
+          <label><input type="checkbox" x-model="query.shared"> Shared experts</label>
           <button class="button primary" :disabled="loading" @click="loadNeurons()">Neurons</button>
           <button class="button" :disabled="loading" @click="loadExperts()">Experts</button>
         </div>
@@ -112,7 +113,7 @@
 
     <template x-if="result && result.neurons">
       <section class="panel">
-        <div class="panel-heading"><div><div class="section-kicker">NEURONS</div><h2 x-text="result.atlas + (result.base ? ' vs ' + result.base : '') + ' · by ' + result.by"></h2><p>Each neuron's strongest activation in the corpus, highlighted in context; below it, what the neuron's output pushes the next token toward (logit lens).</p></div></div>
+        <div class="panel-heading"><div><div class="section-kicker">NEURONS</div><h2 x-text="result.atlas + (result.base ? ' vs ' + result.base : '') + ' · by ' + result.by"></h2><p>Each neuron's strongest activation in the corpus, highlighted in context; below it, what the neuron writes toward at that activation (logit lens of its output).</p><p class="note" x-show="!result.base" style="color:#ffc579">Without a baseline this lists neurons that fire strongly on any text. Build an atlas of ordinary text and pick it as the baseline to see what is specific to this corpus.</p></div></div>
         <div class="body"><div class="table-scroll"><table class="dense">
           <thead><tr><th>Neuron</th><th class="numeric">Score</th><th class="numeric">Mean</th><th class="numeric" x-show="result.base">Baseline</th><th class="numeric">Peak</th><th>Strongest example · pushes</th><th></th></tr></thead>
           <tbody><template x-for="n in result.neurons" :key="nname(n)"><tr>
@@ -121,7 +122,7 @@
             <td class="numeric" x-text="n.mean.toFixed(4)"></td>
             <td class="numeric" x-show="result.base" x-text="n.base_mean === undefined ? '' : n.base_mean.toFixed(4) + (n.base_peak == null ? '' : ' / ' + n.base_peak.toFixed(2))"></td>
             <td class="numeric" x-text="n.peak ? n.peak.value.toFixed(2) : '—'"></td>
-            <td><div class="snippet" x-html="snippet(n)"></div><div class="pushes" x-show="lens[nname(n)]" x-html="pushes(lens[nname(n)])"></div></td>
+            <td><div class="snippet" x-html="snippet(n)"></div><div class="pushes" x-show="lens[nname(n)]" x-html="pushes(lens[nname(n)], n.peak)"></div></td>
             <td style="white-space:nowrap"><button class="mini" @click="toInspector(n, 0)" title="Add 'off' to the inspector's edits">off</button> <button class="mini" @click="toInspector(n, 1, 10 * Math.sign(n.peak ? n.peak.value : 1))" title="Add a push to the inspector's edits">push</button></td>
           </tr></template></tbody>
         </table></div></div>

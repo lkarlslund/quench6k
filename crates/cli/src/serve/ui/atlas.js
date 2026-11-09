@@ -8,7 +8,8 @@ document.addEventListener('alpine:init', () => {
     return {
       models: [], model: '', atlases: [], atlasDir: false, error: '', added: '',
       name: '', source: 'topic', topic: '', samples: 16, maxTokens: 512, upload: null, file: '', creating: false,
-      query: { atlas: '', base: '', by: 'mean', layer: '' }, result: null, loading: false, lens: {},
+      baseChosen: false,
+      query: { atlas: '', base: '', by: 'mean', layer: '', shared: false }, result: null, loading: false, lens: {},
       get ready() { return this.atlases.filter(a => a.phase === 'ready'); },
       async init() {
         try {
@@ -24,6 +25,8 @@ document.addEventListener('alpine:init', () => {
           this.atlases = data.data;
           this.atlasDir = data.atlas_dir;
           if (!this.ready.some(a => a.name === this.query.atlas)) this.query.atlas = this.ready[0]?.name || '';
+          // A baseline by default: another ready atlas.
+          if (!this.query.base && !this.baseChosen) this.query.base = this.ready.find(a => a.name !== this.query.atlas)?.name || '';
         } catch (e) { /* the next poll retries */ }
       },
       async call(method, path, body) {
@@ -58,6 +61,7 @@ document.addEventListener('alpine:init', () => {
         const p = new URLSearchParams({ by: this.query.by, limit: '60' });
         if (this.query.base) p.set('base', this.query.base);
         if (this.query.layer !== '') p.set('layer', this.query.layer);
+        if (this.query.shared) p.set('shared', 'true');
         return p;
       },
       async loadNeurons() {
@@ -92,9 +96,12 @@ document.addEventListener('alpine:init', () => {
           return i === n.peak.at ? '<b>' + t + '</b>' : t;
         }).join('');
       },
-      pushes(p) {
+      // The neuron's effect at its peak: a negative activation writes the lens reversed.
+      pushes(p, peak) {
+        const flip = peak && peak.value < 0;
+        const [up, down] = flip ? [p.down, p.up] : [p.up, p.down];
         const tok = (t, cls) => '<span class="tok ' + cls + '" title="' + t.value.toFixed(2) + '">' + escape(this.text(t.id).replace(/ /g, '␣').replace(/\n/g, '↵') || '∅') + '</span>';
-        return '<span class="label">up</span>' + p.up.map(t => tok(t, 'up')).join('') + '<span class="label" style="margin-left:6px">down</span>' + p.down.map(t => tok(t, 'down')).join('');
+        return '<span class="label">' + (flip ? 'at its (negative) peak: up' : 'up') + '</span>' + up.map(t => tok(t, 'up')).join('') + '<span class="label" style="margin-left:6px">down</span>' + down.map(t => tok(t, 'down')).join('');
       },
       // Edits go to the inspector through local storage (it reads them when it loads).
       sendEdit(spec, label) {

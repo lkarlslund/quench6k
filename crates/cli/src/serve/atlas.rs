@@ -432,6 +432,9 @@ pub(super) struct RankQuery {
     by: Option<String>,
     limit: Option<usize>,
     layer: Option<usize>,
+    /// Include the shared experts' neurons (they fire on every token, so they top an unbaselined
+    /// ranking by mean).
+    shared: Option<bool>,
 }
 
 fn name_of((layer, expert, unit): NeuronId) -> Value {
@@ -491,6 +494,7 @@ pub(super) async fn neurons(
     };
     let mut scored: Vec<(f32, NeuronId)> = Stats::neurons()
         .filter(|id| q.layer.is_none_or(|l| l == id.0))
+        .filter(|id| id.1.is_some() || q.shared == Some(true))
         .map(|id| {
             let v = value(stats, n, id) - base_stats.map_or(0.0, |(b, bn)| value(b, bn, id));
             (v, id)
