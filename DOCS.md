@@ -48,7 +48,7 @@ to rewrite a file uncompressed on btrfs, create the copy with `chattr +m` set be
 | `--default-max-tokens N` | 65536 | Completion limit when a request sets none |
 | `--tool-retries N` | 2 | Regenerations of a malformed tool call |
 | `--no-thinking` | | Chat requests do not think unless they set `enable_thinking` or `reasoning_effort` |
-| `--cache-host-gib N` | 16 | Pinned host memory for stored contexts |
+| `--cache-host-gib N` | 16 | Host memory for stored contexts waiting to be written to disk (without `--cache-dir`: for all stored contexts) |
 | `--cache-dir DIR` | | Disk tier for stored contexts, kept across restarts |
 | `--cache-disk-gib N` | 200 | Most disk space for the disk tier (0: no limit) |
 | `--cache-max-age-days N` | | Deletes stored contexts unused for N days |
@@ -199,13 +199,16 @@ the text before it is kept. While a tool call is being generated, streaming clie
   shortest conversation, so conversations running side by side each keep their own slot.
 - When device memory runs out, it is taken from the slots without a running request, least recently
   used first: memory past what a slot holds, then periodic snapshots, then a slot's whole conversation
-  (saved to the host tier first, so the next request of that conversation loads it from there).
-- When a request would overwrite a different conversation, that conversation's state is moved to
-  pinned host memory (`--cache-host-gib`) and, with `--cache-dir`, to disk.
-- Host entries are persisted eagerly by a bounded background disk writer. Pending writes share their
-  host-tier buffers and count toward the host budget. If the writer cannot keep up, eviction applies
-  backpressure rather than growing an unbounded queue. Shutdown drains pending writes. Disk restores
-  also enforce the host budget; their transfer buffer is protected until the GPU has consumed it.
+  (stored first, so the next request of that conversation loads it from the store).
+- When a request would overwrite a different conversation, that conversation's state is stored: copied
+  to host memory and, with `--cache-dir`, written to disk by a bounded background writer, after which
+  the process frees its copy. Loading a stored context maps its file, so recently used contexts stay in
+  the kernel's page cache, which the system manages and reclaims under memory pressure; the process
+  pins no host memory for them. Contexts waiting to be written count toward `--cache-host-gib`; if the
+  writer cannot keep up, storing waits for it rather than growing an unbounded queue. Shutdown drains
+  pending writes. Without `--cache-dir`, stored contexts stay in host memory up to `--cache-host-gib`.
+- Keep `--cache-dir` on a filesystem without transparent compression (as for the PLE table, above):
+  every load of a context not in the page cache would decompress it.
 - The disk tier keeps within `--cache-disk-gib` and `--cache-max-age-days` by deleting the least
   recently used contexts first (a file's modification time is its last use; reusing a context renews
   it). Files written for another model configuration count toward the limit and go first.

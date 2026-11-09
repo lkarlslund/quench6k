@@ -1,7 +1,9 @@
 //! Stored contexts for prefix reuse beyond the GPU-resident conversation: each entry is the complete
 //! sequence state at a prompt position (recurrent state, position table and attention caches up to
-//! it) keyed by its tokens. Entries live in pinned host memory up to a byte budget and are persisted
-//! eagerly by a bounded background writer; disk entries survive restarts and are indexed at startup. The
+//! it) keyed by its tokens. New entries are persisted eagerly by a bounded background writer and leave
+//! host memory once written: reads map the file, so the kernel's page cache holds recently used
+//! contexts and gives the memory back under pressure. Without a disk tier entries stay in host memory
+//! up to a byte budget. Disk entries survive restarts and are indexed at startup. The
 //! disk tier is kept within a size and an age limit by deleting the least recently used files; a file's
 //! modification time is its entry's last use, so the order survives restarts. Entries of a model
 //! variant (a steering strength, an adapter) carry its tag and only match prompts of that variant.
@@ -12,11 +14,10 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, ensure};
-use quench6k_cuda::PinnedBuffer;
 
 #[derive(Clone, Debug, Default)]
 pub struct StoreOptions {
-    /// Pinned host memory for stored contexts (0: no host tier).
+    /// Host memory for entries not yet written to disk; without `dir`, for all entries (0: none).
     pub host_bytes: usize,
     /// Directory for the disk tier and persistence (None: no disk tier).
     pub dir: Option<PathBuf>,
@@ -34,8 +35,8 @@ struct Entry {
     /// The model variant the state was computed with ("" for the base model).
     variant: String,
     bytes: usize,
-    /// The data in pinned memory, and its file in the disk tier; at least one of them.
-    host: Option<Arc<PinnedBuffer>>,
+    /// The data in host memory (until written, with a disk tier), and its file; at least one of them.
+    host: Option<Arc<Vec<u8>>>,
     pending: bool,
     disk_evicted: bool,
     write_error: Option<String>,
@@ -149,6 +150,21 @@ fn slow_io(start: Instant) -> bool {
 
 const MAGIC: &[u8; 8] = b"SQCTX01\0";
 
+/// A stored context's data: its host copy or its mapped file.
+pub enum ContextData {
+    Host(Arc<Vec<u8>>),
+    File { map: memmap2::Mmap, offset: usize },
+}
+
+impl ContextData {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Host(data) => data,
+            Self::File { map, offset } => &map[*offset..],
+        }
+    }
+}
+
 impl ContextStore {
     pub fn open(opts: StoreOptions) -> Result<Self> {
         let mut entries = Vec::new();
@@ -241,12 +257,12 @@ impl ContextStore {
 
     /// Adds an immutable host entry and starts eager background persistence. The writer shares this
     /// allocation; queued/in-flight bytes still count against the host budget until writing finishes.
-    pub fn insert(&mut self, tokens: Vec<i32>, variant: &str, data: PinnedBuffer) -> Result<()> {
+    pub fn insert(&mut self, tokens: Vec<i32>, variant: &str, data: Vec<u8>) -> Result<()> {
         self.poll_io(false)?;
         let bytes = data.len();
         // Make room before committing the new allocation. A failed spill must not leave another
         // entry behind on every subsequent insertion attempt.
-        self.evict_to(self.opts.host_bytes.saturating_sub(bytes), None)?;
+        self.evict_to(self.opts.host_bytes.saturating_sub(bytes))?;
         let id = self.next_id;
         self.next_id += 1;
         self.entries.push(Entry {
@@ -261,7 +277,7 @@ impl ContextStore {
             disk_evicted: false,
             write_error: None,
         });
-        let result = self.schedule_write().and_then(|()| self.evict(None));
+        let result = self.schedule_write().and_then(|()| self.evict());
         if result.is_err() {
             if let Some(i) = self.entries.iter().position(|e| e.id == id && !e.pending) {
                 self.entries.remove(i);
@@ -270,23 +286,19 @@ impl ContextStore {
         result
     }
 
-    /// Returns an entry by its stable ID. Loading a disk entry also trims other host entries, so
-    /// repeatedly reading disk contexts cannot silently grow the pinned tier past its budget.
-    pub fn get(&mut self, id: usize) -> Result<(Vec<i32>, &PinnedBuffer)> {
+    /// Returns an entry by its stable ID: its host copy, or else its file mapped (read through the page
+    /// cache, so loading uses no memory of the process's own).
+    pub fn get(&mut self, id: usize) -> Result<(Vec<i32>, ContextData)> {
         self.poll_io(false)?;
         let i = self.index(id)?;
         self.entries[i].used = SystemTime::now();
         self.entries[i].disk_evicted = false;
-        let loaded = self.entries[i].host.is_none();
-        if self.entries[i].host.is_none() {
-            let e = &self.entries[i];
-            let path = e
-                .file
-                .as_ref()
-                .context("context has neither host data nor a disk file")?;
-            let data = read_data(path, e.bytes)?;
-            self.entries[i].host = Some(Arc::new(data));
-        }
+        let e = &self.entries[i];
+        let data = match (&e.host, &e.file) {
+            (Some(host), _) => ContextData::Host(host.clone()),
+            (None, Some(path)) => map_data(path, e.bytes)?,
+            (None, None) => anyhow::bail!("context has neither host data nor a disk file"),
+        };
         if let Some(path) = &self.entries[i].file {
             if let Err(err) = std::fs::File::options()
                 .write(true)
@@ -296,15 +308,7 @@ impl ContextStore {
                 eprintln!("marking context file {} as used: {err}", path.display());
             }
         }
-        if let Err(err) = self.evict(Some(id)) {
-            if loaded {
-                let i = self.index(id)?;
-                self.entries[i].host = None;
-            }
-            return Err(err);
-        }
-        let e = &self.entries[self.index(id)?];
-        Ok((e.tokens.clone(), e.host.as_deref().unwrap()))
+        Ok((self.entries[i].tokens.clone(), data))
     }
 
     fn index(&self, id: usize) -> Result<usize> {
@@ -320,11 +324,6 @@ impl ContextStore {
         self.schedule_write()?;
         self.trim_disk();
         Ok(())
-    }
-
-    /// Release a get() call's protected entry after its host-to-device transfer has synchronized.
-    pub fn trim_host(&mut self) -> Result<()> {
-        self.evict(None)
     }
 
     fn poll_io(&mut self, wait: bool) -> Result<()> {
@@ -350,6 +349,8 @@ impl ContextStore {
                         );
                     }
                     e.file = Some(result.path);
+                    // Reads map the file from now on.
+                    e.host = None;
                 }
                 Err(err) => {
                     let message = format!("persisting context {}: {err:#}", result.path.display());
@@ -462,19 +463,19 @@ impl ContextStore {
             + self.foreign.iter().map(|f| f.1).sum::<usize>()
     }
 
-    /// Keep pinned memory bounded. Pending writes retain their host allocation; if disk cannot keep
+    /// Keep host memory bounded. Pending writes retain their host allocation; if disk cannot keep
     /// up, explicit backpressure waits for completion rather than growing an unbounded queue.
-    fn evict(&mut self, protect: Option<usize>) -> Result<()> {
-        self.evict_to(self.opts.host_bytes, protect)
+    fn evict(&mut self) -> Result<()> {
+        self.evict_to(self.opts.host_bytes)
     }
 
-    fn evict_to(&mut self, budget: usize, protect: Option<usize>) -> Result<()> {
+    fn evict_to(&mut self, budget: usize) -> Result<()> {
         while self.host_bytes() > budget {
             self.poll_io(false)?;
             let Some(id) = self
                 .entries
                 .iter()
-                .filter(|e| e.host.is_some() && Some(e.id) != protect)
+                .filter(|e| e.host.is_some())
                 .min_by_key(|e| e.used)
                 .map(|e| e.id)
             else {
@@ -662,40 +663,35 @@ fn read_header(path: &Path) -> Result<(String, Vec<i32>, usize)> {
     ))
 }
 
-fn read_data(path: &Path, bytes: usize) -> Result<PinnedBuffer> {
+/// Maps a context file; its data starts after the header and token IDs.
+fn map_data(path: &Path, bytes: usize) -> Result<ContextData> {
     let mut f = std::fs::File::open(path)?;
-    let mut magic = [0u8; 8];
-    f.read_exact(&mut magic)?;
-    let mut len = [0u8; 8];
-    f.read_exact(&mut len)?;
-    let mut header = vec![0u8; u64::from_le_bytes(len) as usize];
+    let mut head = [0u8; 16];
+    f.read_exact(&mut head)?;
+    ensure!(&head[..8] == MAGIC, "not a quench6k context file");
+    let len = u64::from_le_bytes(head[8..].try_into().unwrap()) as usize;
+    let mut header = vec![0u8; len];
     f.read_exact(&mut header)?;
     let h: serde_json::Value = serde_json::from_slice(&header)?;
     let n = h["tokens"].as_u64().context("tokens")? as usize;
-    std::io::copy(&mut (&mut f).take((n * 4) as u64), &mut std::io::sink())?;
-    let start = Instant::now();
-    let mut buf = PinnedBuffer::new(bytes)?;
-    let read_start = Instant::now();
-    f.read_exact(buf.as_mut_slice())?;
-    if slow_io(start) {
-        eprintln!(
-            "cache disk read: {} MiB, alloc {:.3}s read {:.3}s",
-            bytes >> 20,
-            (read_start - start).as_secs_f64(),
-            read_start.elapsed().as_secs_f64()
-        );
-    }
-    Ok(buf)
+    let offset = 16 + len + 4 * n;
+    // Safety: context files are written once (to a temporary name, then renamed) and never modified.
+    let map = unsafe { memmap2::Mmap::map(&f)? };
+    ensure!(
+        map.len() == offset + bytes,
+        "context file {} is truncated",
+        path.display()
+    );
+    let _ = map.advise(memmap2::Advice::Sequential);
+    Ok(ContextData::File { map, offset })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn data(bytes: usize, fill: u8) -> PinnedBuffer {
-        let mut b = PinnedBuffer::new(bytes).unwrap();
-        b.as_mut_slice().fill(fill);
-        b
+    fn data(bytes: usize, fill: u8) -> Vec<u8> {
+        vec![fill; bytes]
     }
 
     fn files(dir: &Path) -> Vec<PathBuf> {
@@ -717,7 +713,6 @@ mod tests {
             .unwrap();
     }
 
-    // Needs the CUDA driver (pinned host memory).
     #[test]
     fn disk_tier_limits() {
         let dir = std::env::temp_dir().join(format!("quench6k-store-test-{}", std::process::id()));
@@ -884,49 +879,41 @@ mod tests {
     }
 
     #[test]
-    fn repeated_disk_reads_enforce_host_budget() {
-        let (mut store, dir) = test_store("read-budget-cache", 0, 0);
+    fn written_entries_leave_host_memory() {
+        let (mut store, dir) = test_store("written-cache", 4000, 0);
         for value in 1..=3 {
             store
                 .insert(vec![value], "", data(1000, value as u8))
                 .unwrap();
         }
+        store.persist().unwrap();
         assert_eq!(store.host_bytes(), 0);
-        store.opts.host_bytes = 1000;
         for value in [1, 2, 3, 1] {
             let id = store.best(&[value, 9], "").unwrap().0;
-            assert_eq!(store.get(id).unwrap().1.as_slice()[0], value as u8);
-            assert_eq!(store.host_bytes(), 1000);
+            let (_, d) = store.get(id).unwrap();
+            assert!(matches!(d, ContextData::File { .. }));
+            assert_eq!(d.as_slice(), &data(1000, value as u8)[..]);
+            assert_eq!(store.host_bytes(), 0);
         }
-        store.opts.host_bytes = 0;
-        store.trim_host().unwrap();
-        assert_eq!(store.host_bytes(), 0);
-        let id = store.best(&[1, 9], "").unwrap().0;
-        assert_eq!(store.get(id).unwrap().1.as_slice()[0], 1);
-        store.trim_host().unwrap();
-        assert_eq!(store.host_bytes(), 0);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn disk_eviction_does_not_rewrite_cold_host_entries() {
+    fn disk_budget_deletes_least_recently_used() {
         let (mut store, dir) = test_store("disk-budget-cache", 4000, 1500);
         for value in 1..=3 {
             store
                 .insert(vec![value], "", data(1000, value as u8))
                 .unwrap();
+            store.persist().unwrap();
         }
-        store.persist().unwrap();
         assert!(store.disk_bytes() <= 1500);
-        assert_eq!(store.entries.iter().filter(|e| e.disk_evicted).count(), 2);
+        assert_eq!(store.len(), 1);
         store.poll().unwrap();
         assert!(!store.writer.as_ref().unwrap().busy);
-        // A host hit makes an entry hot again and eligible for disk persistence.
-        let id = store.best(&[1, 9], "").unwrap().0;
-        assert_eq!(store.get(id).unwrap().1.as_slice()[0], 1);
-        store.persist().unwrap();
-        assert!(store.entries[store.index(id).unwrap()].file.is_some());
+        let id = store.best(&[3, 9], "").unwrap().0;
+        assert_eq!(store.get(id).unwrap().1.as_slice()[0], 3);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -983,7 +970,6 @@ mod tests {
         assert_ne!(file_name(&[1, 2], ""), file_name(&[1, 2], "adapter=1"));
     }
 
-    // Needs the CUDA driver (pinned host memory).
     #[test]
     fn variants_are_separate() {
         let dir = std::env::temp_dir().join(format!(

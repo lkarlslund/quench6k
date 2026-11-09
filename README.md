@@ -16,7 +16,7 @@ directly from the safetensors checkpoint ([supported checkpoints](DOCS.md#checkp
 - Adaptive MTP speculative decoding for greedy and sampled Qwen requests; optional DFlash 2 drafter.
 - Context up to 262,144 tokens per request; BF16 or FP8 KV cache.
 - Images and video for Qwen, with image content included in prefix-cache identity.
-- Context cache: snapshots on the GPU, a pinned host tier and a disk tier that survives restarts.
+- Context cache: snapshots on the GPU and a disk tier that survives restarts, read through the page cache.
 - Rank-1 adapters served alongside the base model under a separate model name, sharing its weights.
 - Direction-removal steering packs with a per-request strength; activation capture.
 - [Built-in web dashboard](#dashboard), JSON statistics and per-slot Prometheus metrics.

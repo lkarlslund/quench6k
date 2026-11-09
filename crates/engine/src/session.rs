@@ -1306,14 +1306,15 @@ impl Session {
         let kv = lane.kv_pieces(snap.pos);
         let total = rec + kv.iter().map(|p| p.1).sum::<usize>();
         let t0 = std::time::Instant::now();
-        let buf = quench6k_cuda::PinnedBuffer::new(total)?;
+        // Pageable: the store writes it to disk and frees it (a PCIe Gen3 x4 link is the bound anyway).
+        let mut buf = vec![0u8; total];
         let t1 = std::time::Instant::now();
         let s = Stream::new()?;
         unsafe {
-            s.copy_d2h(buf.as_ptr(), snap.buf.addr(), rec)?;
+            s.copy_d2h(buf.as_mut_ptr(), snap.buf.addr(), rec)?;
             let mut off = rec;
             for (addr, bytes) in kv {
-                s.copy_d2h(buf.as_ptr().add(off), addr, bytes)?;
+                s.copy_d2h(buf.as_mut_ptr().add(off), addr, bytes)?;
                 off += bytes;
             }
         }
@@ -1351,6 +1352,7 @@ impl Session {
         let (tokens, data) = self.store.get(i)?;
         let t2 = std::time::Instant::now();
         let kv = lane.kv_pieces(tokens.len());
+        let data = data.as_slice();
         unsafe {
             s.copy_h2d(snap_buf.addr(), data.as_ptr(), rec)?;
             let mut off = rec;
@@ -1361,18 +1363,15 @@ impl Session {
         }
         s.synchronize()?;
         let t3 = std::time::Instant::now();
-        // get() protects its returned allocation until the GPU has consumed it.
-        self.store.trim_host()?;
         if t0.elapsed() >= std::time::Duration::from_millis(100)
             || std::env::var_os("QUENCH6K_TIMING").is_some()
         {
             eprintln!(
-                "load {} tokens from the store into slot {slot}: setup {:.3}s host {:.3}s copy {:.3}s trim {:.3}s",
+                "load {} tokens from the store into slot {slot}: setup {:.3}s host {:.3}s copy {:.3}s",
                 tokens.len(),
                 (t1 - t0).as_secs_f64(),
                 (t2 - t1).as_secs_f64(),
-                (t3 - t2).as_secs_f64(),
-                t3.elapsed().as_secs_f64()
+                (t3 - t2).as_secs_f64()
             );
         }
         lane.snapshots.push(Snapshot {
