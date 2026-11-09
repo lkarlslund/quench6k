@@ -547,6 +547,16 @@ pub mod ffi {
             yd: *mut f32,
             stream: Stream,
         ) -> Error;
+        pub fn quench6k_nvfp4_column_dots(
+            dw: *const u64,
+            ds: *const u64,
+            d2: *const f32,
+            experts: *const i32,
+            pairs: c_int,
+            r: *const f32,
+            out: *mut f32,
+            stream: Stream,
+        ) -> Error;
         pub fn quench6k_quantize_nvfp4(
             w: *const c_void,
             count: c_int,

@@ -975,7 +975,10 @@ pub struct CaptureTarget {
 /// Per-layer record of an activation capture (byte offsets): the pre-mix lane state (F32 [4, 2560],
 /// before the attention-input HyperConnection), the mixed block input (BF16 [2560]), the attention or
 /// GDN block output (F32 [2560]), the MoE output (F32 [2560]), the router logits (F32 [512]) and the
-/// routed experts (I32 [10]) with their weights (F32 [10]).
+/// routed experts (I32 [10]) with their weights (F32 [10]). Then, for inspection: the injection
+/// weights of the block and MoE outputs (F32 [4] each) and, in single-token steps only, each routed
+/// expert's output (F32 [10, 2560], before its routing weight) and activations (BF16 [10, 640]), and
+/// the shared expert's gate and up projections and gate logit (F32 [640], [640], [1]).
 pub struct CaptureLayout;
 
 impl CaptureLayout {
@@ -986,7 +989,12 @@ impl CaptureLayout {
     pub const ROUTER: usize = Self::MOE + D * 4;
     pub const TOP_I: usize = Self::ROUTER + EXPERTS * 4;
     pub const TOP_W: usize = Self::TOP_I + TOP_K * 4;
-    pub const BYTES: usize = Self::TOP_W + TOP_K * 4;
+    pub const INJ_ATTN: usize = Self::TOP_W + TOP_K * 4;
+    pub const INJ_MLP: usize = Self::INJ_ATTN + S * 4;
+    pub const YD: usize = Self::INJ_MLP + S * 4;
+    pub const ACT: usize = Self::YD + TOP_K * D * 4;
+    pub const SHARED: usize = Self::ACT + TOP_K * EXPERT_WIDTH * 2;
+    pub const BYTES: usize = Self::SHARED + (2 * EXPERT_WIDTH + 1) * 4;
 }
 
 /// Byte offsets inside the step block: [start: i32 | pad][tokens: i32 x max][pos3: i32 x 3 x max][PLE rows: BF16 x D x max].
@@ -1900,6 +1908,18 @@ fn final_mixer(
     }
 }
 
+/// The final mixer's gate pre-activations (F32 [4, 2560]) for the residual in row 0 of `ws.h` (after a
+/// step): the mixer output is the mean over streams of sigmoid(u) x (1 + norm) times the stream's RMS
+/// factor. Recomputed with the batch kernels (the decoding kernel keeps them on chip).
+pub fn final_gates(model: &Model, ws: &Workspace, s: &Stream) -> Result<Vec<f32>> {
+    let hc = &model.final_hc;
+    k::grouped_rmsnorm(s, ws.h, 0, ws.n, 1)?;
+    project(s, ws, ws.n, &hc.down, ws.proj, 1)?;
+    k::hc_act(s, ws.proj, hc.down.n, ws.low_bf, 0, 1)?;
+    linear(s, ws, ws.low_bf, &hc.up, ws.up, 1)?;
+    s.download(ws.up, H)
+}
+
 /// One decoder layer (SPEC §3) over the step's tokens, with the layer's own GDN or QSA state.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
@@ -2129,6 +2149,11 @@ fn layer_forward(
             buf + CaptureLayout::MIX as u64,
             ws.m + (row * D * 2) as u64,
             D * 2,
+        )?;
+        s.copy_d2d(
+            buf + CaptureLayout::INJ_ATTN as u64,
+            carry.inj + (row * S * 4) as u64,
+            S * 4,
         )?;
     }
     match &layer.block {
@@ -2628,6 +2653,13 @@ fn finish_layer(
             prof.as_deref_mut(),
         )?;
     }
+    if let Some((buf, row)) = rec {
+        s.copy_d2d(
+            buf + CaptureLayout::INJ_MLP as u64,
+            carry.inj + (row * S * 4) as u64,
+            S * 4,
+        )?;
+    }
     let moe = &layer.moe;
     let (ld, x) = (moe.proj.n, ws.proj);
     let col = |j: usize| x + (moe.proj.col(j) * 4) as u64;
@@ -3030,6 +3062,19 @@ fn finish_layer(
             ws.top_w + (row * TOP_K * 4) as u64,
             TOP_K * 4,
         )?;
+        if t == 1 {
+            // Single-token steps keep the routed outputs and activations in routing-slot order.
+            s.copy_d2d(buf + CaptureLayout::YD as u64, ws.yd, TOP_K * D * 4)?;
+            s.copy_d2d(
+                buf + CaptureLayout::ACT as u64,
+                ws.act,
+                TOP_K * EXPERT_WIDTH * 2,
+            )?;
+            for (j, n) in [(1, EXPERT_WIDTH), (2, EXPERT_WIDTH), (3, 1)] {
+                let at = [0, 0, EXPERT_WIDTH, 2 * EXPERT_WIDTH][j];
+                s.copy_d2d(buf + (CaptureLayout::SHARED + at * 4) as u64, col(j), n * 4)?;
+            }
+        }
     }
     // The block output is added to the residual by whatever reads it next (the next HyperConnection
     // fuses it with its norm).
@@ -3450,6 +3495,10 @@ pub struct HeadWorkspace {
 
 impl HeadWorkspace {
     /// Device address of the logits ([rows, VOCAB] F32).
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
     pub fn logits_addr(&self) -> u64 {
         self.logits.addr()
     }

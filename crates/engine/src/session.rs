@@ -682,6 +682,50 @@ impl Session {
         }))
     }
 
+    /// Inspects the next-token prediction after `prompt` on idle `slot`: prefills all but the last
+    /// token (reusing cached prefixes), runs the last one as a single-token step with activation
+    /// capture, and splits the logit of `target` (default: the most likely token) into its parts.
+    pub fn inspect(
+        &mut self,
+        model: &Model,
+        s: &Stream,
+        slot: usize,
+        prompt: &[i32],
+        p: &GenParams,
+        target: Option<i32>,
+    ) -> Result<crate::inspect::Report> {
+        ensure!(
+            prompt.len() >= 2,
+            "inspection needs at least two prompt tokens"
+        );
+        let mut p = p.clone();
+        p.capture = false;
+        p.max_tokens = 1;
+        p.temperature = 0.0;
+        let raw = (|| {
+            let (last, head) = prompt.split_last().unwrap();
+            self.begin(model, s, slot, head, &p, false)?;
+            let buf = self.capture_buf()?;
+            let lane = &mut self.lanes[slot];
+            let pos = lane.state.len();
+            self.ws.capture = Some(forward::CaptureTarget { pos, buf });
+            let r = forward::forward(model, &mut lane.state, &mut self.ws, s, &[*last]);
+            self.ws.capture = None;
+            r?;
+            lane.sync_kv_tokens();
+            forward::head_logits(model, &self.hw, s, self.ws.out)?;
+            Ok::<_, anyhow::Error>(crate::inspect::Raw {
+                records: s.download(buf, crate::model::LAYERS * CAPTURE_LAYER_BYTES)?,
+                h: s.download(self.ws.h, crate::model::H)?,
+                u: forward::final_gates(model, &self.ws, s)?,
+                out: s.download(self.ws.out, crate::model::D)?,
+                logits: s.download(self.hw.logits_addr(), VOCAB)?,
+            })
+        })();
+        self.end(slot);
+        crate::inspect::analyze(model, s, &self.hw_batch, &raw?, target)
+    }
+
     /// Adds slots up to `slots` (at most [`MAX_SLOTS`]), each with speculative decoding and a prefix
     /// cache of its own. Concurrent requests decode in group rounds (speculative) or batched steps
     /// (plain). Attention-cache memory is mapped as the slots' contexts grow; when the device is full,

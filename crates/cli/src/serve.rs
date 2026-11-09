@@ -79,10 +79,29 @@ pub fn model_id(model_dir: &std::path::Path) -> String {
 
 enum Work {
     Generate(QueuedJob),
+    /// Logit attribution of the next-token prediction after a prompt.
+    Inspect(InspectJob),
     /// Write stored contexts to disk, then acknowledge.
     Persist(mpsc::Sender<()>),
     /// Unload the model once no request is running or queued, then acknowledge.
     Unload(mpsc::Sender<()>),
+}
+
+/// Answers work that cannot run (the model failed to load).
+fn fail_work(w: Work, metrics: &Metrics, msg: &str) {
+    match w {
+        Work::Generate(queued) => {
+            metrics.queued.fetch_sub(1, Ordering::Relaxed);
+            metrics.errors.fetch_add(1, Ordering::Relaxed);
+            let _ = queued.job.tx.send(Msg::Error(msg.to_string()));
+        }
+        Work::Inspect(job) => {
+            let _ = job.tx.send(Err(msg.to_string()));
+        }
+        Work::Persist(ack) | Work::Unload(ack) => {
+            let _ = ack.send(());
+        }
+    }
 }
 
 /// Why a GPU worker's scheduler returned.
@@ -107,6 +126,13 @@ struct Job {
     tx: tmpsc::UnboundedSender<Msg>,
     /// Activation capture: the output file and metadata to embed.
     capture: Option<(PathBuf, Value)>,
+}
+
+struct InspectJob {
+    ids: Vec<i32>,
+    params: GenParams,
+    target: Option<i32>,
+    tx: tokio::sync::oneshot::Sender<std::result::Result<quench6k_engine::inspect::Report, String>>,
 }
 
 struct QueuedJob {
@@ -405,7 +431,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         // The first load reports to startup (a failure ends the server); later loads are started by a
         // request that found the model unloaded and report failures to the requests waiting.
         let mut ready = Some(ready_tx);
-        let mut waiting: Vec<QueuedJob> = Vec::new();
+        let mut waiting: Vec<Work> = Vec::new();
         loop {
             metrics.model_state.store(MODEL_LOADING, Ordering::Relaxed);
             let t0 = std::time::Instant::now();
@@ -517,21 +543,16 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                         return;
                     }
                     eprintln!("loading the model: {e:#}");
-                    for queued in waiting.drain(..) {
-                        metrics.queued.fetch_sub(1, Ordering::Relaxed);
-                        metrics.errors.fetch_add(1, Ordering::Relaxed);
-                        let _ = queued
-                            .job
-                            .tx
-                            .send(Msg::Error(format!("loading the model: {e:#}")));
+                    for w in waiting.drain(..) {
+                        fail_work(w, &metrics, &format!("loading the model: {e:#}"));
                     }
                 }
             }
             // Unloaded: the next request loads the model again.
             loop {
                 match jobs_rx.recv() {
-                    Ok(Work::Generate(job)) => {
-                        waiting.push(job);
+                    Ok(w @ (Work::Generate(_) | Work::Inspect(_))) => {
+                        waiting.push(w);
                         break;
                     }
                     Ok(Work::Persist(ack) | Work::Unload(ack)) => {
@@ -603,6 +624,8 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/completions", post(completions))
         .route("/tokenize", post(tokenize))
+        .route("/inspect", get(dashboard::inspect_page))
+        .route("/v1/inspect", post(inspect))
         .route("/detokenize", post(detokenize))
         .route("/metrics", get(metrics_text))
         // axum's default of 2 MB is less than a long conversation with tool output or an image or video data URL.
@@ -644,7 +667,7 @@ fn schedule(
     jobs: &mpsc::Receiver<Work>,
     metrics: &Metrics,
     prefill_share: f64,
-    waiting: Vec<QueuedJob>,
+    waiting: Vec<Work>,
     unload_idle: Option<std::time::Duration>,
 ) -> Exit {
     use quench6k_engine::session::Run;
@@ -733,7 +756,7 @@ fn schedule(
     };
     let nslots = session.slots();
     let mut slots: Vec<Option<Active>> = (0..nslots).map(|_| None).collect();
-    let mut queue: std::collections::VecDeque<QueuedJob> = waiting.into();
+    let mut queue: std::collections::VecDeque<QueuedJob> = std::collections::VecDeque::new();
     // Unload requests wait until nothing runs or is queued.
     let mut unload: Vec<mpsc::Sender<()>> = Vec::new();
     let mut idle_since = std::time::Instant::now();
@@ -741,11 +764,14 @@ fn schedule(
     let mut prefilling: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
     // Decode time owed to the running requests for the prefill time spent (see --prefill-share).
     let mut decode_credit = 0.0f64;
+    let mut inspects: std::collections::VecDeque<InspectJob> = std::collections::VecDeque::new();
     let take = |w: Work,
                 queue: &mut std::collections::VecDeque<QueuedJob>,
                 unload: &mut Vec<mpsc::Sender<()>>,
+                inspects: &mut std::collections::VecDeque<InspectJob>,
                 session: &mut Session| match w {
         Work::Generate(job) => queue.push_back(job),
+        Work::Inspect(job) => inspects.push_back(job),
         Work::Persist(ack) => {
             if let Err(e) = session.persist() {
                 eprintln!("persisting contexts: {e:#}");
@@ -754,6 +780,10 @@ fn schedule(
         }
         Work::Unload(ack) => unload.push(ack),
     };
+    // Requests that arrived while the model was unloaded.
+    for w in waiting {
+        take(w, &mut queue, &mut unload, &mut inspects, session);
+    }
     loop {
         if let Err(e) = session.poll_cache() {
             eprintln!("background context persistence: {e:#}");
@@ -762,7 +792,11 @@ fn schedule(
             (slots.iter().flatten().count() + prefilling.len()) as u64,
             Ordering::Relaxed,
         );
-        if slots.iter().all(Option::is_none) && queue.is_empty() && prefilling.is_empty() {
+        if slots.iter().all(Option::is_none)
+            && queue.is_empty()
+            && prefilling.is_empty()
+            && inspects.is_empty()
+        {
             if !unload.is_empty() || unload_idle.is_some_and(|d| idle_since.elapsed() >= d) {
                 // Keep the slots' contexts: the reloaded model starts from the store.
                 if let Err(e) = session.persist() {
@@ -771,13 +805,42 @@ fn schedule(
                 return Exit::Unload(unload);
             }
             match jobs.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(w) => take(w, &mut queue, &mut unload, session),
+                Ok(w) => take(w, &mut queue, &mut unload, &mut inspects, session),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Exit::Closed,
             }
         }
         while let Ok(w) = jobs.try_recv() {
-            take(w, &mut queue, &mut unload, session);
+            take(w, &mut queue, &mut unload, &mut inspects, session);
+        }
+        // Inspections run whole between steps on a free slot (the one holding most of the prompt).
+        while let Some(job) = inspects.front() {
+            let key = quench6k_engine::session::prompt_key(&job.ids, &[]);
+            let free = (0..nslots)
+                .filter(|&i| slots[i].is_none() && !prefilling.iter().any(|p| p.pf.slot() == i))
+                .map(|i| {
+                    let (reusable, held) = session.cached_prefix_key(i, &key, job.params.variant());
+                    (reusable, std::cmp::Reverse(held), std::cmp::Reverse(i))
+                })
+                .max();
+            let Some((_, _, std::cmp::Reverse(slot))) = free else {
+                break;
+            };
+            if !session.admits(slot, job.ids.len(), 1) {
+                break;
+            }
+            let job = inspects.pop_front().unwrap();
+            let t0 = std::time::Instant::now();
+            let r = session
+                .inspect(model, s, slot, &job.ids, &job.params, job.target)
+                .map_err(|e| format!("{e:#}"));
+            eprintln!(
+                "inspect: slot {slot}, prompt {} in {:.2}s{}",
+                job.ids.len(),
+                t0.elapsed().as_secs_f64(),
+                r.as_ref().err().map_or(String::new(), |e| format!(": {e}"))
+            );
+            let _ = job.tx.send(r);
         }
         idle_since = std::time::Instant::now();
         // Admit queued requests into free slots: the one whose GPU cache holds the most of the prompt,
@@ -984,7 +1047,7 @@ fn schedule_flint(
     context: usize,
     jobs: &mpsc::Receiver<Work>,
     metrics: &Metrics,
-    waiting: Vec<QueuedJob>,
+    waiting: Vec<Work>,
     unload_idle: Option<std::time::Duration>,
 ) -> Exit {
     use quench6k_engine::flint as fl;
@@ -1000,9 +1063,8 @@ fn schedule_flint(
         Err(e) => {
             // Unload; the next request tries again.
             eprintln!("flint worker: {e:#}");
-            for queued in waiting {
-                metrics.queued.fetch_sub(1, Ordering::Relaxed);
-                let _ = queued.job.tx.send(Msg::Error(format!("{e:#}")));
+            for w in waiting {
+                fail_work(w, metrics, &format!("{e:#}"));
             }
             return Exit::Unload(Vec::new());
         }
@@ -1010,7 +1072,7 @@ fn schedule_flint(
     let mut waiting = waiting.into_iter();
     loop {
         let w = match (waiting.next(), unload_idle) {
-            (Some(queued), _) => Work::Generate(queued),
+            (Some(w), _) => w,
             (None, Some(idle)) => match jobs.recv_timeout(idle) {
                 Ok(w) => w,
                 Err(mpsc::RecvTimeoutError::Timeout) => return Exit::Unload(Vec::new()),
@@ -1028,6 +1090,12 @@ fn schedule_flint(
             }
             Work::Unload(ack) => return Exit::Unload(vec![ack]),
             Work::Generate(queued) => queued.job,
+            Work::Inspect(job) => {
+                let _ = job
+                    .tx
+                    .send(Err("inspection is not supported for this model".into()));
+                continue;
+            }
         };
         metrics.queued.fetch_sub(1, Ordering::Relaxed);
         if job.ids.len() >= context {
@@ -2588,6 +2656,94 @@ async fn tokenize(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
     }
 }
 
+/// `/v1/inspect`: splits the logit of the next token after a prompt ("messages", rendered with the
+/// generation prompt, or a raw "prompt") into the parts of the model that wrote it. "target" is the
+/// token to explain (an id or text; default: the most likely next token); "model" picks the variant.
+async fn inspect(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
+    if app.flint {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "inspection is not supported for this model",
+        )
+        .into_response();
+    }
+    let p = if req.get("messages").is_some() {
+        prepare(&app, &req)
+    } else {
+        raw_ids(&app, req.get("prompt"))
+            .and_then(|ids| prepare_ids(&app, &req, ids, Vec::new(), false, None))
+    };
+    let p = match p.and_then(|p| check_context(&app, &p).map(|()| p)) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    if !p.params.images.is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "inspection of image prompts is not supported",
+        )
+        .into_response();
+    }
+    let target = match req.get("target") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => n.as_i64().map(|v| v as i32),
+        Some(Value::String(t)) if !t.is_empty() => match app.chat.encode(t) {
+            Ok(ids) if !ids.is_empty() => Some(ids[0]),
+            _ => {
+                return error(StatusCode::BAD_REQUEST, "target must encode to a token")
+                    .into_response();
+            }
+        },
+        _ => {
+            return error(StatusCode::BAD_REQUEST, "target must be a token id or text")
+                .into_response();
+        }
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let job = InspectJob {
+        ids: p.ids.clone(),
+        params: p.params.clone(),
+        target,
+        tx,
+    };
+    if app.jobs.send(Work::Inspect(job)).is_err() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "worker stopped").into_response();
+    }
+    let report = match rx.await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "worker stopped").into_response(),
+    };
+    // Texts of every token the report names, and of the prompt's end (the inspected token last).
+    let mut named: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+    named.insert(report.target);
+    named.extend(report.top.iter().map(|t| t.id));
+    for l in &report.layers {
+        let pushes = [&l.mixer_pushes, &l.moe_pushes]
+            .into_iter()
+            .chain(l.experts.iter().map(|e| &e.pushes))
+            .flatten();
+        for ps in pushes {
+            named.extend(ps.up.iter().chain(&ps.down).map(|t| t.id));
+        }
+    }
+    let context = &p.ids[p.ids.len().saturating_sub(48)..];
+    named.extend(context.iter().copied());
+    let text = |id: i32| app.chat.decode(&[id], false).unwrap_or_default();
+    let tokens: serde_json::Map<String, Value> = named
+        .iter()
+        .map(|&id| (id.to_string(), json!(text(id))))
+        .collect();
+    Json(json!({
+        "model": p.model,
+        "prompt_tokens": p.ids.len(),
+        "context": context,
+        "tokens": tokens,
+        "report": report,
+    }))
+    .into_response()
+}
+
 /// `/detokenize`: the text of `tokens` (special tokens included), as vLLM's `prompt` and llama.cpp's
 /// `content`.
 async fn detokenize(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
@@ -3014,7 +3170,7 @@ fn write_capture(
             "F32",
             L::TOP_W,
             vec![10],
-            L::BYTES - L::TOP_W,
+            L::INJ_ATTN - L::TOP_W,
         ),
     ];
     let mut header = serde_json::Map::new();

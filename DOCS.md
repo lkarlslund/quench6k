@@ -245,6 +245,26 @@ A capture request writes `<name>.safetensors` to `--capture-dir`: per-layer acti
 log-probabilities at the last prompt token and at the last generated token, with the request as JSON
 metadata. Capture requests use plain decoding.
 
+## Inspection
+
+`/inspect` is a page for asking why the model predicts a token; `POST /v1/inspect` is its API. It
+takes `messages` (rendered with the generation prompt) or a raw `prompt`, an optional `target` (a token
+id or text; default: the most likely next token) and `model` (the variant). The answer splits the
+target's logit at the prompt's last token into what wrote it: the embedding, the PLE injection, each
+layer's mixer (gated DeltaNet or attention) and MoE output, each routed expert and the shared expert,
+and every expert neuron (an intermediate unit: activation times routing weight times its
+down-projection column). The residual is a plain sum of these parts, each written into the four streams
+with its injection weights, and the final mixer is linear in the residual once its gates and the
+streams' RMS factors are held at the values this prompt gave, so the split is exact; the report shows
+the checks (the residual rebuilt from its parts, the neurons' share of their experts). These are direct
+effects: what a part changes through later layers is credited to those layers. For the largest parts
+it also lists the tokens their outputs push up and down, and for each layer the experts the router
+ranked next.
+
+An inspection runs between steps on a free slot: the prompt is prefilled (cached prefixes reused, so
+asking about another target of the same prompt is quick), then its last token runs as a single-token
+step with activation capture. Image prompts are not supported.
+
 ## Environment variables
 
 | Variable | |

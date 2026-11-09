@@ -1641,6 +1641,33 @@ pub fn moe_experts_t1(
     )
 }
 
+/// Per-neuron readouts of routed experts: `out[p, j] = scale2[e] * down_e[:, j] . r[p]` for expert
+/// `e = experts[p]` (`down`: the (codes, scales, weight_scale_2) tables; `r`: F32 [pairs, 2560]; `out`:
+/// F32 [pairs, 640]).
+pub fn nvfp4_column_dots(
+    s: &Stream,
+    down: (u64, u64, u64),
+    experts: u64,
+    pairs: usize,
+    r: u64,
+    out: u64,
+) -> Result<()> {
+    let t = |a: u64| a as *const u64;
+    launch!(
+        "nvfp4_column_dots",
+        ffi::quench6k_nvfp4_column_dots(
+            t(down.0),
+            t(down.1),
+            f(down.2),
+            i(experts),
+            n32(pairs),
+            f(r),
+            fm(out),
+            s.raw()
+        )
+    )
+}
+
 /// NVFP4-quantizes `count` consecutive BF16 matrices of `n` x `k` (checkpoint layout: codes, FP8 block
 /// scales per 16, FP32 global scale per matrix). `amax` is scratch for `count` u32.
 #[allow(clippy::too_many_arguments)]
