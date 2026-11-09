@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="/assets/dashboard.css">
   <style>
     .form { display: grid; gap: 12px; }
-    .form textarea { width: 100%; min-height: 140px; resize: vertical; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .form textarea { width: 100%; min-height: 64px; resize: vertical; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .form-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
     .form-row label { display: flex; gap: 8px; align-items: center; color: var(--muted); }
     .form-row input, .form-row select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; }
@@ -46,6 +46,28 @@
     .neg-text { color: #ff6b6b; }
     .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+    /* Dense tables: many rows of small numbers. */
+    main { gap: 12px; }
+    .panel { margin-bottom: 12px; }
+    .panel-heading { padding: 14px 16px 10px; }
+    .panel-heading p { margin: 4px 0 0; font-size: 12px; }
+    .panel > .form, .panel > .context, .panel > .predictions, .panel > .checks, .panel > h4 { margin-left: 16px; margin-right: 16px; }
+    .panel > .form { margin: 16px; }
+    .panel > .checks { margin-bottom: 16px; }
+    .heading { padding-bottom: 8px; }
+    table.dense { width: auto; }
+    table.dense th { padding: 5px 12px; }
+    table.dense td { height: auto; padding: 2px 12px; font-size: 12px; line-height: 1.35; }
+    table.dense td.numeric { font-variant-numeric: tabular-nums; }
+    .bar { width: 180px; min-width: 0; height: 10px; }
+    .bar i { top: 1px; bottom: 1px; }
+    .detail td { padding: 8px 12px 12px; }
+    .detail table.dense td { padding: 1px 8px; }
+    .pushes { gap: 2px; }
+    .pushes .tok { font-size: 11px; padding: 0 3px; }
+    .checks div { padding: 6px 10px; }
+    .checks b { font-size: 15px; margin-top: 2px; }
+    .predictions button { padding: 2px 6px; }
   </style>
   <script defer src="/assets/inspect.js"></script>
   <script defer src="/assets/alpine.min.js"></script>
@@ -101,7 +123,7 @@
 
         <section class="panel">
           <div class="panel-heading"><div><div class="section-kicker">02 / LAYERS</div><h2>Where the logit comes from</h2><p>Each layer's mixer (gated DeltaNet or attention) and MoE output. Click a row for its experts and what it pushes toward.</p></div></div>
-          <div class="table-scroll"><table>
+          <div class="table-scroll"><table class="dense">
             <thead><tr><th>Part</th><th class="numeric">Mixer</th><th></th><th class="numeric">MoE</th><th></th><th class="numeric">Shared expert</th></tr></thead>
             <tbody>
               <tr><td>Embedding</td><td class="numeric" :class="sign(r.embedding)" x-text="fixed(r.embedding)"></td><td><div class="bar" x-html="bar(r.embedding)"></div></td><td colspan="3"></td></tr>
@@ -119,7 +141,7 @@
                     <div class="grid2">
                       <div>
                         <h4>Routed experts</h4>
-                        <table><thead><tr><th>Expert</th><th class="numeric">Weight</th><th class="numeric">Contribution</th><th></th></tr></thead><tbody>
+                        <table class="dense"><thead><tr><th>Expert</th><th class="numeric">Weight</th><th class="numeric">Contribution</th><th></th></tr></thead><tbody>
                           <template x-for="e in l.experts" :key="e.expert"><tr><td class="mono" x-text="'E' + e.expert"></td><td class="numeric" x-text="pct(Math.log(e.weight))"></td><td class="numeric" :class="sign(e.contribution)" x-text="fixed(e.contribution)"></td><td><div class="pushes" x-show="e.pushes" x-html="pushes(e.pushes)"></div></td></tr></template>
                         </tbody></table>
                         <p class="table-note" x-text="'Next in line: ' + l.runners_up.map(e => 'E' + e.id + ' (' + (100 * e.value).toFixed(1) + '%)').join(', ')"></p>
@@ -141,7 +163,7 @@
 
         <section class="panel">
           <div class="panel-heading"><div><div class="section-kicker">03 / NEURONS</div><h2>Neurons that matter most</h2><p>An expert's intermediate unit: its activation times its routing weight times its down-projection column, read out to the target logit.</p></div></div>
-          <div class="table-scroll"><table>
+          <div class="table-scroll"><table class="dense">
             <thead><tr><th>Neuron</th><th class="numeric">Activation</th><th class="numeric">Contribution</th><th></th></tr></thead>
             <tbody><template x-for="n in r.neurons.slice(0, 60)" :key="neuronName(n)"><tr><td class="mono" x-text="neuronName(n)"></td><td class="numeric" x-text="n.activation.toFixed(3)"></td><td class="numeric" :class="sign(n.contribution)" x-text="fixed(n.contribution)"></td><td><div class="bar" x-html="bar(n.contribution, neuronScale)"></div></td></tr></template></tbody>
           </table></div>
