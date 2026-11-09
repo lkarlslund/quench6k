@@ -68,6 +68,13 @@
     .checks div { padding: 6px 10px; }
     .checks b { font-size: 15px; margin-top: 2px; }
     .predictions button { padding: 2px 6px; }
+    .mini { font-size: 11px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--muted); }
+    .mini:hover { color: var(--text); border-color: var(--accent); }
+    .edits { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .edit-chip { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--accent); border-radius: 6px; padding: 2px 4px 2px 8px; }
+    .edit-chip button { border: 0; background: none; color: var(--muted); }
+    .continuation { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin: 0; font-size: 12px; max-height: 360px; overflow: auto; }
+    h4.sub { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 500; }
   </style>
   <script defer src="/assets/inspect.js"></script>
   <script defer src="/assets/alpine.min.js"></script>
@@ -100,9 +107,36 @@
           <label>Model <select x-model="model"><template x-for="m in models" :key="m"><option :value="m" x-text="m"></option></template></select></label>
           <label>Target <input x-model="target" placeholder="most likely token" size="16"></label>
           <button class="button primary" :disabled="busy" @click="run()" x-text="busy ? 'Inspecting…' : 'Inspect'"></button>
+          <button class="button" :disabled="comparing" @click="generate()" x-text="comparing ? 'Generating…' : (edits.length ? 'Compare outputs' : 'Generate')"></button>
+          <label>Tokens <input x-model="tokens" size="4"></label>
         </div>
       </div>
     </section>
+
+    <section class="panel">
+      <div class="panel-heading"><div><div class="section-kicker">EDITS</div><h2>Model edits</h2><p>Applied to inspections and comparisons. Add them from the neuron and expert rows below, or here: an expert number (or "shared") with a unit edits a neuron (activation × scale + add); without a unit it bans the expert.</p></div></div>
+      <div class="form" style="margin:10px 16px 14px">
+        <div class="edits" x-show="edits.length"><template x-for="(e, i) in edits" :key="e.label"><span class="edit-chip"><span class="mono" x-text="e.label"></span><button @click="edits.splice(i, 1)" aria-label="Remove edit">×</button></span></template><button class="button" @click="edits = []">Clear all</button></div>
+        <div class="form-row">
+          <label>Layer <input x-model="manual.layer" size="3"></label>
+          <label>Expert <input x-model="manual.expert" size="6" placeholder="or shared"></label>
+          <label>Unit <input x-model="manual.unit" size="4" placeholder="none: ban"></label>
+          <label>Scale <input x-model="manual.scale" size="4"></label>
+          <label>Add <input x-model="manual.add" size="4"></label>
+          <button class="button" @click="addManual()">Add edit</button>
+        </div>
+      </div>
+    </section>
+
+    <template x-if="compare">
+      <section class="panel">
+        <div class="panel-heading"><div><div class="section-kicker">COMPARE</div><h2>Greedy continuation</h2></div></div>
+        <div class="grid2" style="margin:10px 16px 16px">
+          <div><h4 class="sub">Unedited</h4><pre class="continuation" x-text="compare.base"></pre></div>
+          <div x-show="compare.edited !== null"><h4 class="sub">With edits</h4><pre class="continuation" x-text="compare.edited"></pre></div>
+        </div>
+      </section>
+    </template>
 
     <div class="notice error-notice" role="alert" x-show="error" x-cloak><div><strong>Inspection failed</strong><span x-text="error"></span></div></div>
 
@@ -112,9 +146,9 @@
           <div class="panel-heading"><div><div class="section-kicker">01 / PREDICTION</div><h2>Next token</h2><p>The prompt's end; the highlighted token is the one whose output is analysed. Click a prediction to explain it instead.</p></div><span class="unit" x-text="result.prompt_tokens + ' prompt tokens · ' + result.model"></span></div>
           <div class="context"><template x-for="(id, i) in result.context" :key="i"><span class="tok" :class="{ last: i === result.context.length - 1 }" x-text="show(id)"></span></template><span class="arrow">→</span><span class="tok last" x-text="show(r.target)"></span></div>
           <h4 style="margin:16px 0 8px;color:var(--muted);font-weight:500">Most likely next tokens</h4>
-          <div class="predictions"><template x-for="p in r.top" :key="p.id"><button :class="{ selected: p.id === r.target }" @click="target = String(p.id); run()"><span class="tok" x-text="show(p.id)"></span><small x-text="pct(p.value)"></small></button></template></div>
+          <div class="predictions"><template x-for="p in r.top" :key="p.id"><button :class="{ selected: p.id === r.target }" @click="target = String(p.id); run()"><span class="tok" x-text="show(p.id)"></span><small x-text="pct(p.value) + delta(p)"></small></button></template></div>
           <div class="checks">
-            <div><span>Target logit</span><b x-text="fixed(r.logit)"></b><span x-text="'p = ' + pct(r.logprob)"></span></div>
+            <div><span>Target logit</span><b x-text="fixed(r.logit)"></b><span x-text="'p = ' + pct(r.logprob) + (baseTop ? ' (unedited ' + pct(baseTop.target) + ')' : '')"></span></div>
             <div><span>Sum of contributions</span><b x-text="fixed(r.sum)"></b><span x-text="'linearized ' + fixed(r.linear_logit)"></span></div>
             <div><span>Residual rebuilt from parts</span><b x-text="r.residual_error.toExponential(1)"></b><span>largest difference</span></div>
             <div><span>Neurons cover experts</span><b x-text="(100 * r.neuron_coverage).toFixed(2) + '%'"></b><span x-text="'shared experts ' + (100 * r.shared_coverage).toFixed(2) + '%'"></span></div>
@@ -142,7 +176,7 @@
                       <div>
                         <h4>Routed experts</h4>
                         <table class="dense"><thead><tr><th>Expert</th><th class="numeric">Weight</th><th class="numeric">Contribution</th><th></th></tr></thead><tbody>
-                          <template x-for="e in l.experts" :key="e.expert"><tr><td class="mono" x-text="'E' + e.expert"></td><td class="numeric" x-text="pct(Math.log(e.weight))"></td><td class="numeric" :class="sign(e.contribution)" x-text="fixed(e.contribution)"></td><td><div class="pushes" x-show="e.pushes" x-html="pushes(e.pushes)"></div></td></tr></template>
+                          <template x-for="e in l.experts" :key="e.expert"><tr><td class="mono"><span x-text="'E' + e.expert"></span> <button class="mini" @click.stop="banExpert(l.layer, e.expert)" title="Ban this expert in this layer">ban</button></td><td class="numeric" x-text="pct(Math.log(e.weight))"></td><td class="numeric" :class="sign(e.contribution)" x-text="fixed(e.contribution)"></td><td><div class="pushes" x-show="e.pushes" x-html="pushes(e.pushes)"></div></td></tr></template>
                         </tbody></table>
                         <p class="table-note" x-text="'Next in line: ' + l.runners_up.map(e => 'E' + e.id + ' (' + (100 * e.value).toFixed(1) + '%)').join(', ')"></p>
                       </div>
@@ -152,7 +186,7 @@
                         <template x-if="l.mixer_pushes"><div><h4>Mixer output pushes</h4><div class="pushes" x-html="pushes(l.mixer_pushes)"></div></div></template>
                         <template x-if="l.moe_pushes"><div style="margin-top:12px"><h4>MoE output pushes</h4><div class="pushes" x-html="pushes(l.moe_pushes)"></div></div></template>
                         <h4 style="margin-top:12px">Top neurons in this layer</h4>
-                        <div class="mono"><template x-for="n in r.neurons.filter(n => n.layer === l.layer).slice(0, 8)"><div><span x-text="neuronName(n)"></span> <span :class="sign(n.contribution)" x-text="fixed(n.contribution)"></span> <span style="color:var(--muted)" x-text="'act ' + n.activation.toFixed(3)"></span></div></template></div>
+                        <div class="mono"><template x-for="n in r.neurons.filter(n => n.layer === l.layer).slice(0, 8)"><div><button class="mini" @click.stop="editNeuron(n, 0)">off</button> <span x-text="neuronName(n)"></span> <span :class="sign(n.contribution)" x-text="fixed(n.contribution)"></span> <span style="color:var(--muted)" x-text="'act ' + n.activation.toFixed(3)"></span></div></template></div>
                       </div>
                     </div>
                   </td></tr>
@@ -164,8 +198,8 @@
         <section class="panel">
           <div class="panel-heading"><div><div class="section-kicker">03 / NEURONS</div><h2>Neurons that matter most</h2><p>An expert's intermediate unit: its activation times its routing weight times its down-projection column, read out to the target logit.</p></div></div>
           <div class="table-scroll"><table class="dense">
-            <thead><tr><th>Neuron</th><th class="numeric">Activation</th><th class="numeric">Contribution</th><th></th></tr></thead>
-            <tbody><template x-for="n in r.neurons.slice(0, 60)" :key="neuronName(n)"><tr><td class="mono" x-text="neuronName(n)"></td><td class="numeric" x-text="n.activation.toFixed(3)"></td><td class="numeric" :class="sign(n.contribution)" x-text="fixed(n.contribution)"></td><td><div class="bar" x-html="bar(n.contribution, neuronScale)"></div></td></tr></template></tbody>
+            <thead><tr><th>Neuron</th><th class="numeric">Activation</th><th class="numeric">Contribution</th><th></th><th>Edit</th></tr></thead>
+            <tbody><template x-for="n in r.neurons.slice(0, 60)" :key="neuronName(n)"><tr><td class="mono" x-text="neuronName(n)"></td><td class="numeric" x-text="n.activation.toFixed(3)"></td><td class="numeric" :class="sign(n.contribution)" x-text="fixed(n.contribution)"></td><td><div class="bar" x-html="bar(n.contribution, neuronScale)"></div></td><td><button class="mini" @click="editNeuron(n, 0)">off</button> <button class="mini" @click="editNeuron(n, -1)">flip</button> <button class="mini" @click="editNeuron(n, 2)">×2</button> <button class="mini" @click="editNeuron(n, 1, n.contribution * n.activation > 0 ? 10 : -10)" title="Add 10 to the activation in the direction that raises the target">push</button></td></tr></template></tbody>
           </table></div>
         </section>
       </div>

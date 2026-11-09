@@ -363,6 +363,9 @@ pub struct Workspace {
     /// Activation capture for the next eager steps: the row at absolute position `pos` is recorded into
     /// `buf` (see `CaptureLayout`). Not for captured graphs.
     pub capture: Option<CaptureTarget>,
+    /// Model edits for the next eager steps of one sequence (see [`crate::edits`]). Not for captured
+    /// graphs or batched steps.
+    pub edits: Option<std::sync::Arc<crate::edits::Edits>>,
     /// DFlash feature capture for the next steps (eager or captured into graphs); see [`crate::dflash::Taps`].
     pub taps: Option<crate::dflash::Taps>,
     /// DFlash drafter scratch, when the model has the drafter.
@@ -512,6 +515,7 @@ impl Workspace {
         Self {
             max_tokens,
             capture: None,
+            edits: None,
             taps: None,
             dflash: None,
             score_cols,
@@ -1317,6 +1321,7 @@ pub fn forward_segments(
         adapter: model.adapter.as_ref().map(|a| (a, 0)),
         batch: Some(segs),
         capture: None,
+        edits: None,
         taps: ws.taps,
     };
     let mut carry = Carry::new(ws, from_ple);
@@ -1621,6 +1626,7 @@ pub fn forward_part(
             .map(|a| (a, state.adapter_scale.addr())),
         batch: None,
         capture,
+        edits: ws.edits.as_deref(),
         taps: ws.taps,
     };
     if !from_ple {
@@ -1774,6 +1780,7 @@ struct LayerCtx<'a> {
     batch: Option<&'a [Seg<'a>]>,
     /// Activation capture: (record buffer, row of this step).
     capture: Option<(u64, usize)>,
+    edits: Option<&'a crate::edits::Edits>,
     /// DFlash feature capture.
     taps: Option<crate::dflash::Taps>,
 }
@@ -2449,7 +2456,7 @@ fn layer_forward(
                     t,
                     prof.as_deref_mut(),
                 )?;
-                return finish_layer(layer, ctx, carry, prof, None);
+                return finish_layer(index, layer, ctx, carry, prof, None);
             }
             let c = qsa.expect("QSA layer cache");
             op!(
@@ -2583,7 +2590,7 @@ fn layer_forward(
             D * 4,
         )?;
     }
-    finish_layer(layer, ctx, carry, prof, rec)
+    finish_layer(index, layer, ctx, carry, prof, rec)
 }
 
 /// Prefill experts on the FP4 tensor cores (W4A4, activations quantized per row with least-error block
@@ -2617,6 +2624,7 @@ fn fp4_mode() -> u8 {
 
 /// The second half of a layer: the MLP HyperConnection, the MoE block and its output.
 fn finish_layer(
+    index: usize,
     layer: &crate::model::Layer,
     ctx: &LayerCtx,
     carry: &mut Carry,
@@ -2664,6 +2672,19 @@ fn finish_layer(
     let (ld, x) = (moe.proj.n, ws.proj);
     let col = |j: usize| x + (moe.proj.col(j) * 4) as u64;
     op!(prof, "moe proj", s, project(s, ws, ws.m, &moe.proj, x, t));
+    let edits = ctx.edits.and_then(|e| e.layer(index));
+    if let Some(r) = edits.and_then(|e| e.router.as_ref()) {
+        k::router_bias(s, col(0), ld, t, r.buf.addr(), r.n)?;
+    }
+    let routed_edits = edits.and_then(|e| e.routed.as_ref());
+    let shared_edits = edits.and_then(|e| e.shared.as_ref());
+    // Routed neuron edits: on the activations of every (token, slot) pair routed to an edited expert.
+    let edit_routed = |top_i: u64, pair_row: u64, pairs: usize| -> Result<()> {
+        match routed_edits {
+            Some(r) => k::edit_act(s, ws.act, top_i, pair_row, pairs, r.buf.addr(), r.n),
+            None => Ok(()),
+        }
+    };
     let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
     // Small batches: the shared expert's SwiGLU and down projection depend only on the projection, so
     // they run on a side stream while the routing (one block) and the routed experts run.
@@ -2671,12 +2692,29 @@ fn finish_layer(
     // kernels' rows (each slice's expert outputs and pair indices at its own offsets).
     let small_moe = t <= k::moe_small_tokens() || ctx.small;
     let slice = k::moe_small_tokens();
-    let side = t > 1 && small_moe && quench6k_cuda::variants::get("moe.shared_side", 1) != 0;
+    let side = t > 1
+        && small_moe
+        && shared_edits.is_none()
+        && quench6k_cuda::variants::get("moe.shared_side", 1) != 0;
     // FP4 prefill: the routed experts' down projection is written in BF16 (QUENCH6K_YD_BF16=0: FP32).
     let yd_bf16 = !small_moe
         && matches!(fp4_mode(), 1 | 3)
         && std::env::var("QUENCH6K_YD_BF16").map_or(true, |v| v != "0");
-    if t == 1 {
+    if t == 1 && routed_edits.is_some() {
+        k::moe_t1_gate_up(
+            s,
+            ws.m,
+            col(0),
+            tables(&moe.gate),
+            tables(&moe.up),
+            ws.top_i,
+            ws.top_w,
+            ws.pair_row,
+            ws.act,
+        )?;
+        edit_routed(ws.top_i, ws.pair_row, TOP_K)?;
+        k::moe_t1_down(s, ws.act, tables(&moe.down), ws.top_i, ws.yd, col(0))?;
+    } else if t == 1 {
         op!(
             prof,
             "experts t1",
@@ -2754,6 +2792,7 @@ fn finish_layer(
                     ws.act
                 )
             );
+            edit_routed(ws.top_i + pairs, ws.pair_row + pairs, ts * TOP_K)?;
             op!(
                 prof,
                 "experts down",
@@ -2888,6 +2927,7 @@ fn finish_layer(
                     k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, pairs)
                 );
             }
+            edit_routed(ws.top_i, ws.pair_row, pairs)?;
             if mode == 1 || mode == 3 {
                 op!(
                     prof,
@@ -2965,6 +3005,7 @@ fn finish_layer(
                     t * TOP_K
                 )
             );
+            edit_routed(ws.top_i, ws.pair_row, t * TOP_K)?;
             if fake_fp4 {
                 k::fake_fp4_act(s, ws.act, t * TOP_K, EXPERT_WIDTH)?;
             }
@@ -2978,7 +3019,7 @@ fn finish_layer(
     }
     // One token: the shared-expert tail (SwiGLU, down projection, combine) in one kernel. Larger
     // batches are faster as three kernels; the arithmetic is the same either way.
-    if t == 1 {
+    if t == 1 && shared_edits.is_none() {
         let down = (
             moe.shared_down.fmt,
             moe.shared_down.addr,
@@ -3000,6 +3041,9 @@ fn finish_layer(
                 s,
                 k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t)
             );
+            if let Some(e) = shared_edits {
+                k::edit_act(s, ws.sact, 0, 0, t, e.buf.addr(), e.n)?;
+            }
             op!(
                 prof,
                 "shared down",
@@ -3206,6 +3250,7 @@ pub fn forward_mtp_staged(
         adapter: None,
         batch: None,
         capture: None,
+        edits: None,
         taps: None,
     };
     let mut carry = Carry::new(ws, false);

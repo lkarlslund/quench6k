@@ -1641,6 +1641,119 @@ pub fn moe_experts_t1(
     )
 }
 
+/// [`moe_experts_t1`] in two halves (routing and gate/up into `act`, then down into `yd`), so the
+/// activations can be edited between them.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_t1_gate_up(
+    s: &Stream,
+    m: u64,
+    logits: u64,
+    gate: (u64, u64, u64),
+    up: (u64, u64, u64),
+    top_i: u64,
+    top_w: u64,
+    pair_row: u64,
+    act: u64,
+) -> Result<()> {
+    let t = |a: u64| a as *const u64;
+    launch!(
+        "moe_t1_gate_up",
+        ffi::quench6k_moe_t1_gate_up(
+            p(m),
+            f(logits),
+            t(gate.0),
+            t(gate.1),
+            f(gate.2),
+            t(up.0),
+            t(up.1),
+            f(up.2),
+            im(top_i),
+            fm(top_w),
+            im(pair_row),
+            pm(act),
+            s.raw()
+        )
+    )
+}
+
+pub fn moe_t1_down(
+    s: &Stream,
+    act: u64,
+    down: (u64, u64, u64),
+    top_i: u64,
+    yd: u64,
+    logits: u64,
+) -> Result<()> {
+    let t = |a: u64| a as *const u64;
+    launch!(
+        "moe_t1_down",
+        ffi::quench6k_moe_t1_down(
+            p(act),
+            t(down.0),
+            t(down.1),
+            f(down.2),
+            i(top_i),
+            fm(yd),
+            f(logits),
+            s.raw()
+        )
+    )
+}
+
+/// Neuron edits on expert activations (BF16 rows of 640): `act[row, unit] = act * scale + add` for
+/// each edit `k` (arrays of `n` at `edits`: experts I32, units I32, scale F32, add F32) whose expert is
+/// routed for `pair` (row `pair_row[pair]`); with `top_i == 0`, on rows 0..pairs (the shared expert).
+pub fn edit_act(
+    s: &Stream,
+    act: u64,
+    top_i: u64,
+    pair_row: u64,
+    pairs: usize,
+    edits: u64,
+    n: usize,
+) -> Result<()> {
+    let at = |k: u64| edits + k * 4 * n as u64;
+    launch!(
+        "edit_act",
+        ffi::quench6k_edit_act(
+            pm(act),
+            i(top_i),
+            i(pair_row),
+            n32(pairs),
+            i(at(0)),
+            i(at(1)),
+            f(at(2)),
+            f(at(3)),
+            n32(n),
+            s.raw()
+        )
+    )
+}
+
+/// Router edits: `logits[r, experts[k]] += bias[k]` for `t` rows of stride `ld` (arrays of `n` at
+/// `edits`: experts I32, bias F32).
+pub fn router_bias(
+    s: &Stream,
+    logits: u64,
+    ld: usize,
+    t: usize,
+    edits: u64,
+    n: usize,
+) -> Result<()> {
+    launch!(
+        "router_bias",
+        ffi::quench6k_router_bias(
+            fm(logits),
+            n32(ld),
+            n32(t),
+            i(edits),
+            f(edits + 4 * n as u64),
+            n32(n),
+            s.raw()
+        )
+    )
+}
+
 /// Per-neuron readouts of routed experts: `out[p, j] = scale2[e] * down_e[:, j] . r[p]` for expert
 /// `e = experts[p]` (`down`: the (codes, scales, weight_scale_2) tables; `r`: F32 [pairs, 2560]; `out`:
 /// F32 [pairs, 640]).

@@ -6,6 +6,9 @@ document.addEventListener('alpine:init', () => {
     return {
       prompt: 'The capital of France is', mode: 'raw', thinking: false, model: '', models: [], target: '',
       busy: false, error: '', result: null, open: null,
+      // Model edits (see DOCS.md "Inspection"), the unedited top predictions, and the side-by-side texts.
+      edits: [], baseTop: null, tokens: 48, compare: null, comparing: false,
+      manual: { layer: '', expert: '', unit: '', scale: '0', add: '0' },
       get r() { return this.result.report; },
       get scale() {
         const r = this.r;
@@ -19,9 +22,7 @@ document.addEventListener('alpine:init', () => {
           this.model = this.models[0] || '';
         } catch (e) { this.error = 'Could not list models: ' + e; }
       },
-      async run() {
-        this.busy = true;
-        this.error = '';
+      request(withEdits) {
         const body = { model: this.model };
         if (this.mode === 'chat') {
           body.messages = [{ role: 'user', content: this.prompt }];
@@ -29,19 +30,89 @@ document.addEventListener('alpine:init', () => {
         } else {
           body.prompt = this.prompt;
         }
+        if (withEdits && this.edits.length) body.edits = this.edits.map(e => e.spec);
+        return body;
+      },
+      async post(path, body) {
+        const res = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error?.message || res.statusText);
+        return data;
+      },
+      async run() {
+        this.busy = true;
+        this.error = '';
+        const body = this.request(true);
         const t = this.target.trim();
         if (t) body.target = /^\d+$/.test(t) ? Number(t) : this.target;
         try {
-          const res = await fetch('/v1/inspect', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.error?.message || res.statusText);
+          const data = await this.post('/v1/inspect', body);
+          // With edits, the unedited prediction for comparison (its prompt is cached by now).
+          let base = null;
+          if (this.edits.length) {
+            const plain = this.request(false);
+            plain.target = data.report.target;
+            const b = await this.post('/v1/inspect', plain);
+            base = Object.fromEntries(b.report.top.map(p => [p.id, p.value]));
+            base.target = b.report.logprob;
+            Object.assign(data.tokens, b.tokens);
+          }
           this.result = data;
+          this.baseTop = base;
           this.open = null;
         } catch (e) {
           this.error = String(e.message || e);
         } finally {
           this.busy = false;
         }
+      },
+      // Greedy continuations without and with the edits, side by side.
+      async generate() {
+        this.comparing = true;
+        this.error = '';
+        const run = async withEdits => {
+          const body = this.request(withEdits);
+          Object.assign(body, { max_tokens: Number(this.tokens) || 48, temperature: 0 });
+          const chat = this.mode === 'chat';
+          const data = await this.post(chat ? '/v1/chat/completions' : '/v1/completions', body);
+          const c = data.choices[0];
+          return chat ? (c.message.reasoning_content ? '<think>' + c.message.reasoning_content + '</think>' : '') + (c.message.content || '') : c.text;
+        };
+        try {
+          const base = await run(false);
+          const edited = this.edits.length ? await run(true) : null;
+          this.compare = { base, edited };
+        } catch (e) {
+          this.error = String(e.message || e);
+        } finally {
+          this.comparing = false;
+        }
+      },
+      addEdit(spec, label) {
+        const key = JSON.stringify(spec);
+        if (!this.edits.some(e => JSON.stringify(e.spec) === key)) this.edits.push({ spec, label });
+      },
+      editNeuron(n, scale, add) {
+        const spec = { layer: n.layer, unit: n.unit, scale, add: add || 0 };
+        if (n.expert === null) spec.shared = true; else spec.expert = n.expert;
+        this.addEdit(spec, this.neuronName(n) + (add ? ' +' + add : scale === 0 ? ' off' : ' ×' + scale));
+      },
+      banExpert(layer, expert) { this.addEdit({ layer, expert, ban: true }, 'L' + layer + '.E' + expert + ' banned'); },
+      addManual() {
+        const m = this.manual, layer = Number(m.layer), unit = m.unit === '' ? null : Number(m.unit);
+        if (m.layer === '' || m.expert === '') { this.error = 'An edit needs a layer and an expert (or "shared").'; return; }
+        const shared = m.expert.trim() === 'shared';
+        if (unit === null) {
+          if (shared) { this.error = 'A router edit needs an expert number.'; return; }
+          this.banExpert(layer, Number(m.expert));
+        } else {
+          this.editNeuron({ layer, unit, expert: shared ? null : Number(m.expert) }, Number(m.scale), Number(m.add));
+        }
+      },
+      delta(p) {
+        if (!this.baseTop) return '';
+        const before = this.baseTop[p.id];
+        return before === undefined ? ' (new)' : ' (was ' + this.pct(before) + ')';
       },
       // A token's text with whitespace made visible.
       show(id) {

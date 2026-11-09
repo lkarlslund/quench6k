@@ -1509,6 +1509,57 @@ fn raw_ids(app: &App, prompt: Option<&Value>) -> Result<Vec<i32>, ApiError> {
     }
 }
 
+/// Model edits of a request ("edits": a list). A neuron: {"layer", "expert" or "shared": true, "unit",
+/// "scale" (default 1), "add" (default 0)}; activation = activation * scale + add. A router edit:
+/// {"layer", "expert", "ban": true} or {"layer", "expert", "router_bias"}.
+fn parse_edits(v: Option<&Value>) -> Result<Option<Arc<quench6k_engine::edits::Edits>>, ApiError> {
+    use quench6k_engine::edits::{Edit, Edits};
+    let Some(list) = v.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let bad = |m: &str| error(StatusCode::BAD_REQUEST, format!("edits: {m}"));
+    let list = list.as_array().ok_or_else(|| bad("must be a list"))?;
+    if list.is_empty() {
+        return Ok(None);
+    }
+    let mut edits = Vec::new();
+    for e in list {
+        let int = |k: &str| e.get(k).and_then(Value::as_u64).map(|v| v as usize);
+        let num = |k: &str| e.get(k).and_then(Value::as_f64).map(|v| v as f32);
+        let layer = int("layer").ok_or_else(|| bad("each edit needs a layer"))?;
+        let shared = e.get("shared").and_then(Value::as_bool).unwrap_or(false);
+        let expert = int("expert");
+        edits.push(if let Some(unit) = int("unit") {
+            if expert.is_some() == shared {
+                return Err(bad("a neuron edit names an expert or \"shared\": true"));
+            }
+            Edit::Neuron {
+                layer,
+                expert,
+                unit,
+                scale: num("scale").unwrap_or(1.0),
+                add: num("add").unwrap_or(0.0),
+            }
+        } else {
+            let expert = expert.ok_or_else(|| bad("a router edit names an expert"))?;
+            let bias = if e.get("ban").and_then(Value::as_bool) == Some(true) {
+                f32::NEG_INFINITY
+            } else {
+                num("router_bias")
+                    .ok_or_else(|| bad("a router edit needs \"ban\" or \"router_bias\""))?
+            };
+            Edit::Router {
+                layer,
+                expert,
+                bias,
+            }
+        });
+    }
+    Edits::new(edits)
+        .map(|e| Some(Arc::new(e)))
+        .map_err(|e| bad(&format!("{e:#}")))
+}
+
 /// Sampling and request options common to the chat and raw completion endpoints.
 fn prepare_ids(
     app: &App,
@@ -1639,14 +1690,21 @@ fn prepare_ids(
         capture: capture.is_some(),
         images,
         progress: None,
+        edits: parse_edits(req.get("edits"))?,
     };
+    if app.flint && params.edits.is_some() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "edits are not supported for this model",
+        ));
+    }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let progress = stream
         && req
             .get("return_progress")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let mtp = req.get("mtp").and_then(Value::as_bool).unwrap_or(true);
+    let mtp = req.get("mtp").and_then(Value::as_bool).unwrap_or(true) && params.edits.is_none();
     Ok(Prepared {
         capture,
         ids,

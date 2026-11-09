@@ -1216,6 +1216,7 @@ fn chat_once(
     let text = chat.render(&messages, None, Some(think), None)?;
     let (ids, images) = chat.expand_media(&chat.encode(&text)?, inputs, clips)?;
     let params = quench6k_engine::session::GenParams {
+        edits: None,
         max_tokens,
         temperature,
         top_p,

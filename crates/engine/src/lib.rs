@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod checkpoint;
 pub mod context_store;
 pub mod dflash;
+pub mod edits;
 pub mod fileio;
 pub mod flint;
 pub mod forward;

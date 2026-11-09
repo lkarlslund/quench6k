@@ -265,6 +265,23 @@ An inspection runs between steps on a free slot: the prompt is prefilled (cached
 asking about another target of the same prompt is quick), then its last token runs as a single-token
 step with activation capture. Image prompts are not supported.
 
+### Edits
+
+Any request (chat, completion or inspection) can carry model edits as `"edits"`, a list of:
+
+| Edit | |
+|---|---|
+| `{"layer": L, "expert": E, "unit": U, "scale": S, "add": A}` | A routed expert's neuron: activation × S + A (defaults 1 and 0), wherever a token routes to the expert |
+| `{"layer": L, "shared": true, "unit": U, ...}` | The same for the shared expert's neuron |
+| `{"layer": L, "expert": E, "ban": true}` | The router never picks the expert |
+| `{"layer": L, "expert": E, "router_bias": B}` | Adds B to the expert's router logit |
+
+Scale 0 switches a neuron off, −1 flips it, and `add` pushes it. A request with edits decodes alone
+and without speculation (one eager step per token), so it never affects other requests; its cached
+states are kept apart by the edit set and reused only by requests with the same edits. An edit that
+changes nothing (scale 1) gives the same output as no edit. The inspector page adds edits from its
+neuron and expert rows, shows the prediction before and after, and compares greedy continuations.
+
 ## Environment variables
 
 | Variable | |

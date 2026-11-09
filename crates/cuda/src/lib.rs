@@ -547,6 +547,52 @@ pub mod ffi {
             yd: *mut f32,
             stream: Stream,
         ) -> Error;
+        pub fn quench6k_moe_t1_gate_up(
+            m: *const c_void,
+            logits: *const f32,
+            gw: *const u64,
+            gs: *const u64,
+            g2: *const f32,
+            uw: *const u64,
+            us: *const u64,
+            u2: *const f32,
+            top_i: *mut i32,
+            top_w: *mut f32,
+            pair_row: *mut i32,
+            act: *mut c_void,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_moe_t1_down(
+            act: *const c_void,
+            dw: *const u64,
+            ds: *const u64,
+            d2: *const f32,
+            top_i: *const i32,
+            yd: *mut f32,
+            logits: *const f32,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_edit_act(
+            act: *mut c_void,
+            top_i: *const i32,
+            pair_row: *const i32,
+            pairs: c_int,
+            experts: *const i32,
+            units: *const i32,
+            scale: *const f32,
+            add: *const f32,
+            n: c_int,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_router_bias(
+            logits: *mut f32,
+            ld: c_int,
+            t: c_int,
+            experts: *const i32,
+            bias: *const f32,
+            n: c_int,
+            stream: Stream,
+        ) -> Error;
         pub fn quench6k_nvfp4_column_dots(
             dw: *const u64,
             ds: *const u64,

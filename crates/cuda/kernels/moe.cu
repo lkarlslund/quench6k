@@ -1132,6 +1132,23 @@ extern "C" cudaError_t quench6k_moe_experts_t1(const void* m, const float* logit
     SQ_RETURN_LAUNCH();
 }
 
+// The two halves of quench6k_moe_experts_t1, for edits of the activations between them.
+extern "C" cudaError_t quench6k_moe_t1_gate_up(const void* m, const float* logits, const uint64_t* gw, const uint64_t* gs,
+                                            const float* g2, const uint64_t* uw, const uint64_t* us, const float* u2,
+                                            int* top_i, float* top_w, int* pair_row, void* act, cudaStream_t st) {
+    SQ_CHECK_LAUNCH(sq_launch(gate_up_t1_kernel<false>, dim3(640 / (EW * 2), TOPK), EW * 32, 0, st,
+                              static_cast<const __nv_bfloat16*>(m), logits, gw, gs, g2, uw, us, u2, top_i, top_w, pair_row,
+                              static_cast<__nv_bfloat16*>(act)));
+    SQ_RETURN_LAUNCH();
+}
+
+extern "C" cudaError_t quench6k_moe_t1_down(const void* act, const uint64_t* dw, const uint64_t* ds, const float* d2,
+                                         const int* top_i, float* yd, const float* logits, cudaStream_t st) {
+    SQ_CHECK_LAUNCH(sq_launch(down_t1_kernel<false>, dim3(D / (EW * 8), TOPK), EW * 32, 0, st,
+                              static_cast<const __nv_bfloat16*>(act), dw, ds, d2, top_i, yd, logits));
+    SQ_RETURN_LAUNCH();
+}
+
 namespace {
 
 // ---- draft head shortlist: a 1-bit sketch of the head ranks the vocabulary, the exact NVFP4 rows
