@@ -40,6 +40,11 @@ pub struct GenParams {
     pub progress: Option<Progress>,
     /// Model edits (the request decodes alone and eagerly; see [`crate::edits`]).
     pub edits: Option<std::sync::Arc<crate::edits::Edits>>,
+    /// Atlas recording of the prompt's expert activations: the recorder and the corpus token of prompt
+    /// position 0.
+    pub record: Option<(std::sync::Arc<crate::atlas::Recorder>, usize)>,
+    /// Compute the whole prompt (no cached prefix is reused).
+    pub fresh: bool,
 }
 
 impl GenParams {
@@ -748,6 +753,16 @@ impl Session {
         crate::inspect::analyze(model, s, &self.hw_batch, &raw?, target)
     }
 
+    /// What neurons write toward (see [`crate::inspect::lens`]).
+    pub fn lens(
+        &self,
+        model: &Model,
+        s: &Stream,
+        neurons: &[crate::atlas::NeuronId],
+    ) -> Result<Vec<crate::inspect::Pushes>> {
+        crate::inspect::lens(model, s, &self.hw_batch, neurons)
+    }
+
     /// Adds slots up to `slots` (at most [`MAX_SLOTS`]), each with speculative decoding and a prefix
     /// cache of its own. Concurrent requests decode in group rounds (speculative) or batched steps
     /// (plain). Attention-cache memory is mapped as the slots' contexts grow; when the device is full,
@@ -1121,6 +1136,7 @@ impl Session {
             &p.boundaries,
             p.variant(),
             p.progress.as_ref(),
+            p.fresh,
         )?;
         Ok(Prefill {
             run,
@@ -1170,6 +1186,7 @@ impl Session {
             e.upload(s)?;
         }
         self.ws.edits = pf.run.params.edits.clone();
+        self.ws.record = pf.run.params.record.clone();
         let progress = pf.run.params.progress.clone();
         let chunk = if capture.is_some() || self.lanes[slot].dec.dflash.is_some() {
             self.chunk
@@ -1188,6 +1205,7 @@ impl Session {
         );
         self.ws.capture = None;
         self.ws.edits = None;
+        self.ws.record = None;
         r?;
         if let Some(c) = capture {
             let logits = self.lanes[slot].dec.last_logits_addr();
@@ -1494,8 +1512,9 @@ impl Session {
         variant: Variant,
         progress: Option<&Progress>,
     ) -> Result<()> {
-        let mut plan =
-            self.prefill_setup(s, slot, prompt, images, boundaries, variant, progress)?;
+        let mut plan = self.prefill_setup(
+            s, slot, prompt, images, boundaries, variant, progress, false,
+        )?;
         self.prefill_advance(
             model,
             s,
@@ -1520,6 +1539,7 @@ impl Session {
         boundaries: &[usize],
         variant: Variant,
         progress: Option<&Progress>,
+        fresh: bool,
     ) -> Result<PrefillPlan> {
         // Memory for the whole prompt (a stored context loaded below is a prefix of it).
         self.ensure_kv(slot, prompt.len() + 2 * (self.lanes[slot].dec.drafts + 2))?;
@@ -1534,19 +1554,23 @@ impl Session {
         let lane = &self.lanes[slot];
         let marks = image_marks(images);
         let key = keyed(prompt, &marks);
-        let mut lcp = lane
-            .kv_tokens
-            .iter()
-            .zip(&key)
-            .take_while(|(a, b)| a == b)
-            .count();
+        let mut lcp = if fresh {
+            0
+        } else {
+            lane.kv_tokens
+                .iter()
+                .zip(&key)
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
         if self.store.enabled() {
             // The new prompt overwrites the cached conversation past `lcp`: keep its boundary state.
             if lane.snapshots.iter().any(|sn| sn.pos > lcp) {
                 self.stash(slot, usize::MAX)?;
             }
             let gpu_best = self.lanes[slot].cached_prefix(&key);
-            if let Some((i, len)) = self.store.best(&key, &variant_tag(variant)) {
+            if fresh {
+            } else if let Some((i, len)) = self.store.best(&key, &variant_tag(variant)) {
                 if len > gpu_best {
                     match self.load_entry(s, slot, i) {
                         Ok(()) => lcp = len,

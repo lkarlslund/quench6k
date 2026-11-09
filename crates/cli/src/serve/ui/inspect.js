@@ -16,6 +16,9 @@ document.addEventListener('alpine:init', () => {
       },
       get neuronScale() { return Math.max(...this.r.neurons.map(n => Math.abs(n.contribution))) || 1; },
       async init() {
+        // Edits persist in local storage (the atlas page adds to them).
+        try { this.edits = JSON.parse(localStorage.getItem('quench6k.edits') || '[]'); } catch (e) { this.edits = []; }
+        this.$watch('edits', v => { try { localStorage.setItem('quench6k.edits', JSON.stringify(v)); } catch (e) { /* not persisted */ } });
         try {
           const res = await fetch('/v1/models');
           this.models = (await res.json()).data.map(m => m.id);

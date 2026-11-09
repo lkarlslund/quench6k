@@ -572,6 +572,27 @@ pub mod ffi {
             logits: *const f32,
             stream: Stream,
         ) -> Error;
+        pub fn quench6k_atlas_record(
+            act: *const c_void,
+            top_i: *const i32,
+            pair_row: *const i32,
+            pairs: c_int,
+            token0: c_int,
+            sum: *mut f32,
+            top: *mut u64,
+            counts: *mut u32,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_nvfp4_columns(
+            dw: *const u64,
+            ds: *const u64,
+            d2: *const f32,
+            experts: *const i32,
+            units: *const i32,
+            count: c_int,
+            out: *mut f32,
+            stream: Stream,
+        ) -> Error;
         pub fn quench6k_edit_act(
             act: *mut c_void,
             top_i: *const i32,

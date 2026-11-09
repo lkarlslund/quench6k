@@ -295,6 +295,10 @@ enum Command {
         /// Directory for activation captures requested per request ("capture": {"name": ...}).
         #[arg(long)]
         capture_dir: Option<PathBuf>,
+        /// Directory whose text files neuron atlases may be built from by path (otherwise only
+        /// uploaded text and model-written text).
+        #[arg(long)]
+        atlas_dir: Option<PathBuf>,
         /// Do not load the vision tower (requests with images are rejected).
         #[arg(long)]
         no_vision: bool,
@@ -653,6 +657,7 @@ fn main() -> Result<()> {
             plan_tokens,
             prefill_share,
             capture_dir,
+            atlas_dir,
             no_vision,
             image_max_pixels,
             video_max_frames,
@@ -680,6 +685,10 @@ fn main() -> Result<()> {
             plan_tokens,
             prefill_share,
             capture_dir,
+            atlas_dir: atlas_dir
+                .map(|d| d.canonicalize())
+                .transpose()
+                .context("--atlas-dir")?,
             vision: !no_vision,
             image_max_pixels,
             video_max_frames,
@@ -1217,6 +1226,8 @@ fn chat_once(
     let (ids, images) = chat.expand_media(&chat.encode(&text)?, inputs, clips)?;
     let params = quench6k_engine::session::GenParams {
         edits: None,
+        record: None,
+        fresh: false,
         max_tokens,
         temperature,
         top_p,

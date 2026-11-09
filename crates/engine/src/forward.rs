@@ -366,6 +366,9 @@ pub struct Workspace {
     /// Model edits for the next eager steps of one sequence (see [`crate::edits`]). Not for captured
     /// graphs or batched steps.
     pub edits: Option<std::sync::Arc<crate::edits::Edits>>,
+    /// Atlas recording for the next eager steps of one sequence: the recorder and the corpus token of
+    /// the sequence's position 0.
+    pub record: Option<(std::sync::Arc<crate::atlas::Recorder>, usize)>,
     /// DFlash feature capture for the next steps (eager or captured into graphs); see [`crate::dflash::Taps`].
     pub taps: Option<crate::dflash::Taps>,
     /// DFlash drafter scratch, when the model has the drafter.
@@ -516,6 +519,7 @@ impl Workspace {
             max_tokens,
             capture: None,
             edits: None,
+            record: None,
             taps: None,
             dflash: None,
             score_cols,
@@ -1322,6 +1326,7 @@ pub fn forward_segments(
         batch: Some(segs),
         capture: None,
         edits: None,
+        record: None,
         taps: ws.taps,
     };
     let mut carry = Carry::new(ws, from_ple);
@@ -1627,6 +1632,7 @@ pub fn forward_part(
         batch: None,
         capture,
         edits: ws.edits.as_deref(),
+        record: ws.record.as_ref().map(|(r, base)| (&**r, base + first)),
         taps: ws.taps,
     };
     if !from_ple {
@@ -1781,6 +1787,8 @@ struct LayerCtx<'a> {
     /// Activation capture: (record buffer, row of this step).
     capture: Option<(u64, usize)>,
     edits: Option<&'a crate::edits::Edits>,
+    /// Atlas recorder and the corpus token of the step's first row.
+    record: Option<(&'a crate::atlas::Recorder, usize)>,
     /// DFlash feature capture.
     taps: Option<crate::dflash::Taps>,
 }
@@ -2678,13 +2686,20 @@ fn finish_layer(
     }
     let routed_edits = edits.and_then(|e| e.routed.as_ref());
     let shared_edits = edits.and_then(|e| e.shared.as_ref());
-    // Routed neuron edits: on the activations of every (token, slot) pair routed to an edited expert.
-    let edit_routed = |top_i: u64, pair_row: u64, pairs: usize| -> Result<()> {
-        match routed_edits {
-            Some(r) => k::edit_act(s, ws.act, top_i, pair_row, pairs, r.buf.addr(), r.n),
-            None => Ok(()),
+    let record = ctx.record.filter(|_| index < LAYERS);
+    // Routed activations of every (token, slot) pair (token-major, the first pair's token row `r0`
+    // of the step): neuron edits on those routed to an edited expert, then atlas recording.
+    let act_hook = |top_i: u64, pair_row: u64, pairs: usize, r0: usize| -> Result<()> {
+        if let Some(r) = routed_edits {
+            k::edit_act(s, ws.act, top_i, pair_row, pairs, r.buf.addr(), r.n)?;
         }
+        if let Some((rec, token0)) = record {
+            rec.routed(s, index, ws.act, top_i, pair_row, pairs, token0 + r0)?;
+        }
+        Ok(())
     };
+    let routed_hook = routed_edits.is_some() || record.is_some();
+    let shared_hook = shared_edits.is_some() || record.is_some();
     let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
     // Small batches: the shared expert's SwiGLU and down projection depend only on the projection, so
     // they run on a side stream while the routing (one block) and the routed experts run.
@@ -2694,13 +2709,13 @@ fn finish_layer(
     let slice = k::moe_small_tokens();
     let side = t > 1
         && small_moe
-        && shared_edits.is_none()
+        && !shared_hook
         && quench6k_cuda::variants::get("moe.shared_side", 1) != 0;
     // FP4 prefill: the routed experts' down projection is written in BF16 (QUENCH6K_YD_BF16=0: FP32).
     let yd_bf16 = !small_moe
         && matches!(fp4_mode(), 1 | 3)
         && std::env::var("QUENCH6K_YD_BF16").map_or(true, |v| v != "0");
-    if t == 1 && routed_edits.is_some() {
+    if t == 1 && routed_hook {
         k::moe_t1_gate_up(
             s,
             ws.m,
@@ -2712,7 +2727,7 @@ fn finish_layer(
             ws.pair_row,
             ws.act,
         )?;
-        edit_routed(ws.top_i, ws.pair_row, TOP_K)?;
+        act_hook(ws.top_i, ws.pair_row, TOP_K, 0)?;
         k::moe_t1_down(s, ws.act, tables(&moe.down), ws.top_i, ws.yd, col(0))?;
     } else if t == 1 {
         op!(
@@ -2792,7 +2807,7 @@ fn finish_layer(
                     ws.act
                 )
             );
-            edit_routed(ws.top_i + pairs, ws.pair_row + pairs, ts * TOP_K)?;
+            act_hook(ws.top_i + pairs, ws.pair_row + pairs, ts * TOP_K, r0)?;
             op!(
                 prof,
                 "experts down",
@@ -2927,7 +2942,7 @@ fn finish_layer(
                     k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, pairs)
                 );
             }
-            edit_routed(ws.top_i, ws.pair_row, pairs)?;
+            act_hook(ws.top_i, ws.pair_row, pairs, 0)?;
             if mode == 1 || mode == 3 {
                 op!(
                     prof,
@@ -3005,7 +3020,7 @@ fn finish_layer(
                     t * TOP_K
                 )
             );
-            edit_routed(ws.top_i, ws.pair_row, t * TOP_K)?;
+            act_hook(ws.top_i, ws.pair_row, t * TOP_K, 0)?;
             if fake_fp4 {
                 k::fake_fp4_act(s, ws.act, t * TOP_K, EXPERT_WIDTH)?;
             }
@@ -3019,7 +3034,7 @@ fn finish_layer(
     }
     // One token: the shared-expert tail (SwiGLU, down projection, combine) in one kernel. Larger
     // batches are faster as three kernels; the arithmetic is the same either way.
-    if t == 1 && shared_edits.is_none() {
+    if t == 1 && !shared_hook {
         let down = (
             moe.shared_down.fmt,
             moe.shared_down.addr,
@@ -3043,6 +3058,9 @@ fn finish_layer(
             );
             if let Some(e) = shared_edits {
                 k::edit_act(s, ws.sact, 0, 0, t, e.buf.addr(), e.n)?;
+            }
+            if let Some((rec, token0)) = record {
+                rec.shared(s, index, ws.sact, t, token0)?;
             }
             op!(
                 prof,
@@ -3251,6 +3269,7 @@ pub fn forward_mtp_staged(
         batch: None,
         capture: None,
         edits: None,
+        record: None,
         taps: None,
     };
     let mut carry = Carry::new(ws, false);

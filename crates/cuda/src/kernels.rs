@@ -1700,6 +1700,64 @@ pub fn moe_t1_down(
     )
 }
 
+/// Atlas recording of expert activations (BF16 rows of 640): per (pair, unit) of expert `e`,
+/// `sum[e, unit] += |act|` and `top[e, unit]` = max of (|act| bits << 32 | negative << 31 | token);
+/// `counts[e] += 1` per pair (`counts` may be 0). With `top_i`, pair `p` is token `token0 + p / 10`
+/// at row `pair_row[p]`; with `top_i == 0`, row `p` is token `token0 + p` of the shared expert.
+#[allow(clippy::too_many_arguments)]
+pub fn atlas_record(
+    s: &Stream,
+    act: u64,
+    top_i: u64,
+    pair_row: u64,
+    pairs: usize,
+    token0: usize,
+    sum: u64,
+    top: u64,
+    counts: u64,
+) -> Result<()> {
+    launch!(
+        "atlas_record",
+        ffi::quench6k_atlas_record(
+            p(act),
+            i(top_i),
+            i(pair_row),
+            n32(pairs),
+            n32(token0),
+            fm(sum),
+            top as *mut u64,
+            counts as *mut u32,
+            s.raw()
+        )
+    )
+}
+
+/// Columns of routed experts' NVFP4 down projections: `out[p]` (F32 [2560]) = `scale2[e] * W_e[:, unit]`
+/// for `e = experts[p]`, `unit = units[p]` (I32 arrays of `count`).
+pub fn nvfp4_columns(
+    s: &Stream,
+    down: (u64, u64, u64),
+    experts: u64,
+    units: u64,
+    count: usize,
+    out: u64,
+) -> Result<()> {
+    let t = |a: u64| a as *const u64;
+    launch!(
+        "nvfp4_columns",
+        ffi::quench6k_nvfp4_columns(
+            t(down.0),
+            t(down.1),
+            f(down.2),
+            i(experts),
+            i(units),
+            n32(count),
+            fm(out),
+            s.raw()
+        )
+    )
+}
+
 /// Neuron edits on expert activations (BF16 rows of 640): `act[row, unit] = act * scale + add` for
 /// each edit `k` (arrays of `n` at `edits`: experts I32, units I32, scale F32, add F32) whose expert is
 /// routed for `pair` (row `pair_row[pair]`); with `top_i == 0`, on rows 0..pairs (the shared expert).

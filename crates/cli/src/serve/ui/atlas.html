@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Neuron atlas: which expert neurons fire on a corpus, and what they write.">
+  <title>quench6k · Neuron atlas</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff8956'/%3E%3Cpath d='M9 10h14M9 16h10M9 22h6' stroke='%23111316' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/dashboard.css">
+  <style>
+    .panel { margin-bottom: 12px; }
+    .panel-heading { padding: 14px 16px 10px; }
+    .panel-heading p { margin: 4px 0 0; font-size: 12px; }
+    .heading { padding-bottom: 8px; }
+    .body { padding: 4px 16px 16px; display: grid; gap: 10px; }
+    .form-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    .form-row label { display: flex; gap: 8px; align-items: center; color: var(--muted); }
+    input, select, textarea { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; }
+    textarea { width: 100%; min-height: 56px; resize: vertical; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .button.primary { background: var(--accent); color: #111316; border-color: var(--accent); font-weight: 600; }
+    .button[disabled] { opacity: .5; cursor: wait; }
+    table.dense { width: auto; }
+    table.dense th { padding: 5px 12px; }
+    table.dense td { height: auto; padding: 3px 12px; font-size: 12px; line-height: 1.35; vertical-align: top; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .tok { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; background: #24282d; border-radius: 3px; padding: 0 3px; }
+    .snippet { font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; color: #aeb7c1; max-width: 640px; }
+    .snippet b { color: #111316; background: var(--accent); border-radius: 3px; padding: 0 2px; font-weight: 500; }
+    .pushes { display: flex; flex-wrap: wrap; gap: 2px; align-items: center; margin-top: 3px; }
+    .pushes .label { color: var(--muted); font-size: 11px; margin-right: 2px; }
+    .pushes .up { box-shadow: inset 0 -2px 0 var(--green); }
+    .pushes .down { box-shadow: inset 0 -2px 0 #ff6b6b; }
+    .progress { width: 140px; height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; }
+    .progress i { display: block; height: 100%; background: var(--accent); }
+    .mini { font-size: 11px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--muted); }
+    .mini:hover { color: var(--text); border-color: var(--accent); }
+    .muted { color: var(--muted); }
+    .note { color: var(--muted); font-size: 12px; margin: 0; }
+  </style>
+  <script defer src="/assets/atlas.js"></script>
+  <script defer src="/assets/alpine.min.js"></script>
+</head>
+<body x-data="atlas">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="quench6k dashboard">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>quench<span class="brand-suffix">6k</span></span>
+    </a>
+    <span class="nav-label">NEURON ATLAS</span>
+    <div class="topbar-right"><a href="/inspect" class="text-link">Inspector <span aria-hidden="true">↗</span></a> <a href="/" class="text-link">Engine monitor <span aria-hidden="true">↗</span></a></div>
+  </header>
+
+  <main>
+    <section class="heading">
+      <div><p class="eyebrow">MODEL / NEURONS</p><h1>Neuron atlas<span class="heading-dot">.</span></h1>
+        <p class="model-name">Run the model over a corpus and record every expert neuron: how strongly it fires and on which token. Compare a topic with a baseline to find the neurons that belong to it.</p></div>
+    </section>
+
+    <div class="notice error-notice" role="alert" x-show="error" x-cloak><div><strong>Error</strong><span x-text="error"></span></div></div>
+
+    <section class="panel">
+      <div class="panel-heading"><div><div class="section-kicker">01 / BUILD</div><h2>New atlas</h2><p>Scanning shares the GPU with running requests, like a long prompt does.</p></div></div>
+      <div class="body">
+        <div class="form-row">
+          <label>Name <input x-model="name" size="18" placeholder="e.g. cuba"></label>
+          <div class="segmented" role="group" aria-label="Corpus source">
+            <button :class="{ selected: source === 'topic' }" @click="source = 'topic'">Model writes about a topic</button>
+            <button :class="{ selected: source === 'upload' }" @click="source = 'upload'">Upload a text file</button>
+            <button x-show="atlasDir" :class="{ selected: source === 'file' }" @click="source = 'file'">Server file</button>
+          </div>
+          <label>Model <select x-model="model"><template x-for="m in models" :key="m"><option :value="m" x-text="m"></option></template></select></label>
+        </div>
+        <template x-if="source === 'topic'"><div class="form-row" style="align-items:flex-start">
+          <textarea x-model="topic" placeholder="Write a detailed essay about the Cuban missile crisis."></textarea>
+          <label>Texts <input x-model="samples" size="4"></label>
+          <label>Tokens each <input x-model="maxTokens" size="5"></label>
+        </div></template>
+        <template x-if="source === 'upload'"><div class="form-row"><input type="file" accept=".txt,.md,text/*" @change="readFile($event)"><span class="muted" x-text="upload ? upload.name + ' · ' + upload.text.length.toLocaleString() + ' characters' : ''"></span></div></template>
+        <template x-if="source === 'file'"><div class="form-row"><label>Path in the atlas directory <input x-model="file" size="40"></label></div></template>
+        <div class="form-row"><button class="button primary" :disabled="creating" @click="create()">Build atlas</button>
+          <p class="note">A baseline is an atlas of ordinary text (for example the model writing about anything, or a general text file).</p></div>
+      </div>
+    </section>
+
+    <section class="panel" x-show="atlases.length">
+      <div class="panel-heading"><div><div class="section-kicker">02 / ATLASES</div><h2>Atlases</h2></div></div>
+      <div class="body"><div class="table-scroll"><table class="dense">
+        <thead><tr><th>Name</th><th>Source</th><th>Model</th><th>Status</th><th class="numeric">Tokens</th><th></th></tr></thead>
+        <tbody><template x-for="a in atlases" :key="a.name"><tr>
+          <td x-text="a.name"></td><td x-text="a.source"></td><td class="muted" x-text="a.model"></td>
+          <td><span x-text="a.phase"></span> <span class="progress" x-show="a.phase === 'generating' || a.phase === 'scanning'"><i :style="'width:' + (a.total ? 100 * a.progress / a.total : 0) + '%'"></i></span></td>
+          <td class="numeric" x-text="a.tokens.toLocaleString()"></td>
+          <td><button class="mini" @click="remove(a.name)">delete</button></td>
+        </tr></template></tbody>
+      </table></div></div>
+    </section>
+
+    <section class="panel" x-show="ready.length">
+      <div class="panel-heading"><div><div class="section-kicker">03 / QUERY</div><h2>Which neurons fire</h2><p>Mean: |activation| per corpus token (frequent and strong). Peak: the strongest single activation (rare but sharp). Against a baseline: the difference.</p></div></div>
+      <div class="body">
+        <div class="form-row">
+          <label>Atlas <select x-model="query.atlas"><template x-for="a in ready" :key="a.name"><option :value="a.name" x-text="a.name"></option></template></select></label>
+          <label>Baseline <select x-model="query.base"><option value="">none</option><template x-for="a in ready" :key="a.name"><option :value="a.name" x-text="a.name"></option></template></select></label>
+          <div class="segmented" role="group" aria-label="Rank by"><button :class="{ selected: query.by === 'mean' }" @click="query.by = 'mean'">Mean</button><button :class="{ selected: query.by === 'peak' }" @click="query.by = 'peak'">Peak</button></div>
+          <label>Layer <input x-model="query.layer" size="3" placeholder="all"></label>
+          <button class="button primary" :disabled="loading" @click="loadNeurons()">Neurons</button>
+          <button class="button" :disabled="loading" @click="loadExperts()">Experts</button>
+        </div>
+      </div>
+    </section>
+
+    <template x-if="result && result.neurons">
+      <section class="panel">
+        <div class="panel-heading"><div><div class="section-kicker">NEURONS</div><h2 x-text="result.atlas + (result.base ? ' vs ' + result.base : '') + ' · by ' + result.by"></h2><p>Each neuron's strongest activation in the corpus, highlighted in context; below it, what the neuron's output pushes the next token toward (logit lens).</p></div></div>
+        <div class="body"><div class="table-scroll"><table class="dense">
+          <thead><tr><th>Neuron</th><th class="numeric">Score</th><th class="numeric">Mean</th><th class="numeric" x-show="result.base">Baseline</th><th class="numeric">Peak</th><th>Strongest example · pushes</th><th></th></tr></thead>
+          <tbody><template x-for="n in result.neurons" :key="nname(n)"><tr>
+            <td class="mono" x-text="nname(n)"></td>
+            <td class="numeric" x-text="n.score.toFixed(4)"></td>
+            <td class="numeric" x-text="n.mean.toFixed(4)"></td>
+            <td class="numeric" x-show="result.base" x-text="n.base_mean === undefined ? '' : n.base_mean.toFixed(4) + (n.base_peak == null ? '' : ' / ' + n.base_peak.toFixed(2))"></td>
+            <td class="numeric" x-text="n.peak ? n.peak.value.toFixed(2) : '—'"></td>
+            <td><div class="snippet" x-html="snippet(n)"></div><div class="pushes" x-show="lens[nname(n)]" x-html="pushes(lens[nname(n)])"></div></td>
+            <td style="white-space:nowrap"><button class="mini" @click="toInspector(n, 0)" title="Add 'off' to the inspector's edits">off</button> <button class="mini" @click="toInspector(n, 1, 10 * Math.sign(n.peak ? n.peak.value : 1))" title="Add a push to the inspector's edits">push</button></td>
+          </tr></template></tbody>
+        </table></div></div>
+      </section>
+    </template>
+
+    <template x-if="result && result.experts">
+      <section class="panel">
+        <div class="panel-heading"><div><div class="section-kicker">EXPERTS</div><h2 x-text="result.atlas + (result.base ? ' vs ' + result.base : '') + ' · routing rate'"></h2></div></div>
+        <div class="body"><div class="table-scroll"><table class="dense">
+          <thead><tr><th>Expert</th><th class="numeric">Routed</th><th class="numeric" x-show="result.base">Baseline</th><th class="numeric">Difference</th><th></th></tr></thead>
+          <tbody><template x-for="e in result.experts" :key="e.layer + '.' + e.expert"><tr>
+            <td class="mono" x-text="'L' + e.layer + '.E' + e.expert"></td>
+            <td class="numeric" x-text="(100 * e.rate).toFixed(2) + '%'"></td>
+            <td class="numeric" x-show="result.base" x-text="e.base_rate == null ? '' : (100 * e.base_rate).toFixed(2) + '%'"></td>
+            <td class="numeric" x-text="(100 * e.score).toFixed(2) + ' pp'"></td>
+            <td><button class="mini" @click="banToInspector(e)" title="Add a ban to the inspector's edits">ban</button></td>
+          </tr></template></tbody>
+        </table></div></div>
+      </section>
+    </template>
+    <p class="note" x-show="added" x-text="added"></p>
+  </main>
+</body>
+</html>

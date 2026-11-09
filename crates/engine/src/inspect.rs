@@ -509,3 +509,51 @@ pub fn analyze(
         shared_coverage: (shared_sum / shared_total) as f32,
     })
 }
+
+/// What neurons write, independent of context: each neuron's down-projection column through the LM
+/// head (a logit lens), scaled per feature by the final mixer's mean norm weight (its gates and the
+/// streams' RMS factors depend on the context and are left out).
+pub fn lens(
+    model: &Model,
+    s: &Stream,
+    hw: &HeadWorkspace,
+    neurons: &[crate::atlas::NeuronId],
+) -> Result<Vec<Pushes>> {
+    let norm: Vec<u16> = s.download(model.final_hc.norm, H)?;
+    let weight: Vec<f32> = (0..D)
+        .map(|d| (0..S).map(|st| 1.0 + bf16(norm[st * D + d])).sum::<f32>() / S as f32)
+        .collect();
+    let mut vectors = Vec::new();
+    for &(layer, expert, unit) in neurons {
+        ensure!(
+            layer < LAYERS && unit < EXPERT_WIDTH,
+            "no neuron L{layer}.N{unit}"
+        );
+        let col: Vec<f32> = match expert {
+            Some(e) => {
+                ensure!(e < crate::model::EXPERTS, "no expert {e}");
+                let ids = DeviceBuffer::new(8)?;
+                s.upload_to(ids.addr(), &[e as i32, unit as i32])?;
+                let out = DeviceBuffer::new(D * 4)?;
+                let down = &model.layers[layer].moe.down;
+                k::nvfp4_columns(
+                    s,
+                    (down.weights, down.scales, down.scale2),
+                    ids.addr(),
+                    ids.addr() + 4,
+                    1,
+                    out.addr(),
+                )?;
+                s.download(out.addr(), D)?
+            }
+            None => {
+                let w = weight_rows(s, &model.layers[layer].moe.shared_down, 0..D)?;
+                (0..D).map(|d| w[d * EXPERT_WIDTH + unit]).collect()
+            }
+        };
+        // Unit length (BF16 range), then the mixer's per-feature weight.
+        let len = col.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+        vectors.push(col.iter().zip(&weight).map(|(v, w)| v / len * w).collect());
+    }
+    pushes(model, s, hw, &vectors)
+}

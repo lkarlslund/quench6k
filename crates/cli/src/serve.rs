@@ -23,6 +23,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::chat::{Chat, TextStream};
 
+mod atlas;
 mod dashboard;
 
 pub struct ServeOptions {
@@ -52,6 +53,8 @@ pub struct ServeOptions {
     pub plan_tokens: usize,
     pub prefill_share: f64,
     pub capture_dir: Option<PathBuf>,
+    /// Canonical directory of text files atlases may be built from by path.
+    pub atlas_dir: Option<PathBuf>,
     pub vision: bool,
     pub image_max_pixels: usize,
     pub video_max_frames: usize,
@@ -81,6 +84,10 @@ enum Work {
     Generate(QueuedJob),
     /// Logit attribution of the next-token prediction after a prompt.
     Inspect(InspectJob),
+    /// Neuron statistics over a corpus (see `atlas`).
+    Scan(atlas::ScanJob),
+    /// What neurons write toward.
+    Lens(atlas::LensJob),
     /// Write stored contexts to disk, then acknowledge.
     Persist(mpsc::Sender<()>),
     /// Unload the model once no request is running or queued, then acknowledge.
@@ -96,6 +103,12 @@ fn fail_work(w: Work, metrics: &Metrics, msg: &str) {
             let _ = queued.job.tx.send(Msg::Error(msg.to_string()));
         }
         Work::Inspect(job) => {
+            let _ = job.tx.send(Err(msg.to_string()));
+        }
+        Work::Scan(job) => {
+            let _ = job.tx.send(Err(msg.to_string()));
+        }
+        Work::Lens(job) => {
             let _ = job.tx.send(Err(msg.to_string()));
         }
         Work::Persist(ack) | Work::Unload(ack) => {
@@ -362,6 +375,8 @@ struct App {
     thinking: bool,
     tool_call_token: Option<i32>,
     capture_dir: Option<PathBuf>,
+    atlas_dir: Option<PathBuf>,
+    atlases: atlas::Atlases,
     model_id: String,
     /// Longest prompt + completion in tokens (per slot), reported as `max_model_len`.
     context: usize,
@@ -551,7 +566,9 @@ pub fn run(opts: ServeOptions) -> Result<()> {
             // Unloaded: the next request loads the model again.
             loop {
                 match jobs_rx.recv() {
-                    Ok(w @ (Work::Generate(_) | Work::Inspect(_))) => {
+                    Ok(
+                        w @ (Work::Generate(_) | Work::Inspect(_) | Work::Scan(_) | Work::Lens(_)),
+                    ) => {
                         waiting.push(w);
                         break;
                     }
@@ -604,6 +621,8 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         thinking: opts.thinking,
         tool_call_token,
         capture_dir: opts.capture_dir.clone(),
+        atlas_dir: opts.atlas_dir.clone(),
+        atlases: Default::default(),
         model_id: model_id(&opts.model),
         context: opts.context,
         started: now(),
@@ -626,6 +645,12 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         .route("/tokenize", post(tokenize))
         .route("/inspect", get(dashboard::inspect_page))
         .route("/v1/inspect", post(inspect))
+        .route("/atlas", get(dashboard::atlas_page))
+        .route("/v1/atlas", get(atlas::list).post(atlas::create))
+        .route("/v1/atlas/{name}", axum::routing::delete(atlas::delete))
+        .route("/v1/atlas/{name}/neurons", get(atlas::neurons))
+        .route("/v1/atlas/{name}/experts", get(atlas::experts))
+        .route("/v1/lens", post(atlas::lens))
         .route("/detokenize", post(detokenize))
         .route("/metrics", get(metrics_text))
         // axum's default of 2 MB is less than a long conversation with tool output or an image or video data URL.
@@ -690,6 +715,8 @@ fn schedule(
         prompt: usize,
         /// Seconds spent computing the prompt.
         secs: f64,
+        /// A segment of the front scan job (recorded, never decoded).
+        scan: bool,
     }
     let end = |session: &mut Session, slot: usize, failed: bool| {
         metrics.live[slot].end(failed);
@@ -765,13 +792,22 @@ fn schedule(
     // Decode time owed to the running requests for the prefill time spent (see --prefill-share).
     let mut decode_credit = 0.0f64;
     let mut inspects: std::collections::VecDeque<InspectJob> = std::collections::VecDeque::new();
+    let mut scans: std::collections::VecDeque<atlas::ScanJob> = std::collections::VecDeque::new();
     let take = |w: Work,
                 queue: &mut std::collections::VecDeque<QueuedJob>,
                 unload: &mut Vec<mpsc::Sender<()>>,
                 inspects: &mut std::collections::VecDeque<InspectJob>,
+                scans: &mut std::collections::VecDeque<atlas::ScanJob>,
                 session: &mut Session| match w {
         Work::Generate(job) => queue.push_back(job),
         Work::Inspect(job) => inspects.push_back(job),
+        Work::Scan(job) => scans.push_back(job),
+        Work::Lens(job) => {
+            let r = session
+                .lens(model, s, &job.neurons)
+                .map_err(|e| format!("{e:#}"));
+            let _ = job.tx.send(r);
+        }
         Work::Persist(ack) => {
             if let Err(e) = session.persist() {
                 eprintln!("persisting contexts: {e:#}");
@@ -782,7 +818,14 @@ fn schedule(
     };
     // Requests that arrived while the model was unloaded.
     for w in waiting {
-        take(w, &mut queue, &mut unload, &mut inspects, session);
+        take(
+            w,
+            &mut queue,
+            &mut unload,
+            &mut inspects,
+            &mut scans,
+            session,
+        );
     }
     loop {
         if let Err(e) = session.poll_cache() {
@@ -796,6 +839,7 @@ fn schedule(
             && queue.is_empty()
             && prefilling.is_empty()
             && inspects.is_empty()
+            && scans.is_empty()
         {
             if !unload.is_empty() || unload_idle.is_some_and(|d| idle_since.elapsed() >= d) {
                 // Keep the slots' contexts: the reloaded model starts from the store.
@@ -805,13 +849,27 @@ fn schedule(
                 return Exit::Unload(unload);
             }
             match jobs.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(w) => take(w, &mut queue, &mut unload, &mut inspects, session),
+                Ok(w) => take(
+                    w,
+                    &mut queue,
+                    &mut unload,
+                    &mut inspects,
+                    &mut scans,
+                    session,
+                ),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Exit::Closed,
             }
         }
         while let Ok(w) = jobs.try_recv() {
-            take(w, &mut queue, &mut unload, &mut inspects, session);
+            take(
+                w,
+                &mut queue,
+                &mut unload,
+                &mut inspects,
+                &mut scans,
+                session,
+            );
         }
         // Inspections run whole between steps on a free slot (the one holding most of the prompt).
         while let Some(job) = inspects.front() {
@@ -841,6 +899,45 @@ fn schedule(
                 r.as_ref().err().map_or(String::new(), |e| format!(": {e}"))
             );
             let _ = job.tx.send(r);
+        }
+        // Scan jobs: one segment at a time, prefilled like a request (taking turns with running
+        // requests by --prefill-share) with the recorder attached.
+        if let Some(job) = scans.front_mut()
+            && !prefilling.iter().any(|p| p.scan)
+        {
+            let free = (0..nslots)
+                .filter(|&i| slots[i].is_none() && !prefilling.iter().any(|p| p.pf.slot() == i))
+                .min_by_key(|&i| session.cached_prefix_key(i, &[], job.variant).1);
+            if job.tx.is_closed() {
+                scans.pop_front();
+            } else if job.next == job.segments.len() {
+                // Every segment recorded.
+                let job = scans.pop_front().unwrap();
+                let r = job
+                    .recorder
+                    .as_ref()
+                    .map_or(Err(anyhow::anyhow!("empty corpus")), |r| r.download(s))
+                    .map_err(|e| format!("{e:#}"));
+                let _ = job.tx.send(r);
+            } else if let Some(slot) = free
+                && session.admits(slot, job.segment_len(), 1)
+            {
+                match job.start(session, s, slot) {
+                    Ok(pf) => prefilling.push_back(Pending {
+                        prompt: pf.remaining(),
+                        pf,
+                        tx: job.keep.0.clone(),
+                        capture: None,
+                        secs: 0.0,
+                        scan: true,
+                    }),
+                    Err(e) => {
+                        session.end(slot);
+                        let job = scans.pop_front().unwrap();
+                        let _ = job.tx.send(Err(format!("{e:#}")));
+                    }
+                }
+            }
         }
         idle_since = std::time::Instant::now();
         // Admit queued requests into free slots: the one whose GPU cache holds the most of the prompt,
@@ -886,6 +983,7 @@ fn schedule(
                         capture: job.capture,
                         prompt: job.ids.len(),
                         secs: t0.elapsed().as_secs_f64(),
+                        scan: false,
                     });
                 }
                 Err(e) => {
@@ -930,6 +1028,13 @@ fn schedule(
             }
             match r {
                 Ok(false) => {}
+                Ok(true) if p.scan => {
+                    let p = prefilling.pop_front().unwrap();
+                    session.end(p.pf.slot());
+                    if let Some(job) = scans.front() {
+                        job.done(p.prompt);
+                    }
+                }
                 Ok(true) => {
                     let p = prefilling.pop_front().unwrap();
                     let (slot, reused) = (p.pf.slot(), p.pf.reused());
@@ -959,6 +1064,14 @@ fn schedule(
                             end(session, slot, true);
                             let _ = p.tx.send(Msg::Error(format!("{e:#}")));
                         }
+                    }
+                }
+                Err(e) if p.scan => {
+                    let p = prefilling.pop_front().unwrap();
+                    eprintln!("scanning a corpus segment on slot {}: {e:#}", p.pf.slot());
+                    session.end(p.pf.slot());
+                    if let Some(job) = scans.pop_front() {
+                        let _ = job.tx.send(Err(format!("{e:#}")));
                     }
                 }
                 Err(e) => {
@@ -1094,6 +1207,16 @@ fn schedule_flint(
                 let _ = job
                     .tx
                     .send(Err("inspection is not supported for this model".into()));
+                continue;
+            }
+            Work::Scan(job) => {
+                let _ = job
+                    .tx
+                    .send(Err("atlases are not supported for this model".into()));
+                continue;
+            }
+            Work::Lens(job) => {
+                let _ = job.tx.send(Err("not supported for this model".into()));
                 continue;
             }
         };
@@ -1691,6 +1814,8 @@ fn prepare_ids(
         images,
         progress: None,
         edits: parse_edits(req.get("edits"))?,
+        record: None,
+        fresh: false,
     };
     if app.flint && params.edits.is_some() {
         return Err(error(

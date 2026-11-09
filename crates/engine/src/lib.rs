@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod atlas;
 pub mod checkpoint;
 pub mod context_store;
 pub mod dflash;

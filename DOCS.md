@@ -282,6 +282,26 @@ states are kept apart by the edit set and reused only by requests with the same 
 changes nothing (scale 1) gives the same output as no edit. The inspector page adds edits from its
 neuron and expert rows, shows the prediction before and after, and compares greedy continuations.
 
+### Neuron atlas
+
+`/atlas` builds atlases: the model runs over a corpus while every expert neuron's activations are
+recorded on the GPU (the sum of |activation|, the strongest activation with its token, and how often
+each expert is routed). The corpus is an uploaded text, a file under `--atlas-dir` (the only way to
+name server files), or text the model writes about a topic (`samples` texts of up to `max_tokens`, at
+temperature 1). Scans run in 2048-token segments taking turns with running requests, like prefill.
+
+| Endpoint | |
+|---|---|
+| `POST /v1/atlas` | `{"name", "topic", "samples", "max_tokens"}`, `{"name", "text"}` or `{"name", "file"}`; `"model"` picks the variant |
+| `GET /v1/atlas`, `DELETE /v1/atlas/{name}` | List (with progress), delete |
+| `GET /v1/atlas/{name}/neurons?base=&by=mean\|peak&layer=&limit=` | Neurons by mean \|activation\| per token or by peak, minus a baseline atlas's; each with its strongest example in context |
+| `GET /v1/atlas/{name}/experts?base=` | Experts by routing rate, minus the baseline's |
+| `POST /v1/lens` | `{"neurons": [{"layer", "expert" or "shared": true, "unit"}]}`: tokens each neuron's output raises and lowers |
+
+A baseline atlas of ordinary text (the model writing about anything) turns "fires often" into "fires on
+this topic". Atlases live in memory (at most 6, about 190 MB each). The page sends neurons and experts to
+the inspector's edits.
+
 ## Environment variables
 
 | Variable | |
