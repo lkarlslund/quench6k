@@ -707,6 +707,10 @@ impl Session {
     /// Inspects the next-token prediction after `prompt` on idle `slot`: prefills all but the last
     /// token (reusing cached prefixes), runs the last one as a single-token step with activation
     /// capture, and splits the logit of `target` (default: the most likely token) into its parts.
+    /// With `edits_last`, the request's edits apply to the inspected token only: the prefix is the
+    /// unedited model's (and reuses its cache), and the slot's state is dropped afterwards so the
+    /// edited token is never reused.
+    #[allow(clippy::too_many_arguments)]
     pub fn inspect(
         &mut self,
         model: &Model,
@@ -715,6 +719,8 @@ impl Session {
         prompt: &[i32],
         p: &GenParams,
         target: Option<i32>,
+        contrast: Option<i32>,
+        edits_last: bool,
     ) -> Result<crate::inspect::Report> {
         ensure!(
             prompt.len() >= 2,
@@ -724,9 +730,14 @@ impl Session {
         p.capture = false;
         p.max_tokens = 1;
         p.temperature = 0.0;
+        let edits_last = edits_last && p.edits.is_some();
         let raw = (|| {
             let (last, head) = prompt.split_last().unwrap();
-            self.begin(model, s, slot, head, &p, false)?;
+            let head_params = GenParams {
+                edits: if edits_last { None } else { p.edits.clone() },
+                ..p.clone()
+            };
+            self.begin(model, s, slot, head, &head_params, false)?;
             let buf = self.capture_buf()?;
             let lane = &mut self.lanes[slot];
             let pos = lane.state.len();
@@ -740,6 +751,13 @@ impl Session {
             self.ws.edits = None;
             r?;
             lane.sync_kv_tokens();
+            if edits_last {
+                lane.kv_tokens.clear();
+                lane.kv_marks.clear();
+                lane.snapshots.clear();
+                lane.state.tokens.clear();
+                lane.state.trim_kv(0)?;
+            }
             forward::head_logits(model, &self.hw, s, self.ws.out)?;
             Ok::<_, anyhow::Error>(crate::inspect::Raw {
                 records: s.download(buf, crate::model::LAYERS * CAPTURE_LAYER_BYTES)?,
@@ -750,7 +768,7 @@ impl Session {
             })
         })();
         self.end(slot);
-        crate::inspect::analyze(model, s, &self.hw_batch, &raw?, target)
+        crate::inspect::analyze(model, s, &self.hw_batch, &raw?, target, contrast)
     }
 
     /// What neurons write toward (see [`crate::inspect::lens`]).

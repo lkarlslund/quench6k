@@ -205,6 +205,15 @@ before `<tool_call>` with a new seed and a temperature of at least 0.7, up to `-
 the text before it is kept. While a tool call is being generated, streaming clients receive
 `tool_call_progress` chunks with the byte count instead of partial text.
 
+Qwen3.8 models sometimes write a URL of the fetch proxy Alibaba used in their training environment
+(`https://routify-file-proxy-sg.oss-ap-southeast-1.aliyuncs.com/proxy_temp_file/production/...` with an
+invented signature) instead of the URL they mean; a client that runs such a call contacts Alibaba Cloud.
+A tool call containing `routify-file-proxy`, `routify.alibaba-inc` or `proxy_temp_file/production` is
+treated as invalid and regenerated at least four times (more if `--tool-retries` is higher); if every
+attempt produces one, the calls are dropped and only the text before them is returned.
+`/metrics` counts them (`quench6k_proxy_tool_calls_total`, `quench6k_proxy_tool_calls_dropped_total`).
+This only covers calls this server generates: block the domain at the client's egress as well.
+
 ## Context cache
 
 - The GPU holds the current conversation of each slot plus recurrent-state snapshots at turn
@@ -249,8 +258,9 @@ metadata. Capture requests use plain decoding.
 
 `/inspect` is a page for asking why the model predicts a token; `POST /v1/inspect` is its API. It
 takes `messages` (rendered with the generation prompt) or a raw `prompt`, an optional `target` (a token
-id or text; default: the most likely next token) and `model` (the variant). The answer splits the
-target's logit at the prompt's last token into what wrote it: the embedding, the PLE injection, each
+id or text; default: the most likely next token), an optional `contrast` token (then everything splits
+logit(target) − logit(contrast), e.g. why the model prefers one token over another) and `model` (the
+variant). The answer splits the target's logit at the prompt's last token into what wrote it: the embedding, the PLE injection, each
 layer's mixer (gated DeltaNet or attention) and MoE output, each routed expert and the shared expert,
 and every expert neuron (an intermediate unit: activation times routing weight times its
 down-projection column). The residual is a plain sum of these parts, each written into the four streams
@@ -263,7 +273,10 @@ ranked next.
 
 An inspection runs between steps on a free slot: the prompt is prefilled (cached prefixes reused, so
 asking about another target of the same prompt is quick), then its last token runs as a single-token
-step with activation capture. Image prompts are not supported.
+step with activation capture. Image prompts are not supported. With `"edits_at": "last"`, an
+inspection's edits apply to the inspected token only: the prefix comes from the unedited model's cache
+(so a sweep over many edits of one long prompt costs about a second each), and the slot's state is
+dropped afterwards.
 
 ### Edits
 

@@ -145,6 +145,8 @@ struct InspectJob {
     ids: Vec<i32>,
     params: GenParams,
     target: Option<i32>,
+    contrast: Option<i32>,
+    edits_last: bool,
     tx: tokio::sync::oneshot::Sender<std::result::Result<quench6k_engine::inspect::Report, String>>,
 }
 
@@ -204,6 +206,10 @@ struct Metrics {
     /// Attention-cache memory mapped per slot (bytes).
     kv_bytes: Vec<AtomicU64>,
     errors: AtomicU64,
+    /// Tool calls aimed at Alibaba's training-time fetch proxy (see [`proxy_call`]), and calls dropped
+    /// because every retry produced one.
+    proxy_calls: AtomicU64,
+    proxy_dropped: AtomicU64,
     /// Requests waiting for a slot, and requests running.
     queued: AtomicU64,
     running: AtomicU64,
@@ -331,6 +337,12 @@ impl Metrics {
             out,
             "# HELP quench6k_errors_total Generations that failed.\n# TYPE quench6k_errors_total counter\nquench6k_errors_total {}",
             self.errors.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP quench6k_proxy_tool_calls_total Tool calls with an Alibaba fetch-proxy URL (regenerated).\n# TYPE quench6k_proxy_tool_calls_total counter\nquench6k_proxy_tool_calls_total {}\n# HELP quench6k_proxy_tool_calls_dropped_total Tool calls dropped because every retry produced a proxy URL.\n# TYPE quench6k_proxy_tool_calls_dropped_total counter\nquench6k_proxy_tool_calls_dropped_total {}",
+            self.proxy_calls.load(Ordering::Relaxed),
+            self.proxy_dropped.load(Ordering::Relaxed)
         );
         let _ = writeln!(
             out,
@@ -890,7 +902,7 @@ fn schedule(
             let job = inspects.pop_front().unwrap();
             let t0 = std::time::Instant::now();
             let r = session
-                .inspect(model, s, slot, &job.ids, &job.params, job.target)
+                .inspect(model, s, slot, &job.ids, &job.params, job.target, job.contrast, job.edits_last)
                 .map_err(|e| format!("{e:#}"));
             eprintln!(
                 "inspect: slot {slot}, prompt {} in {:.2}s{}",
@@ -2321,7 +2333,10 @@ async fn drive(
 /// Runs a prepared request to completion. When the output contains tool calls that fail validation,
 /// the text before the first `<tool_call>` is kept and the call is regenerated from there (sampled, a
 /// new seed per attempt) up to `tool_retries` times, so a malformed call is retried instead of being
-/// returned as text. Returns (segmenter, generated tokens, finish, cached prompt tokens).
+/// returned as text. A call with a URL of Alibaba's fetch proxy ([`proxy_call`]) is treated as invalid
+/// and retried at least [`PROXY_RETRIES`] times; if every attempt produces one, the calls are dropped
+/// and the text before them returned. Returns (segmenter, generated tokens, finish, cached prompt
+/// tokens).
 async fn generate(
     app: &App,
     p: &Prepared,
@@ -2332,7 +2347,7 @@ async fn generate(
     let (mut total, mut cached_first) = (0usize, None);
     let mut params = p.params.clone();
     let mut ids = p.ids.clone();
-    for attempt in 0..=app.tool_retries {
+    for attempt in 0.. {
         let (tx, mut rx) = tmpsc::unbounded_channel();
         if p.progress {
             let ptx = tx.clone();
@@ -2373,7 +2388,17 @@ async fn generate(
         } else {
             seg.text.as_str()
         };
+        let proxy = proxy_call(body);
+        if proxy {
+            app.metrics.proxy_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        let retries = if proxy {
+            app.tool_retries.max(PROXY_RETRIES)
+        } else {
+            app.tool_retries
+        };
         let problem = match validate_calls(body, tools) {
+            Ok(()) if proxy => Some("URL of Alibaba's fetch proxy".to_string()),
             // QUENCH6K_TEST_TOOL_RETRY: treat the first attempt's tool calls as invalid (exercises retries).
             Ok(())
                 if attempt == 0
@@ -2392,8 +2417,17 @@ async fn generate(
         let Some(at) = generated.iter().position(|&t| t == tc) else {
             return Ok((seg, total, finish, cached_first.unwrap_or(0)));
         };
-        if attempt == app.tool_retries || params.max_tokens <= n {
+        if attempt >= retries || params.max_tokens <= n {
             eprintln!("tool call still invalid after {attempt} retries: {problem}");
+            if proxy {
+                // Never hand out a proxy call: keep only the text before it.
+                app.metrics.proxy_dropped.fetch_add(1, Ordering::Relaxed);
+                seg.text = app
+                    .chat
+                    .decode(&generated[..at], true)
+                    .map_err(|e| format!("{e:#}"))?;
+                seg.sent = seg.sent.min(seg.text.len());
+            }
             return Ok((seg, total, finish, cached_first.unwrap_or(0)));
         }
         eprintln!(
@@ -2416,6 +2450,36 @@ async fn generate(
         params.seed = params.seed.wrapping_add(0x9e37_79b9 * (attempt as u64 + 1));
     }
     unreachable!()
+}
+
+/// Minimum retries for a tool call with a fetch-proxy URL (they come back in a few percent of
+/// resamples, so the configured `tool_retries` may be too few).
+const PROXY_RETRIES: usize = 4;
+
+/// Whether a `<tool_call>` block contains a URL of the fetch proxy Qwen3.8 models learned in training
+/// (`routify-file-proxy-sg.oss-ap-southeast-1.aliyuncs.com/proxy_temp_file/production/...` with an
+/// invented signature, or the `routify.alibaba-inc.com` gateway). The model writes these instead of
+/// the URL it means in roughly 1% of URL-bearing calls; a client that runs the call contacts
+/// Alibaba Cloud.
+fn proxy_call(body: &str) -> bool {
+    const MARKERS: [&str; 3] = [
+        "routify-file-proxy",
+        "routify.alibaba-inc",
+        "proxy_temp_file/production",
+    ];
+    let mut cursor = 0;
+    while let Some(start) = body[cursor..].find("<tool_call>") {
+        let b0 = cursor + start;
+        let end = body[b0..]
+            .find("</tool_call>")
+            .map_or(body.len(), |e| b0 + e);
+        let block = body[b0..end].to_ascii_lowercase();
+        if MARKERS.iter().any(|m| block.contains(m)) {
+            return true;
+        }
+        cursor = end;
+    }
+    false
 }
 
 /// Checks every `<tool_call>` block: it parses, is closed, names a declared function, has the required
@@ -2867,26 +2931,35 @@ async fn inspect(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respons
         )
         .into_response();
     }
-    let target = match req.get("target") {
-        None | Some(Value::Null) => None,
-        Some(Value::Number(n)) => n.as_i64().map(|v| v as i32),
-        Some(Value::String(t)) if !t.is_empty() => match app.chat.encode(t) {
-            Ok(ids) if !ids.is_empty() => Some(ids[0]),
-            _ => {
-                return error(StatusCode::BAD_REQUEST, "target must encode to a token")
-                    .into_response();
-            }
-        },
-        _ => {
-            return error(StatusCode::BAD_REQUEST, "target must be a token id or text")
-                .into_response();
+    // "target" and "contrast": a token id, or text (its first token).
+    let token = |key: &str| -> Result<Option<i32>, ApiError> {
+        match req.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(n)) => Ok(n.as_i64().map(|v| v as i32)),
+            Some(Value::String(t)) if !t.is_empty() => match app.chat.encode(t) {
+                Ok(ids) if !ids.is_empty() => Ok(Some(ids[0])),
+                _ => Err(error(
+                    StatusCode::BAD_REQUEST,
+                    format!("{key} must encode to a token"),
+                )),
+            },
+            _ => Err(error(
+                StatusCode::BAD_REQUEST,
+                format!("{key} must be a token id or text"),
+            )),
         }
+    };
+    let (target, contrast) = match (token("target"), token("contrast")) {
+        (Ok(t), Ok(c)) => (t, c),
+        (Err(e), _) | (_, Err(e)) => return e.into_response(),
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
     let job = InspectJob {
         ids: p.ids.clone(),
         params: p.params.clone(),
         target,
+        contrast,
+        edits_last: req.get("edits_at").and_then(Value::as_str) == Some("last"),
         tx,
     };
     if app.jobs.send(Work::Inspect(job)).is_err() {
@@ -2900,6 +2973,7 @@ async fn inspect(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respons
     // Texts of every token the report names, and of the prompt's end (the inspected token last).
     let mut named: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
     named.insert(report.target);
+    named.extend(report.contrast);
     named.extend(report.top.iter().map(|t| t.id));
     for l in &report.layers {
         let pushes = [&l.mixer_pushes, &l.moe_pushes]
@@ -3240,6 +3314,12 @@ mod tests {
                 .unwrap_err()
                 .contains("not a integer")
         );
+        let proxy = "<tool_call>\n<function=get_weather>\n<parameter=city>\nhttps://routify-file-proxy-sg.oss-ap-southeast-1.aliyuncs.com/proxy_temp_file/production/2026-10-23/x?Expires=1\n</parameter>\n</function>\n</tool_call>";
+        assert!(proxy_call(proxy));
+        assert!(proxy_call(&proxy.to_uppercase().replace("TOOL_CALL", "tool_call")));
+        assert!(!proxy_call(ok));
+        assert!(!proxy_call("routify-file-proxy mentioned outside a call"));
+        assert!(!proxy_call("<tool_call>\n<function=f>\n<parameter=url>\nhttps://help.aliyun.com/\n</parameter>\n</function>\n</tool_call>"));
         let json_style = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n</tool_call>";
         assert!(
             validate_calls(json_style, &tools()).is_ok(),

@@ -83,7 +83,10 @@ pub struct Layer {
 #[derive(Serialize)]
 pub struct Report {
     pub target: i32,
-    /// The target's logit and log-probability as the model computed them.
+    /// With a contrast token, every contribution (and `logit`, `sum`, `linear_logit`, the parts'
+    /// pushes excepted) is to logit(target) − logit(contrast) instead of logit(target).
+    pub contrast: Option<i32>,
+    /// The target's logit (minus the contrast's) and log-probability as the model computed them.
     pub logit: f32,
     pub logprob: f32,
     /// The model's most likely next tokens (log-probabilities).
@@ -226,13 +229,15 @@ fn pushes(
     Ok(out)
 }
 
-/// Splits the logit of `target` (default: the most likely token) into its parts.
+/// Splits the logit of `target` (default: the most likely token) into its parts; with `contrast`, the
+/// difference logit(target) − logit(contrast) (the LM head is linear, so it splits the same way).
 pub fn analyze(
     model: &Model,
     s: &Stream,
     hw: &HeadWorkspace,
     raw: &Raw,
     target: Option<i32>,
+    contrast: Option<i32>,
 ) -> Result<Report> {
     ensure!(raw.records.len() == LAYERS * L::BYTES, "capture records");
     let lse = {
@@ -249,13 +254,19 @@ pub fn analyze(
     order.truncate(20);
     order.sort_by(|a, b| raw.logits[*b].total_cmp(&raw.logits[*a]));
     let target = target.unwrap_or(order[0] as i32);
-    if !(0..VOCAB as i32).contains(&target) {
-        bail!("token {target} is outside the vocabulary");
+    for t in std::iter::once(target).chain(contrast) {
+        if !(0..VOCAB as i32).contains(&t) {
+            bail!("token {t} is outside the vocabulary");
+        }
     }
 
     // The mixer output is sum over streams of c[s, d] h[s, d]; ρ folds in the target's LM-head row.
     let norm: Vec<u16> = s.download(model.final_hc.norm, H)?;
-    let lm = weight_rows(s, &model.lm_head, target as usize..target as usize + 1)?;
+    let mut lm = weight_rows(s, &model.lm_head, target as usize..target as usize + 1)?;
+    if let Some(c) = contrast {
+        let other = weight_rows(s, &model.lm_head, c as usize..c as usize + 1)?;
+        lm.iter_mut().zip(&other).for_each(|(a, b)| *a -= b);
+    }
     let mut c = vec![0f32; H];
     for st in 0..S {
         let x = &raw.h[st * D..(st + 1) * D];
@@ -488,7 +499,8 @@ pub fn analyze(
             .sum::<f32>();
     Ok(Report {
         target,
-        logit: raw.logits[target as usize],
+        contrast,
+        logit: raw.logits[target as usize] - contrast.map_or(0.0, |c| raw.logits[c as usize]),
         logprob: raw.logits[target as usize] - lse,
         top: order
             .iter()
