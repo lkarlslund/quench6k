@@ -552,3 +552,44 @@ Later the same day:
   splits x 4 KV heads = 256 CTAs leave a partial second wave on 188 SMs. A cap of 94 (two full waves)
   with the split count recounted from the tiles per split (empty splits dropped; 8K keeps 64 x 2 tiles):
   FP8 decode at 64K 340 -> 357 tok/s, 8K unchanged (`flint.splits`).
+
+## 2026-11-12: prefill after rtp-llm's Qwen4 PLE/GDN work
+
+Alibaba's rtp-llm PRs [#1673](https://github.com/alibaba/rtp-llm/pull/1673) and
+[#1681](https://github.com/alibaba/rtp-llm/pull/1681) tune `qwen4_exp` (this architecture) for H20 TP2 at
+batch 16-64: one GEMM for the PLE key and value projections, the PLE convolution, history roll and
+residual add in one kernel, Q/K normalization fused into the GDN prefill scatter, GDN decode
+convolution fused with the gate, and narrower value tiles (BV16) in the GDN chunk-state kernel. Our
+engine already fuses the PLE and GDN decode work (`ple_gate` + `ple_conv`, `gdn_fused_small`); PLE is
+0.7% of a decode step and 0.5% of prefill here, so packing its projections is not worth it.
+
+`bench --profile` now also times one eager prefill per op. 8K prefill at 600 W (15.3K tok/s): GDN
+chunked 14.4%, routed experts 15.6% (gate/up 9.9%, down 5.7%), QSA attention 8.8% (11.4% at 64K), the
+four HC ops 25%, GDN in/out projections 13.5%, FP4 activation quantization 4.1%, QSA projections 5.8%.
+
+- **GDN state walk** (kept, exact): the chunk-state kernel is 72% of `gdn_chunked_tc` (1.51 of
+  2.10 ms per layer at 8K; prep 0.55 ms). Without its MMAs it takes 0.58 ms, so it is bound by the
+  3xTF32 MMA chains, on 144 of 188 SMs (one block per SM by shared memory; a fourth column slab per
+  head would be 192 blocks, a second wave). BV16 does not apply: narrower slabs mean more blocks than
+  SMs. Two phases per chunk instead of four (W S, Q S and Vn = U - W S by the same warps; then O and
+  the state update), four block barriers instead of eight, and `mma_pair` interleaving two tiles' MMA
+  chains (W S and Q S share the S fragments): 2.107 -> 1.999 ms per layer (-5.1%), outputs and state
+  bit-identical (`micro gdn_chunked_tc_8k` hashes them).
+- **FP4 activation quantization** (kept, exact): 214 + 277 us per layer at 8K (the 8192 x 2560 expert
+  input and the 81920 x 640 down input), about 7x its memory floor: the least-error block scale tries 5
+  scales x 16 IEEE divisions per block. The E2M1 code and value now come from `rintf` (step 0.5 below
+  2, 1 up to 4, then 4 or 6; ties to even, which is what the thresholds of `e2m1_code` give, checked
+  case by case at every threshold), and the winning candidate's codes are kept instead of dividing the
+  block a sixth time: 171 + 225 us (-19%), bytes identical (`micro fp4_quant_rows_prefill`). Division
+  stays IEEE: a reciprocal-based code needs an exact fallback near every threshold, which costs more
+  than the division.
+- Full model, `score --decode` on the six oracle fixtures: every `.bin` byte-identical to main.
+  Prefill, two interleaved base/new pairs at 600 W (FP8 KV; the GPU warms from pair to pair): 8K
+  +0.35% / +1.2%, 64K +0.09% / +0.9%, 131K -0.12% / +0.8%. Expected from the kernels: ~1.5% at 8K.
+- **Routed experts** (not attempted): gate/up run at ~490 TFLOPS and down at ~430 TFLOPS, about a
+  quarter of FP4 peak. At ~160 rows per expert per 8K chunk, the 128-row tiles of the grouped GEMM are
+  ~62% full; smaller or adaptive tail tiles are the next prefill candidate (a larger change).
+- `kernels` test `expert_gate_up_small_matches_cpu` fails on main too (t 2 row 0 feature 0: -0.150 vs
+  -0.118); its hand-built offsets probably no longer match `moe_gate_up_small`'s layout, and in parallel
+  runs the out-of-bounds reads poison the shared context, so other tests fail with error 700. Decode
+  sanity checks and oracle scores are unaffected. Not fixed yet.

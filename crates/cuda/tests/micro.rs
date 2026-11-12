@@ -527,3 +527,115 @@ fn draft_head_latency() {
         kernels::draft_sketch_bytes(V) as f64 / 1e6
     );
 }
+
+/// Chunked GDN prefill (prep + state walk) for one layer at 8192 tokens.
+#[test]
+#[ignore]
+fn gdn_chunked_tc_8k() {
+    quench6k_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    const T: usize = 8192;
+    const C: usize = 10240;
+    const VH: usize = 48;
+    const DK: usize = 128;
+    let mut x = 0x1234_5678u32;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        (x as f32 / u32::MAX as f32) - 0.5
+    };
+    let qkv: Vec<f32> = (0..T * C).map(|_| rnd() * 0.18).collect();
+    let beta: Vec<f32> = (0..T * VH).map(|_| 0.5 + rnd() * 0.9).collect();
+    let g: Vec<f32> = (0..T * VH).map(|_| -0.45 + rnd() * 0.5).collect();
+    let up = |v: &Vec<f32>| -> DeviceBuffer {
+        let b = DeviceBuffer::new(v.len() * 4).unwrap();
+        s.upload(&b, v.as_slice()).unwrap();
+        b
+    };
+    let (dq, db, dg) = (up(&qkv), up(&beta), up(&g));
+    let st = DeviceBuffer::zeroed(VH * DK * DK * 4).unwrap();
+    let out = DeviceBuffer::new(T * VH * DK * 4).unwrap();
+    let scratch = DeviceBuffer::new(kernels::gdn_tc_scratch_floats(T) * 4).unwrap();
+    let run = || {
+        kernels::gdn_chunked_tc(&s, dq.addr(), db.addr(), dg.addr(), st.addr(), out.addr(), T, scratch.addr())
+            .unwrap()
+    };
+    run();
+    s.synchronize().unwrap();
+    let (a, b) = (Event::timing().unwrap(), Event::timing().unwrap());
+    let mut v: Vec<f64> = (0..7)
+        .map(|_| {
+            a.record(&s).unwrap();
+            for _ in 0..10 {
+                run();
+            }
+            b.record(&s).unwrap();
+            b.synchronize().unwrap();
+            Event::elapsed_ms(&a, &b).unwrap() as f64 * 100.0
+        })
+        .collect();
+    v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    s.memset(st.addr(), 0, VH * DK * DK * 4).unwrap();
+    run();
+    let o: Vec<f32> = s.download(out.addr(), T * VH * DK).unwrap();
+    let st_out: Vec<f32> = s.download(st.addr(), VH * DK * DK).unwrap();
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for v in o.iter().chain(&st_out) {
+        h = (h ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    let sum = h;
+    println!(
+        "{} ",
+        std::env::var("QUENCH6K_VARIANTS").unwrap_or_default());
+    println!("gdn_chunked_tc T={T}: {:.1} us per layer (bits hash {sum:016x})", v[3]);
+}
+
+/// NVFP4 activation quantization of a prefill chunk: the 8192 x 2560 expert input and the
+/// 81920 x 640 down-projection input.
+#[test]
+#[ignore]
+fn fp4_quant_rows_prefill() {
+    quench6k_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    for &(rows, k) in &[(8192usize, 2560usize), (81920, 640)] {
+        let mut x = 0x9e37_79b9u32;
+        let vals: Vec<u16> = (0..rows * k)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                // BF16 of a heavy-tailed value: occasional outliers per row
+                let u = (x as f32 / u32::MAX as f32) - 0.5;
+                let v = if i % 997 == 0 { u * 40.0 } else { u * u * u * 8.0 };
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let xb = DeviceBuffer::new(rows * k * 2).unwrap();
+        s.upload(&xb, &vals).unwrap();
+        let bytes = kernels::fp4_rows_bytes(rows, k);
+        let out = DeviceBuffer::zeroed(bytes).unwrap();
+        let run = || kernels::fp4_quant_rows(&s, xb.addr(), rows, k, out.addr()).unwrap();
+        run();
+        s.synchronize().unwrap();
+        let (a, b) = (Event::timing().unwrap(), Event::timing().unwrap());
+        let mut v: Vec<f64> = (0..7)
+            .map(|_| {
+                a.record(&s).unwrap();
+                for _ in 0..20 {
+                    run();
+                }
+                b.record(&s).unwrap();
+                b.synchronize().unwrap();
+                Event::elapsed_ms(&a, &b).unwrap() as f64 * 50.0
+            })
+            .collect();
+        v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let o: Vec<u8> = s.download(out.addr(), bytes).unwrap();
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &c in &o {
+            h = (h ^ c as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        println!("fp4_quant_rows {rows} x {k}: {:.1} us (bytes hash {h:016x})", v[3]);
+    }
+}

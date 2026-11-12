@@ -346,7 +346,7 @@ enum Command {
         /// Prefill chunk (tokens per forward pass).
         #[arg(long, default_value_t = 8192)]
         chunk: usize,
-        /// Also print per-op GPU time for a few eager decode steps.
+        /// Also print per-op GPU time for a few eager decode steps and for one eager prefill.
         #[arg(long)]
         profile: bool,
         /// After the timed run, decode this many graph steps inside a cudaProfilerStart/Stop region

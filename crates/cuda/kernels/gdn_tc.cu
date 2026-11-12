@@ -9,7 +9,9 @@
 // then per head, the chunks in order with the state S [128 k][128 v]:
 //   Vn = U - W S,  O = diag(exp(G)) (Q S) + P Vn,  S = exp(G_L) S + K^T (diag(exp(G_L - G)) Vn).
 // The state walk keeps every per-chunk buffer in shared memory and prefetches the next chunk's copy of
-// each with cp.async as soon as the current chunk is done with it.
+// each with cp.async as soon as the current chunk is done with it. It runs in two phases per chunk (two
+// block barriers each), and its warps interleave two tiles' MMA chains (mma_pair), which is what bounds
+// it: without the MMAs it takes 40% of the time.
 
 #include "mma.cuh"
 
@@ -68,6 +70,58 @@ SQ_DEVICE void mma_tile(float* c, const float* A, int ar, int ak, const float* B
     if constexpr (TF32X3)
 #pragma unroll
         for (int x = 0; x < 4; ++x) c[x] += lo[x];
+}
+
+// Two m16n8 tiles at once (independent MMA chains interleaved; each tile's arithmetic and summation
+// order exactly as mma_tile's): c0 += A0 B0, c1 += A1 B1, B rows optionally scaled by ks0 / ks1. With
+// SHARE_B, B1 is B0 and its fragments are loaded and split once.
+template <int K, bool SHARE_B>
+SQ_DEVICE void mma_pair(float* c0, const float* A0, int ar0, int ak0, const float* B0, const float* ks0, float* c1,
+                        const float* A1, int ar1, int ak1, const float* B1, const float* ks1, int bk, int bn) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    float lo0[4] = {0.f, 0.f, 0.f, 0.f}, lo1[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll 4
+    for (int k = 0; k < K; k += 8) {
+        const float a0[4] = {A0[g * ar0 + (k + t) * ak0], A0[(g + 8) * ar0 + (k + t) * ak0], A0[g * ar0 + (k + t + 4) * ak0],
+                             A0[(g + 8) * ar0 + (k + t + 4) * ak0]};
+        const float a1[4] = {A1[g * ar1 + (k + t) * ak1], A1[(g + 8) * ar1 + (k + t) * ak1], A1[g * ar1 + (k + t + 4) * ak1],
+                             A1[(g + 8) * ar1 + (k + t + 4) * ak1]};
+        float b0[2] = {B0[(k + t) * bk + g * bn], B0[(k + t + 4) * bk + g * bn]};
+        if (ks0) b0[0] *= ks0[k + t], b0[1] *= ks0[k + t + 4];
+        uint32_t ah0[4], al0[4], ah1[4], al1[4], bh0[2], bl0[2], bh1[2], bl1[2];
+#pragma unroll
+        for (int x = 0; x < 4; ++x) {
+            ah0[x] = tf32(a0[x]);
+            al0[x] = tf32(a0[x] - __uint_as_float(ah0[x]));
+            ah1[x] = tf32(a1[x]);
+            al1[x] = tf32(a1[x] - __uint_as_float(ah1[x]));
+        }
+#pragma unroll
+        for (int x = 0; x < 2; ++x) {
+            bh0[x] = tf32(b0[x]);
+            bl0[x] = tf32(b0[x] - __uint_as_float(bh0[x]));
+        }
+        if constexpr (SHARE_B) {
+#pragma unroll
+            for (int x = 0; x < 2; ++x) bh1[x] = bh0[x], bl1[x] = bl0[x];
+        } else {
+            float b1[2] = {B1[(k + t) * bk + g * bn], B1[(k + t + 4) * bk + g * bn]};
+            if (ks1) b1[0] *= ks1[k + t], b1[1] *= ks1[k + t + 4];
+#pragma unroll
+            for (int x = 0; x < 2; ++x) {
+                bh1[x] = tf32(b1[x]);
+                bl1[x] = tf32(b1[x] - __uint_as_float(bh1[x]));
+            }
+        }
+        mma_tf32(lo0, al0, bh0);
+        mma_tf32(lo1, al1, bh1);
+        mma_tf32(lo0, ah0, bl0);
+        mma_tf32(lo1, ah1, bl1);
+        mma_tf32(c0, ah0, bh0);
+        mma_tf32(c1, ah1, bh1);
+    }
+#pragma unroll
+    for (int x = 0; x < 4; ++x) c0[x] += lo0[x], c1[x] += lo1[x];
 }
 
 // Accumulator element e of an m16n8 tile sits at row g (+8 for e >= 2), column 2t (+1 for odd e).
@@ -259,7 +313,8 @@ __global__ void __launch_bounds__(ST_THREADS) state_tc_kernel(const float* __res
         }
         cp_async_commit();
     };
-    // Groups are committed in the order W/Q, U, P, K; each phase waits for the oldest of four.
+    // Groups are committed in the order W/Q, U, P, K. Two phases per chunk: (1) W S and Q S, then
+    // Vn = U - W S by the same warps; (2) O = exp(G) (Q S) + P Vn and the state update.
     load_wq(0);
     load_u(0);
     load_p(0);
@@ -267,65 +322,76 @@ __global__ void __launch_bounds__(ST_THREADS) state_tc_kernel(const float* __res
     // 32 x nc outputs (Q S, W S, O, Vn) as m16n8 tiles: warp w < 2 nt takes row block w % 2, n tile w / 2.
     const bool has = warp < 2 * nt;
     const int rb = warp & 1, cb = (warp >> 1) * 8;
+    constexpr int NW = ST_THREADS / 32;
     for (int ch = 0; ch < chunks; ++ch) {
         const int t0 = ch * L, len = min(L, T - t0);
-        cp_async_wait<3>();  // W, Q, g of this chunk
+        cp_async_wait<2>();  // W, Q, g and U of this chunk
         __syncthreads();
         if (warp == 0) Gs[lane] = warp_scan(gbuf[ch & 1][lane]);
-        // Phase 1: W S and Q S.
-        float ws[4] = {}, qs[4] = {};
+        // Phase 1: W S and Q S (shared S fragments), Vn = U - W S.
+        float qs[4] = {};
         if (has) {
-            mma_tile<DK>(ws, Wb + rb * 16 * LDK, LDK, 1, Ss + cb, LDN, 1);
-            mma_tile<DK>(qs, Qb + rb * 16 * LDK, LDK, 1, Ss + cb, LDN, 1);
-        }
-        __syncthreads();  // W, Q free; Gs visible
-        load_wq(ch + 1);
-        const float GL = Gs[L - 1];
-        if (tid < L) Kd[tid] = __expf(GL - Gs[tid]);
-        cp_async_wait<3>();  // U
-        __syncthreads();
-        // Phase 2: Vn = U - W S.
-        if (has)
+            float ws[4] = {};
+            mma_pair<DK, true>(ws, Wb + rb * 16 * LDK, LDK, 1, Ss + cb, nullptr, qs, Qb + rb * 16 * LDK, LDK, 1, Ss + cb, nullptr,
+                               LDN, 1);
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const int i = rb * 16 + frag_row(e), c = cb + frag_col(e);
                 Vn[i * LDN + c] = Ub[i * LDN + c] - ws[e];
             }
-        __syncthreads();  // U free; Vn, Kd visible
-        load_u(ch + 1);
-        cp_async_wait<3>();  // P
-        __syncthreads();
-        // Phase 3: O = exp(G) (Q S) + P Vn.
-        if (has) {
-            float o[4];
-#pragma unroll
-            for (int e = 0; e < 4; ++e) o[e] = __expf(Gs[rb * 16 + frag_row(e)]) * qs[e];
-            mma_tile<L>(o, Pb + rb * 16 * LDP, LDP, 1, Vn + cb, LDN, 1);
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const int i = rb * 16 + frag_row(e), c = cb + frag_col(e);
-                if (i < len) out[(size_t)(t0 + i) * VH * DV + vh * DV + c0 + c] = o[e];
-            }
         }
-        __syncthreads();  // P free
-        load_p(ch + 1);
-        cp_async_wait<3>();  // K
-        __syncthreads();
-        // Phase 4: S = exp(G_L) S + K^T diag(exp(G_L - G)) Vn: 128 x nc outputs, 8 row blocks x nt tiles.
+        __syncthreads();  // W, Q, U free; Vn, Gs visible
+        load_wq(ch + 1);
+        load_u(ch + 1);
+        const float GL = Gs[L - 1];
+        if (tid < L) Kd[tid] = __expf(GL - Gs[tid]);
+        cp_async_wait<2>();  // P, K
+        __syncthreads();     // Kd visible
+        // Phase 2: O = exp(G) (Q S) + P Vn (warps < 2 nt, paired with their first state tile), and
+        // S = exp(G_L) S + K^T diag(exp(G_L - G)) Vn: 128 x nc outputs, 8 row blocks x nt tiles.
         {
             const float egl = __expf(GL);
-            for (int id = warp; id < 8 * nt; id += ST_THREADS / 32) {
+            const int tiles = 8 * nt;
+            auto store_s = [&](int id, const float* sa) {
                 const int rk = id & 7, n = id >> 3;
-                float sa[4] = {};
-                mma_tile<L>(sa, Kb + rk * 16, 1, LDK, Vn + n * 8, LDN, 1, Kd);
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     const int d = rk * 16 + frag_row(e), c = n * 8 + frag_col(e);
                     Ss[d * LDN + c] = fmaf(egl, Ss[d * LDN + c], sa[e]);
                 }
+            };
+            int id = warp;
+            if (has) {
+                float o[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) o[e] = __expf(Gs[rb * 16 + frag_row(e)]) * qs[e];
+                float sa[4] = {};
+                const int rk = id & 7, n = id >> 3;
+                mma_pair<L, false>(o, Pb + rb * 16 * LDP, LDP, 1, Vn + cb, nullptr, sa, Kb + rk * 16, 1, LDK, Vn + n * 8, Kd, LDN, 1);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int i = rb * 16 + frag_row(e), c = cb + frag_col(e);
+                    if (i < len) out[(size_t)(t0 + i) * VH * DV + vh * DV + c0 + c] = o[e];
+                }
+                store_s(id, sa);
+                id += NW;
+            }
+            for (; id + NW < tiles; id += 2 * NW) {
+                float sa[4] = {}, sb[4] = {};
+                const int ra = id & 7, na = id >> 3, rbk = (id + NW) & 7, nb = (id + NW) >> 3;
+                mma_pair<L, false>(sa, Kb + ra * 16, 1, LDK, Vn + na * 8, Kd, sb, Kb + rbk * 16, 1, LDK, Vn + nb * 8, Kd, LDN, 1);
+                store_s(id, sa);
+                store_s(id + NW, sb);
+            }
+            if (id < tiles) {
+                float sa[4] = {};
+                const int rk = id & 7, n = id >> 3;
+                mma_tile<L>(sa, Kb + rk * 16, 1, LDK, Vn + n * 8, LDN, 1, Kd);
+                store_s(id, sa);
             }
         }
-        __syncthreads();  // K free; S updated
+        __syncthreads();  // P, K free; S updated
+        load_p(ch + 1);
         load_k(ch + 1);
     }
     cp_async_wait<0>();

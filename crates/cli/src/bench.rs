@@ -224,6 +224,19 @@ pub fn run(
                 "per-op GPU time over {STEPS} eager decode steps at context {ctx}:\n{}",
                 prof.report()
             );
+            // The same prompt prefilled again into a fresh state, timed per op (eager, so the host
+            // PLE gather does not overlap layer 0 as it does in the timed run).
+            let mut fresh = SequenceState::new(ctx + 16)?;
+            let mut prof = quench6k_engine::profile::Profiler::default();
+            let t0 = Instant::now();
+            for c in tokens.chunks(chunk) {
+                forward::forward_profiled(&model, &mut fresh, &mut ws, &stream, c, &mut prof)?;
+            }
+            println!(
+                "per-op GPU time of a {ctx}-token prefill in {chunk}-token chunks ({:.0} tok/s eager):\n{}",
+                ctx as f64 / t0.elapsed().as_secs_f64(),
+                prof.report()
+            );
         }
     }
     Ok(())
