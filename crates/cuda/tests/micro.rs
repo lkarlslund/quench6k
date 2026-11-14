@@ -558,8 +558,17 @@ fn gdn_chunked_tc_8k() {
     let out = DeviceBuffer::new(T * VH * DK * 4).unwrap();
     let scratch = DeviceBuffer::new(kernels::gdn_tc_scratch_floats(T) * 4).unwrap();
     let run = || {
-        kernels::gdn_chunked_tc(&s, dq.addr(), db.addr(), dg.addr(), st.addr(), out.addr(), T, scratch.addr())
-            .unwrap()
+        kernels::gdn_chunked_tc(
+            &s,
+            dq.addr(),
+            db.addr(),
+            dg.addr(),
+            st.addr(),
+            out.addr(),
+            T,
+            scratch.addr(),
+        )
+        .unwrap()
     };
     run();
     s.synchronize().unwrap();
@@ -587,8 +596,12 @@ fn gdn_chunked_tc_8k() {
     let sum = h;
     println!(
         "{} ",
-        std::env::var("QUENCH6K_VARIANTS").unwrap_or_default());
-    println!("gdn_chunked_tc T={T}: {:.1} us per layer (bits hash {sum:016x})", v[3]);
+        std::env::var("QUENCH6K_VARIANTS").unwrap_or_default()
+    );
+    println!(
+        "gdn_chunked_tc T={T}: {:.1} us per layer (bits hash {sum:016x})",
+        v[3]
+    );
 }
 
 /// NVFP4 activation quantization of a prefill chunk: the 8192 x 2560 expert input and the
@@ -607,7 +620,11 @@ fn fp4_quant_rows_prefill() {
                 x ^= x << 5;
                 // BF16 of a heavy-tailed value: occasional outliers per row
                 let u = (x as f32 / u32::MAX as f32) - 0.5;
-                let v = if i % 997 == 0 { u * 40.0 } else { u * u * u * 8.0 };
+                let v = if i % 997 == 0 {
+                    u * 40.0
+                } else {
+                    u * u * u * 8.0
+                };
                 (v.to_bits() >> 16) as u16
             })
             .collect();
@@ -636,6 +653,230 @@ fn fp4_quant_rows_prefill() {
         for &c in &o {
             h = (h ^ c as u64).wrapping_mul(0x100_0000_01b3);
         }
-        println!("fp4_quant_rows {rows} x {k}: {:.1} us (bytes hash {h:016x})", v[3]);
+        println!(
+            "fp4_quant_rows {rows} x {k}: {:.1} us (bytes hash {h:016x})",
+            v[3]
+        );
+    }
+}
+
+/// Device bytes from a xorshift stream; `lo..lo+span` bounds each byte (E4M3 scales stay finite).
+fn random_bytes(s: &Stream, n: usize, seed: u32, lo: u8, span: u8) -> DeviceBuffer {
+    let mut x = seed | 1;
+    let v: Vec<u8> = (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            if span == 0 {
+                x as u8
+            } else {
+                lo + (x % span as u32) as u8
+            }
+        })
+        .collect();
+    let b = DeviceBuffer::new(n).unwrap();
+    s.upload(&b, &v).unwrap();
+    b
+}
+
+/// Routed-expert W4A4 GEMMs of one 8K prefill chunk (512 experts, top 10, 81920 routed rows):
+/// gate/up with SwiGLU (N 640, K 2560) and down (N 2560, K 640), on a skewed synthetic routing.
+#[test]
+#[ignore]
+fn fp4_expert_gemm_prefill() {
+    quench6k_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    const E: usize = 512;
+    const T: usize = 8192;
+    const TOPK: usize = 10;
+    const I: usize = 640;
+    let pairs = T * TOPK;
+    // Skewed expert popularity: weight ~ 1 / (rank + 40) over a fixed permutation.
+    let mut x = 0x2545_f491u32;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        x
+    };
+    let w: Vec<f64> = (0..E)
+        .map(|e| 1.0 / ((e * 197 % E) as f64 + 40.0))
+        .collect();
+    let total: f64 = w.iter().sum();
+    let mut top: Vec<i32> = Vec::with_capacity(pairs);
+    for _ in 0..T {
+        let mut chosen: Vec<i32> = Vec::new();
+        while chosen.len() < TOPK {
+            let mut u = rnd() as f64 / u32::MAX as f64 * total;
+            let mut e = 0;
+            while e + 1 < E && u > w[e] {
+                u -= w[e];
+                e += 1;
+            }
+            if !chosen.contains(&(e as i32)) {
+                chosen.push(e as i32);
+            }
+        }
+        top.extend(chosen);
+    }
+    let mut counts = vec![0usize; E];
+    for &e in &top {
+        counts[e as usize] += 1;
+    }
+    let bm = kernels::fp4_tile_rows();
+    let tiles_needed: usize = counts.iter().map(|c| c.div_ceil(bm)).sum();
+    let max_tiles = pairs.div_ceil(bm) + E;
+    let top_i = DeviceBuffer::new(pairs * 4).unwrap();
+    s.upload(&top_i, &top).unwrap();
+    let ib = |n: usize| DeviceBuffer::zeroed(n * 4).unwrap();
+    let (cnt, cur, off, te, tr, nt, pr) = (
+        ib(E),
+        ib(E),
+        ib(E + 1),
+        ib(max_tiles),
+        ib(max_tiles),
+        ib(1),
+        ib(pairs),
+    );
+    kernels::moe_plan(
+        &s,
+        top_i.addr(),
+        T,
+        cnt.addr(),
+        cur.addr(),
+        off.addr(),
+        te.addr(),
+        tr.addr(),
+        nt.addr(),
+        pr.addr(),
+        bm,
+    )
+    .unwrap();
+    // Expert weights: codes [N, K/2], E4M3 block scales of 1.0 [N, K/16], scale2 per expert.
+    let proj = |n: usize,
+                k: usize|
+     -> (
+        DeviceBuffer,
+        DeviceBuffer,
+        DeviceBuffer,
+        DeviceBuffer,
+        DeviceBuffer,
+    ) {
+        let wq = random_bytes(&s, E * n * k / 2, (n * 31 + k) as u32, 0, 0);
+        let sq = random_bytes(&s, E * n * k / 16, (n * 7 + k * 3) as u32, 0x30, 16);
+        let wp: Vec<u64> = (0..E).map(|e| wq.addr() + (e * n * k / 2) as u64).collect();
+        let sp: Vec<u64> = (0..E)
+            .map(|e| sq.addr() + (e * n * k / 16) as u64)
+            .collect();
+        let (wpb, spb) = (
+            DeviceBuffer::new(E * 8).unwrap(),
+            DeviceBuffer::new(E * 8).unwrap(),
+        );
+        s.upload(&wpb, &wp).unwrap();
+        s.upload(&spb, &sp).unwrap();
+        (wq, sq, wpb, spb, scales(&s, E))
+    };
+    let gate = proj(I, D);
+    let up = proj(I, D);
+    let down = proj(D, I);
+    let a_in = DeviceBuffer::zeroed(kernels::fp4_rows_bytes(pairs, D)).unwrap();
+    let a_dn = DeviceBuffer::zeroed(kernels::fp4_rows_bytes(pairs, I)).unwrap();
+    for (buf, k) in [(&a_in, D), (&a_dn, I)] {
+        let (c, sc, r) = kernels::fp4_rows_layout(buf.addr(), pairs, k);
+        let codes = random_bytes(&s, pairs * k / 2, k as u32 * 11, 0, 0);
+        let bscale = random_bytes(&s, pairs * k / 16, k as u32 * 13, 0x30, 16);
+        s.copy_d2d(c, codes.addr(), pairs * k / 2).unwrap();
+        s.copy_d2d(sc, bscale.addr(), pairs * k / 16).unwrap();
+        s.upload_to(r, &vec![0.01f32; pairs]).unwrap();
+    }
+    let act = DeviceBuffer::zeroed(pairs * I * 2).unwrap();
+    let y = DeviceBuffer::zeroed(pairs * D * 2).unwrap();
+    let only = std::env::var("QUENCH6K_MICRO_ONLY").unwrap_or_default();
+    let gu = || {
+        kernels::moe_fp4_gate_up(
+            &s,
+            a_in.addr(),
+            pairs,
+            (gate.2.addr(), gate.3.addr(), gate.4.addr()),
+            (up.2.addr(), up.3.addr(), up.4.addr()),
+            off.addr(),
+            te.addr(),
+            tr.addr(),
+            nt.addr(),
+            max_tiles,
+            act.addr(),
+            I,
+            D,
+        )
+        .unwrap()
+    };
+    let dn = || {
+        kernels::moe_fp4_gemm_out(
+            &s,
+            a_dn.addr(),
+            pairs,
+            down.2.addr(),
+            down.3.addr(),
+            down.4.addr(),
+            off.addr(),
+            te.addr(),
+            tr.addr(),
+            nt.addr(),
+            max_tiles,
+            y.addr(),
+            D,
+            I,
+            true,
+        )
+        .unwrap()
+    };
+    let time = |f: &dyn Fn(), reps: usize| -> f64 {
+        f();
+        s.synchronize().unwrap();
+        let (a, b) = (Event::timing().unwrap(), Event::timing().unwrap());
+        let mut v: Vec<f64> = (0..7)
+            .map(|_| {
+                a.record(&s).unwrap();
+                for _ in 0..reps {
+                    f();
+                }
+                b.record(&s).unwrap();
+                b.synchronize().unwrap();
+                Event::elapsed_ms(&a, &b).unwrap() as f64 * 1000.0 / reps as f64
+            })
+            .collect();
+        v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        v[3]
+    };
+    let hash = |addr: u64, n: usize| {
+        let o: Vec<u16> = s.download(addr, n).unwrap();
+        o.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &v| {
+            (h ^ v as u64).wrapping_mul(0x100_0000_01b3)
+        })
+    };
+    let flops = |n: usize, k: usize| 2.0 * (pairs * n * k) as f64;
+    println!(
+        "routing: {} tiles of {bm} rows ({:.0}% full), largest expert {} rows, smallest {}",
+        tiles_needed,
+        100.0 * pairs as f64 / (tiles_needed * bm) as f64,
+        counts.iter().max().unwrap(),
+        counts.iter().min().unwrap()
+    );
+    if only.is_empty() || only == "gate_up" {
+        let us = time(&gu, 10);
+        println!(
+            "gate_up: {us:.1} us, {:.0} TFLOPS (act hash {:016x})",
+            flops(2 * I, D) / us / 1e6,
+            hash(act.addr(), pairs * I)
+        );
+    }
+    if only.is_empty() || only == "down" {
+        let us = time(&dn, 10);
+        println!(
+            "down: {us:.1} us, {:.0} TFLOPS (y hash {:016x})",
+            flops(D, I) / us / 1e6,
+            hash(y.addr(), pairs * D)
+        );
     }
 }

@@ -587,9 +587,34 @@ four HC ops 25%, GDN in/out projections 13.5%, FP4 activation quantization 4.1%,
   Prefill, two interleaved base/new pairs at 600 W (FP8 KV; the GPU warms from pair to pair): 8K
   +0.35% / +1.2%, 64K +0.09% / +0.9%, 131K -0.12% / +0.8%. Expected from the kernels: ~1.5% at 8K.
 - **Routed experts** (not attempted): gate/up run at ~490 TFLOPS and down at ~430 TFLOPS, about a
-  quarter of FP4 peak. At ~160 rows per expert per 8K chunk, the 128-row tiles of the grouped GEMM are
-  ~62% full; smaller or adaptive tail tiles are the next prefill candidate (a larger change).
+  quarter of FP4 peak. (The guess here that half-empty 128-row tiles were the cause was wrong; see
+  2026-11-14: both kernels move only their compulsory DRAM traffic.)
 - `kernels` test `expert_gate_up_small_matches_cpu` fails on main too (t 2 row 0 feature 0: -0.150 vs
   -0.118); its hand-built offsets probably no longer match `moe_gate_up_small`'s layout, and in parallel
   runs the out-of-bounds reads poison the shared context, so other tests fail with error 700. Decode
   sanity checks and oracle scores are unaffected. Not fixed yet.
+
+## 2026-11-14: routed-expert FP4 GEMMs under ncu
+
+`fp4_expert_gemm_prefill` in
+crates/cuda/tests/micro.rs runs one 8K chunk's routed GEMMs (512 experts, top 10, 81,920 rows; a skewed
+synthetic routing with 872 tiles, 73% full, 43 to 755 rows per expert).
+
+- gate_up with SwiGLU (N 640 x 2, K 2560): 988 us, 543 TFLOPS. down with BF16 output (N 2560, K 640):
+  628 us, 427 TFLOPS. Live profiles agree (~490 and ~430 TFLOPS).
+- **Both are bound by DRAM traffic they cannot avoid.** gate_up moves 1.16 GB from DRAM (65% of peak).
+  Its compulsory traffic is 1.17 GB: every expert's gate and up codes and scales (944 MB), the
+  quantized rows (118 MB) and the output (105 MB). down moves 0.88 GB at 83% of peak: 420 MB of
+  weights and 420 MB of BF16 output. Tile fill doesn't matter because tensor throughput is 38% and 32%.
+  Only a larger chunk lowers the weight bytes per token: see the 2026-10-16 findings, where a 16K chunk was +3.7% at
+  32K but needed 6.4 GB more device memory.
+- gate_up stalls: MIO throttle 34% of samples, math pipe 15%, barrier 12%, wait 13%, long scoreboard
+  9%. Achieved occupancy is 28% (2 CTAs per SM, limited by registers and shared memory).
+- Tried, no gain (all bit-identical):
+  - 64-value k-tiles in 4 or 5 stages, to keep more reads in flight: gate_up 1606 us (+63%), down
+    +2%. Per-step barriers and copy instructions cost more than the extra bytes in flight gain.
+  - Both k64 steps' block scales in one 8-byte shared load: no change.
+- The BF16-output down kernel spills 4 bytes per thread (ptxas), which is negligible.
+- What is left would need a different kernel design to raise gate_up's DRAM efficiency: warp
+  specialization with TMA bulk copies, fewer registers for 3 CTAs per SM. The bound is at most about
+  0.2 ms of 1.0 ms per layer, or about 2% of prefill.
