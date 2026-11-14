@@ -55,6 +55,8 @@ pub struct ServeOptions {
     pub vision: bool,
     pub image_max_pixels: usize,
     pub video_max_frames: usize,
+    /// Unload the model after this long without requests (the next request loads it again).
+    pub unload_idle: Option<std::time::Duration>,
 }
 
 /// Identity of the served model and numerics for stored contexts: config.json (and an overlay's
@@ -79,7 +81,22 @@ enum Work {
     Generate(QueuedJob),
     /// Write stored contexts to disk, then acknowledge.
     Persist(mpsc::Sender<()>),
+    /// Unload the model once no request is running or queued, then acknowledge.
+    Unload(mpsc::Sender<()>),
 }
+
+/// Why a GPU worker's scheduler returned.
+enum Exit {
+    /// The request channel closed.
+    Closed,
+    /// Unload the model (contexts persisted); acknowledge these requesters once it is gone.
+    Unload(Vec<mpsc::Sender<()>>),
+}
+
+/// Model states for `/metrics` and `/health`.
+const MODEL_UNLOADED: u64 = 0;
+const MODEL_LOADING: u64 = 1;
+const MODEL_LOADED: u64 = 2;
 
 /// A queued generation and where its tokens go.
 struct Job {
@@ -151,6 +168,20 @@ struct Metrics {
     /// Requests waiting for a slot, and requests running.
     queued: AtomicU64,
     running: AtomicU64,
+    /// MODEL_UNLOADED, MODEL_LOADING or MODEL_LOADED.
+    model_state: AtomicU64,
+    /// Model loads after the first (requests that found the model unloaded).
+    reloads: AtomicU64,
+}
+
+impl Metrics {
+    fn model_state_name(&self) -> &'static str {
+        match self.model_state.load(Ordering::Relaxed) {
+            MODEL_UNLOADED => "unloaded",
+            MODEL_LOADING => "loading",
+            _ => "loaded",
+        }
+    }
 }
 
 impl Metrics {
@@ -272,6 +303,16 @@ impl Metrics {
             "# HELP quench6k_requests_running Requests prefilling or decoding.\n# TYPE quench6k_requests_running gauge\nquench6k_requests_running {}",
             self.running.load(Ordering::Relaxed)
         );
+        let _ = writeln!(
+            out,
+            "# HELP quench6k_model_loaded Whether the model is loaded (0 unloaded, 1 loading, 2 loaded).\n# TYPE quench6k_model_loaded gauge\nquench6k_model_loaded {}",
+            self.model_state.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP quench6k_model_reloads_total Model loads after an unload.\n# TYPE quench6k_model_reloads_total counter\nquench6k_model_reloads_total {}",
+            self.reloads.load(Ordering::Relaxed)
+        );
         out
     }
 }
@@ -358,67 +399,148 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     let vision = opts.vision && !flint;
     let metrics = Arc::new(Metrics::new(if flint { 1 } else { slots }));
     let worker_metrics = metrics.clone();
+    let unload_idle = opts.unload_idle;
     std::thread::spawn(move || {
         let metrics = worker_metrics;
-        if flint {
-            match crate::flint::load(&model_dir) {
-                Ok((model, stream)) => {
-                    let _ = ready_tx.send(Ok(0.0));
-                    schedule_flint(&model, &stream, context, &jobs_rx, &metrics);
+        // The first load reports to startup (a failure ends the server); later loads are started by a
+        // request that found the model unloaded and report failures to the requests waiting.
+        let mut ready = Some(ready_tx);
+        let mut waiting: Vec<QueuedJob> = Vec::new();
+        loop {
+            metrics.model_state.store(MODEL_LOADING, Ordering::Relaxed);
+            let t0 = std::time::Instant::now();
+            let reload = ready.is_none();
+            let loaded = |metrics: &Metrics| {
+                metrics.model_state.store(MODEL_LOADED, Ordering::Relaxed);
+                if reload {
+                    metrics.reloads.fetch_add(1, Ordering::Relaxed);
+                    println!("model loaded again in {:.1}s", t0.elapsed().as_secs_f64());
+                }
+            };
+            let run = if flint {
+                crate::flint::load(&model_dir).map(|(model, stream)| {
+                    if let Some(tx) = ready.take() {
+                        let _ = tx.send(Ok(0.0));
+                    }
+                    loaded(&metrics);
+                    for slot in &metrics.live {
+                        slot.end(false);
+                    }
+                    let exit = schedule_flint(
+                        &model,
+                        &stream,
+                        context,
+                        &jobs_rx,
+                        &metrics,
+                        std::mem::take(&mut waiting),
+                        unload_idle,
+                    );
+                    drop(model);
+                    drop(stream);
+                    exit
+                })
+            } else {
+                let setup = (|| -> Result<_> {
+                    let (mut model, stream) = crate::load(&model_dir, Precision::Int8Group, true)?;
+                    let strength = steer.attach(&mut model, &stream)?;
+                    let mut session =
+                        Session::new(&model, &stream, context, 8192, drafts, store.clone())?;
+                    session.set_plan_tokens(plan_tokens);
+                    let observer_metrics = metrics.clone();
+                    session.set_prefill_observer(move |slot, done, cached| {
+                        observer_metrics.live[slot].prefill(done, cached);
+                    });
+                    if vision {
+                        let ckpt = quench6k_engine::checkpoint::Checkpoint::open(&model_dir)?;
+                        session.set_vision(quench6k_engine::vision::VisionModel::load(
+                            &ckpt,
+                            quench6k_engine::loader::LoadOptions::default(),
+                            &stream,
+                        )?);
+                    }
+                    println!(
+                        "context store: {} stored contexts",
+                        session.stored_contexts()
+                    );
+                    Ok((model, stream, session, strength))
+                })();
+                setup.map(|(model, stream, mut session, strength)| {
+                    if let Some(tx) = ready.take() {
+                        let _ = tx.send(Ok(strength));
+                    }
+                    if let Err(e) = session.add_slots(&model, &stream, slots) {
+                        eprintln!("{} of {slots} slots: {e:#}", session.slots());
+                    }
+                    for (i, slot) in metrics.live.iter().enumerate() {
+                        if i < session.slots() {
+                            slot.end(false);
+                        } else {
+                            slot.unavailable();
+                        }
+                    }
+                    loaded(&metrics);
+                    let exit = schedule(
+                        &model,
+                        &stream,
+                        &mut session,
+                        &jobs_rx,
+                        &metrics,
+                        prefill_share,
+                        std::mem::take(&mut waiting),
+                        unload_idle,
+                    );
+                    // The session's graphs and buffers refer to the model's, and both to the stream.
+                    drop(session);
+                    drop(model);
+                    drop(stream);
+                    exit
+                })
+            };
+            metrics.model_state.store(MODEL_UNLOADED, Ordering::Relaxed);
+            for slot in &metrics.live {
+                slot.unavailable();
+            }
+            for bytes in &metrics.kv_bytes {
+                bytes.store(0, Ordering::Relaxed);
+            }
+            match run {
+                Ok(Exit::Closed) => return,
+                Ok(Exit::Unload(acks)) => {
+                    println!("model unloaded");
+                    for ack in acks {
+                        let _ = ack.send(());
+                    }
                 }
                 Err(e) => {
-                    let _ = ready_tx.send(Err(e));
+                    if let Some(tx) = ready.take() {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                    eprintln!("loading the model: {e:#}");
+                    for queued in waiting.drain(..) {
+                        metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                        metrics.errors.fetch_add(1, Ordering::Relaxed);
+                        let _ = queued
+                            .job
+                            .tx
+                            .send(Msg::Error(format!("loading the model: {e:#}")));
+                    }
                 }
             }
-            return;
-        }
-        let setup = (|| -> Result<_> {
-            let (mut model, stream) = crate::load(&model_dir, Precision::Int8Group, true)?;
-            let strength = steer.attach(&mut model, &stream)?;
-            let mut session = Session::new(&model, &stream, context, 8192, drafts, store)?;
-            session.set_plan_tokens(plan_tokens);
-            let observer_metrics = metrics.clone();
-            session.set_prefill_observer(move |slot, done, cached| {
-                observer_metrics.live[slot].prefill(done, cached);
-            });
-            if vision {
-                let ckpt = quench6k_engine::checkpoint::Checkpoint::open(&model_dir)?;
-                session.set_vision(quench6k_engine::vision::VisionModel::load(
-                    &ckpt,
-                    quench6k_engine::loader::LoadOptions::default(),
-                    &stream,
-                )?);
+            // Unloaded: the next request loads the model again.
+            loop {
+                match jobs_rx.recv() {
+                    Ok(Work::Generate(job)) => {
+                        waiting.push(job);
+                        break;
+                    }
+                    Ok(Work::Persist(ack) | Work::Unload(ack)) => {
+                        let _ = ack.send(());
+                    }
+                    Err(_) => return,
+                }
             }
-            println!(
-                "context store: {} stored contexts",
-                session.stored_contexts()
-            );
-            Ok((model, stream, session, strength))
-        })();
-        let (model, stream, mut session) = match setup {
-            Ok((m, s, sess, strength)) => {
-                let _ = ready_tx.send(Ok(strength));
-                (m, s, sess)
-            }
-            Err(e) => {
-                let _ = ready_tx.send(Err(e));
-                return;
-            }
-        };
-        if let Err(e) = session.add_slots(&model, &stream, slots) {
-            eprintln!("{} of {slots} slots: {e:#}", session.slots());
         }
-        for slot in &metrics.live[session.slots()..] {
-            slot.unavailable();
-        }
-        schedule(
-            &model,
-            &stream,
-            &mut session,
-            &jobs_rx,
-            &metrics,
-            prefill_share,
-        );
     });
     let _ = ready_rx.recv().context("worker thread")??;
     let sampler = dashboard::start(metrics.clone(), opts.stats_dir, opts.stats_retention_days)?;
@@ -473,6 +595,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         .route("/assets/{file}", get(dashboard::asset))
         .route("/stats", get(dashboard::stats))
         .route("/health", get(health))
+        .route("/v1/unload", post(unload))
         .route("/v1/models", get(models))
         .route("/v1/models/{id}", get(model))
         .route("/v1/chat/completions", post(chat_completions))
@@ -521,7 +644,9 @@ fn schedule(
     jobs: &mpsc::Receiver<Work>,
     metrics: &Metrics,
     prefill_share: f64,
-) {
+    waiting: Vec<QueuedJob>,
+    unload_idle: Option<std::time::Duration>,
+) -> Exit {
     use quench6k_engine::session::Run;
     struct Active {
         run: Run,
@@ -608,13 +733,17 @@ fn schedule(
     };
     let nslots = session.slots();
     let mut slots: Vec<Option<Active>> = (0..nslots).map(|_| None).collect();
-    let mut queue: std::collections::VecDeque<QueuedJob> = std::collections::VecDeque::new();
+    let mut queue: std::collections::VecDeque<QueuedJob> = waiting.into();
+    // Unload requests wait until nothing runs or is queued.
+    let mut unload: Vec<mpsc::Sender<()>> = Vec::new();
+    let mut idle_since = std::time::Instant::now();
     let mut waiting_for_memory = false;
     let mut prefilling: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
     // Decode time owed to the running requests for the prefill time spent (see --prefill-share).
     let mut decode_credit = 0.0f64;
     let take = |w: Work,
                 queue: &mut std::collections::VecDeque<QueuedJob>,
+                unload: &mut Vec<mpsc::Sender<()>>,
                 session: &mut Session| match w {
         Work::Generate(job) => queue.push_back(job),
         Work::Persist(ack) => {
@@ -623,6 +752,7 @@ fn schedule(
             }
             let _ = ack.send(());
         }
+        Work::Unload(ack) => unload.push(ack),
     };
     loop {
         if let Err(e) = session.poll_cache() {
@@ -633,15 +763,23 @@ fn schedule(
             Ordering::Relaxed,
         );
         if slots.iter().all(Option::is_none) && queue.is_empty() && prefilling.is_empty() {
+            if !unload.is_empty() || unload_idle.is_some_and(|d| idle_since.elapsed() >= d) {
+                // Keep the slots' contexts: the reloaded model starts from the store.
+                if let Err(e) = session.persist() {
+                    eprintln!("persisting contexts: {e:#}");
+                }
+                return Exit::Unload(unload);
+            }
             match jobs.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(w) => take(w, &mut queue, session),
+                Ok(w) => take(w, &mut queue, &mut unload, session),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Exit::Closed,
             }
         }
         while let Ok(w) = jobs.try_recv() {
-            take(w, &mut queue, session);
+            take(w, &mut queue, &mut unload, session);
         }
+        idle_since = std::time::Instant::now();
         // Admit queued requests into free slots: the one whose GPU cache holds the most of the prompt,
         // else the one holding the shortest context (the cheapest to stash and overwrite).
         while let Some(queued) = queue.front() {
@@ -846,7 +984,9 @@ fn schedule_flint(
     context: usize,
     jobs: &mpsc::Receiver<Work>,
     metrics: &Metrics,
-) {
+    waiting: Vec<QueuedJob>,
+    unload_idle: Option<std::time::Duration>,
+) -> Exit {
     use quench6k_engine::flint as fl;
     let setup = || -> Result<_> {
         Ok((
@@ -858,16 +998,35 @@ fn schedule_flint(
     let (mut ws, mut seq, mut sampler) = match setup() {
         Ok(v) => v,
         Err(e) => {
+            // Unload; the next request tries again.
             eprintln!("flint worker: {e:#}");
-            return;
+            for queued in waiting {
+                metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                let _ = queued.job.tx.send(Msg::Error(format!("{e:#}")));
+            }
+            return Exit::Unload(Vec::new());
         }
     };
-    while let Ok(w) = jobs.recv() {
+    let mut waiting = waiting.into_iter();
+    loop {
+        let w = match (waiting.next(), unload_idle) {
+            (Some(queued), _) => Work::Generate(queued),
+            (None, Some(idle)) => match jobs.recv_timeout(idle) {
+                Ok(w) => w,
+                Err(mpsc::RecvTimeoutError::Timeout) => return Exit::Unload(Vec::new()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Exit::Closed,
+            },
+            (None, None) => match jobs.recv() {
+                Ok(w) => w,
+                Err(_) => return Exit::Closed,
+            },
+        };
         let job = match w {
             Work::Persist(ack) => {
                 let _ = ack.send(());
                 continue;
             }
+            Work::Unload(ack) => return Exit::Unload(vec![ack]),
             Work::Generate(queued) => queued.job,
         };
         metrics.queued.fetch_sub(1, Ordering::Relaxed);
@@ -1009,8 +1168,29 @@ fn schedule_flint(
     }
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+async fn health(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(json!({"status": "ok", "model": app.metrics.model_state_name()}))
+}
+
+/// POST /v1/unload: unloads the model once no request is running or queued (stored contexts are
+/// written to the store first) and answers when it is gone; the next request loads it again.
+async fn unload(State(app): State<Arc<App>>) -> Response {
+    let (ack_tx, ack_rx) = mpsc::channel();
+    if app.jobs.send(Work::Unload(ack_tx)).is_err() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the GPU worker has stopped",
+        )
+        .into_response();
+    }
+    match tokio::task::spawn_blocking(move || ack_rx.recv()).await {
+        Ok(Ok(())) => Json(json!({"status": "unloaded"})).into_response(),
+        _ => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the GPU worker did not unload",
+        )
+        .into_response(),
+    }
 }
 
 /// The served model names: the base model, the steered one with a pack loaded, and the adapted one

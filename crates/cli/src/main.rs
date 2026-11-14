@@ -298,6 +298,11 @@ enum Command {
         /// Do not load the vision tower (requests with images are rejected).
         #[arg(long)]
         no_vision: bool,
+        /// Unload the model after this many seconds without requests, freeing its GPU and host memory
+        /// (stored contexts are written to the store first); the next request loads it again.
+        /// POST /v1/unload unloads on demand.
+        #[arg(long, value_name = "SECS")]
+        unload_idle: Option<f64>,
         /// Largest image area after resizing, in pixels (the checkpoint's processor allows 16777216;
         /// each 32x32 block becomes one token).
         #[arg(long, default_value_t = 4194304)]
@@ -651,6 +656,7 @@ fn main() -> Result<()> {
             no_vision,
             image_max_pixels,
             video_max_frames,
+            unload_idle,
         } => serve::run(serve::ServeOptions {
             model,
             listen,
@@ -677,6 +683,9 @@ fn main() -> Result<()> {
             vision: !no_vision,
             image_max_pixels,
             video_max_frames,
+            unload_idle: unload_idle
+                .filter(|s| *s > 0.0)
+                .map(std::time::Duration::from_secs_f64),
         })?,
         Command::BatchCheck {
             model,

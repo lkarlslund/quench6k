@@ -62,6 +62,7 @@ to rewrite a file uncompressed on btrfs, create the copy with `chattr +m` set be
 | `--no-vision` | | Skips the vision tower (image and video requests are rejected) |
 | `--image-max-pixels N` | 4194304 | Largest image area after resizing (each 32×32 block is one token) |
 | `--video-max-frames N` | 128 | Most frames sampled from a video (2 per second) |
+| `--unload-idle SECS` | | Unloads the model after this many seconds without requests (see [Unloading](#unloading)) |
 
 Attention-cache memory is used per token a slot holds, not reserved per slot: about 18 KB per token
 with `--kv fp8` (36 KB with BF16). With `--context 262144 --slots 8 --kv fp8`, the weights and the
@@ -101,7 +102,9 @@ than its plan grows into free memory; only if none is left does it fail.
   about one second). Lifetime totals remain after graph retention expires. Persistence failures are
   logged and shown in the dashboard as `server.storage_error`. Disk work runs outside inference and
   history locks; concurrent historical scans are limited to two.
-- `GET /health`: `{"status": "ok"}` once the model is loaded.
+- `GET /health`: `{"status": "ok", "model": "loaded"}` once the server is up; `model` is `loaded`,
+  `loading` or `unloaded` (see [Unloading](#unloading)).
+- `POST /v1/unload`: unloads the model and answers `{"status": "unloaded"}` once it is gone.
 - `GET /v1/models`, `GET /v1/models/{id}`: the served model names, each with its context limit in
   `max_model_len` (as vLLM) and `context_length` (as OpenRouter): `--context`.
 - `POST /v1/chat/completions`: OpenAI chat completions, streaming with `"stream": true`. Reasoning is
@@ -120,7 +123,19 @@ than its plan grows into free memory; only if none is left does it fail.
 - `POST /detokenize`: `{"tokens": [...]}` to text, returned as `prompt` (vLLM) and `content` (llama.cpp).
 - `GET /metrics`: Prometheus counters per slot (generations, prompt tokens, prompt tokens served from
   the cache, generated tokens, prefill and decode seconds, attention-cache bytes in use), failed
-  generations, and the waiting and running requests.
+  generations, the waiting and running requests, the model state (`quench6k_model_loaded`: 0
+  unloaded, 1 loading, 2 loaded) and reloads after an unload.
+
+### Unloading
+
+`POST /v1/unload`, or `--unload-idle SECS` without requests, frees the model's device and host memory
+while the server keeps listening. It waits until no request is running or queued (requests queued
+before it finish first), writes the slots' contexts to the context store as a shutdown does, and drops
+the model; the CUDA context itself (well under 1 GB) stays. The next generation request loads the
+model again and is processed once loading finishes; requests arriving meanwhile queue behind it, and
+a request whose prompt was stored continues from the store. If loading fails, the waiting requests
+get the error and the next request tries again. Tokenizing, `/health`, `/metrics` and the dashboard
+answer without loading the model.
 
 A prompt of `--context` tokens or more is rejected with HTTP 400 and code `context_length_exceeded`.
 
