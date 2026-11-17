@@ -26,6 +26,7 @@ pub mod ffi {
 
     unsafe extern "C" {
         pub fn cudaGetErrorString(err: Error) -> *const c_char;
+        pub fn cudaGetLastError() -> Error;
         pub fn quench6k_set_variant(key: *const c_char, value: c_int);
         pub fn quench6k_clear_variants();
         pub fn cudaSetDevice(device: c_int) -> Error;
@@ -1084,6 +1085,9 @@ pub fn check(err: ffi::Error, what: &str) -> Result<()> {
     if err == ffi::SUCCESS {
         return Ok(());
     }
+    // A failed runtime call also sets the thread's last error, which the next kernel launch would report
+    // as its own (launches return cudaGetLastError()). Reported here, it is cleared; sticky errors stay.
+    unsafe { ffi::cudaGetLastError() };
     let message = unsafe { CStr::from_ptr(ffi::cudaGetErrorString(err)) }.to_string_lossy();
     bail!("{what}: CUDA error {err}: {message}")
 }

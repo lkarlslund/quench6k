@@ -902,6 +902,21 @@ impl Session {
         }
     }
 
+    /// Allocates `bytes` of device memory for `slot`, freeing memory elsewhere while the device is full.
+    fn alloc(&mut self, slot: usize, bytes: usize) -> Result<DeviceBuffer> {
+        loop {
+            match DeviceBuffer::new(bytes) {
+                Ok(b) => return Ok(b),
+                Err(e) if format!("{e:#}").contains("out of memory") => {
+                    if !self.free_memory(slot)? {
+                        return Err(e.context(format!("{bytes} bytes for slot {slot}: device memory is held by running requests")));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Frees device memory for `keep`'s caches, cheapest loss first: memory mapped past the positions
     /// each other slot holds; a periodic snapshot; the context of the least recently used idle slot (saved to
     /// the store first); older snapshots of other slots, then their last ones (saved first); older
@@ -1340,12 +1355,18 @@ impl Session {
     /// snapshot at its end).
     fn load_entry(&mut self, s: &Stream, slot: usize, i: usize) -> Result<()> {
         let t0 = std::time::Instant::now();
-        let lane = &mut self.lanes[slot];
-        let rec: usize = lane.pieces().iter().map(|p| p.1).sum();
+        let rec: usize = self.lanes[slot].pieces().iter().map(|p| p.1).sum();
         // The snapshot buffer first: without one the slot's context stays as it is.
-        let snap_buf = match lane.snapshots.last() {
-            Some(sn) if sn.buf.bytes() >= rec => lane.snapshots.pop().unwrap().buf,
-            _ => DeviceBuffer::new(rec)?,
+        let fits = |l: &Lane| l.snapshots.last().is_some_and(|sn| sn.buf.bytes() >= rec);
+        let fresh_buf = if fits(&self.lanes[slot]) {
+            None
+        } else {
+            Some(self.alloc(slot, rec)?)
+        };
+        let lane = &mut self.lanes[slot];
+        let snap_buf = match fresh_buf {
+            Some(b) => b,
+            None => lane.snapshots.pop().unwrap().buf,
         };
         lane.snapshots.clear();
         let t1 = std::time::Instant::now();
