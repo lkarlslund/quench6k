@@ -110,6 +110,11 @@ pub fn upload_quantized(
             );
             grouped.insert(m.as_str());
         }
+        let native = members.iter().filter(|m| native_mxfp8(ckpt, m)).count();
+        anyhow::ensure!(
+            native == 0 || native == members.len(),
+            "fusion group {name}: members mix checkpoint MXFP8 and other formats"
+        );
         units[file].push(unit_list.len());
         unit_list.push((
             Some(name.as_str()),
@@ -126,7 +131,7 @@ pub fn upload_quantized(
     for name in singles {
         let info = &ckpt.tensors[name];
         anyhow::ensure!(
-            info.dtype == DType::BF16 && info.shape.len() == 2,
+            (info.dtype == DType::BF16 || native_mxfp8(ckpt, name)) && info.shape.len() == 2,
             "{name}: only 2-D BF16 tensors quantize"
         );
         units[info.file].push(unit_list.len());
@@ -139,9 +144,16 @@ pub fn upload_quantized(
     };
     let mut stats = LoadStats::default();
     for file_units in units.iter().filter(|u| !u.is_empty()) {
+        let scale_names: Vec<String> = file_units
+            .iter()
+            .flat_map(|&u| unit_list[u].1.iter().copied())
+            .filter(|m| native_mxfp8(ckpt, m))
+            .map(|m| format!("{m}_scale"))
+            .collect();
         let mut names: Vec<&str> = file_units
             .iter()
             .flat_map(|&u| unit_list[u].1.iter().copied())
+            .chain(scale_names.iter().map(|n| n.as_str()))
             .collect();
         names.sort();
         let (staged, s) = upload(ckpt, |n| names.binary_search(&n).is_ok(), opts)?;
@@ -153,15 +165,17 @@ pub fn upload_quantized(
             let members = &unit_list[u].1;
             let kk = ckpt.tensors[members[0]].shape[1];
             let rows: usize = members.iter().map(|m| ckpt.tensors[*m].shape[0]).sum();
+            let mx8 = is_mx8(unit_list[u].0) || native_mxfp8(ckpt, members[0]);
             let (q, sc) = (total, total + (rows * kk).div_ceil(256) * 256);
-            total = sc + scale_bytes(is_mx8(unit_list[u].0), rows, kk).div_ceil(256) * 256;
+            total = sc + scale_bytes(mx8, rows, kk).div_ceil(256) * 256;
             placements.push((u, q, sc, rows, kk));
         }
         let arena = DeviceBuffer::new(total)?;
         for (u, q, sc, rows, kk) in placements {
             let (group, members) = &unit_list[u];
             let (mut qa, mut sa) = (arena.addr() + q as u64, arena.addr() + sc as u64);
-            let mx8 = is_mx8(*group);
+            let native = native_mxfp8(ckpt, members[0]);
+            let mx8 = is_mx8(*group) || native;
             let dtype = if mx8 { DType::MX8 } else { DType::I8G };
             if let Some(g) = group {
                 out.tensors.insert(
@@ -178,11 +192,23 @@ pub fn upload_quantized(
             for name in members {
                 let src = staged.get(name)?;
                 let n = src.shape[0];
-                prep(name, src.addr, n, kk)?;
-                if mx8 {
+                if native {
+                    // Stored as MXFP8 in the checkpoint: codes and scales are copied as they are.
+                    let sc = staged.get(&format!("{name}_scale"))?;
+                    anyhow::ensure!(
+                        sc.bytes as usize == n * kk / 32,
+                        "{name}_scale: {} bytes, {} expected",
+                        sc.bytes,
+                        n * kk / 32
+                    );
+                    stream.copy_d2d(qa, src.addr, n * kk)?;
+                    stream.copy_d2d(sa, sc.addr, n * kk / 32)?;
+                } else if mx8 {
+                    prep(name, src.addr, n, kk)?;
                     anyhow::ensure!(kk % 128 == 0, "{name}: K {kk} is not a multiple of 128");
                     k::mxfp8_rows(stream, src.addr, n, kk, kk, qa, sa)?;
                 } else {
+                    prep(name, src.addr, n, kk)?;
                     anyhow::ensure!(
                         kk % k::int8_group() == 0,
                         "{name}: K {kk} is not a multiple of the INT8 group"
@@ -205,6 +231,125 @@ pub fn upload_quantized(
         }
         stream.synchronize()?;
         out.segments.push(arena);
+    }
+    stats.segments = out.segments.len();
+    stats.seconds = start.elapsed().as_secs_f64();
+    Ok((out, stats))
+}
+
+/// Whether projection `name` is stored as MXFP8 in the checkpoint: E4M3 codes `[n, k]` with a sibling
+/// `<name>_scale` of UE8M0 bytes `[n, k / 32]`.
+pub fn native_mxfp8(ckpt: &Checkpoint, name: &str) -> bool {
+    let (Some(w), Some(s)) = (
+        ckpt.tensors.get(name),
+        ckpt.tensors.get(&format!("{name}_scale")),
+    ) else {
+        return false;
+    };
+    w.dtype == DType::F8E4M3
+        && s.dtype == DType::U8
+        && w.shape.len() == 2
+        && w.shape[1] % 32 == 0
+        && s.shape == [w.shape[0], w.shape[1] / 32]
+}
+
+/// Decodes every NVFP4 block-scale matrix stored in CSF form (see [`crate::csf`]) among the selected
+/// scales, `<scale>.nvfp4_csf_fixed` and `<scale>.nvfp4_csf_exceptions`, and uploads it under `<scale>` as
+/// F8 E4M3 `[rows, cols]`. Scales are batched into device allocations of about `batch_bytes`.
+pub fn upload_csf_scales(
+    ckpt: &Checkpoint,
+    select: impl Fn(&str) -> bool,
+    batch_bytes: usize,
+    stream: &Stream,
+) -> Result<(DeviceWeights, LoadStats)> {
+    use crate::csf;
+    let start = Instant::now();
+    let suffix = format!(".{}", csf::FIXED);
+    let mut scales: Vec<(String, usize, usize)> = ckpt
+        .tensors
+        .iter()
+        .filter_map(|(n, info)| {
+            let base = n.strip_suffix(&suffix)?;
+            select(base).then(|| (base.to_string(), info.shape.clone()))
+        })
+        .map(|(base, shape)| {
+            let (rows, cols) = csf::dims(&shape)?;
+            Ok((base, rows, cols))
+        })
+        .collect::<Result<_>>()?;
+    scales.sort();
+    let mut out = DeviceWeights {
+        segments: Vec::new(),
+        tensors: HashMap::new(),
+    };
+    let mut stats = LoadStats::default();
+    let mut i = 0;
+    while i < scales.len() {
+        let mut j = i;
+        let mut bytes = 0;
+        while j < scales.len() && (j == i || bytes + scales[j].1 * scales[j].2 <= batch_bytes) {
+            bytes += (scales[j].1 * scales[j].2).div_ceil(256) * 256;
+            j += 1;
+        }
+        let batch = &scales[i..j];
+        let mut offsets = Vec::with_capacity(batch.len());
+        let mut at = 0;
+        for (_, rows, cols) in batch {
+            offsets.push(at);
+            at += (rows * cols).div_ceil(256) * 256;
+        }
+        let mut host = vec![0u8; at];
+        // Split the host buffer per scale and decode in parallel.
+        let mut parts: Vec<(&(String, usize, usize), &mut [u8])> = Vec::with_capacity(batch.len());
+        let mut rest = host.as_mut_slice();
+        for (k, s) in batch.iter().enumerate() {
+            let len = offsets.get(k + 1).copied().unwrap_or(at) - offsets[k];
+            let (head, tail) = rest.split_at_mut(len);
+            parts.push((s, &mut head[..s.1 * s.2]));
+            rest = tail;
+        }
+        let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).min(16);
+        let per = parts.len().div_ceil(threads);
+        let errors = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for chunk in parts.chunks_mut(per.max(1)) {
+                let errors = &errors;
+                scope.spawn(move || {
+                    for ((base, _, _), dst) in chunk.iter_mut() {
+                        let r = (|| -> Result<()> {
+                            let fixed_name = format!("{base}.{}", csf::FIXED);
+                            let fixed = ckpt.read(&fixed_name)?;
+                            let ex = ckpt.read(&format!("{base}.{}", csf::EXCEPTIONS))?;
+                            csf::decode(&fixed, &ckpt.tensors[&fixed_name].shape, &ex, dst)
+                        })();
+                        if let Err(e) = r {
+                            errors.lock().unwrap().push(e.context(format!("decoding {base}")));
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = errors.into_inner().unwrap().into_iter().next() {
+            return Err(e);
+        }
+        let buffer = DeviceBuffer::new(at)?;
+        stream.upload_to(buffer.addr(), &host)?;
+        stream.synchronize()?;
+        for ((base, rows, cols), off) in batch.iter().zip(offsets) {
+            out.tensors.insert(
+                base.clone(),
+                DeviceTensor {
+                    addr: buffer.addr() + off as u64,
+                    bytes: (rows * cols) as u64,
+                    dtype: DType::F8E4M3,
+                    shape: vec![*rows, *cols],
+                    scale: 0,
+                },
+            );
+        }
+        stats.bytes += at as u64;
+        out.segments.push(buffer);
+        i = j;
     }
     stats.segments = out.segments.len();
     stats.seconds = start.elapsed().as_secs_f64();

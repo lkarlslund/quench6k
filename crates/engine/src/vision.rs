@@ -81,7 +81,37 @@ fn taps(i: usize, size: usize) -> [(usize, f32); 2] {
 
 impl VisionModel {
     pub fn load(ckpt: &Checkpoint, opts: LoadOptions, s: &Stream) -> Result<Self> {
-        let (weights, _) = loader::upload(ckpt, crate::selection::vision, opts)?;
+        // Quantized projections (NVIDIA's FP4-Local stores MXFP8 attention and NVFP4 MLP weights) are
+        // dequantized to BF16 on the host; the tower runs in BF16.
+        let mut quantized = Vec::new();
+        for name in ckpt.tensors.keys().filter(|n| crate::selection::vision(n)) {
+            if let Some((values, shape)) = crate::model::dequantize_bf16(ckpt, name)? {
+                quantized.push((name.clone(), values, shape));
+            }
+        }
+        let is_quantized = |n: &str| {
+            quantized.iter().any(|(q, _, _)| {
+                n == q || n.strip_prefix(q.as_str()).is_some_and(|r| r.starts_with("_scale"))
+            })
+        };
+        let (mut weights, _) =
+            loader::upload(ckpt, |n| crate::selection::vision(n) && !is_quantized(n), opts)?;
+        for (name, values, shape) in quantized {
+            let buf = DeviceBuffer::new(values.len() * 2)?;
+            s.upload(&buf, &values)?;
+            weights.tensors.insert(
+                name,
+                loader::DeviceTensor {
+                    addr: buf.addr(),
+                    bytes: (values.len() * 2) as u64,
+                    dtype: crate::checkpoint::DType::BF16,
+                    shape: shape.to_vec(),
+                    scale: 0,
+                },
+            );
+            weights.segments.push(buf);
+        }
+        s.synchronize()?;
         let mut fc2 = Vec::with_capacity(DEPTH);
         for b in 0..DEPTH {
             let t = weights.get(&format!("model.visual.blocks.{b}.mlp.linear_fc2.weight"))?;
