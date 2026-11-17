@@ -14,15 +14,24 @@ prints its options with `--help`.
 
 ## Checkpoints
 
-ModelOpt NVFP4 exports that quantize only the routed experts of the 48 text layers and keep every
-other tensor in BF16; the PLE n-gram table may be BF16 or FP8 E4M3 with a scale (Qwen's FP8 table).
+ModelOpt NVFP4 exports of Qwen3.8 Flash-Next with NVFP4 routed experts in the 48 text layers. The other
+projections may be BF16 (quantized to 8 bits at load) or MXFP8 (E4M3 with a UE8M0 scale per 32, used as
+stored); NVFP4 block scales may be plain or in ModelOpt's lossless CSF form (decoded at load); the PLE
+n-gram table may be BF16, FP8 E4M3 with a scale (Qwen's FP8 table) or NVFP4; MTP experts may be BF16
+(quantized to NVFP4 at load) or NVFP4.
 
 | Checkpoint | |
 |---|---|
+| [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVIDIA's quantization-aware distilled checkpoint for one GPU: MXFP8 attention, GDN and shared experts, NVFP4 PLE table (96 GB) |
 | [ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) | The correctness gate's reference model (a finetune) |
 | [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | Qwen's model; FP8 PLE table |
 
-Not supported: quantized attention or shared experts, compressed-tensors exports, GGUF.
+The gate's reference distributions (`oracle/fixtures`) were produced with Swift's weights; they do not
+judge other checkpoints, whose numerics differ by design.
+
+Not supported: NVFP4 shared experts or FP8 block-scaled MTP experts (e.g.
+[nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)),
+compressed-tensors exports, GGUF.
 
 Keep the PLE n-gram table's files (Swift: 92 GiB of BF16 in `embedding-model-*.safetensors`) on
 storage without filesystem compression. The table is memory-mapped and gathered on the host, 16 random

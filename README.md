@@ -57,7 +57,7 @@ quench6k serve --model /path/to/Qwen3.8-Flash-Next-NVFP4 --listen 0.0.0.0:8003 \
     --context 262144 --slots 8 --kv fp8 --cache-dir ~/.cache/quench6k
 ```
 
-Loading takes about 30 s (72.7 GiB uploaded to the GPU). Keep the checkpoint on fast local storage:
+Loading takes 25-30 s (about 72 GiB uploaded to the GPU). Keep the checkpoint on fast local storage:
 prefill reads per-layer embedding rows from it on demand.
 
 Slots share the available GPU memory: eight slots do not reserve eight full-size contexts. Requests
