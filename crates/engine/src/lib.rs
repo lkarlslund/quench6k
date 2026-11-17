@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod atlas;
 pub mod checkpoint;
 pub mod context_store;
+pub mod csf;
 pub mod dflash;
 pub mod edits;
 pub mod fileio;

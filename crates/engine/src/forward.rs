@@ -568,8 +568,8 @@ impl Workspace {
             xn: alloc(t * H * 4)?,
             out: alloc(t * D * 2)?,
             partial: alloc(PARTIAL_FLOATS * 4)?,
-            xq: alloc((t * D).div_ceil(256) * 256 + t * D / 32)?,
-            xq_bytes: t * D,
+            xq: alloc((t * MX8_MAX_K).div_ceil(256) * 256 + t * MX8_MAX_K / 32)?,
+            xq_bytes: t * MX8_MAX_K,
             active: alloc(EXPERTS * 4)?,
             num_active: alloc(4)?,
             row_token: alloc(k::moe_small_tokens() * TOP_K * 4)?,
@@ -712,6 +712,13 @@ fn linear_ld(
 
 const SMS: usize = 188;
 
+/// The largest K of a projection that may be MXFP8 (checkpoints that store the attention and GDN output
+/// projections in it): the size of the workspace's quantized-activation buffer per row.
+const MX8_MAX_K: usize = {
+    let a = if D > GDN_Z { D } else { GDN_Z };
+    if a > QSA_HEADS * QSA_DIM { a } else { QSA_HEADS * QSA_DIM }
+};
+
 fn linear(s: &Stream, ws: &Workspace, x: u64, w: &Linear, y: u64, t: usize) -> Result<()> {
     linear_ws(s, ws, x, w.k, w, y, w.n, t)
 }
@@ -767,15 +774,15 @@ fn dequantized(s: &Stream, ws: &Workspace, w: &Linear, t: usize) -> Result<Optio
 
 /// Computes every member of `proj` for `t` rows of `x` into `out` ([t, proj.n], FP32).
 fn project(s: &Stream, ws: &Workspace, x: u64, proj: &Proj, out: u64, t: usize) -> Result<()> {
-    match &proj.fused {
-        Some(w) => linear_ws(s, ws, x, w.k, w, out, proj.n, t),
-        None => {
-            for (w, col) in &proj.parts {
-                linear_ws(s, ws, x, w.k, w, out + (*col * 4) as u64, proj.n, t)?;
-            }
-            Ok(())
-        }
+    let runs = if proj.fused.is_empty() {
+        &proj.parts
+    } else {
+        &proj.fused
+    };
+    for (w, col) in runs {
+        linear_ws(s, ws, x, w.k, w, out + (*col * 4) as u64, proj.n, t)?;
     }
+    Ok(())
 }
 
 /// Mixes the residual through a HyperConnection: writes the BF16 block input to `out` and, when the HC
@@ -1734,10 +1741,8 @@ fn layer_weight_ranges(layer: &crate::model::Layer) -> Vec<(u64, u64)> {
         }
     }
     fn proj(v: &mut Vec<(u64, u64)>, p: &Proj) {
-        match &p.fused {
-            Some(l) => linear(v, l),
-            None => p.parts.iter().for_each(|(l, _)| linear(v, l)),
-        }
+        let runs = if p.fused.is_empty() { &p.parts } else { &p.fused };
+        runs.iter().for_each(|(l, _)| linear(v, l));
     }
     let mut v = Vec::new();
     proj(&mut v, &layer.attn_hc.down);
@@ -3044,7 +3049,18 @@ fn finish_layer(
             prof,
             "moe_shared_combine",
             s,
-            k::moe_shared_combine(s, x, ld, t, down, ws.yd, ws.pair_row, ws.top_w, ws.y)
+            k::moe_shared_combine(
+                s,
+                x,
+                ld,
+                [moe.proj.col(1), moe.proj.col(2), moe.proj.col(3)],
+                t,
+                down,
+                ws.yd,
+                ws.pair_row,
+                ws.top_w,
+                ws.y
+            )
         );
     } else {
         if side {

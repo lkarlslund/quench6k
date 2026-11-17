@@ -20,6 +20,7 @@ pub enum DType {
     /// Not a checkpoint dtype: MXFP8 weights produced at load (E4M3, a UE8M0 scale per 32 weights).
     MX8,
     I32,
+    U32,
     I64,
 }
 
@@ -32,6 +33,7 @@ impl DType {
             "F8_E4M3" => Self::F8E4M3,
             "U8" => Self::U8,
             "I32" => Self::I32,
+            "U32" => Self::U32,
             "I64" => Self::I64,
             other => bail!("unsupported safetensors dtype {other}"),
         })
@@ -41,7 +43,7 @@ impl DType {
         match self {
             Self::F8E4M3 | Self::U8 | Self::I8G | Self::MX8 => 1,
             Self::BF16 | Self::F16 => 2,
-            Self::F32 | Self::I32 => 4,
+            Self::F32 | Self::I32 | Self::U32 => 4,
             Self::I64 => 8,
         }
     }
@@ -141,7 +143,26 @@ impl Checkpoint {
             .map(|entry| entry.map(|e| e.path()))
             .collect::<std::io::Result<_>>()?;
         paths.retain(|p| p.extension().is_some_and(|e| e == "safetensors"));
+        // Shards the index places in subdirectories (e.g. `tensors/model-00001-of-00021.safetensors`).
+        if let Ok(index) = std::fs::read(dir.join("model.safetensors.index.json")) {
+            #[derive(Deserialize)]
+            struct Index {
+                weight_map: HashMap<String, String>,
+            }
+            let index: Index = serde_json::from_slice(&index)
+                .with_context(|| format!("parsing {}/model.safetensors.index.json", dir.display()))?;
+            let mut nested: Vec<PathBuf> = index
+                .weight_map
+                .into_values()
+                .filter(|f| f.contains('/'))
+                .map(|f| dir.join(f))
+                .collect();
+            nested.sort();
+            nested.dedup();
+            paths.extend(nested);
+        }
         paths.sort();
+        paths.dedup();
         ensure!(
             !paths.is_empty(),
             "no .safetensors files in {}",

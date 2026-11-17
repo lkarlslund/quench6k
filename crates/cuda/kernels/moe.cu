@@ -683,19 +683,19 @@ __global__ void __launch_bounds__(EW * 32) down_kernel(const __nv_bfloat16* __re
 
 
 // Small batches: the shared expert's down projection with its SwiGLU input computed on the fly from
-// the fused MoE projection rows (gate at column 512, up at 1152, shared-expert gate logit at 1792),
+// the MoE projection rows (gate at column GATE, up at UP, shared-expert gate logit at SG),
 // and the routed combine in the epilogue:
 //   y[t, n] = sum_k w[t, k] * yd[pair_row[t, k], n] + sigmoid(sg[t]) * (down_s[n] . swiglu(t)).
 // One warp per output feature n; K = 640 = 40 chunks of 16, two per lane, loaded before the PDL wait.
 template <WFmt F, int MAXT>
-__global__ void __launch_bounds__(256) shared_combine_kernel(const float* __restrict__ proj, int ld, int T,
+__global__ void __launch_bounds__(256) shared_combine_kernel(const float* __restrict__ proj, int ld, int GATE, int UP, int SG, int T,
                                                               const uint8_t* __restrict__ W,
                                                               const float* __restrict__ scale,
                                                               const float* __restrict__ yd,
                                                               const int* __restrict__ pair_row,
                                                               const float* __restrict__ top_w, float* y) {
     pdl_launch_dependents();
-    constexpr int K = 640, GATE = 512, UP = 1152, SG = 1792;
+    constexpr int K = 640;
     const int lane = threadIdx.x & 31, n = blockIdx.x * 8 + (threadIdx.x >> 5);
     const uint8_t* row = W + (size_t)n * K * elem_bytes<F>();
     Raw16<F> pre[2];
@@ -706,6 +706,8 @@ __global__ void __launch_bounds__(256) shared_combine_kernel(const float* __rest
         if (k < K) {
             pre[c] = load_raw16<F>(row, k);
             if constexpr (F == WFmt::INT8G) gs[c] = ld_stream_f32(scale + (size_t)n * (K / GROUP) + k / GROUP);
+            if constexpr (F == WFmt::MX8)
+                gs[c] = ue8m0_value(reinterpret_cast<const uint8_t*>(scale)[(size_t)n * (K / 32) + k / 32]);
         }
     }
     pdl_wait();
@@ -1082,14 +1084,14 @@ extern "C" cudaError_t quench6k_moe_down_small(const void* act, const uint64_t* 
     SQ_RETURN_LAUNCH();
 }
 
-// fmt 0 BF16 or 3 INT8 (scale per 64) shared-expert down weights [2560, 640].
-extern "C" cudaError_t quench6k_moe_shared_combine(int fmt, const float* proj, int ld, int T, const void* w,
+// fmt 0 BF16, 3 INT8 (scale per 64) or 4 MXFP8 shared-expert down weights [2560, 640].
+extern "C" cudaError_t quench6k_moe_shared_combine(int fmt, const float* proj, int ld, int gate, int up, int sg, int T, const void* w,
                                                  const float* scale, const float* yd, const int* pair_row,
                                                  const float* top_w, float* y, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     if (T > SMALL_T) return cudaErrorInvalidValue;
     const auto* w8 = static_cast<const uint8_t*>(w);
-#define SQ_SC(FMT, R) SQ_CHECK_LAUNCH(sq_launch(shared_combine_kernel<FMT, R>, D / 8, 256, 0, st, proj, ld, T, w8, scale, yd, pair_row, top_w, y))
+#define SQ_SC(FMT, R) SQ_CHECK_LAUNCH(sq_launch(shared_combine_kernel<FMT, R>, D / 8, 256, 0, st, proj, ld, gate, up, sg, T, w8, scale, yd, pair_row, top_w, y))
 #define SQ_SC_T(FMT) \
     if (T <= 1) SQ_SC(FMT, 1); \
     else if (T <= 2) SQ_SC(FMT, 2); \
@@ -1100,6 +1102,8 @@ extern "C" cudaError_t quench6k_moe_shared_combine(int fmt, const float* proj, i
         SQ_SC_T(WFmt::BF16)
     } else if (fmt == 3) {
         SQ_SC_T(WFmt::INT8G)
+    } else if (fmt == 4) {
+        SQ_SC_T(WFmt::MX8)
     } else {
         return cudaErrorInvalidValue;
     }

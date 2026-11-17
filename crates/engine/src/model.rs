@@ -34,11 +34,12 @@ pub struct Linear {
 }
 
 /// Projections that share an input, computed into one output row per token: member `i` fills columns
-/// `parts[i].1 ..` of a row of width `n`. With `fused`, the members are contiguous rows of one weight
-/// and a single GEMV/GEMM computes all of them.
+/// `parts[i].1 ..` of a row of width `n`. With `fused` runs, each run `(weight, column)` holds several
+/// members as contiguous rows of one weight (all of them, or those sharing a format), and one GEMV/GEMM
+/// per run computes them; without, every member is computed on its own.
 pub struct Proj {
     pub parts: Vec<(Linear, usize)>,
-    pub fused: Option<Linear>,
+    pub fused: Vec<(Linear, usize)>,
     pub n: usize,
 }
 
@@ -121,25 +122,41 @@ pub struct Layer {
     pub ple: Option<Ple>,
 }
 
-/// The host-resident PLE table: 128 memory-mapped shards of `[rows, 160]`, BF16 or FP8 E4M3 with a
-/// scale for the whole table (as in Qwen's FP8 release); FP8 rows are dequantized to BF16 when gathered.
-pub struct PleTable {
-    maps: Vec<(Mmap, usize)>,
-    rows_per_shard: usize,
-    /// FP8 tables: each code's value times the table scale.
-    fp8: Option<Box<[f32; 256]>>,
+/// How the host-resident PLE table stores its rows.
+enum PleFormat {
+    Bf16,
+    /// FP8 E4M3 with a scale for the whole table (as in Qwen's FP8 release): each code's value times it.
+    Fp8(Box<[f32; 256]>),
+    /// NVFP4: 4-bit E2M1 codes (two per byte, low nibble first), an E4M3 scale per 16 values in a sibling
+    /// `weight_scale` tensor per shard, and one FP32 `weight_scale_2` for the table.
+    Nvfp4 { scale2: f32 },
 }
+
+/// The host-resident PLE table: 128 memory-mapped shards of `[rows, 160]` values (BF16, FP8 E4M3 or
+/// NVFP4); quantized rows are dequantized to BF16 when gathered.
+pub struct PleTable {
+    /// Per shard: the row codes' mapping and offset, and for NVFP4 the block scales' mapping and offset.
+    maps: Vec<(Mmap, usize, Option<(Mmap, usize)>)>,
+    rows_per_shard: usize,
+    format: PleFormat,
+}
+
+/// E2M1 values by code.
+const FP4: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
 
 impl PleTable {
     pub const WIDTH: usize = 160;
 
     fn open(ckpt: &Checkpoint) -> Result<Self> {
-        let prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_";
+        let prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.";
         let mut shards: Vec<(usize, &str)> = ckpt
             .tensors
             .keys()
             .filter_map(|n| {
                 n.strip_prefix(prefix)
+                    .and_then(|r| r.strip_prefix("shard_"))
                     .and_then(|r| r.strip_suffix(".weight"))
                     .map(|i| (i.parse().unwrap(), n.as_str()))
             })
@@ -147,36 +164,33 @@ impl PleTable {
         shards.sort();
         ensure!(!shards.is_empty(), "checkpoint has no PLE table");
         let dtype = ckpt.get(shards[0].1)?.dtype;
-        let fp8 = match dtype {
-            DType::BF16 => None,
-            DType::F8E4M3 => {
-                let name =
-                    "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale";
-                let info = ckpt
-                    .get(name)
-                    .context("FP8 PLE table without a weight_scale")?;
-                let b = ckpt.read(name)?;
-                let scale = match (info.dtype, b.len()) {
-                    (DType::BF16, 2) => {
-                        f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)
-                    }
-                    (DType::F32, 4) => f32::from_le_bytes(b[..4].try_into().unwrap()),
-                    _ => anyhow::bail!("{name}: expected one BF16 or F32 value"),
-                };
-                Some(Box::new(std::array::from_fn(|c| e4m3(c as u8) * scale)))
-            }
-            other => anyhow::bail!("PLE table: {other:?} is not supported (BF16 or F8_E4M3)"),
-        };
-        let mut maps = Vec::with_capacity(shards.len());
-        let mut rows_per_shard = 0;
-        for (i, (index, name)) in shards.iter().enumerate() {
-            ensure!(*index == i, "PLE shard {i} missing");
+        let read_scalar = |name: &str| -> Result<f32> {
             let info = ckpt.get(name)?;
-            ensure!(
-                info.dtype == dtype && info.shape[1] == Self::WIDTH,
-                "{name}: unexpected PLE shard layout"
-            );
-            rows_per_shard = info.shape[0];
+            let b = ckpt.read(name)?;
+            Ok(match (info.dtype, b.len()) {
+                (DType::BF16, 2) => f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16),
+                (DType::F32, 4) => f32::from_le_bytes(b[..4].try_into().unwrap()),
+                _ => anyhow::bail!("{name}: expected one BF16 or F32 value"),
+            })
+        };
+        let (format, width) = match dtype {
+            DType::BF16 => (PleFormat::Bf16, Self::WIDTH),
+            DType::F8E4M3 => {
+                let scale = read_scalar(&format!("{prefix}weight_scale"))
+                    .context("FP8 PLE table without a weight_scale")?;
+                (
+                    PleFormat::Fp8(Box::new(std::array::from_fn(|c| e4m3(c as u8) * scale))),
+                    Self::WIDTH,
+                )
+            }
+            DType::U8 => {
+                let scale2 = read_scalar(&format!("{prefix}weight_scale_2"))
+                    .context("NVFP4 PLE table without a weight_scale_2")?;
+                (PleFormat::Nvfp4 { scale2 }, Self::WIDTH / 2)
+            }
+            other => anyhow::bail!("PLE table: {other:?} is not supported (BF16, F8_E4M3 or NVFP4)"),
+        };
+        let map = |info: &crate::checkpoint::TensorInfo| -> Result<(Mmap, usize)> {
             let file = &ckpt.files[info.file];
             let map = unsafe { Mmap::map(&file.file) }
                 .with_context(|| format!("mapping {}", file.path.display()))?;
@@ -185,18 +199,62 @@ impl PleTable {
             #[cfg(unix)]
             map.advise(memmap2::Advice::Random)
                 .context("madvise(MADV_RANDOM) on the PLE table")?;
-            maps.push((map, info.offset as usize));
+            Ok((map, info.offset as usize))
+        };
+        let mut maps = Vec::with_capacity(shards.len());
+        let mut rows_per_shard = 0;
+        for (i, (index, name)) in shards.iter().enumerate() {
+            ensure!(*index == i, "PLE shard {i} missing");
+            let info = ckpt.get(name)?;
+            ensure!(
+                info.dtype == dtype
+                    && info.shape[1] == width
+                    && (i == 0 || info.shape[0] == rows_per_shard),
+                "{name}: unexpected PLE shard layout"
+            );
+            rows_per_shard = info.shape[0];
+            let scales = match format {
+                PleFormat::Nvfp4 { .. } => {
+                    let sname = format!("{prefix}shard_{i}.weight_scale");
+                    let s = ckpt.get(&sname)?;
+                    ensure!(
+                        s.dtype == DType::F8E4M3 && s.shape == [rows_per_shard, Self::WIDTH / 16],
+                        "{sname}: unexpected NVFP4 scale layout"
+                    );
+                    Some(map(s)?)
+                }
+                _ => None,
+            };
+            let (m, off) = map(info)?;
+            maps.push((m, off, scales));
         }
         Ok(Self {
             maps,
             rows_per_shard,
-            fp8,
+            format,
         })
     }
 
-    /// Bytes per row.
+    /// Bytes per row of codes.
     fn row_bytes(&self) -> usize {
-        Self::WIDTH * if self.fp8.is_some() { 1 } else { 2 }
+        match self.format {
+            PleFormat::Bf16 => 2 * Self::WIDTH,
+            PleFormat::Fp8(_) => Self::WIDTH,
+            PleFormat::Nvfp4 { .. } => Self::WIDTH / 2,
+        }
+    }
+
+    /// The row's codes and, for NVFP4, its block scales.
+    fn row(&self, r: usize) -> (&[u8], Option<&[u8]>) {
+        let (map, base, scales) = &self.maps[r / self.rows_per_shard];
+        let i = r % self.rows_per_shard;
+        let start = base + i * self.row_bytes();
+        let codes = &map[start..start + self.row_bytes()];
+        let scales = scales.as_ref().map(|(m, b)| {
+            let s = b + i * (Self::WIDTH / 16);
+            &m[s..s + Self::WIDTH / 16]
+        });
+        (codes, scales)
     }
 
     /// Asks the kernel to start reading row `r` from disk if it is not resident, so that a batch of cold
@@ -204,9 +262,20 @@ impl PleTable {
     pub fn prefetch(&self, r: usize) {
         #[cfg(unix)]
         {
-            let (map, base) = &self.maps[r / self.rows_per_shard];
-            let start = base + (r % self.rows_per_shard) * self.row_bytes();
-            let _ = map.advise_range(memmap2::Advice::WillNeed, start, self.row_bytes());
+            let (map, base, scales) = &self.maps[r / self.rows_per_shard];
+            let i = r % self.rows_per_shard;
+            let _ = map.advise_range(
+                memmap2::Advice::WillNeed,
+                base + i * self.row_bytes(),
+                self.row_bytes(),
+            );
+            if let Some((m, b)) = scales {
+                let _ = m.advise_range(
+                    memmap2::Advice::WillNeed,
+                    b + i * (Self::WIDTH / 16),
+                    Self::WIDTH / 16,
+                );
+            }
         }
         #[cfg(not(unix))]
         let _ = r;
@@ -214,29 +283,90 @@ impl PleTable {
 
     /// Reads row `r`, faulting it into the page cache (blocking).
     pub fn touch(&self, r: usize) -> u8 {
-        let (map, base) = &self.maps[r / self.rows_per_shard];
-        let start = base + (r % self.rows_per_shard) * self.row_bytes();
+        let (codes, scales) = self.row(r);
         // The row may straddle a page boundary.
-        unsafe {
-            std::ptr::read_volatile(&map[start])
-                ^ std::ptr::read_volatile(&map[start + self.row_bytes() - 1])
+        let mut x = unsafe {
+            std::ptr::read_volatile(&codes[0]) ^ std::ptr::read_volatile(&codes[codes.len() - 1])
+        };
+        if let Some(s) = scales {
+            x ^= unsafe { std::ptr::read_volatile(&s[0]) ^ std::ptr::read_volatile(&s[s.len() - 1]) };
         }
+        x
     }
 
     /// Appends row `r` (160 BF16 values) to `out`.
     pub fn gather(&self, r: usize, out: &mut Vec<u16>) {
-        let (map, base) = &self.maps[r / self.rows_per_shard];
-        let start = base + (r % self.rows_per_shard) * self.row_bytes();
-        let bytes = &map[start..start + self.row_bytes()];
-        match &self.fp8 {
-            None => out.extend(
+        let (bytes, scales) = self.row(r);
+        match &self.format {
+            PleFormat::Bf16 => out.extend(
                 bytes
                     .chunks_exact(2)
                     .map(|b| u16::from_le_bytes([b[0], b[1]])),
             ),
-            Some(lut) => out.extend(bytes.iter().map(|&c| bf16_rne(lut[c as usize]))),
+            PleFormat::Fp8(lut) => out.extend(bytes.iter().map(|&c| bf16_rne(lut[c as usize]))),
+            PleFormat::Nvfp4 { scale2 } => {
+                let scales = scales.expect("NVFP4 PLE rows have scales");
+                out.extend(nvfp4_row(bytes, scales, *scale2));
+            }
         }
     }
+}
+
+/// One NVFP4 row of `2 * codes.len()` values as BF16: E2M1 value times (E4M3 block scale times `scale2`).
+fn nvfp4_row<'a>(codes: &'a [u8], scales: &'a [u8], scale2: f32) -> impl Iterator<Item = u16> + 'a {
+    codes.iter().enumerate().flat_map(move |(j, &c)| {
+        let s = e4m3(scales[j / 8]) * scale2;
+        [bf16_rne(FP4[(c & 15) as usize] * s), bf16_rne(FP4[(c >> 4) as usize] * s)]
+    })
+}
+
+/// A projection weight that the checkpoint stores quantized, dequantized to BF16 on the host: MXFP8
+/// (E4M3 codes with a sibling `weight_scale` of UE8M0 bytes per 32) or NVFP4 (packed E2M1 codes with a
+/// sibling `weight_scale` of E4M3 bytes per 16 and an FP32 `weight_scale_2`). `None` for other tensors.
+pub fn dequantize_bf16(ckpt: &Checkpoint, name: &str) -> Result<Option<(Vec<u16>, [usize; 2])>> {
+    let Some(sname) = name
+        .strip_suffix(".weight")
+        .map(|b| format!("{b}.weight_scale"))
+    else {
+        return Ok(None);
+    };
+    let (Some(w), Some(sc)) = (ckpt.tensors.get(name), ckpt.tensors.get(&sname)) else {
+        return Ok(None);
+    };
+    if w.shape.len() != 2 {
+        return Ok(None);
+    }
+    if crate::loader::native_mxfp8(ckpt, name) {
+        let (n, k) = (w.shape[0], w.shape[1]);
+        let (codes, scales) = (ckpt.read(name)?, ckpt.read(&sname)?);
+        let out = codes
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| {
+                let s = f32::from_bits((scales[(i / k) * (k / 32) + (i % k) / 32] as u32) << 23);
+                bf16_rne(e4m3(c) * s)
+            })
+            .collect();
+        return Ok(Some((out, [n, k])));
+    }
+    let s2name = format!("{}_2", sname);
+    if w.dtype == DType::U8 && sc.dtype == DType::F8E4M3 && sc.shape == [w.shape[0], w.shape[1] / 8] {
+        let (n, k) = (w.shape[0], 2 * w.shape[1]);
+        let s2 = ckpt.read(&s2name)?;
+        ensure!(s2.len() == 4, "{s2name}: expected one F32 value");
+        let scale2 = f32::from_le_bytes(s2[..4].try_into().unwrap());
+        let (codes, scales) = (ckpt.read(name)?, ckpt.read(&sname)?);
+        let mut out = Vec::with_capacity(n * k);
+        for r in 0..n {
+            out.extend(nvfp4_row(
+                &codes[r * k / 2..(r + 1) * k / 2],
+                &scales[r * k / 16..(r + 1) * k / 16],
+                scale2,
+            ));
+        }
+        return Ok(Some((out, [n, k])));
+    }
+    Ok(None)
 }
 
 /// FP8 E4M3 (fn: no infinities, 0x7f/0xff NaN) to f32.
@@ -283,6 +413,23 @@ pub struct ExpertTables {
 }
 
 impl ExpertTables {
+    /// Tables over the NVFP4 experts of layer `prefix` as stored per expert in the checkpoint (codes,
+    /// block scales and `weight_scale_2`), already on the device in `weights`.
+    pub fn bind(ckpt: &Checkpoint, weights: &DeviceWeights, prefix: &str, stream: &Stream) -> Result<Self> {
+        let mut addrs = [[0u64; EXPERTS]; 6];
+        let mut scale2 = [[0f32; EXPERTS]; 3];
+        for e in 0..EXPERTS {
+            for (j, proj) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
+                let base = format!("{prefix}.mlp.experts.{e}.{proj}");
+                addrs[2 * j][e] = weights.get(&format!("{base}.weight"))?.addr;
+                addrs[2 * j + 1][e] = weights.get(&format!("{base}.weight_scale"))?.addr;
+                let s2 = ckpt.read(&format!("{base}.weight_scale_2"))?;
+                scale2[j][e] = f32::from_le_bytes(s2[..4].try_into()?);
+            }
+        }
+        Self::upload(&addrs, &scale2, Vec::new(), stream)
+    }
+
     /// `addrs`: [gate codes, gate scales, up codes, up scales, down codes, down scales][expert];
     /// `scale2`: [gate, up, down][expert].
     pub fn upload(
@@ -402,11 +549,11 @@ impl Model {
                 n += l.n;
             }
             let fused = if weights.tensors.contains_key(&group) {
-                Some(lin(&group)?)
+                vec![(lin(&group)?, 0)]
             } else if parts.len() == 1 {
-                Some(parts[0].0)
+                vec![(parts[0].0, 0)]
             } else {
-                None
+                Vec::new()
             };
             Ok(Proj { parts, fused, n })
         };
@@ -444,8 +591,25 @@ impl Model {
         };
         let moe = |p: &str, tables: ExpertTables| -> Result<Moe> {
             let m = format!("{p}.mlp");
+            let [(route, _), (shared, _)] = moe_runs(p);
+            let proj = if weights.tensors.contains_key(&route) {
+                // Router and shared-expert gate logit in one run (columns 0..513), the shared expert's
+                // gate and up projections in another (from column 640); member columns as listed.
+                let x = |s: &str| lin(&format!("{m}.{s}.weight"));
+                let (router, sg) = (x("gate")?, x("shared_expert_gate")?);
+                let (gate, up) = (x("shared_expert.gate_proj")?, x("shared_expert.up_proj")?);
+                let at = MOE_SHARED_RUN_COL;
+                ensure!(router.n + sg.n <= at, "MoE router run overlaps the shared-expert run");
+                Proj {
+                    parts: vec![(router, 0), (gate, at), (up, at + gate.n), (sg, router.n)],
+                    fused: vec![(lin(&route)?, 0), (lin(&shared)?, at)],
+                    n: at + gate.n + up.n,
+                }
+            } else {
+                proj(moe_group(p))?
+            };
             Ok(Moe {
-                proj: proj(moe_group(p))?,
+                proj,
                 shared_down: lin(&format!("{m}.shared_expert.down_proj.weight"))?,
                 gate: tables.gate,
                 up: tables.up,
@@ -458,19 +622,7 @@ impl Model {
         let mut layers = Vec::with_capacity(count);
         for i in 0..count {
             let p = format!("model.language_model.layers.{i}");
-            // Expert codes, scales and weight_scale_2 as stored per expert in the checkpoint.
-            let mut addrs = [[0u64; EXPERTS]; 6];
-            let mut scale2 = [[0f32; EXPERTS]; 3];
-            for e in 0..EXPERTS {
-                for (j, proj) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
-                    let base = format!("{p}.mlp.experts.{e}.{proj}");
-                    addrs[2 * j][e] = w(&format!("{base}.weight"))?;
-                    addrs[2 * j + 1][e] = w(&format!("{base}.weight_scale"))?;
-                    let s2 = ckpt.read(&format!("{base}.weight_scale_2"))?;
-                    scale2[j][e] = f32::from_le_bytes(s2[..4].try_into()?);
-                }
-            }
-            let tables = ExpertTables::upload(&addrs, &scale2, Vec::new(), stream)?;
+            let tables = ExpertTables::bind(ckpt, &weights, &p, stream)?;
 
             let ple = if i == 1 {
                 let q = format!("{p}.ple");
@@ -578,6 +730,24 @@ fn moe_group(layer: &str) -> (String, Vec<String>) {
         .map(|x| format!("{m}.{x}.weight"))
         .collect(),
     )
+}
+
+/// Output column of the shared expert's gate/up run when the MoE input projection is computed as two runs.
+pub const MOE_SHARED_RUN_COL: usize = 640;
+
+/// The MoE input projection as two runs of one format each, for checkpoints that store the shared
+/// expert's gate and up projections as MXFP8 but the router and shared-expert gate in BF16: (router,
+/// shared-expert gate logit) and (shared gate, shared up).
+pub fn moe_runs(layer: &str) -> [(String, Vec<String>); 2] {
+    let m = format!("{layer}.mlp");
+    let w = |x: &str| format!("{m}.{x}.weight");
+    [
+        (format!("{m}.quench6k.route"), vec![w("gate"), w("shared_expert_gate")]),
+        (
+            format!("{m}.quench6k.shared"),
+            vec![w("shared_expert.gate_proj"), w("shared_expert.up_proj")],
+        ),
+    ]
 }
 
 /// Every multi-member projection group of the text model; quantized profiles store each contiguously.
@@ -724,12 +894,63 @@ pub fn load_text(
         Some(i) => i < opts.layers,
         None => true,
     };
-    let wanted = |n: &str| {
-        (selection::text(n) && in_layers(n))
-            || (mtp && selection::mtp(n) && !n.contains(".experts."))
+    // Checkpoints quantized for local inference (NVIDIA's FP4-Local) store the MTP experts as NVFP4 per
+    // expert like the main layers' (instead of one BF16 tensor quantized at load), the attention, GDN and
+    // shared-expert projections as MXFP8 (used as stored), and NVFP4 block scales in CSF form.
+    let mtp_nvfp4 = ckpt
+        .tensors
+        .contains_key("mtp.layers.0.mlp.experts.0.gate_proj.weight");
+    let native = |n: &str| loader::native_mxfp8(ckpt, n);
+    let native_scale = |n: &str| {
+        n.strip_suffix("_scale")
+            .is_some_and(|w| selection::eight_bit(w) && native(w))
     };
+    let in_model = |n: &str| {
+        (selection::text(n) && in_layers(n))
+            || (mtp && selection::mtp(n) && (mtp_nvfp4 || !n.contains(".experts.")))
+    };
+    let wanted = |n: &str| in_model(n) && !n.contains(".nvfp4_csf_") && !native_scale(n);
     let quantized = |n: &str| format != WeightFormat::Bf16 && selection::eight_bit(n);
+    ensure!(
+        format != WeightFormat::Bf16
+            || !ckpt.tensors.keys().any(|n| selection::eight_bit(n) && native(n)),
+        "the BF16 profile cannot load a checkpoint with MXFP8 projections"
+    );
     let (mut weights, mut stats) = loader::upload(ckpt, |n| wanted(n) && !quantized(n), opts)?;
+    // Norm weights stored in FP32 (NVIDIA's FP4-Local keeps the HyperConnection and PLE norms in FP32;
+    // the kernels read BF16 norms): rounded to nearest-even BF16.
+    let f32_norms: Vec<String> = weights
+        .tensors
+        .iter()
+        .filter(|(n, t)| {
+            t.dtype == DType::F32
+                && t.shape.len() == 1
+                && n.strip_suffix(".weight")
+                    .and_then(|m| m.rsplit('.').next())
+                    .is_some_and(|m| m.contains("norm"))
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    for name in f32_norms {
+        let raw = ckpt.read(&name)?;
+        let bf: Vec<u16> = raw
+            .chunks_exact(4)
+            .map(|b| bf16_rne(f32::from_le_bytes(b.try_into().unwrap())))
+            .collect();
+        let buf = DeviceBuffer::new(bf.len() * 2)?;
+        stream.upload(&buf, &bf)?;
+        let t = weights.tensors.get_mut(&name).unwrap();
+        t.addr = buf.addr();
+        t.bytes = (bf.len() * 2) as u64;
+        t.dtype = DType::BF16;
+        weights.segments.push(buf);
+    }
+    stream.synchronize()?;
+    let (scales, s) = loader::upload_csf_scales(ckpt, |n| in_model(n), 256 << 20, stream)?;
+    stats.bytes += s.bytes;
+    stats.seconds += s.seconds;
+    stats.segments += s.segments;
+    weights.merge(scales);
     // Fold each HyperConnection's (1 + w) norm weight into its down and injection projections (SPEC §4),
     // so small batches can project the raw residual and apply the per-stream RMS factor afterwards.
     // Experiment: QUENCH6K_FAKE_FP4_W (comma-separated classes) rounds those BF16 weights to NVFP4 values
@@ -823,11 +1044,29 @@ pub fn load_text(
         }
         stream.synchronize()?;
     } else {
+        // A group fuses into one weight only if its members share a format: the MoE input group of an
+        // MXFP8 checkpoint (BF16 router and shared-expert gate, MXFP8 shared gate/up) stays unfused.
+        // Such a group is computed as runs of one format each where a layout exists (the MoE input).
+        let mut groups = Vec::new();
+        for (name, members) in projection_groups(mtp, opts.layers) {
+            let k = members.iter().filter(|x| native(x)).count();
+            if k == 0 || k == members.len() {
+                groups.push((name, members));
+            } else if let Some(layer) = name.strip_suffix(".mlp.quench6k.in_proj") {
+                let runs = moe_runs(layer);
+                if runs.iter().all(|(_, m)| {
+                    let k = m.iter().filter(|x| native(x)).count();
+                    k == 0 || k == m.len()
+                }) {
+                    groups.extend(runs);
+                }
+            }
+        }
         let (converted, s) = loader::upload_quantized(
             ckpt,
             |n| wanted(n) && quantized(n),
             format,
-            &projection_groups(mtp, opts.layers),
+            &groups,
             &fold,
             opts,
             stream,
@@ -839,7 +1078,12 @@ pub fn load_text(
     }
     let mtp_experts = if mtp {
         let (head, sketch, bufs) = load_draft_head(ckpt, opts, stream)?;
-        Some((load_mtp_experts(ckpt, opts, stream)?, head, sketch, bufs))
+        let tables = if mtp_nvfp4 {
+            ExpertTables::bind(ckpt, &weights, "mtp.layers.0", stream)?
+        } else {
+            load_mtp_experts(ckpt, opts, stream)?
+        };
+        Some((tables, head, sketch, bufs))
     } else {
         None
     };
@@ -851,7 +1095,22 @@ pub fn load_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{bf16_rne, e4m3};
+    use super::{bf16_rne, e4m3, nvfp4_row};
+
+    #[test]
+    fn nvfp4_rows() {
+        // Codes (1, 7) and (9, 15) under block scale 2.0 (0x40), then (2, 0) under 0.5 (0x30); scale2 0.25.
+        let mut codes = vec![0x71, 0xf9];
+        codes.extend(std::iter::repeat_n(0, 6));
+        codes.push(0x02);
+        codes.extend(std::iter::repeat_n(0, 7));
+        let row: Vec<f32> = nvfp4_row(&codes, &[0x40, 0x30], 0.25)
+            .map(|b| f32::from_bits((b as u32) << 16))
+            .collect();
+        assert_eq!(row.len(), 32);
+        assert_eq!(&row[..4], &[0.25, 3.0, -0.25, -3.0]);
+        assert_eq!(&row[16..18], &[0.125, 0.0]);
+    }
 
     #[test]
     fn e4m3_values() {
