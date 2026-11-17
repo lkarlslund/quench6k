@@ -189,7 +189,10 @@ cudaError_t launch_m(const __nv_bfloat16* X, int ldx, const uint8_t* W, const fl
     const int k_per_split = ((K + splits - 1) / splits + 511) / 512 * 512;
     splits = (K + k_per_split - 1) / k_per_split;
     const int variant = M == 1 || M == 4;
-    const int pre = variant ? sq_variant_shape("gemv.pre", N, 5) : 5, nw = variant ? sq_variant_shape("gemv.warps", N, WARPS) : WARPS;
+    // Four-row steps over long rows (K >= 4096: the attention and GDN output projections) prefetch 8
+    // chunks per lane (kbench, MXFP8 at K 6144: -0.9% per verify step).
+    const int pre_default = M == 4 && K >= 4096 ? 8 : 5;
+    const int pre = variant ? sq_variant_shape("gemv.pre", N, pre_default) : 5, nw = variant ? sq_variant_shape("gemv.warps", N, WARPS) : WARPS;
     int rows = variant ? sq_variant_shape("gemv.rows", N, 0) : 0;
     // Default: two rows per warp when that still gives at least one CTA per SM, otherwise one; four-row
     // steps (MTP verify rounds) always take two (kbench: 1.1% faster per verify step).

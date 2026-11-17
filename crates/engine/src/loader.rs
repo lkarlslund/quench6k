@@ -16,8 +16,13 @@ use quench6k_cuda::{DeviceBuffer, Event, PinnedBuffer, Stream};
 
 use crate::checkpoint::{Checkpoint, DType};
 
-/// Unselected bytes tolerated inside a segment instead of splitting it.
+/// Unselected bytes between tensors that are still read as part of one segment (one device allocation,
+/// one sequence of large reads).
 const MAX_GAP: u64 = 1 << 20;
+
+/// Unselected bytes between tensors that are also copied to the device, keeping both in one run; larger
+/// gaps are read but not copied (the runs are packed in the segment's allocation).
+const PACK_GAP: u64 = 4096;
 
 #[derive(Clone, Debug)]
 pub struct DeviceTensor {
@@ -384,11 +389,13 @@ pub struct LoadStats {
     pub seconds: f64,
 }
 
+/// A read of `len` bytes at `offset` of `file`, and the pieces of it that are copied to the device:
+/// (offset in the read, bytes, device address).
 struct Chunk {
     file: usize,
     offset: u64,
     len: usize,
-    dst: u64,
+    pieces: Vec<(usize, usize, u64)>,
 }
 
 fn required_alignment(ckpt: &Checkpoint, name: &str) -> u64 {
@@ -423,26 +430,46 @@ pub fn upload(
         list.sort_by_key(|&(_, begin, _)| begin);
         let mut i = 0;
         while i < list.len() {
-            // The segment starts at its first tensor, which lands on the (256-byte aligned) allocation
-            // base; a later tensor joins only if it stays aligned (16 bytes, or its dtype size if smaller).
+            // A segment: tensors whose gaps are at most MAX_GAP, read together. Within it, runs: tensors
+            // whose gaps are at most PACK_GAP and that stay aligned relative to the run's first tensor
+            // (16 bytes, or their dtype size if smaller), copied as one range; each run starts on a
+            // 256-byte boundary of the segment's allocation.
             let seg_begin = list[i].1;
             let mut seg_end = list[i].2;
             let mut j = i + 1;
-            while j < list.len()
-                && list[j].1 <= seg_end + MAX_GAP
-                && (list[j].1 - seg_begin) % required_alignment(ckpt, list[j].0) == 0
-            {
+            while j < list.len() && list[j].1 <= seg_end + MAX_GAP {
                 seg_end = seg_end.max(list[j].2);
                 j += 1;
             }
-            let len = (seg_end - seg_begin) as usize;
-            let buffer = DeviceBuffer::new(len)?;
+            // (file begin, file end, offset in the allocation)
+            let mut runs: Vec<(u64, u64, u64)> = Vec::new();
+            let mut run_of = Vec::with_capacity(j - i);
+            let mut alloc = 0u64;
             for &(name, begin, end) in &list[i..j] {
+                let joins = runs.last().is_some_and(|r| {
+                    begin <= r.1 + PACK_GAP
+                        && (begin - r.0) % required_alignment(ckpt, name) == 0
+                });
+                if joins {
+                    let r = runs.last_mut().unwrap();
+                    r.1 = r.1.max(end);
+                } else {
+                    if let Some(r) = runs.last() {
+                        alloc += (r.1 - r.0).div_ceil(256) * 256;
+                    }
+                    runs.push((begin, end, alloc));
+                }
+                run_of.push(runs.len() - 1);
+            }
+            let last = runs.last().unwrap();
+            let len = (alloc + (last.1 - last.0)) as usize;
+            let buffer = DeviceBuffer::new(len)?;
+            for (&(name, begin, end), &r) in list[i..j].iter().zip(&run_of) {
                 let info = &ckpt.tensors[name];
                 tensors.insert(
                     name.to_string(),
                     DeviceTensor {
-                        addr: buffer.addr() + (begin - seg_begin),
+                        addr: buffer.addr() + runs[r].2 + (begin - runs[r].0),
                         bytes: end - begin,
                         dtype: info.dtype,
                         shape: info.shape.clone(),
@@ -450,16 +477,37 @@ pub fn upload(
                     },
                 );
             }
-            let mut offset = 0usize;
-            while offset < len {
-                let n = opts.chunk_bytes.min(len - offset);
-                chunks.push(Chunk {
-                    file,
-                    offset: seg_begin + offset as u64,
-                    len: n,
-                    dst: buffer.addr() + offset as u64,
-                });
-                offset += n;
+            // Reads of up to chunk_bytes over the segment's file range, each copying the runs it covers.
+            let mut at = seg_begin;
+            let mut r = 0;
+            while at < seg_end {
+                let n = (opts.chunk_bytes as u64).min(seg_end - at);
+                let mut pieces = Vec::new();
+                while r < runs.len() && runs[r].0 < at + n {
+                    let (b, e, dst) = runs[r];
+                    let (pb, pe) = (b.max(at), e.min(at + n));
+                    if pe > pb {
+                        pieces.push((
+                            (pb - at) as usize,
+                            (pe - pb) as usize,
+                            buffer.addr() + dst + (pb - b),
+                        ));
+                    }
+                    if e <= at + n {
+                        r += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if !pieces.is_empty() {
+                    chunks.push(Chunk {
+                        file,
+                        offset: at,
+                        len: n as usize,
+                        pieces,
+                    });
+                }
+                at += n;
             }
             total += len as u64;
             segments.push(buffer);
@@ -567,10 +615,99 @@ fn upload_worker(
                 &buffer[..chunk.len]
             }
         };
-        unsafe { stream.copy_h2d(chunk.dst, data.as_ptr(), chunk.len)? };
+        for &(off, len, dst) in &chunk.pieces {
+            unsafe { stream.copy_h2d(dst, data.as_ptr().add(off), len)? };
+        }
         events[slot].record(&stream)?;
         used[slot] = true;
         slot ^= 1;
     }
     stream.synchronize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes a safetensors file of U8 tensors laid out back to back (in the given order).
+    fn write(path: &std::path::Path, tensors: &[(String, Vec<u8>)]) {
+        let mut header = serde_json::Map::new();
+        let mut at = 0;
+        for (name, data) in tensors {
+            header.insert(
+                name.clone(),
+                serde_json::json!({"dtype": "U8", "shape": [data.len()], "data_offsets": [at, at + data.len()]}),
+            );
+            at += data.len();
+        }
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        tensors.iter().for_each(|t| bytes.extend_from_slice(&t.1));
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Selected tensors separated by unselected gaps of every size class (within a run, packed out of a
+    /// segment, splitting segments), odd sizes and chunk boundaries inside tensors: every selected
+    /// tensor reads back exactly, and gaps larger than PACK_GAP take no device memory.
+    #[test]
+    fn upload_packs_runs() {
+        quench6k_cuda::set_device(0).unwrap();
+        let dir = std::env::temp_dir().join(format!("quench6k-loader-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut x = 0x2545_f491_u32;
+        let mut bytes = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect()
+        };
+        let sizes = [
+            (1000, 10),
+            (3, 100),
+            (50_000, 60_000),
+            (16, 2),
+            (200_000, 3_000_000),
+            (77_777, 4096),
+            (5, 0),
+            (40_000, 1),
+        ];
+        let mut tensors = Vec::new();
+        for (k, &(keep, gap)) in sizes.iter().enumerate() {
+            tensors.push((format!("keep{k}"), bytes(keep)));
+            if gap > 0 {
+                tensors.push((format!("skip{k}"), bytes(gap)));
+            }
+        }
+        write(&dir.join("a.safetensors"), &tensors);
+        let ckpt = Checkpoint::open(&dir).unwrap();
+        let opts = LoadOptions {
+            chunk_bytes: 32 << 10,
+            threads: 3,
+            direct: false,
+            ..LoadOptions::default()
+        };
+        let (w, stats) = upload(&ckpt, |n| n.starts_with("keep"), opts).unwrap();
+        let s = Stream::new().unwrap();
+        for (name, data) in &tensors {
+            if name.starts_with("keep") {
+                let t = w.get(name).unwrap();
+                let got: Vec<u8> = s.download(t.addr, data.len()).unwrap();
+                assert!(got == *data, "{name} differs");
+            }
+        }
+        let kept: usize = tensors.iter().filter(|t| t.0.starts_with("keep")).map(|t| t.1.len()).sum();
+        let small_gaps: usize = sizes.iter().map(|s| s.1).filter(|&g| g <= PACK_GAP as usize).sum();
+        assert!(
+            stats.bytes as usize <= kept + small_gaps + 256 * tensors.len(),
+            "{} device bytes for {kept} selected",
+            stats.bytes
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
