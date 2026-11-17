@@ -1990,3 +1990,21 @@ fn dflash_attention_matches_cpu() {
         );
     }
 }
+
+/// A failed allocation is reported once: the next kernel launch must not return its error as its own.
+#[test]
+fn failed_alloc_does_not_fail_next_launch() {
+    quench6k_cuda::set_device(0).unwrap();
+    let s = Stream::new().unwrap();
+    let err = DeviceBuffer::new(1 << 50).err().expect("a petabyte allocation should fail");
+    assert!(format!("{err:#}").contains("out of memory"), "{err:#}");
+    let t = 4;
+    let src: Vec<i32> = (0..3 * t as i32).collect();
+    let src = upload(&s, &src);
+    let start = upload(&s, &[1i32]);
+    let pos3 = upload(&s, &vec![-1i32; 3 * (t + 1)]);
+    kernels::store_positions(&s, src.addr(), pos3.addr(), start.addr(), t).unwrap();
+    let got: Vec<i32> = s.download(pos3.addr(), 3 * (t + 1)).unwrap();
+    assert_eq!(&got[..3], &[-1, -1, -1]);
+    assert_eq!(&got[3..], &(0..3 * t as i32).collect::<Vec<_>>()[..]);
+}
