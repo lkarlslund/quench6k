@@ -1,6 +1,7 @@
 //! The server's worker loop for Hy4-flash checkpoints: one sequence, its cached prefix reused across
 //! requests (the sliding rings are snapshotted at the end of each prompt), greedy or sampled decoding
-//! with prompt-lookup drafts verified in one step.
+//! with drafts verified in one step: the checkpoint's DFly drafter (as many of its drafts as
+//! [`DraftPolicy`] expects to pay off), or prompt-lookup drafts without one.
 
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -8,6 +9,7 @@ use std::sync::mpsc;
 use anyhow::Result;
 use quench6k_engine::hy4::Hy4Model;
 use quench6k_engine::hy4::forward::{Logits, State, Workspace};
+use quench6k_engine::hy4::policy::DraftPolicy;
 
 use super::{Exit, Finish, Metrics, Msg, Work, fail_work};
 
@@ -111,9 +113,12 @@ pub(super) fn schedule(
             let prefill = t0.elapsed().as_secs_f64();
             metrics.live[0].decoding();
             let budget = p.max_tokens.min(context - job.ids.len()).max(1);
-            // Prompt-lookup drafts (request field "mtp", default on): the tokens that followed the latest
-            // earlier occurrence of the last few tokens are verified in one step.
-            let lookup = job.mtp && quench6k_cuda::variants::get("hy4.lookup", 1) != 0;
+            // Drafts (request field "mtp", default on): the drafter's, or else the tokens that followed the
+            // latest earlier occurrence of the last few tokens.
+            let dfly = job.mtp && model.dfly.is_some();
+            let lookup = job.mtp && !dfly && quench6k_cuda::variants::get("hy4.lookup", 1) != 0;
+            let mut policy = DraftPolicy::new(model.dfly.as_ref().map_or(0, |f| f.width - 1), 0.010, 0.0018, 0.0024);
+            let mut row = st.last_t - 1;
             let mut hist = job.ids.clone();
             let mut generated = Vec::new();
             let (mut drafted, mut accepted, mut steps) = (0usize, 0usize, 0usize);
@@ -145,12 +150,20 @@ pub(super) fn schedule(
                 } else {
                     MAX_STEP - 1
                 };
-                let room = cap.min(budget - generated.len()).min(context - st.pos - 1);
-                let draft = if lookup {
-                    crate::flint::lookup_draft(&hist, room)
+                let room = (budget - generated.len()).min(context - st.pos - 1);
+                let td = std::time::Instant::now();
+                let draft = if dfly {
+                    let n = policy.drafts().min(room);
+                    let mut d = if n > 0 { model.draft(&mut st, &mut ws, s, pending, row)? } else { Vec::new() };
+                    d.truncate(n);
+                    d
+                } else if lookup {
+                    crate::flint::lookup_draft(&hist, cap.min(room))
                 } else {
                     Vec::new()
                 };
+                let draft_secs = (!draft.is_empty()).then(|| td.elapsed().as_secs_f64());
+                let tv = std::time::Instant::now();
                 let mut toks = Vec::with_capacity(draft.len() + 1);
                 toks.push(pending);
                 toks.extend_from_slice(&draft);
@@ -160,6 +173,7 @@ pub(super) fn schedule(
                 steps += 1;
                 drafted += draft.len();
                 sampler.fetch(s, ws.out_logits, toks.len(), vocab, p)?;
+                let verify_secs = tv.elapsed().as_secs_f64();
                 let mut j = 0;
                 loop {
                     let tok = sampler.pick(j, p, &generated);
@@ -175,13 +189,18 @@ pub(super) fn schedule(
                 if !draft.is_empty() {
                     rate = 0.8 * rate + 0.2 * (j as f64 / draft.len() as f64);
                 }
+                if dfly {
+                    policy.update(draft.len(), j, verify_secs, draft_secs);
+                }
                 // Keep the fed tokens that were accepted; the rest are overwritten later.
                 st.truncate(before + 1 + j);
+                row = j;
             }
             let finish = done.unwrap();
-            let spec_note = if lookup && steps > 0 {
+            let spec_note = if (lookup || dfly) && steps > 0 {
                 format!(
-                    ", lookup {accepted}/{drafted} drafts accepted, {:.2} tokens/step",
+                    ", {} {accepted}/{drafted} drafts accepted, {:.2} tokens/step",
+                    if dfly { "dfly" } else { "lookup" },
                     generated.len().saturating_sub(1) as f64 / steps as f64
                 )
             } else {

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Per-layer comparison of Hy4-flash hidden lanes: tools/ref/hy4_ref.py --dump-dir output (lanes-NN.npy,
-F32 [T, 4, 3072]) against the engine's QUENCH6K_HY4_DUMP output (lanes-NN.bin, BF16 [T, 4, 3072]).
+F32 [T, 4, 3072]) against the engine's QUENCH6K_HY4_DUMP output (lanes-NN.bin, F32 [T, 4, 3072]; BF16 from
+engines that kept BF16 lanes, told apart by the file size).
 
     python3 -I tools/ref/hy4_compare.py out/hy4-ref-dump out/hy4-engine-dump
 """
@@ -22,7 +23,8 @@ def main():
         if not e.exists():
             continue
         a = np.load(r).astype(np.float64)
-        b = bf16(e).astype(np.float64)[: a.size].reshape(a.shape)
+        raw = np.fromfile(e, dtype=np.float32) if e.stat().st_size >= 4 * a.size else bf16(e)
+        b = raw.astype(np.float64)[: a.size].reshape(a.shape)
         diff = a - b
         rel = np.sqrt((diff ** 2).sum() / (a ** 2).sum())
         per_tok = np.sqrt((diff ** 2).sum(axis=(1, 2)) / (a ** 2).sum(axis=(1, 2)))

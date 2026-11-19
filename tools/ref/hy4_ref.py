@@ -93,8 +93,12 @@ def nvfp4_dequant(codes, scale, scale2, device, dtype, chunk=64):
 
 
 class Reference:
-    def __init__(self, ckpt: Checkpoint, cfg: dict, dtype, dump_layers=(), dump_dir=None):
+    def __init__(self, ckpt: Checkpoint, cfg: dict, dtype, dump_layers=(), dump_dir=None, fp32=()):
         self.ckpt, self.cfg, self.dt = ckpt, cfg, dtype
+        # Parts kept in FP32 under --dtype bf16: "lanes" (the hyper-connection streams between sublayers),
+        # "moe_sum" (the routed experts' weighted sum).
+        self.fp32 = set(fp32)
+        self.lane_dt = torch.float32 if "lanes" in self.fp32 else dtype
         self.dev = ckpt.device
         self.dump_layers, self.dump_dir = set(dump_layers), dump_dir
         self.D = cfg["hidden_size"]
@@ -185,7 +189,7 @@ class Reference:
         up = self.w(p + ".experts.up_proj.weight")
         down = self.w(p + ".experts.down_proj.weight")
         lim = c["swiglu_limit"]
-        final = torch.zeros_like(routed_in)
+        final = torch.zeros_like(routed_in, dtype=torch.float32 if "moe_sum" in self.fp32 else routed_in.dtype)
         hit = torch.unique(top_i).tolist()  # ascending, as the transformers loop visits them
         for e in hit:
             tok, pos = torch.where(top_i == e)
@@ -195,7 +199,7 @@ class Reference:
             cur = self.lin(F.silu(g) * u, down[e]) * top_w[tok, pos, None]
             final.index_add_(0, tok, cur.to(final.dtype))
         del gate, up, down
-        routed_out = self.lin(final, self.w(p + ".routed_expert_up_proj.weight"))
+        routed_out = self.lin(final.to(routed_in.dtype), self.w(p + ".routed_expert_up_proj.weight"))
         h = routed_out + self.mlp(x, p + ".shared_experts")
         return self.rms(h, self.w(p + ".combine_output_norm.weight"))
 
@@ -370,14 +374,14 @@ class Reference:
         post, h = self.hyper(lanes, p + ".hc_attn_layer")
         h = self.rms(h, self.w(p + ".input_layernorm.weight"))
         y = self.attention(h, p, self.layer_types[i], positions)
-        lanes = (post[..., None] * y[:, None].float() + lanes.float()).to(self.dt)
+        lanes = (post[..., None] * y[:, None].float() + lanes.float()).to(self.lane_dt)
         post, h = self.hyper(lanes, p + ".hc_mlp_layer")
         h = self.rms(h, self.w(p + ".post_attention_layernorm.weight"))
         if c["mlp_layer_types"][i] == "sparse":
             y = self.moe(h, p + ".mlp")
         else:
             y = self.rms(self.mlp(h, p + ".mlp"), self.w(p + ".mlp.post_fc2_norm.weight"))
-        return (post[..., None] * y[:, None].float() + lanes.float()).to(self.dt)
+        return (post[..., None] * y[:, None].float() + lanes.float()).to(self.lane_dt)
 
     def forward(self, sequences):
         """Final hidden states (after the head's norm) of each token sequence, layer-major."""
@@ -424,7 +428,7 @@ def score(args):
             tokens = tokens[:args.limit]
         seqs.append(tokens)
         prompt_lens.append(min(seq["prompt_len"], len(tokens)))
-    ref = Reference(ckpt, cfg, dtype, args.dump_layers, pathlib.Path(args.dump_dir) if args.dump_dir else None)
+    ref = Reference(ckpt, cfg, dtype, args.dump_layers, pathlib.Path(args.dump_dir) if args.dump_dir else None, fp32=args.fp32)
     t0 = time.time()
     with torch.no_grad():
         outs = ref.forward(seqs)
@@ -467,6 +471,8 @@ def main():
     ap.add_argument("--out", required=True, help="output directory; writes <fixture><suffix>.{bin,json}")
     ap.add_argument("--suffix", default="")
     ap.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
+    ap.add_argument("--fp32", nargs="*", default=[], choices=("lanes", "moe_sum"),
+                    help="parts kept in FP32 under --dtype bf16")
     ap.add_argument("--top-k", type=int, default=32)
     ap.add_argument("--limit", type=int, default=0, help="score only the first N tokens")
     ap.add_argument("--dump-layers", type=int, nargs="*", default=[])

@@ -44,16 +44,30 @@ stacked per layer and attention projections BF16 or FP8 with a scale per 128 x 1
 | [Avifenesh/Hy4-flash-NVFP4](https://huggingface.co/Avifenesh/Hy4-flash-NVFP4) | NVFP4 experts with a scale per expert, FP8 attention, FP8 Engram tables with a scale per row (161 GB) |
 
 `quench6k serve --model DIR` detects the model and serves one sequence at a time (prefix reuse,
-prompt-lookup drafts, tool calls, reasoning efforts `none`/`high`/`max`); steering, adapters, vision,
-edits and stored contexts are not available for it. About 85.5 GiB of weights load onto the GPU; the
+drafted decoding, tool calls, reasoning efforts `none`/`high`/`max`); steering, adapters, vision,
+edits and stored contexts are not available for it. About 87 GiB of weights load onto the GPU; the
 shared experts, the latent projections around the routed experts and the LM head are quantized to FP8 at
 load (`QUENCH6K_HY4_FP8`). The four Engram tables (63 GB) stay on the host, memory-mapped; 64 random
 rows per token are gathered from them, so keep them in the page cache (`QUENCH6K_HY4_ENGRAM_PRELOAD=1`
-reads them in at load) and on uncompressed storage, as for the PLE table below. The drafter (DFly2) and
-the vision tower are not supported yet.
+reads them in at load) and on uncompressed storage, as for the PLE table below. The vision tower is not
+supported yet.
+
+The checkpoint's DFly2 drafter (5 layers) drafts five tokens after each step in one pass: the accepted
+token and four mask tokens attend through the target's caches of layers 25 to 41 (and the key lists
+their indexers chose), then a hidden correction picks the drafts in order through the target's LM head.
+Each step verifies as many of them as are expected to pay off, from running estimates of each draft
+position's acceptance and of step times by width (`QUENCH6K_HY4_DRAFTS=N` fixes the count in `quench6k
+hy4`; requests with `"mtp": false` decode without drafts; `QUENCH6K_HY4_DFLY=0` does not load the
+drafter, and prompt-lookup drafts are used instead). Greedy and sampled decoding stay exact: a draft is
+kept only when it is the token the target picks.
+
+The hyper-connection lanes (the residual streams) are kept in FP32, where the transformers model keeps
+them in BF16: on the gate's fixtures the generated positions' log-probabilities are closer to an FP32
+forward that way (mean |dlogp| 5 to 30% lower), at no measurable cost.
 
 Its correctness gate compares teacher-forced distributions against `tools/ref/hy4_ref.py`, an
-independent PyTorch implementation run on the same weights in BF16 (reference A) and FP32 (B):
+independent PyTorch implementation run on the same weights in BF16 (reference A; `--fp32 lanes` keeps the
+lanes in FP32 as the engine does, `--fp32 moe_sum` the routed experts' sum) and FP32 (B):
 
 ```
 python3 -I tools/ref/hy4_fixtures.py --model $M --qwen $SWIFT --out out/hy4-fixtures
@@ -64,7 +78,8 @@ quench6k hy4 score --model $M --fixture out/hy4-fixtures/* --out out/hy4-eng
 quench6k gate --fixtures out/hy4-fixtures --candidates out/hy4-eng --ref-a ref-bf16 --ref-b ref-fp32
 ```
 
-`quench6k hy4 generate` and `quench6k hy4 bench` run greedy generation and throughput measurements.
+`quench6k hy4 generate` and `quench6k hy4 bench` run greedy generation and throughput measurements
+(`--dfly`: drafted decoding).
 
 Keep the PLE n-gram table's files (Swift: 92 GiB of BF16 in `embedding-model-*.safetensors`) on
 storage without filesystem compression. The table is memory-mapped and gathered on the host, 16 random
@@ -368,5 +383,7 @@ the inspector's edits.
 | `QUENCH6K_HY4_FP8=LIST` | Hy4-flash: BF16 projections quantized to FP8 at load, as name fragments (`all`, `none`; default `shared_experts,routed_expert,lm_head`) |
 | `QUENCH6K_HY4_ENGRAM_PRELOAD=1` | Hy4-flash: read the Engram tables into the page cache at load |
 | `QUENCH6K_HY4_GRAPHS=0` | Hy4-flash: run small steps eagerly instead of as CUDA graphs |
+| `QUENCH6K_HY4_DFLY=0` | Hy4-flash: do not load the DFly2 drafter (the server then drafts by prompt lookup) |
+| `QUENCH6K_HY4_DRAFTS=N` | Hy4-flash, `quench6k hy4 ... --dfly`: verify N drafts per step instead of choosing the count |
 | `QUENCH6K_HY4_W4A4=1` | Hy4-flash: prefill experts with NVFP4 activations on the FP4 tensor cores (faster; fails the gate) |
 | `QUENCH6K_HY4_DUMP=DIR`, `QUENCH6K_HY4_TIMING=1` | Hy4-flash debugging: per-layer hidden states, per-step host timings |

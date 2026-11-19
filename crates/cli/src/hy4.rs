@@ -49,6 +49,9 @@ pub enum Hy4Cmd {
         context: usize,
         #[arg(long, default_value_t = 2048)]
         chunk: usize,
+        /// Greedy decoding with the checkpoint's DFly drafter.
+        #[arg(long)]
+        dfly: bool,
     },
     /// Prefill and greedy decode throughput at each context length, on a text corpus (its first
     /// `ctx` tokens).
@@ -65,6 +68,9 @@ pub enum Hy4Cmd {
         chunk: usize,
         #[arg(long)]
         json: Option<PathBuf>,
+        /// Greedy decoding with the checkpoint's DFly drafter.
+        #[arg(long)]
+        dfly: bool,
     },
 }
 
@@ -93,7 +99,8 @@ pub fn run(cmd: Hy4Cmd) -> Result<()> {
             n,
             context,
             chunk,
-        } => generate(&model, &prompt, raw, &effort, n, context, chunk),
+            dfly,
+        } => generate(&model, &prompt, raw, &effort, n, context, chunk, dfly),
         Hy4Cmd::Bench {
             model,
             text,
@@ -101,7 +108,8 @@ pub fn run(cmd: Hy4Cmd) -> Result<()> {
             generate,
             chunk,
             json,
-        } => bench(&model, &text, &ctx, generate, chunk, json.as_deref()),
+            dfly,
+        } => bench(&model, &text, &ctx, generate, chunk, json.as_deref(), dfly),
     }
 }
 
@@ -127,6 +135,76 @@ fn prefill(model: &Hy4Model, st: &mut State, ws: &mut Workspace, s: &quench6k_cu
 fn argmax(ws: &Workspace, model: &Hy4Model, s: &quench6k_cuda::Stream) -> Result<i32> {
     k::argmax(s, ws.out_logits, 1, model.cfg.vocab, model.cfg.vocab, ws.argmax_scratch, ws.argmax)?;
     Ok(s.download::<i32>(ws.argmax, 1)?[0])
+}
+
+/// Drafted-and-verified greedy decoding after a prefill whose last step chose `first`: up to `n` tokens
+/// (stopping after any of `stop`). Returns the tokens and the number of verification steps.
+fn decode_dfly(
+    model: &Hy4Model,
+    st: &mut State,
+    ws: &mut Workspace,
+    s: &quench6k_cuda::Stream,
+    first: i32,
+    n: usize,
+    stop: &dyn Fn(i32) -> bool,
+) -> Result<(Vec<i32>, usize)> {
+    let vocab = model.cfg.vocab;
+    let mut out = vec![first];
+    let mut pending = first;
+    let mut row = st.last_t - 1;
+    let mut steps = 0;
+    let timing = std::env::var_os("QUENCH6K_HY4_TIMING").is_some();
+    let (mut t_draft, mut t_verify) = (0.0f64, 0.0f64);
+    let mut hist = [0usize; 17];
+    let fixed = std::env::var("QUENCH6K_HY4_DRAFTS").ok().and_then(|v| v.parse::<usize>().ok());
+    let mut policy = quench6k_engine::hy4::policy::DraftPolicy::new(
+        model.dfly.as_ref().map_or(0, |f| f.width - 1),
+        0.010,
+        0.0018,
+        0.0024,
+    );
+    while out.len() < n && !stop(pending) {
+        let t0 = Instant::now();
+        let want_drafts = fixed.unwrap_or_else(|| policy.drafts());
+        let mut drafts = if want_drafts > 0 { model.draft(st, ws, s, pending, row)? } else { Vec::new() };
+        let t1 = Instant::now();
+        t_draft += (t1 - t0).as_secs_f64();
+        drafts.truncate(want_drafts.min(n - out.len()));
+        let mut toks = vec![pending];
+        toks.extend_from_slice(&drafts);
+        let before = st.pos;
+        let want = if toks.len() == 1 { Logits::Last } else { Logits::All };
+        model.forward(st, ws, s, &toks, want)?;
+        steps += 1;
+        k::argmax(s, ws.out_logits, toks.len(), vocab, vocab, ws.argmax_scratch, ws.argmax)?;
+        let picks = s.download::<i32>(ws.argmax, toks.len())?;
+        let verify = t1.elapsed().as_secs_f64();
+        t_verify += verify;
+        let mut j = 0;
+        loop {
+            let tok = picks[j];
+            out.push(tok);
+            if j < drafts.len() && tok == drafts[j] && !stop(tok) && out.len() < n {
+                j += 1;
+                continue;
+            }
+            pending = tok;
+            break;
+        }
+        st.truncate(before + 1 + j);
+        row = j;
+        hist[j.min(16)] += 1;
+        policy.update(drafts.len(), j, verify, (!drafts.is_empty()).then(|| (t1 - t0).as_secs_f64()));
+    }
+    if timing {
+        eprintln!("dfly: accepted drafts per step (0, 1, ...): {:?}", &hist[..8]);
+        eprintln!(
+            "dfly: {steps} steps, draft {:.2} ms, verify {:.2} ms per step",
+            t_draft * 1e3 / steps.max(1) as f64,
+            t_verify * 1e3 / steps.max(1) as f64
+        );
+    }
+    Ok((out, steps))
 }
 
 fn score(model: &Hy4Model, s: &quench6k_cuda::Stream, fixture: &Path, out: &Path, chunk: usize, limit: usize) -> Result<()> {
@@ -198,7 +276,8 @@ fn score(model: &Hy4Model, s: &quench6k_cuda::Stream, fixture: &Path, out: &Path
     Ok(())
 }
 
-fn generate(dir: &Path, prompt: &str, raw: bool, effort: &str, n: usize, context: usize, chunk: usize) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn generate(dir: &Path, prompt: &str, raw: bool, effort: &str, n: usize, context: usize, chunk: usize, dfly: bool) -> Result<()> {
     let chat = Chat::load(dir, None)?;
     let text = if raw {
         prompt.to_string()
@@ -220,12 +299,21 @@ fn generate(dir: &Path, prompt: &str, raw: bool, effort: &str, n: usize, context
     let pf = t0.elapsed().as_secs_f64();
     let mut out = vec![next];
     let t1 = Instant::now();
-    while out.len() < n && !model.cfg.eos.contains(&next) && !chat.stop_tokens.contains(&next) {
-        model.forward(&mut st, &mut ws, &s, &[next], Logits::Last)?;
-        next = argmax(&ws, &model, &s)?;
-        out.push(next);
+    let mut steps = 0;
+    if dfly {
+        let stop = |t: i32| model.cfg.eos.contains(&t) || chat.stop_tokens.contains(&t);
+        (out, steps) = decode_dfly(&model, &mut st, &mut ws, &s, next, n, &stop)?;
+    } else {
+        while out.len() < n && !model.cfg.eos.contains(&next) && !chat.stop_tokens.contains(&next) {
+            model.forward(&mut st, &mut ws, &s, &[next], Logits::Last)?;
+            next = argmax(&ws, &model, &s)?;
+            out.push(next);
+        }
     }
     let dec = t1.elapsed().as_secs_f64();
+    if dfly {
+        eprintln!("dfly: {:.2} tokens per step", (out.len() - 1) as f64 / steps.max(1) as f64);
+    }
     println!("{}", chat.decode(&out, false)?);
     eprintln!(
         "prompt {} tokens: prefill {:.2}s ({:.0} tok/s); {} tokens decoded at {:.1} tok/s",
@@ -238,7 +326,7 @@ fn generate(dir: &Path, prompt: &str, raw: bool, effort: &str, n: usize, context
     Ok(())
 }
 
-fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, chunk: usize, json: Option<&Path>) -> Result<()> {
+fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, chunk: usize, json: Option<&Path>, dfly: bool) -> Result<()> {
     let chat = Chat::load(dir, None)?;
     let ids = chat.encode(&std::fs::read_to_string(text)?)?;
     let (model, s) = load(dir)?;
@@ -254,15 +342,31 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, chunk: usize,
         let prefill_s = t0.elapsed().as_secs_f64();
         let mut out = vec![next];
         let t1 = Instant::now();
-        for _ in 1..generate {
-            model.forward(&mut st, &mut ws, &s, &[next], Logits::Last)?;
-            next = argmax(&ws, &model, &s)?;
-            out.push(next);
+        let mut steps = generate - 1;
+        if dfly {
+            (out, steps) = decode_dfly(&model, &mut st, &mut ws, &s, next, generate, &|_| false)?;
+            next = *out.last().unwrap();
+        } else {
+            for _ in 1..generate {
+                model.forward(&mut st, &mut ws, &s, &[next], Logits::Last)?;
+                next = argmax(&ws, &model, &s)?;
+                out.push(next);
+            }
         }
         let decode_s = t1.elapsed().as_secs_f64();
         // QUENCH6K_HY4_PROFILE_STEPS=N: N more decode steps inside a cudaProfilerStart/Stop region (nsys
         // --capture-range=cudaProfilerApi; tools/census.py --rounds N).
-        if let Some(n) = std::env::var("QUENCH6K_HY4_PROFILE_STEPS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        if let Some(n) = std::env::var("QUENCH6K_HY4_PROFILE_STEPS").ok().and_then(|v| v.parse::<usize>().ok())
+            && dfly
+        {
+            // Drafted steps: N tokens' worth; the step count is printed for census --rounds.
+            s.synchronize()?;
+            quench6k_cuda::profiler_start()?;
+            let (_, steps) = decode_dfly(&model, &mut st, &mut ws, &s, next, n, &|_| false)?;
+            s.synchronize()?;
+            quench6k_cuda::profiler_stop()?;
+            eprintln!("profiled {steps} drafted steps");
+        } else if let Some(n) = std::env::var("QUENCH6K_HY4_PROFILE_STEPS").ok().and_then(|v| v.parse::<usize>().ok()) {
             s.synchronize()?;
             quench6k_cuda::profiler_start()?;
             for _ in 0..n {
@@ -276,12 +380,13 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, chunk: usize,
         let pf = ctx as f64 / prefill_s;
         let tg = (generate - 1) as f64 / decode_s;
         println!(
-            "ctx {ctx:>6}: prefill {pf:>7.0} tok/s ({prefill_s:.2}s), decode {tg:>6.1} tok/s; corpus continuation {copied}/{generate}; {:?}",
+            "ctx {ctx:>6}: prefill {pf:>7.0} tok/s ({prefill_s:.2}s), decode {tg:>6.1} tok/s ({:.2} tokens/step); corpus continuation {copied}/{generate}; {:?}",
+            (out.len() - 1) as f64 / steps.max(1) as f64,
             chat.decode(&out[..out.len().min(24)], false)?
         );
         if let Some(path) = json {
             use std::io::Write;
-            let rec = serde_json::json!({"engine": "quench6k", "model": "hy4-flash-nvfp4", "mode": "plain", "ctx": ctx,
+            let rec = serde_json::json!({"engine": "quench6k", "model": "hy4-flash-nvfp4", "mode": if dfly { "dfly" } else { "plain" }, "ctx": ctx,
                 "generate": generate, "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0,
                 "copied": copied});
             writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path)?, "{rec}")?;

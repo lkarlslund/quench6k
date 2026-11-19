@@ -8,6 +8,7 @@
 
 pub mod forward;
 pub mod hash;
+pub mod policy;
 
 use std::path::Path;
 
@@ -340,6 +341,44 @@ pub struct Layer {
     pub engram: Option<Engram>,
 }
 
+/// One layer of the DFly drafter: pre-norm attention and a dense SwiGLU MLP on a plain residual stream.
+pub struct DflyLayer {
+    pub in_norm: u64,
+    pub post_attn_norm: u64,
+    pub attn: Attn,
+    pub gate: Linear,
+    pub up: Linear,
+    pub down: Linear,
+}
+
+/// The checkpoint's DFly drafter (`model.dfly_layers`). After a target step it drafts the tokens that follow
+/// the accepted one in a single pass of a query block (that token, then mask tokens) over the target's
+/// caches, then picks them in order through the hidden correction and the target's LM head.
+pub struct Dfly {
+    pub layers: Vec<DflyLayer>,
+    pub norm: u64,
+    /// Fusion of the target's last hidden state into the first query: x0 = e + gate * eh([enorm e, hnorm h]).
+    pub enorm: u64,
+    pub hnorm: u64,
+    pub eh: Linear,
+    pub fuse_gate: u64,
+    /// Hidden correction: h + down(swiglu(gate c, up c)), c = [hidden_norm h, embed_norm(previous token)].
+    pub c_hidden_norm: u64,
+    pub c_embed_norm: u64,
+    pub c_gate: Linear,
+    pub c_up: Linear,
+    pub c_down: Linear,
+    /// The target's token embedding on the device (BF16 [vocab, 3072]).
+    pub embed: u64,
+    pub mask: i32,
+    /// Per drafter layer: the target layer whose key lists it reuses, and the one whose cache it reads and
+    /// writes its query block into.
+    pub index_layers: Vec<usize>,
+    pub kv_layers: Vec<usize>,
+    /// Query block width: the accepted token plus the drafts.
+    pub width: usize,
+}
+
 pub struct Hy4Model {
     pub cfg: Config,
     /// Layers whose Engram memory is loaded (a subset of cfg.engram_layers when tables are missing).
@@ -348,6 +387,8 @@ pub struct Hy4Model {
     pub hc_head: Hc,
     pub norm: u64,
     pub lm_head: Linear,
+    /// The DFly drafter (QUENCH6K_HY4_DFLY=0: not loaded).
+    pub dfly: Option<Dfly>,
     embed: Mmap,
     embed_off: usize,
     pub device_bytes: usize,
@@ -407,24 +448,6 @@ impl Hy4Model {
             let sliding = cfg.sliding[i];
             let heads = if sliding { cfg.heads_sliding } else { cfg.heads_indexed };
             let a = |x: &str| n(&format!("self_attn.{x}"));
-            let kv_b_name = a("kv_b_proj.weight");
-            let kv_b_bytes = l.expect(&kv_b_name, DType::BF16, &[heads * (NOPE + VD), KV_LORA])?;
-            let kv_b = l.upload_bytes(&kv_b_bytes)?;
-            // Transposed key rows: wuk_t[h][j][i] = kv_b[h * 448 + i][j].
-            let src: Vec<u16> = kv_b_bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            let mut wuk = vec![0u16; heads * KV_LORA * NOPE];
-            for h in 0..heads {
-                for i2 in 0..NOPE {
-                    let row = &src[(h * (NOPE + VD) + i2) * KV_LORA..][..KV_LORA];
-                    for (j, &v) in row.iter().enumerate() {
-                        wuk[(h * KV_LORA + j) * NOPE + i2] = v;
-                    }
-                }
-            }
-            let wuk_t = l.upload_slice(&wuk)?;
             let indexer = if sliding {
                 None
             } else {
@@ -440,22 +463,7 @@ impl Hy4Model {
                     key_norm: l.raw(&x("key_norm.weight"), DType::F32, Some(&[ID]))?,
                 })
             };
-            let attn = Attn {
-                heads,
-                sliding,
-                q_a: l.linear(&a("q_a_proj.weight"), Some((Q_LORA, D)))?,
-                q_a_norm: l.raw(&a("q_a_layernorm.weight"), DType::BF16, Some(&[Q_LORA]))?,
-                q_b: l.linear(&a("q_b_proj.weight"), Some((heads * QK, Q_LORA)))?,
-                kv_a: l.linear(&a("kv_a_proj_with_mqa.weight"), Some((KROW, D)))?,
-                kv_a_norm: l.raw(&a("kv_a_layernorm.weight"), DType::BF16, Some(&[KV_LORA]))?,
-                kv_b,
-                wuk_t,
-                gate: l.linear(&a("linear_gate.weight"), Some((heads * VD, D)))?,
-                o: l.linear(&a("o_proj.weight"), Some((D, heads * VD)))?,
-                post_norm: l.raw(&a("post_proj_norm.weight"), DType::BF16, Some(&[D]))?,
-                sinks: l.raw(&a("learnable_sink_param"), DType::F32, Some(&[heads]))?,
-                indexer,
-            };
+            let attn = l.attn(&n("self_attn"), heads, sliding, indexer)?;
             let m = |x: &str| n(&format!("mlp.{x}"));
             let mlp = if cfg.dense_mlp[i] {
                 Mlp::Dense(Dense {
@@ -532,6 +540,11 @@ impl Hy4Model {
         };
         let norm = l.raw("model.norm.weight", DType::BF16, Some(&[D]))?;
         let lm_head = l.linear("lm_head.weight", Some((cfg.vocab, D)))?;
+        let dfly = if std::env::var("QUENCH6K_HY4_DFLY").is_ok_and(|v| v == "0") {
+            None
+        } else {
+            l.dfly(dir, &cfg, &embed[embed_off..embed_off + cfg.vocab * D * 2])?
+        };
         s.synchronize()?;
         let device_bytes = l.bytes;
         let buffers = std::mem::take(&mut l.buffers);
@@ -555,6 +568,7 @@ impl Hy4Model {
             hc_head,
             norm,
             lm_head,
+            dfly,
             embed,
             embed_off,
             device_bytes,
@@ -718,6 +732,158 @@ impl Loader<'_> {
         };
         let w = self.upload_tensor(name)?;
         Ok(Linear { w, scale, fmt, n, k })
+    }
+
+    /// An MLA attention sublayer under `prefix` (`...self_attn`).
+    fn attn(&mut self, prefix: &str, heads: usize, sliding: bool, indexer: Option<Indexer>) -> Result<Attn> {
+        let a = |x: &str| format!("{prefix}.{x}");
+        let kv_b_bytes = self.expect(&a("kv_b_proj.weight"), DType::BF16, &[heads * (NOPE + VD), KV_LORA])?;
+        let kv_b = self.upload_bytes(&kv_b_bytes)?;
+        // Transposed key rows: wuk_t[h][j][i] = kv_b[h * 448 + i][j].
+        let src: Vec<u16> = kv_b_bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let mut wuk = vec![0u16; heads * KV_LORA * NOPE];
+        for h in 0..heads {
+            for i2 in 0..NOPE {
+                let row = &src[(h * (NOPE + VD) + i2) * KV_LORA..][..KV_LORA];
+                for (j, &v) in row.iter().enumerate() {
+                    wuk[(h * KV_LORA + j) * NOPE + i2] = v;
+                }
+            }
+        }
+        let wuk_t = self.upload_slice(&wuk)?;
+        // Sinks as F32 (the drafter stores them in BF16).
+        let sink_name = a("learnable_sink_param");
+        let sinks = if self.ckpt.get(&sink_name)?.dtype == DType::BF16 {
+            let b = self.expect(&sink_name, DType::BF16, &[heads])?;
+            let v: Vec<f32> = b.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect();
+            self.upload_slice(&v)?
+        } else {
+            self.raw(&sink_name, DType::F32, Some(&[heads]))?
+        };
+        Ok(Attn {
+            heads,
+            sliding,
+            q_a: self.linear(&a("q_a_proj.weight"), Some((Q_LORA, D)))?,
+            q_a_norm: self.raw(&a("q_a_layernorm.weight"), DType::BF16, Some(&[Q_LORA]))?,
+            q_b: self.linear(&a("q_b_proj.weight"), Some((heads * QK, Q_LORA)))?,
+            kv_a: self.linear(&a("kv_a_proj_with_mqa.weight"), Some((KROW, D)))?,
+            kv_a_norm: self.raw(&a("kv_a_layernorm.weight"), DType::BF16, Some(&[KV_LORA]))?,
+            kv_b,
+            wuk_t,
+            gate: self.linear(&a("linear_gate.weight"), Some((heads * VD, D)))?,
+            o: self.linear(&a("o_proj.weight"), Some((D, heads * VD)))?,
+            post_norm: self.raw(&a("post_proj_norm.weight"), DType::BF16, Some(&[D]))?,
+            sinks,
+            indexer,
+        })
+    }
+
+    /// An NVFP4 projection (codes `[n, k / 2]`, E4M3 scales per 16, scalar `weight_scale_2`) requantized to
+    /// block-128 FP8 (the GEMV has no NVFP4 path).
+    fn nvfp4_linear(&mut self, name: &str, n: usize, k: usize) -> Result<Linear> {
+        let sname = format!("{name}_scale");
+        for (t, dtype, shape) in [(name, DType::U8, [n, k / 2]), (sname.as_str(), DType::F8E4M3, [n, k / 16])] {
+            let info = self.ckpt.get(t)?;
+            ensure!(info.dtype == dtype && info.shape == shape, "{t}: {:?} {:?}", info.dtype, info.shape);
+        }
+        let codes = DeviceBuffer::new(n * k / 2)?;
+        let scales = DeviceBuffer::new(n * k / 16)?;
+        self.copy_tensor(name, codes.addr())?;
+        self.copy_tensor(&sname, scales.addr())?;
+        let s2b = self.read(&format!("{name}_scale_2"))?;
+        ensure!(s2b.len() == 4, "{name}_scale_2: not a scalar");
+        let s2 = f32::from_le_bytes(s2b[..4].try_into().unwrap());
+        let tmp = DeviceBuffer::new(n * k * 2)?;
+        quench6k_cuda::hy4::nvfp4_to_bf16(self.s, codes.addr(), scales.addr(), s2, n, k, tmp.addr())?;
+        let w = self.alloc(n * k)?;
+        let scale = self.alloc(n.div_ceil(128) * (k / 128) * 4)?;
+        quench6k_cuda::hy4::quantize_fp8b(self.s, tmp.addr(), n, k, w, scale)?;
+        self.s.synchronize()?;
+        Ok(Linear { w, scale, fmt: WeightFormat::Fp8Block, n, k })
+    }
+
+    /// The DFly drafter, if the checkpoint has one.
+    fn dfly(&mut self, dir: &Path, cfg: &Config, embed: &[u8]) -> Result<Option<Dfly>> {
+        let all: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+        let n_layers = all.get("dfly_num_hidden_layers").and_then(Value::as_u64).unwrap_or(0) as usize;
+        if n_layers == 0 || !self.ckpt.tensors.contains_key("model.dfly_layers.final_norm.weight") {
+            return Ok(None);
+        }
+        let ints = |key: &str| -> Result<Vec<usize>> {
+            let v: Vec<usize> = all
+                .get(key)
+                .and_then(Value::as_array)
+                .with_context(|| format!("config: {key}"))?
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|x| x as usize)
+                .collect();
+            ensure!(v.len() == n_layers, "config: {key} needs one target layer per drafter layer");
+            for &i in &v {
+                ensure!(i < cfg.layers && !cfg.sliding[i], "config: {key}: layer {i} is not an indexed layer");
+            }
+            Ok(v)
+        };
+        let index_layers = ints("dfly_target_index_layer")?;
+        let kv_layers = ints("dfly_target_kv_layers")?;
+        ensure!(
+            all.get("dfly_context_local_window").is_none_or(Value::is_null),
+            "config: dfly_context_local_window is not supported"
+        );
+        ensure!(
+            all.get("dfly_mtp_fusion").and_then(Value::as_str).unwrap_or("slot0") == "slot0",
+            "config: dfly_mtp_fusion"
+        );
+        let mask = num(&all, "dfly_mask_token_id")? as i32;
+        ensure!((mask as usize) < cfg.vocab, "config: dfly_mask_token_id");
+        let drafts = all
+            .get("speculative_config")
+            .and_then(|v| v.get("num_speculative_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(5) as usize;
+        let fp4 = |l: &mut Self, name: &str| -> Result<Linear> {
+            let info = l.ckpt.get(name)?;
+            ensure!(info.shape.len() == 2, "{name}: not a matrix");
+            let (n, k) = (info.shape[0], info.shape[1] * 2);
+            l.nvfp4_linear(name, n, k)
+        };
+        let mut layers = Vec::with_capacity(n_layers);
+        for i in 0..n_layers {
+            let n = |x: &str| format!("model.dfly_layers.{i}.{x}");
+            let attn = self.attn(&n("self_attn"), cfg.heads_indexed, false, None)?;
+            layers.push(DflyLayer {
+                in_norm: self.raw(&n("input_layernorm.weight"), DType::BF16, Some(&[D]))?,
+                post_attn_norm: self.raw(&n("post_attention_layernorm.weight"), DType::BF16, Some(&[D]))?,
+                attn,
+                gate: fp4(self, &n("mlp.gate_proj.weight"))?,
+                up: fp4(self, &n("mlp.up_proj.weight"))?,
+                down: fp4(self, &n("mlp.down_proj.weight"))?,
+            });
+        }
+        let x = |y: &str| format!("model.dfly_layers.{y}");
+        let dfly = Dfly {
+            layers,
+            norm: self.raw(&x("final_norm.weight"), DType::BF16, Some(&[D]))?,
+            enorm: self.raw(&x("mtp_fusion.enorm.weight"), DType::BF16, Some(&[D]))?,
+            hnorm: self.raw(&x("mtp_fusion.hnorm.weight"), DType::BF16, Some(&[D]))?,
+            eh: self.linear(&x("mtp_fusion.eh_proj.weight"), Some((D, 2 * D)))?,
+            fuse_gate: self.raw(&x("mtp_fusion.gate"), DType::BF16, Some(&[D]))?,
+            c_hidden_norm: self.raw(&x("hidden_correction.hidden_norm.weight"), DType::BF16, Some(&[D]))?,
+            c_embed_norm: self.raw(&x("hidden_correction.embed_norm.weight"), DType::BF16, Some(&[D]))?,
+            c_gate: fp4(self, &x("hidden_correction.gate_proj.weight"))?,
+            c_up: fp4(self, &x("hidden_correction.up_proj.weight"))?,
+            c_down: fp4(self, &x("hidden_correction.down_proj.weight"))?,
+            embed: self.upload_bytes(embed)?,
+            mask,
+            index_layers,
+            kv_layers,
+            width: drafts + 1,
+        };
+        ensure!(dfly.c_gate.k == 2 * D && dfly.c_down.n == D, "hidden_correction shapes");
+        Ok(Some(dfly))
     }
 
     /// Memory map of a host-resident tensor: (map of its file, byte offset of the tensor in it).

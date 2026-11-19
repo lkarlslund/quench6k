@@ -1,7 +1,8 @@
 // Hy4-flash (hy_v4_flash, tencent/Hy4-flash): kernels of the text model that the shared GEMV/GEMM, top-k
 // and LSE kernels do not cover.
 //
-// - Hidden state: 4 hyper-connection lanes of BF16 [T, 4, 3072]. Each sublayer mixes the lanes into its
+// - Hidden state: 4 hyper-connection lanes of FP32 [T, 4, 3072] (BF16 lanes, as the transformers model keeps
+//   them, are measurably farther from an FP32 forward on generated text). Each sublayer mixes the lanes into its
 //   input (sigmoid weights over a normalized FP32 projection of all lanes), and adds its output back to
 //   every lane with a per-lane weight.
 // - Attention: gated MLA (q_lora 1024, kv_lora 512, nope 192 + rope 64 query/key dims, value 256) with
@@ -31,7 +32,8 @@ using bf16 = __nv_bfloat16;
 constexpr int D = 3072, HC = 4, KVL = 512, ROT = 64, NOPE = 192, QKD = NOPE + ROT;
 constexpr int KROW = KVL + ROT;  // 576: one cache row
 constexpr int LAT = 1536, E = 512, TOPK = 16;
-constexpr int IH = 16, ID = 128, GRP = 4, TOPG = 512, SEL = TOPG * GRP;
+// SEL: width of a query's key list (2048 selected positions, plus the drafter's query block).
+constexpr int IH = 16, ID = 128, GRP = 4, TOPG = 512, SEL = TOPG * GRP + 16;
 constexpr int EH = 16, EDIM = 96;
 constexpr float TORCH_BF16_EPS = 0.0078125f;
 
@@ -64,14 +66,14 @@ SQ_DEVICE void rope_cs(int p, int i, float theta, float& c, float& s) {
 // the 4 * 3072 lane values, flat . fn[j] for the NM mix rows and flat^2; partial [T, HC_SLICES, NM + 1].
 constexpr int HC_SLICES = 24, HC_SLICE = HC * D / HC_SLICES;  // 512 values per slice
 template <int NM>
-__global__ void __launch_bounds__(256) hc_mix_partial_kernel(const bf16* __restrict__ lanes, const float* __restrict__ fn,
+__global__ void __launch_bounds__(256) hc_mix_partial_kernel(const float* __restrict__ lanes, const float* __restrict__ fn,
                                                              float* partial) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float red[8][NM + 1];
     const int slice = blockIdx.x, t = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int i = slice * HC_SLICE + tid * 2;
-    const float2 v = bf2x2(lanes + (size_t)t * HC * D + i);
+    const float2 v = *reinterpret_cast<const float2*>(lanes + (size_t)t * HC * D + i);
     float acc[NM + 1];
 #pragma unroll
     for (int j = 0; j < NM; ++j) {
@@ -96,7 +98,7 @@ __global__ void __launch_bounds__(256) hc_mix_partial_kernel(const bf16* __restr
 // (in slice order); NM = 8 for a sublayer (4 pre + 4 post weights), 4 for the final head (pre only). The
 // mixed input x = bf16(sum_c pre_c lane_c) is then normalized with `norm_w` (eps): out = bf16(w * bf16(x * r)).
 template <int NM>
-__global__ void __launch_bounds__(512) hc_pre_kernel(const bf16* __restrict__ lanes, const float* __restrict__ partial,
+__global__ void __launch_bounds__(512) hc_pre_kernel(const float* __restrict__ lanes, const float* __restrict__ partial,
                                                      const float* __restrict__ base, const float* __restrict__ scale,
                                                      const bf16* __restrict__ norm_w, float hc_eps, float mag, float eps,
                                                      bf16* out, float* post) {
@@ -106,7 +108,7 @@ __global__ void __launch_bounds__(512) hc_pre_kernel(const bf16* __restrict__ la
     __shared__ float xs[D];
     __shared__ float scratch[32];
     const int t = blockIdx.x, tid = threadIdx.x;
-    const bf16* x = lanes + (size_t)t * HC * D;
+    const float* x = lanes + (size_t)t * HC * D;
     if (tid < 32) {
         // Lane j sums mix row j (lane NM: flat^2) over the slices, in slice order.
         float m = 0.0f;
@@ -122,7 +124,7 @@ __global__ void __launch_bounds__(512) hc_pre_kernel(const bf16* __restrict__ la
     for (int d = tid; d < D; d += 512) {
         float s = 0.0f;
 #pragma unroll
-        for (int c = 0; c < HC; ++c) s += coef[c] * bf2f(x[c * D + d]);
+        for (int c = 0; c < HC; ++c) s += coef[c] * x[c * D + d];
         s = rb(s);
         xs[d] = s;
         ss2 += s * s;
@@ -131,23 +133,23 @@ __global__ void __launch_bounds__(512) hc_pre_kernel(const bf16* __restrict__ la
     for (int d = tid; d < D; d += 512) out[(size_t)t * D + d] = f2bf(bf2f(norm_w[d]) * rb(xs[d] * r2));
 }
 
-// lanes[t, c, d] = bf16(post[t, c] * y[t, d] + lanes[t, c, d]); y BF16 rows of stride ldy.
-__global__ void hc_post_kernel(bf16* lanes, const float* __restrict__ post, const bf16* __restrict__ y, int ldy, int T) {
+// lanes[t, c, d] += post[t, c] * y[t, d]; y BF16 rows of stride ldy.
+__global__ void hc_post_kernel(float* lanes, const float* __restrict__ post, const bf16* __restrict__ y, int ldy, int T) {
     pdl_launch_dependents();
     pdl_wait();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)T * HC * D) return;
     const int t = (int)(i / (HC * D)), c = (int)(i / D % HC), d = (int)(i % D);
-    lanes[i] = f2bf(post[t * HC + c] * bf2f(y[(size_t)t * ldy + d]) + bf2f(lanes[i]));
+    lanes[i] = post[t * HC + c] * bf2f(y[(size_t)t * ldy + d]) + lanes[i];
 }
 
 // lanes[t, c, :] = emb[t, :] for every lane.
-__global__ void hc_expand_kernel(const bf16* __restrict__ emb, bf16* lanes, int T) {
+__global__ void hc_expand_kernel(const bf16* __restrict__ emb, float* lanes, int T) {
     pdl_launch_dependents();
     pdl_wait();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)T * HC * D) return;
-    lanes[i] = emb[(i / (HC * D)) * D + i % D];
+    lanes[i] = bf2f(emb[(i / (HC * D)) * D + i % D]);
 }
 
 // ---- Norms and elementwise ---------------------------------------------------------------------------
@@ -866,19 +868,35 @@ SQ_DEVICE void fp4_rows_dot_lane(const Fp4Rows<R>& w, const float* xl, float (&o
     }
 }
 
-// Warp-granular persistent kernels: work item = (pair, 4 rows); each warp strides over items, so the
-// last wave is one item, not one block. Gate/up: x routed input BF16 [T, 1536]; act[pair, n] = swiglu
+// Order of a small step's pairs by expert (ties by pair): order[rank] = pair. One block of 128 threads.
+__global__ void pair_order_kernel(const int* __restrict__ sel_e, int pairs, int* order) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int p = threadIdx.x;
+    if (p >= pairs) return;
+    const int e = sel_e[p];
+    int rank = 0;
+    for (int q = 0; q < pairs; ++q) {
+        const int f = sel_e[q];
+        rank += f < e || (f == e && q < p);
+    }
+    order[rank] = p;
+}
+
+// Warp-granular persistent kernels: work item = (4 rows, pair in expert order); each warp strides over
+// items, so the last wave is one item, not one block. Items of the pairs of one expert are adjacent, so
+// their weight rows are read from DRAM once and from L2 by the others. Gate/up: x routed input BF16 [T, 1536]; act[pair, n] = swiglu
 // with the experts' clamps.
 // Gate/up triggers its dependents only after its dependency wait, so experts_down (which runs after it) may
 // read the routing and load its first item's weights before its own wait.
-__global__ void __launch_bounds__(256) experts_gate_up_kernel(const bf16* __restrict__ x, const int* sel_e, Fp4Experts gate,
-                                                             Fp4Experts up, float limit, int pairs, bf16* act) {
+__global__ void __launch_bounds__(256) experts_gate_up_kernel(const bf16* __restrict__ x, const int* sel_e, const int* order,
+                                                             Fp4Experts gate, Fp4Experts up, float limit, int pairs, bf16* act) {
     pdl_wait();
     pdl_launch_dependents();
     const int lane = threadIdx.x & 31;
     const int warps = gridDim.x * 8, items = pairs * (LAT / EX_ROWS);
     for (int item = blockIdx.x * 8 + (threadIdx.x >> 5); item < items; item += warps) {
-        const int pair = item / (LAT / EX_ROWS), n0 = item % (LAT / EX_ROWS) * EX_ROWS;
+        const int pair = order[item % pairs], n0 = item / pairs * EX_ROWS;
         const int t = pair / TOPK, e = sel_e[pair];
         const size_t row0 = (size_t)e * LAT + n0;
         Fp4Rows<EX_ROWS> wg, wu;
@@ -902,14 +920,15 @@ __global__ void __launch_bounds__(256) experts_gate_up_kernel(const bf16* __rest
 }
 
 // Down: y[pair, n] = s2[e] * W_e[n] . act[pair] (F32 [pairs, 1536]); items of 8 rows.
-__global__ void __launch_bounds__(256) experts_down_kernel(const bf16* act, const int* sel_e, Fp4Experts down, int pairs, float* y) {
+__global__ void __launch_bounds__(256) experts_down_kernel(const bf16* act, const int* sel_e, const int* order, Fp4Experts down, int pairs,
+                                                           float* y) {
     pdl_launch_dependents();
     constexpr int R = 2 * EX_ROWS;
     const int lane = threadIdx.x & 31;
     const int warps = gridDim.x * 8, items = pairs * (LAT / R);
     bool first = true;
     for (int item = blockIdx.x * 8 + (threadIdx.x >> 5); item < items; item += warps) {
-        const int pair = item / (LAT / R), n0 = item % (LAT / R) * R;
+        const int pair = order[item % pairs], n0 = item / pairs * R;
         const int e = sel_e[pair];
         Fp4Rows<R> wd;
         fp4_rows_load(down.codes, down.scales, (size_t)e * LAT + n0, lane, wd);
@@ -1056,13 +1075,13 @@ __global__ void engram_embed_kernel(const uint8_t* __restrict__ q8, const float*
 }
 
 // One block (256 threads) per token. kv: [T, 5 * 3072] F32 from e . [key_0 .. key_3, value]^T, plus
-// bias [5 * 3072]. For lane c: key = rms(bf16(kv_c + b), norm_key_c), query = rms(lane_c, norm_query_c),
-// gate = sigmoid(signed sqrt(bf16(sum bf16(key * query)) * 3072^-0.5)); main = gamma * rms(bf16(value + b));
-// lane_c += bf16(gate * main) + bf16(scale_c * main). Positions with mask 0 are left unchanged.
+// bias [5 * 3072]. For lane c: key = rms(bf16(kv_c + b), norm_key_c) (BF16), query = rms(lane_c, norm_query_c)
+// (FP32, as the lanes), gate = sigmoid(signed sqrt(sum key * query * 3072^-0.5)); main = gamma *
+// rms(bf16(value + b)); lane_c += gate * main + bf16(scale_c * main). Positions with mask 0 are left unchanged.
 __global__ void __launch_bounds__(256) engram_apply_kernel(const float* __restrict__ kv, int ldkv, const bf16* __restrict__ bias,
                                                           const bf16* __restrict__ norm_key, const bf16* __restrict__ norm_query,
                                                           const bf16* __restrict__ gamma, const bf16* __restrict__ hc_scale,
-                                                          const uint8_t* __restrict__ mask, bf16* lanes) {
+                                                          const uint8_t* __restrict__ mask, float* lanes) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float scratch[32];
@@ -1071,7 +1090,7 @@ __global__ void __launch_bounds__(256) engram_apply_kernel(const float* __restri
     const int t = blockIdx.x, tid = threadIdx.x;
     if (!mask[t]) return;
     const float* row = kv + (size_t)t * ldkv;
-    bf16* ln = lanes + (size_t)t * HC * D;
+    float* ln = lanes + (size_t)t * HC * D;
     constexpr int PER = D / 256;
     // value -> main
     {
@@ -1095,7 +1114,7 @@ __global__ void __launch_bounds__(256) engram_apply_kernel(const float* __restri
         for (int j = 0; j < PER; ++j) {
             const int d = tid + 256 * j;
             k[j] = rb(row[c * D + d] + bf2f(bias[c * D + d]));
-            q[j] = bf2f(ln[c * D + d]);
+            q[j] = ln[c * D + d];
             sk += k[j] * k[j];
             sq += q[j] * q[j];
         }
@@ -1106,15 +1125,15 @@ __global__ void __launch_bounds__(256) engram_apply_kernel(const float* __restri
         for (int j = 0; j < PER; ++j) {
             const int d = tid + 256 * j;
             const float kk = rb(k[j] * rk * bf2f(norm_key[c * D + d]));
-            const float qq = rb(q[j] * rq * bf2f(norm_query[c * D + d]));
-            dot += rb(kk * qq);
+            const float qq = q[j] * rq * bf2f(norm_query[c * D + d]);
+            dot += kk * qq;
         }
         dot = block_sum(dot, scratch);
         if (tid == 0) {
-            float g = rb(rb(dot) * 0.018042195912175804f);
-            const float mag = rb(sqrtf(fmaxf(fabsf(g), 1e-6f)));
+            float g = dot * 0.018042195912175804f;
+            const float mag = sqrtf(fmaxf(fabsf(g), 1e-6f));
             g = g > 0 ? mag : (g < 0 ? -mag : 0.0f);
-            gates[c] = rb(1.0f / (1.0f + expf(-g)));
+            gates[c] = 1.0f / (1.0f + expf(-g));
         }
         __syncthreads();
     }
@@ -1123,8 +1142,7 @@ __global__ void __launch_bounds__(256) engram_apply_kernel(const float* __restri
         for (int j = 0; j < PER; ++j) {
             const int d = tid + 256 * j;
             const float m = main_s[d];
-            const float o = rb(rb(gates[c] * m) + rb(bf2f(hc_scale[c * D + d]) * m));
-            ln[c * D + d] = f2bf(bf2f(ln[c * D + d]) + o);
+            ln[c * D + d] += gates[c] * m + rb(bf2f(hc_scale[c * D + d]) * m);
         }
 }
 
@@ -1141,7 +1159,7 @@ cudaError_t quench6k_hy4_hc_pre(const void* lanes, const float* fn, const float*
                               float mag, float eps, int head, int T, float* partial, void* out, float* post, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     auto* o = static_cast<bf16*>(out);
-    const auto* l = static_cast<const bf16*>(lanes);
+    const auto* l = static_cast<const float*>(lanes);
     const auto* w = static_cast<const bf16*>(norm_w);
     const dim3 grid(HC_SLICES, T);
     if (head) {
@@ -1157,7 +1175,7 @@ cudaError_t quench6k_hy4_hc_pre(const void* lanes, const float* fn, const float*
 cudaError_t quench6k_hy4_hc_post(void* lanes, const float* post, const void* y, int ldy, int T, cudaStream_t st) {
     const size_t n = (size_t)T * HC * D;
     if (n == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(hc_post_kernel, (unsigned)((n + 255) / 256), 256, 0, st, static_cast<bf16*>(lanes), post,
+    SQ_CHECK_LAUNCH(sq_launch(hc_post_kernel, (unsigned)((n + 255) / 256), 256, 0, st, static_cast<float*>(lanes), post,
                               static_cast<const bf16*>(y), ldy, T));
     SQ_RETURN_LAUNCH();
 }
@@ -1166,7 +1184,7 @@ cudaError_t quench6k_hy4_hc_expand(const void* emb, void* lanes, int T, cudaStre
     const size_t n = (size_t)T * HC * D;
     if (n == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(hc_expand_kernel, (unsigned)((n + 255) / 256), 256, 0, st, static_cast<const bf16*>(emb),
-                              static_cast<bf16*>(lanes), T));
+                              static_cast<float*>(lanes), T));
     SQ_RETURN_LAUNCH();
 }
 
@@ -1216,6 +1234,8 @@ cudaError_t quench6k_hy4_heads_gemv(const void* x, int ldx, int xh, const void* 
         SQ_CHECK_LAUNCH(sq_launch(heads_gemv_kernel<1>, grid, 256, 0, st, xp, ldx, xh, wp, wh, N, K, T, gate, ldg, yp, ldy, yh));
     else if (T <= 4)
         SQ_CHECK_LAUNCH(sq_launch(heads_gemv_kernel<4>, grid, 256, 0, st, xp, ldx, xh, wp, wh, N, K, T, gate, ldg, yp, ldy, yh));
+    else if (T <= 8)
+        SQ_CHECK_LAUNCH(sq_launch(heads_gemv_kernel<8>, grid, 256, 0, st, xp, ldx, xh, wp, wh, N, K, T, gate, ldg, yp, ldy, yh));
     else
         SQ_CHECK_LAUNCH(sq_launch(heads_gemv_kernel<16>, grid, 256, 0, st, xp, ldx, xh, wp, wh, N, K, T, gate, ldg, yp, ldy, yh));
     SQ_RETURN_LAUNCH();
@@ -1324,14 +1344,16 @@ cudaError_t quench6k_hy4_route(const float* logits, int ld, const float* bias, f
 
 cudaError_t quench6k_hy4_experts_small(const void* x, const int* sel_e, const uint8_t* gc, const uint8_t* gs, const float* g2,
                                      const uint8_t* uc, const uint8_t* us, const float* u2, const uint8_t* dc, const uint8_t* ds,
-                                     const float* d2, float limit, int T, void* act, float* y, cudaStream_t st) {
+                                     const float* d2, float limit, int T, int* order, void* act, float* y, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     const int pairs = T * TOPK;
+    if (pairs > 128) return cudaErrorInvalidValue;  // pair_order_kernel's block
+    SQ_CHECK_LAUNCH(sq_launch(pair_order_kernel, 1, 128, 0, st, sel_e, pairs, order));
     const int gu = resident_blocks(experts_gate_up_kernel, (pairs * (LAT / EX_ROWS) + 7) / 8);
     const int dn = resident_blocks(experts_down_kernel, (pairs * (LAT / (2 * EX_ROWS)) + 7) / 8);
-    SQ_CHECK_LAUNCH(sq_launch(experts_gate_up_kernel, gu, 256, 0, st, static_cast<const bf16*>(x), sel_e, Fp4Experts{gc, gs, g2},
+    SQ_CHECK_LAUNCH(sq_launch(experts_gate_up_kernel, gu, 256, 0, st, static_cast<const bf16*>(x), sel_e, (const int*)order, Fp4Experts{gc, gs, g2},
                               Fp4Experts{uc, us, u2}, limit, pairs, static_cast<bf16*>(act)));
-    SQ_CHECK_LAUNCH(sq_launch(experts_down_kernel, dn, 256, 0, st, static_cast<const bf16*>(act), sel_e, Fp4Experts{dc, ds, d2}, pairs, y));
+    SQ_CHECK_LAUNCH(sq_launch(experts_down_kernel, dn, 256, 0, st, static_cast<const bf16*>(act), sel_e, (const int*)order, Fp4Experts{dc, ds, d2}, pairs, y));
     SQ_RETURN_LAUNCH();
 }
 
@@ -1383,7 +1405,126 @@ cudaError_t quench6k_hy4_engram_apply(const float* kv, int ldkv, const void* bia
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(engram_apply_kernel, T, 256, 0, st, kv, ldkv, static_cast<const bf16*>(bias),
                               static_cast<const bf16*>(norm_key), static_cast<const bf16*>(norm_query), static_cast<const bf16*>(gamma),
-                              static_cast<const bf16*>(hc_scale), mask, static_cast<bf16*>(lanes)));
+                              static_cast<const bf16*>(hc_scale), mask, static_cast<float*>(lanes)));
+    SQ_RETURN_LAUNCH();
+}
+
+}  // extern "C"
+
+// ---- DFly drafter ----------------------------------------------------------------------------------
+
+// out[r, :D] = bf16(w * bf16(bf16(x) * rsqrt(mean + eps))) for BF16 rows x = src[(idx ? idx[r] : r) * lds] (embedding or
+// hidden rows picked by a device index).
+__global__ void __launch_bounds__(256) dfly_norm_kernel(const bf16* __restrict__ src, size_t lds, const int* __restrict__ idx,
+                                                       const bf16* __restrict__ w, float eps, bf16* out, int ldo) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ float scratch[32];
+    const int r = blockIdx.x;
+    const bf16* x = src + (size_t)(idx ? idx[r] : r) * lds;
+    float v[D / 256], ss = 0.0f;
+#pragma unroll
+    for (int c = 0; c < D / 256; ++c) {
+        v[c] = bf2f(x[threadIdx.x + 256 * c]);
+        ss += v[c] * v[c];
+    }
+    const float rs = rsqrtf(block_sum(ss, scratch) / (float)D + eps);
+#pragma unroll
+    for (int c = 0; c < D / 256; ++c) {
+        const int i = threadIdx.x + 256 * c;
+        out[(size_t)r * ldo + i] = f2bf(bf2f(w[i]) * rb(v[c] * rs));
+    }
+}
+
+// x[r, :D] (F32) = embedding rows table[idx[r]].
+__global__ void dfly_embed_kernel(const bf16* __restrict__ table, const int* __restrict__ idx, float* x) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int r = blockIdx.x;
+    const bf16* row = table + (size_t)idx[r] * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) x[(size_t)r * D + i] = bf2f(row[i]);
+}
+
+// x[r, :D] += (gate ? bf16(gate * y) : y) with y BF16 (yb) or F32 (yf); out (optional) = bf16(x).
+__global__ void dfly_add_kernel(float* x, const bf16* __restrict__ yb, const float* __restrict__ yf, const bf16* __restrict__ gate,
+                                bf16* out, int rows) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * D) return;
+    float y = yb ? bf2f(yb[i]) : yf[i];
+    if (gate) y = rb(bf2f(gate[i % D]) * rb(y));
+    const float v = x[i] + y;
+    x[i] = v;
+    if (out) out[i] = f2bf(v);
+}
+
+// Key lists of the drafter's query block (rows j < W at positions anchor + j): the target's list for its
+// source row (keep[krow]) then the block's own positions anchor .. anchor + j; while the source row's own
+// group is among the first 512 (dense attention), every position 0 .. anchor + j.
+__global__ void dfly_sel_kernel(const int* __restrict__ keep, const int* __restrict__ keep_n, const int* __restrict__ stage, int W,
+                                int* sel, int* sel_n) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int anchor = stage[0], krow = stage[2];
+    const int j = blockIdx.x;
+    int* dst = sel + (size_t)j * SEL;
+    if ((anchor - 1) / GRP <= TOPG - 1) {
+        for (int i = threadIdx.x; i <= anchor + j; i += blockDim.x) dst[i] = i;
+        if (threadIdx.x == 0) sel_n[j] = anchor + j + 1;
+        return;
+    }
+    const int n = keep_n[krow];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = keep[(size_t)krow * SEL + i];
+    for (int i = threadIdx.x; i <= j; i += blockDim.x) dst[n + i] = anchor + i;
+    if (threadIdx.x == 0) sel_n[j] = n + j + 1;
+}
+
+// NVFP4 [N, K] (codes [N, K / 2], E4M3 scales [N, K / 16], global scale s2) -> BF16 [N, K].
+__global__ void nvfp4_to_bf16_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales, float s2, size_t pairs,
+                                     int K, bf16* out) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pairs) return;
+    const size_t e = 2 * i, row = e / K, col = e % K;
+    const float sc = e4m3f(scales[row * (K / 16) + col / 16]) * s2;
+    const __half2_raw hr = __nv_cvt_fp4x2_to_halfraw2(codes[i], __NV_E2M1);
+    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+    out[e] = f2bf(f.x * sc);
+    out[e + 1] = f2bf(f.y * sc);
+}
+
+extern "C" {
+
+cudaError_t quench6k_hy4_dfly_norm(const void* src, size_t lds, const int* idx, const void* w, float eps, void* out, int ldo, int rows,
+                                   cudaStream_t st) {
+    if (rows == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(dfly_norm_kernel, rows, 256, 0, st, static_cast<const bf16*>(src), lds, idx, static_cast<const bf16*>(w), eps,
+                              static_cast<bf16*>(out), ldo));
+    SQ_RETURN_LAUNCH();
+}
+
+cudaError_t quench6k_hy4_dfly_embed(const void* table, const int* idx, int rows, float* x, cudaStream_t st) {
+    if (rows == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(dfly_embed_kernel, rows, 256, 0, st, static_cast<const bf16*>(table), idx, x));
+    SQ_RETURN_LAUNCH();
+}
+
+cudaError_t quench6k_hy4_dfly_add(float* x, const void* yb, const float* yf, const void* gate, void* out, int rows, cudaStream_t st) {
+    if (rows == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(dfly_add_kernel, (rows * D + 255) / 256, 256, 0, st, x, static_cast<const bf16*>(yb), yf,
+                              static_cast<const bf16*>(gate), static_cast<bf16*>(out), rows));
+    SQ_RETURN_LAUNCH();
+}
+
+cudaError_t quench6k_hy4_dfly_sel(const int* keep, const int* keep_n, const int* stage, int W, int* sel, int* sel_n, cudaStream_t st) {
+    SQ_CHECK_LAUNCH(sq_launch(dfly_sel_kernel, W, 256, 0, st, keep, keep_n, stage, W, sel, sel_n));
+    SQ_RETURN_LAUNCH();
+}
+
+cudaError_t quench6k_hy4_nvfp4_to_bf16(const uint8_t* codes, const uint8_t* scales, float s2, int N, int K, void* out, cudaStream_t st) {
+    if (K % 16 != 0) return cudaErrorInvalidValue;
+    const size_t pairs = (size_t)N * K / 2;
+    nvfp4_to_bf16_kernel<<<(unsigned)((pairs + 255) / 256), 256, 0, st>>>(codes, scales, s2, pairs, K, static_cast<bf16*>(out));
     SQ_RETURN_LAUNCH();
 }
 

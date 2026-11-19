@@ -200,6 +200,7 @@ mod ffi {
             d2: *const f32,
             limit: f32,
             t: c_int,
+            order: *mut i32,
             act: *mut c_void,
             y: *mut f32,
             st: Stream,
@@ -213,6 +214,45 @@ mod ffi {
             st: Stream,
         ) -> Error;
         pub fn quench6k_hy4_to_bf16(x: *const f32, y: *mut c_void, count: usize, st: Stream) -> Error;
+        pub fn quench6k_hy4_dfly_norm(
+            src: *const c_void,
+            lds: usize,
+            idx: *const i32,
+            w: *const c_void,
+            eps: f32,
+            out: *mut c_void,
+            ldo: c_int,
+            rows: c_int,
+            st: Stream,
+        ) -> Error;
+        pub fn quench6k_hy4_dfly_embed(table: *const c_void, idx: *const i32, rows: c_int, x: *mut f32, st: Stream) -> Error;
+        pub fn quench6k_hy4_dfly_add(
+            x: *mut f32,
+            yb: *const c_void,
+            yf: *const f32,
+            gate: *const c_void,
+            out: *mut c_void,
+            rows: c_int,
+            st: Stream,
+        ) -> Error;
+        pub fn quench6k_hy4_dfly_sel(
+            keep: *const i32,
+            keep_n: *const i32,
+            stage: *const i32,
+            w: c_int,
+            sel: *mut i32,
+            sel_n: *mut i32,
+            st: Stream,
+        ) -> Error;
+        pub fn quench6k_hy4_nvfp4_to_bf16(
+            codes: *const u8,
+            scales: *const u8,
+            s2: f32,
+            n: c_int,
+            k: c_int,
+            out: *mut c_void,
+            st: Stream,
+        ) -> Error;
         pub fn quench6k_hy4_experts_combine(
             y: *const f32,
             pair_row: *const i32,
@@ -693,6 +733,7 @@ pub fn experts_small(
     down: Experts,
     limit: f32,
     t: usize,
+    order: u64,
     act: u64,
     y: u64,
 ) -> Result<()> {
@@ -712,6 +753,7 @@ pub fn experts_small(
             f(down.s2),
             limit,
             n(t),
+            im(order),
             pm(act),
             fm(y),
             s.raw()
@@ -815,5 +857,46 @@ pub fn engram_apply(
             pm(lanes),
             s.raw()
         )
+    )
+}
+
+/// out[r, :3072] = bf16(w * rmsnorm(x)) for BF16 rows x = src + (idx ? idx[r] : r) * lds elements (idx: device
+/// I32 indices, 0 for none).
+#[allow(clippy::too_many_arguments)]
+pub fn dfly_norm(s: &Stream, src: u64, lds: usize, idx: u64, w: u64, eps: f32, out: u64, ldo: usize, rows: usize) -> Result<()> {
+    go!(
+        "hy4_dfly_norm",
+        ffi::quench6k_hy4_dfly_norm(p(src), lds, i(idx), p(w), eps, pm(out), n(ldo), n(rows), s.raw())
+    )
+}
+
+/// x[r] (F32 [rows, 3072]) = table[idx[r]] (BF16 embedding rows; idx device I32).
+pub fn dfly_embed(s: &Stream, table: u64, idx: u64, rows: usize, x: u64) -> Result<()> {
+    go!("hy4_dfly_embed", ffi::quench6k_hy4_dfly_embed(p(table), i(idx), n(rows), fm(x), s.raw()))
+}
+
+/// x (F32 [rows, 3072]) += y, y BF16 (`yb`) or F32 (`yf`; 0 for the other), times bf16 `gate` [3072] when
+/// given; `out` (when not 0) gets bf16(x).
+pub fn dfly_add(s: &Stream, x: u64, yb: u64, yf: u64, gate: u64, out: u64, rows: usize) -> Result<()> {
+    go!(
+        "hy4_dfly_add",
+        ffi::quench6k_hy4_dfly_add(fm(x), p(yb), f(yf), p(gate), pm(out), n(rows), s.raw())
+    )
+}
+
+/// Key lists (sel [w, sel_width()], sel_n [w]) of the drafter's query block from the target's kept lists;
+/// `stage`: device I32 [anchor, hidden row, kept row].
+pub fn dfly_sel(s: &Stream, keep: u64, keep_n: u64, stage: u64, w: usize, sel: u64, sel_n: u64) -> Result<()> {
+    go!(
+        "hy4_dfly_sel",
+        ffi::quench6k_hy4_dfly_sel(i(keep), i(keep_n), i(stage), n(w), im(sel), im(sel_n), s.raw())
+    )
+}
+
+/// NVFP4 [nn, k] (codes, E4M3 block scales, global scale s2) -> BF16 [nn, k].
+pub fn nvfp4_to_bf16(s: &Stream, codes: u64, scales: u64, s2: f32, nn: usize, k: usize, out: u64) -> Result<()> {
+    go!(
+        "hy4_nvfp4_to_bf16",
+        ffi::quench6k_hy4_nvfp4_to_bf16(codes as *const u8, scales as *const u8, s2, n(nn), n(k), pm(out), s.raw())
     )
 }
