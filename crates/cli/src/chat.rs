@@ -11,6 +11,9 @@ pub struct Chat {
     /// Generation stops at these tokens (`generation_config.json` eos ids and `<|im_end|>`).
     pub stop_tokens: Vec<i32>,
     im_start: Option<i32>,
+    /// Hy4-flash's tags (`<think:opensource>`, `<tool_call:opensource>`, ...): decoded output is rewritten to
+    /// the plain tags the server parses, and reasoning efforts map to the template's no_think/high/max.
+    pub hy4: bool,
     /// Encodings of `<|im_start|>`-delimited prompt segments (see [`Chat::encode`]) and their total
     /// text bytes.
     segments: std::sync::Mutex<(std::collections::HashMap<String, Vec<i32>>, usize)>,
@@ -76,7 +79,9 @@ impl Chat {
             }
         }
         let im_start = tokenizer.token_to_id("<|im_start|>").map(|i| i as i32);
+        let hy4 = tokenizer.token_to_id("<think:opensource>").is_some();
         Ok(Self {
+            hy4,
             tokenizer,
             env,
             stop_tokens,
@@ -119,11 +124,21 @@ impl Chat {
         if let Some(t) = tools.filter(|t| !t.is_null()) {
             ctx.insert("tools".into(), t.clone());
         }
-        if let Some(e) = enable_thinking {
-            ctx.insert("enable_thinking".into(), Value::Bool(e));
-        }
-        if let Some(r) = reasoning_effort {
-            ctx.insert("reasoning_effort".into(), Value::String(r.into()));
+        if self.hy4 {
+            // The Hy4-flash template takes only reasoning_effort: no_think, high (default) or max.
+            let effort = match (enable_thinking, reasoning_effort) {
+                (Some(false), _) | (_, Some("none" | "minimal" | "no_think")) => "no_think",
+                (_, Some("max" | "xhigh")) => "max",
+                _ => "high",
+            };
+            ctx.insert("reasoning_effort".into(), Value::String(effort.into()));
+        } else {
+            if let Some(e) = enable_thinking {
+                ctx.insert("enable_thinking".into(), Value::Bool(e));
+            }
+            if let Some(r) = reasoning_effort {
+                ctx.insert("reasoning_effort".into(), Value::String(r.into()));
+            }
         }
         Ok(tmpl.render(minijinja::Value::from_serialize(&ctx))?)
     }
@@ -263,10 +278,28 @@ impl Chat {
 
     pub fn decode(&self, ids: &[i32], skip_special: bool) -> Result<String> {
         let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-        self.tokenizer
+        let text = self
+            .tokenizer
             .decode(&ids, skip_special)
-            .map_err(|e| anyhow!("detokenize: {e}"))
+            .map_err(|e| anyhow!("detokenize: {e}"))?;
+        Ok(if self.hy4 { hy4_plain_tags(&text) } else { text })
     }
+
+    /// Whether a rendered prompt ends inside an open reasoning block.
+    pub fn opens_thinking(&self, text: &str) -> bool {
+        text.ends_with("<think>\n") || (self.hy4 && text.ends_with("<think:opensource>"))
+    }
+}
+
+/// Hy4-flash output with its tags in the plain spelling the server parses: `<think>`, `<tool_call>`,
+/// `<arg_key>`, `<arg_value>` (the `<tool_calls>` wrapper is dropped).
+pub fn hy4_plain_tags(text: &str) -> String {
+    if !text.contains(":opensource>") {
+        return text.to_string();
+    }
+    text.replace("<tool_calls:opensource>", "")
+        .replace("</tool_calls:opensource>", "")
+        .replace(":opensource>", ">")
 }
 
 /// JSON as Python's `json.dumps(v, ensure_ascii=False)` writes it.

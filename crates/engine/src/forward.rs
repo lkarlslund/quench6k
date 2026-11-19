@@ -1738,6 +1738,10 @@ fn layer_weight_ranges(layer: &crate::model::Layer) -> Vec<(u64, u64)> {
                 v.extend([(l.addr, n), (l.scale, n / k::int8_group() as u64 * 4)])
             }
             k::WeightFormat::Mxfp8 => v.extend([(l.addr, n), (l.scale, n / 32)]),
+            k::WeightFormat::Fp8Block => v.extend([
+                (l.addr, n),
+                (l.scale, (l.n.div_ceil(128) * (l.k / 128) * 4) as u64),
+            ]),
         }
     }
     fn proj(v: &mut Vec<(u64, u64)>, p: &Proj) {

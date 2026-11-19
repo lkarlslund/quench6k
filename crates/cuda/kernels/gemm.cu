@@ -33,7 +33,8 @@ SQ_DEVICE void store_out<__nv_bfloat16>(__nv_bfloat16* p, float v, bool accumula
 
 // WF (weight format): 0 BF16; 1 FP8 E4M3 or 2 INT8 [N, K] (ldw in elements = bytes) with an FP32 scale
 // per row, converted exactly to BF16 while staging the tile, the row scale applied in the epilogue;
-// 3 INT8 with an FP32 scale per 64 weights of a row ([N, K / 64]), applied while staging.
+// 3 INT8 with an FP32 scale per 64 weights of a row ([N, K / 64]), applied while staging; 5 FP8 E4M3 with an
+// FP32 scale per 128 x 128 block ([ceil(N / 128), K / 128]), applied while staging.
 // HyperConnection up-projection with the mix fused into the epilogue (MIX): the CTA's 128 columns are
 // 32 features d0 .. d0 + 31 of each of the 4 streams (warp_n = stream), so
 //   m[t, d] = mean_s sigmoid(u[t, s, d]) * n[t, s, d] * (1 + g[s, d])
@@ -46,6 +47,12 @@ struct MixArgs {
     __nv_bfloat16* m;
 };
 
+// Batched launches (gridDim.z = batch, no split K): element strides between consecutive problems of X, W
+// (BF16 weights) and Y. ys == 0: not batched.
+struct BatchArgs {
+    size_t xs, ws, ys;
+};
+
 // BMT x BNT: CTA tile, 128 x 128 (warps 2 x 4 of 64 x 32), 256 x 128 (warps 4 x 2 of 64 x 64: each
 // staged weight tile serves twice the rows, fewer fragment loads per MMA) or 128 x 256.
 template <typename OutT, int WF, bool MIX = false, int STAGES = 3, int BNT = 128, int BMT = 128>
@@ -53,14 +60,20 @@ __global__ void __launch_bounds__(THREADS, BMT == 128 && BNT == 128 ? 2 : 1) gem
                                                        const void* __restrict__ Wv, int ldw,
                                                        const float* __restrict__ row_scale, OutT* Y, int ldy,
                                                        int M, int N, int K, float alpha, bool accumulate,
-                                                       MixArgs mix = {}, float* partial = nullptr) {
+                                                       MixArgs mix = {}, float* partial = nullptr, BatchArgs batch = {}) {
     pdl_launch_dependents();
     pdl_wait();
+    const bool batched = batch.ys != 0;
+    if (batched) {
+        X += blockIdx.z * batch.xs;
+        Wv = static_cast<const __nv_bfloat16*>(Wv) + blockIdx.z * batch.ws;
+        Y += blockIdx.z * batch.ys;
+    }
     const __nv_bfloat16* W = static_cast<const __nv_bfloat16*>(Wv);
     const uint8_t* W8 = static_cast<const uint8_t*>(Wv);
     extern __shared__ __align__(16) unsigned char gemm_smem[];
     auto sA = reinterpret_cast<__nv_bfloat16 (*)[BMT * BK]>(gemm_smem);
-    static_assert((!MIX || (size_t)4 * 64 * 33 * 4 <= (size_t)STAGES * (BMT + BNT) * BK * 2) && ((BNT == 128 && BMT == 128) || (!MIX && (WF == 0 || WF == 3) && BNT * BMT == 128 * 256)), "unsupported tile");
+    static_assert((!MIX || (size_t)4 * 64 * 33 * 4 <= (size_t)STAGES * (BMT + BNT) * BK * 2) && ((BNT == 128 && BMT == 128) || (!MIX && (WF == 0 || WF == 3 || WF == 5) && BNT * BMT == 128 * 256)), "unsupported tile");
     constexpr int WM = BMT / 64, WN = 8 / WM, WTN = BNT / WN;  // warp grid; warp tile 64 x WTN
     auto sB = reinterpret_cast<__nv_bfloat16 (*)[BNT * BK]>(gemm_smem + (size_t)STAGES * BMT * BK * 2);
 
@@ -68,8 +81,8 @@ __global__ void __launch_bounds__(THREADS, BMT == 128 && BNT == 128 ? 2 : 1) gem
     const int warp_m = warp / WN, warp_n = warp % WN;
     const int m0 = blockIdx.y * BMT, n0 = blockIdx.x * BNT;
     // Split K (gridDim.z > 1): this CTA's K range; raw sums go to partial[z][M][N].
-    const int kz = blockIdx.z * (K / gridDim.z);
-    const int k_tiles = K / gridDim.z / BK;
+    const int kz = batched ? 0 : blockIdx.z * (K / gridDim.z);
+    const int k_tiles = (batched ? K : K / gridDim.z) / BK;
     // Global weight row of the tile's local column r.
     auto wrow = [&](int r) { return MIX ? (r >> 5) * HC_D + blockIdx.x * 32 + (r & 31) : n0 + r; };
 
@@ -118,6 +131,7 @@ __global__ void __launch_bounds__(THREADS, BMT == 128 && BNT == 128 ? 2 : 1) gem
 #pragma unroll
             for (int u = 0; u < NU; ++u) braw[u] = __ldg(reinterpret_cast<const uint4*>(W8 + (size_t)bgn * ldw + k + bc + 16 * u));
             if constexpr (WF == 3) bgs = row_scale[(size_t)bgn * (K / 64) + (k + bc) / 64];
+            if constexpr (WF == 5) bgs = row_scale[(size_t)(bgn >> 7) * (K >> 7) + ((k + bc) >> 7)];
         }
     };
     auto store_b = [&](int stage) {
@@ -126,12 +140,23 @@ __global__ void __launch_bounds__(THREADS, BMT == 128 && BNT == 128 ? 2 : 1) gem
             __nv_bfloat16* dst0 = &sB[stage][sw(br, bc + 16 * u)];
             __nv_bfloat16* dst1 = &sB[stage][sw(br, bc + 16 * u + 8)];
             if (bgn < N) {
-                const int8_t* p = reinterpret_cast<const int8_t*>(&braw[u]);
                 uint32_t packed[8];
+                if constexpr (WF == 5) {
+                    const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&braw[u]);
 #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const __nv_bfloat162 v = __floats2bfloat162_rn((float)p[2 * i] * bgs, (float)p[2 * i + 1] * bgs);
-                    packed[i] = *reinterpret_cast<const uint32_t*>(&v);
+                    for (int i = 0; i < 8; ++i) {
+                        const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(p[i], __NV_E4M3);
+                        const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+                        const __nv_bfloat162 v = __floats2bfloat162_rn(f.x * bgs, f.y * bgs);
+                        packed[i] = *reinterpret_cast<const uint32_t*>(&v);
+                    }
+                } else {
+                    const int8_t* p = reinterpret_cast<const int8_t*>(&braw[u]);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const __nv_bfloat162 v = __floats2bfloat162_rn((float)p[2 * i] * bgs, (float)p[2 * i + 1] * bgs);
+                        packed[i] = *reinterpret_cast<const uint32_t*>(&v);
+                    }
                 }
                 *reinterpret_cast<uint4*>(dst0) = make_uint4(packed[0], packed[1], packed[2], packed[3]);
                 *reinterpret_cast<uint4*>(dst1) = make_uint4(packed[4], packed[5], packed[6], packed[7]);
@@ -141,7 +166,7 @@ __global__ void __launch_bounds__(THREADS, BMT == 128 && BNT == 128 ? 2 : 1) gem
             }
         }
     };
-    constexpr bool PIPE_B = WF == 2 || WF == 3;
+    constexpr bool PIPE_B = WF == 2 || WF == 3 || WF == 5;
 
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
@@ -271,7 +296,7 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
     static bool configured = false;
     static int sms = 0;
     if (!configured) {
-        for (const void* kern : {(const void*)gemm_kernel<OutT, 0>, (const void*)gemm_kernel<OutT, 3>}) {
+        for (const void* kern : {(const void*)gemm_kernel<OutT, 0>, (const void*)gemm_kernel<OutT, 3>, (const void*)gemm_kernel<OutT, 5>}) {
             const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GEMM_SMEM);
             if (e != cudaSuccess) return e;
         }
@@ -279,7 +304,8 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
             const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gemm_smem_bytes(2));
             if (e != cudaSuccess) return e;
         }
-        for (const void* kern : {(const void*)gemm_kernel<OutT, 0, false, 3, 128, 256>, (const void*)gemm_kernel<OutT, 3, false, 3, 128, 256>}) {
+        for (const void* kern : {(const void*)gemm_kernel<OutT, 0, false, 3, 128, 256>, (const void*)gemm_kernel<OutT, 3, false, 3, 128, 256>,
+                                 (const void*)gemm_kernel<OutT, 5, false, 3, 128, 256>}) {
             const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gemm_smem_bytes(3, 256, 128));
             if (e != cudaSuccess) return e;
         }
@@ -294,9 +320,9 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
     const dim3 grid_w((N + BN - 1) / BN, (M + 255) / 256);
     const bool wide = ctas > 2 * sms && (int)(grid_w.x * grid_w.y) >= 4 * sms;
     const bool two = !wide;
-    const float* sc = fmt == 3 ? scale : nullptr;
+    const float* sc = fmt == 3 || fmt == 5 ? scale : nullptr;
     auto go = [&](auto kern, size_t smem, dim3 g) {
-        return sq_launch(kern, g, THREADS, smem, stream, x, ldx, W, ldw, sc, y, ldy, M, N, K, alpha, accumulate != 0, MixArgs{}, (float*)nullptr);
+        return sq_launch(kern, g, THREADS, smem, stream, x, ldx, W, ldw, sc, y, ldy, M, N, K, alpha, accumulate != 0, MixArgs{}, (float*)nullptr, BatchArgs{});
     };
     const size_t wide_smem = gemm_smem_bytes(3, 256, 128);
     if (fmt == 3)
@@ -305,6 +331,8 @@ cudaError_t launch(int fmt, const void* X, int ldx, const void* W, int ldw, cons
     else if (fmt == 0)
         SQ_CHECK_LAUNCH(wide ? go(gemm_kernel<OutT, 0, false, 3, 128, 256>, wide_smem, grid_w)
                         : two ? go(gemm_kernel<OutT, 0>, GEMM_SMEM, grid) : go(gemm_kernel<OutT, 0>, GEMM_SMEM, grid));
+    else if (fmt == 5)
+        SQ_CHECK_LAUNCH(wide ? go(gemm_kernel<OutT, 5, false, 3, 128, 256>, wide_smem, grid_w) : go(gemm_kernel<OutT, 5>, GEMM_SMEM, grid));
     else
         return cudaErrorInvalidValue;
     SQ_RETURN_LAUNCH();
@@ -465,10 +493,10 @@ extern "C" cudaError_t quench6k_gemm_bf16_f32_split(int fmt, const void* X, int 
     const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
     if (fmt == 3)
         SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 3>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, scale, Y, ldy, M, N, K, 1.0f, false,
-                                  MixArgs{}, partial));
+                                  MixArgs{}, partial, BatchArgs{}));
     else
         SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 0>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, (const float*)nullptr, Y, ldy, M,
-                                  N, K, 1.0f, false, MixArgs{}, partial));
+                                  N, K, 1.0f, false, MixArgs{}, partial, BatchArgs{}));
     const size_t count = (size_t)M * N;
     SQ_CHECK_LAUNCH(sq_launch(split_reduce_kernel<float>, (unsigned)((count + 255) / 256), 256, 0, stream, (const float*)partial, splits, Y,
                               ldy, M, N, alpha, accumulate != 0));
@@ -494,10 +522,10 @@ extern "C" cudaError_t quench6k_gemm_hc_up_mix(int fmt, const void* X, int ldx, 
     const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
     if (fmt == 3)
         SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 3, true, 3>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, scale, (float*)nullptr, 0, M,
-                                  HC_S * HC_D, K, 1.0f, false, mix, (float*)nullptr));
+                                  HC_S * HC_D, K, 1.0f, false, mix, (float*)nullptr, BatchArgs{}));
     else if (fmt == 0)
         SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<float, 0, true, 3>, grid, THREADS, GEMM_SMEM, stream, x, ldx, W, ldw, (const float*)nullptr,
-                                  (float*)nullptr, 0, M, HC_S * HC_D, K, 1.0f, false, mix, (float*)nullptr));
+                                  (float*)nullptr, 0, M, HC_S * HC_D, K, 1.0f, false, mix, (float*)nullptr, BatchArgs{}));
     else
         return cudaErrorInvalidValue;
     SQ_RETURN_LAUNCH();
@@ -514,4 +542,24 @@ extern "C" cudaError_t quench6k_gemm_bf16_bf16(int fmt, const void* X, int ldx, 
                                              void* Y, int ldy, int M, int N, int K, float alpha, int accumulate,
                                              cudaStream_t stream) {
     return launch<__nv_bfloat16>(fmt, X, ldx, W, ldw, scale, Y, ldy, M, N, K, alpha, accumulate, stream);
+}
+
+// Batched BF16 GEMM, BF16 output: for b < batch, Y_b[M, N] = X_b[M, K] . W_b[N, K]^T with X_b = X + b * xs,
+// W_b = W + b * ws, Y_b = Y + b * ys (elements).
+extern "C" cudaError_t quench6k_gemm_bf16_batched(const void* X, int ldx, size_t xs, const void* W, int ldw, size_t ws, void* Y, int ldy,
+                                                size_t ys, int M, int N, int K, int batch, cudaStream_t stream) {
+    if (K % BK != 0 || ldx % 8 != 0 || ldw % 16 != 0 || xs % 8 != 0 || ws % 8 != 0 || ys == 0) return cudaErrorInvalidValue;
+    if (M == 0 || N == 0 || batch == 0) return cudaSuccess;
+    static bool configured = false;
+    if (!configured) {
+        const cudaError_t e =
+            cudaFuncSetAttribute(gemm_kernel<__nv_bfloat16, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GEMM_SMEM);
+        if (e != cudaSuccess) return e;
+        configured = true;
+    }
+    const dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, batch);
+    SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<__nv_bfloat16, 0>, grid, THREADS, GEMM_SMEM, stream, static_cast<const __nv_bfloat16*>(X), ldx, W,
+                              ldw, (const float*)nullptr, static_cast<__nv_bfloat16*>(Y), ldy, M, N, K, 1.0f, false, MixArgs{},
+                              (float*)nullptr, BatchArgs{xs, ws, ys}));
+    SQ_RETURN_LAUNCH();
 }

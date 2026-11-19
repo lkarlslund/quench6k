@@ -33,6 +33,39 @@ Not supported: NVFP4 shared experts or FP8 block-scaled MTP experts (e.g.
 [nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)),
 compressed-tensors exports, GGUF.
 
+### Hy4-flash
+
+Tencent's Hy4-flash (`hy_v4_flash`: 42 layers of gated MLA attention, sliding-window or indexer-selected,
+512 latent experts per layer, hashed n-gram "Engram" memory) runs from an NVFP4 export with routed experts
+stacked per layer and attention projections BF16 or FP8 with a scale per 128 x 128 block:
+
+| Checkpoint | |
+|---|---|
+| [Avifenesh/Hy4-flash-NVFP4](https://huggingface.co/Avifenesh/Hy4-flash-NVFP4) | NVFP4 experts with a scale per expert, FP8 attention, FP8 Engram tables with a scale per row (161 GB) |
+
+`quench6k serve --model DIR` detects the model and serves one sequence at a time (prefix reuse,
+prompt-lookup drafts, tool calls, reasoning efforts `none`/`high`/`max`); steering, adapters, vision,
+edits and stored contexts are not available for it. About 85.5 GiB of weights load onto the GPU; the
+shared experts, the latent projections around the routed experts and the LM head are quantized to FP8 at
+load (`QUENCH6K_HY4_FP8`). The four Engram tables (63 GB) stay on the host, memory-mapped; 64 random
+rows per token are gathered from them, so keep them in the page cache (`QUENCH6K_HY4_ENGRAM_PRELOAD=1`
+reads them in at load) and on uncompressed storage, as for the PLE table below. The drafter (DFly2) and
+the vision tower are not supported yet.
+
+Its correctness gate compares teacher-forced distributions against `tools/ref/hy4_ref.py`, an
+independent PyTorch implementation run on the same weights in BF16 (reference A) and FP32 (B):
+
+```
+python3 -I tools/ref/hy4_fixtures.py --model $M --qwen $SWIFT --out out/hy4-fixtures
+python3 -I tools/ref/hy4_ref.py --model $M --fixture out/hy4-fixtures/* --out out/hy4-ref --suffix=-bf16
+python3 -I tools/ref/hy4_ref.py --model $M --dtype fp32 --fixture out/hy4-fixtures/* --out out/hy4-ref --suffix=-fp32
+# copy each <fixture>-bf16/-fp32 pair into its fixture directory as ref-bf16 / ref-fp32, then
+quench6k hy4 score --model $M --fixture out/hy4-fixtures/* --out out/hy4-eng
+quench6k gate --fixtures out/hy4-fixtures --candidates out/hy4-eng --ref-a ref-bf16 --ref-b ref-fp32
+```
+
+`quench6k hy4 generate` and `quench6k hy4 bench` run greedy generation and throughput measurements.
+
 Keep the PLE n-gram table's files (Swift: 92 GiB of BF16 in `embedding-model-*.safetensors`) on
 storage without filesystem compression. The table is memory-mapped and gathered on the host, 16 random
 rows per token, and most of it is never in the page cache; on a compressed file (btrfs
@@ -332,3 +365,8 @@ the inspector's edits.
 | `QUENCH6K_TIMING=1` | Logs chat-template rendering and tokenization times |
 | `QUENCH6K_SAMPLED_DRAFTS=P` | Sampled requests draw drafts at P% of the temperature (default 100; 0: greedy drafts) |
 | `QUENCH6K_PLE_WARM_THREADS=N` | Threads that read embedding rows ahead of prefill (default 64) |
+| `QUENCH6K_HY4_FP8=LIST` | Hy4-flash: BF16 projections quantized to FP8 at load, as name fragments (`all`, `none`; default `shared_experts,routed_expert,lm_head`) |
+| `QUENCH6K_HY4_ENGRAM_PRELOAD=1` | Hy4-flash: read the Engram tables into the page cache at load |
+| `QUENCH6K_HY4_GRAPHS=0` | Hy4-flash: run small steps eagerly instead of as CUDA graphs |
+| `QUENCH6K_HY4_W4A4=1` | Hy4-flash: prefill experts with NVFP4 activations on the FP4 tensor cores (faster; fails the gate) |
+| `QUENCH6K_HY4_DUMP=DIR`, `QUENCH6K_HY4_TIMING=1` | Hy4-flash debugging: per-layer hidden states, per-step host timings |

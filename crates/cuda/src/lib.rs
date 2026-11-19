@@ -112,6 +112,22 @@ pub mod ffi {
             accumulate: c_int,
             stream: Stream,
         ) -> Error;
+        pub fn quench6k_gemm_bf16_batched(
+            x: *const c_void,
+            ldx: c_int,
+            xs: usize,
+            w: *const c_void,
+            ldw: c_int,
+            ws: usize,
+            y: *mut c_void,
+            ldy: c_int,
+            ys: usize,
+            m: c_int,
+            n: c_int,
+            k: c_int,
+            batch: c_int,
+            stream: Stream,
+        ) -> Error;
         pub fn quench6k_vit_layernorm(
             x: *const f32,
             t: c_int,
@@ -1137,6 +1153,7 @@ pub mod ffi {
 
 pub mod bf16;
 pub mod flint;
+pub mod hy4;
 pub mod kernels;
 
 /// Runtime kernel variants (dev/KBENCH.md): tuning keys that kernel launchers read when they launch

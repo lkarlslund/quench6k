@@ -23,6 +23,8 @@ pub enum WeightFormat {
     Int8Group = 3,
     /// FP8 E4M3 with a power-of-two (UE8M0 byte) scale per 32 consecutive weights of a row.
     Mxfp8 = 4,
+    /// FP8 E4M3 with an FP32 scale per 128 x 128 block (`[ceil(N / 128), K / 128]`).
+    Fp8Block = 5,
 }
 
 pub fn int8_group() -> usize {
@@ -273,6 +275,46 @@ pub fn gemm_bf16(
         )
     };
     check(err, "gemm_bf16_bf16")
+}
+
+/// Batched BF16 GEMM with BF16 output: for b < batch, Y_b = X_b . W_b^T with X_b = X + b * xs,
+/// W_b = W + b * ws, Y_b = Y + b * ys (strides in elements).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_bf16_batched(
+    s: &Stream,
+    x: u64,
+    ldx: usize,
+    xs: usize,
+    w: u64,
+    ldw: usize,
+    ws: usize,
+    y: u64,
+    ldy: usize,
+    ys: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    batch: usize,
+) -> Result<()> {
+    let err = unsafe {
+        ffi::quench6k_gemm_bf16_batched(
+            p(x),
+            ldx as i32,
+            xs,
+            p(w),
+            ldw as i32,
+            ws,
+            pm(y),
+            ldy as i32,
+            ys,
+            m as i32,
+            n as i32,
+            k as i32,
+            batch as i32,
+            s.raw(),
+        )
+    };
+    check(err, "gemm_bf16_batched")
 }
 
 pub fn gemv_max_m() -> usize {

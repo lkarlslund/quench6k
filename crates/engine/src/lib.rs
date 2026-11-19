@@ -9,6 +9,7 @@ pub mod fileio;
 pub mod flint;
 pub mod forward;
 pub mod gguf;
+pub mod hy4;
 pub mod inspect;
 pub mod loader;
 pub mod model;

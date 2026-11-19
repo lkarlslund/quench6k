@@ -52,6 +52,7 @@ __global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X,
                     pre_gs[r][c] = ld_stream_f32(row_scale + (size_t)min(n0 + r, N - 1) * (K / GROUP) + k / GROUP);
                 if constexpr (F == WFmt::MX8)
                     pre_gs[r][c] = ue8m0_value(reinterpret_cast<const uint8_t*>(row_scale)[(size_t)min(n0 + r, N - 1) * (K / 32) + k / 32]);
+                if constexpr (F == WFmt::FP8B) pre_gs[r][c] = fp8b_scale(row_scale, min(n0 + r, N - 1), k, K);
             }
     }
     pdl_wait();
@@ -77,7 +78,7 @@ __global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X,
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             decode_raw16<F>(pre[r][c], w[r]);
-            if constexpr (F == WFmt::INT8G || F == WFmt::MX8)
+            if constexpr (F == WFmt::INT8G || F == WFmt::MX8 || F == WFmt::FP8B)
 #pragma unroll
                 for (int i = 0; i < 16; ++i) w[r][i] *= pre_gs[r][c];
         }
@@ -95,6 +96,11 @@ __global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X,
             }
             if constexpr (F == WFmt::MX8) {
                 const float gs = ue8m0_value(reinterpret_cast<const uint8_t*>(row_scale)[(size_t)min(n0 + r, N - 1) * (K / 32) + k / 32]);
+#pragma unroll
+                for (int i = 0; i < 16; ++i) w[r][i] *= gs;
+            }
+            if constexpr (F == WFmt::FP8B) {
+                const float gs = fp8b_scale(row_scale, min(n0 + r, N - 1), k, K);
 #pragma unroll
                 for (int i = 0; i < 16; ++i) w[r][i] *= gs;
             }
@@ -237,7 +243,7 @@ cudaError_t launch(int M, const void* Xv, int ldx, const void* Wv, const float* 
 
 extern "C" int quench6k_gemv_max_m() { return 16; }
 
-// fmt: 0 BF16, 3 INT8 with one scale per 64 weights. With splits > 1 the K range is split across CTAs;
+// fmt: 0 BF16, 3 INT8 with one scale per 64 weights, 4 MXFP8, 5 FP8 with a scale per 128 x 128 block. With splits > 1 the K range is split across CTAs;
 // `partial` holds splits * M * N floats, reduced in split order.
 extern "C" cudaError_t quench6k_gemv(int fmt, int M, const void* X, int ldx, const void* W, const float* scale, float* Y,
                                    int ldy, float* partial, int N, int K, int splits, float alpha, int accumulate,
@@ -248,6 +254,8 @@ extern "C" cudaError_t quench6k_gemv(int fmt, int M, const void* X, int ldx, con
         return launch<WFmt::INT8G>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
     if (fmt == 4 && K % 32 == 0)
         return launch<WFmt::MX8>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
+    if (fmt == 5 && K % 128 == 0)
+        return launch<WFmt::FP8B>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
     return cudaErrorInvalidValue;
 }
 

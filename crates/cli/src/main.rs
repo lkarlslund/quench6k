@@ -1,6 +1,7 @@
 mod bench;
 mod chat;
 mod flint;
+mod hy4;
 mod gpumon;
 mod kbench;
 mod mtp;
@@ -514,6 +515,9 @@ enum Command {
     /// Recursive Flint (NVFP4 GGUF) commands.
     #[command(subcommand)]
     Flint(flint::FlintCmd),
+    /// Hy4-flash (hy_v4_flash) commands.
+    #[command(subcommand)]
+    Hy4(hy4::Hy4Cmd),
     Gate {
         /// Fixture root containing one directory per fixture.
         #[arg(long, default_value = "oracle/fixtures")]
@@ -524,6 +528,12 @@ enum Command {
         /// Candidate file suffix: files are named `<fixture><suffix>.{json,bin}`.
         #[arg(long, default_value = "")]
         suffix: String,
+        /// Reference A of each fixture (`<fixture>/<ref_a>.{json,bin}`).
+        #[arg(long, default_value = "llama-w4a4")]
+        ref_a: String,
+        /// Reference B, whose distance to A sets the noise floor.
+        #[arg(long, default_value = "llama-q8")]
+        ref_b: String,
     },
 }
 
@@ -896,10 +906,13 @@ fn main() -> Result<()> {
             binary,
         } => sass::run(binary.as_deref(), &file, kernel.as_deref(), top, &check)?,
         Command::Flint(cmd) => flint::run(cmd)?,
+        Command::Hy4(cmd) => hy4::run(cmd)?,
         Command::Gate {
             fixtures,
             candidates,
             suffix,
+            ref_a,
+            ref_b,
         } => {
             let mut all = true;
             let mut any = false;
@@ -911,7 +924,7 @@ fn main() -> Result<()> {
                     continue;
                 }
                 any = true;
-                let verdict = oracle::gate(&dir, &oracle::Distributions::load(&stem)?)?;
+                let verdict = oracle::gate_with(&dir, &oracle::Distributions::load(&stem)?, &ref_a, &ref_b)?;
                 for r in &verdict.regions {
                     println!(
                         "{name:14} {:10} n={:4} {}  |dlogp| mean {:.4} p99 {:.4} (bound {:.4} / {:.4}; floor {:.4} / {:.4}; vs B {:.4} / {:.4})  top1 agree {:.3}",

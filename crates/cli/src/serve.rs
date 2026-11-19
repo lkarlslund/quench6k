@@ -25,6 +25,7 @@ use crate::chat::{Chat, TextStream};
 
 mod atlas;
 mod dashboard;
+mod hy4;
 
 pub struct ServeOptions {
     pub model: PathBuf,
@@ -418,7 +419,12 @@ impl App {
 
 pub fn run(opts: ServeOptions) -> Result<()> {
     let chat = Chat::load(&opts.model, opts.chat_template.as_deref())?;
-    let tool_call_token = chat.token_id("<tool_call>");
+    // The token a tool-call block starts with (rewinding to it drops the whole block).
+    let tool_call_token = if chat.hy4 {
+        chat.token_id("<tool_calls:opensource>")
+    } else {
+        chat.token_id("<tool_call>")
+    };
     let (jobs_tx, jobs_rx) = mpsc::channel::<Work>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<f32>>();
     let (model_dir, context, drafts, steer, slots, plan_tokens, prefill_share) = (
@@ -440,14 +446,17 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         model_id: model_id(&opts.model),
     };
     let steering = steer.steering.is_some();
-    let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model);
+    let hy4 = quench6k_engine::hy4::Hy4Model::is_hy4(&opts.model);
+    // Flint and Hy4-flash run one sequence through their own worker loops, without the session's
+    // features (steering, adapters, vision, edits, stored contexts).
+    let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model) || hy4;
     anyhow::ensure!(
         !(flint && steering),
-        "steering packs are not supported for Flint"
+        "steering packs are not supported for this model"
     );
     anyhow::ensure!(
         !(flint && steer.adapter.is_some()),
-        "adapters are not supported for Flint"
+        "adapters are not supported for this model"
     );
     let vision = opts.vision && !flint;
     let metrics = Arc::new(Metrics::new(if flint { 1 } else { slots }));
@@ -470,7 +479,29 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                     println!("model loaded again in {:.1}s", t0.elapsed().as_secs_f64());
                 }
             };
-            let run = if flint {
+            let run = if hy4 {
+                crate::hy4::load(&model_dir).map(|(model, stream)| {
+                    if let Some(tx) = ready.take() {
+                        let _ = tx.send(Ok(0.0));
+                    }
+                    loaded(&metrics);
+                    for slot in &metrics.live {
+                        slot.end(false);
+                    }
+                    let exit = hy4::schedule(
+                        &model,
+                        &stream,
+                        context,
+                        &jobs_rx,
+                        &metrics,
+                        std::mem::take(&mut waiting),
+                        unload_idle,
+                    );
+                    drop(model);
+                    drop(stream);
+                    exit
+                })
+            } else if flint {
                 crate::flint::load(&model_dir).map(|(model, stream)| {
                     if let Some(tx) = ready.take() {
                         let _ = tx.send(Ok(0.0));
@@ -1546,7 +1577,7 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, ApiError> {
             .chat
             .decode(&ids[ids.len().saturating_sub(4)..], false)
             .unwrap_or_default();
-        thinking = tail.ends_with("<think>\n");
+        thinking = app.chat.opens_thinking(&tail);
     }
     prepare_ids(app, req, ids, images, thinking, tools)
 }
@@ -1602,7 +1633,7 @@ fn render_chat(
         .chat
         .render(&messages, tools, enable_thinking, effort)
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
-    let thinking = text.ends_with("<think>\n");
+    let thinking = app.chat.opens_thinking(&text);
     let t1 = std::time::Instant::now();
     let ids = app
         .chat

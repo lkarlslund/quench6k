@@ -185,6 +185,18 @@ fn weight_rows(s: &Stream, w: &Linear, rows: std::ops::Range<usize>) -> Result<V
                 .map(|(i, &c)| e4m3(c) * f32::from_bits((scales[i / 32] as u32) << 23))
                 .collect()
         }
+        k::WeightFormat::Fp8Block => {
+            let codes: Vec<u8> = s.download(w.addr + (rows.start * kk) as u64, n * kk)?;
+            let scales: Vec<f32> = s.download(w.scale, w.n.div_ceil(128) * (kk / 128))?;
+            codes
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| {
+                    let (r, col) = (rows.start + i / kk, i % kk);
+                    e4m3(c) * scales[r / 128 * (kk / 128) + col / 128]
+                })
+                .collect()
+        }
     })
 }
 
