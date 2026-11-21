@@ -1048,34 +1048,53 @@ struct ExpertW {
 // The rows are one contiguous run of 16-byte chunks (NVFP4: 32 values and 2 scale bytes; MXFP8: 16 values
 // and half a scale byte); lane l takes chunks l, l + 32, ..., so every load is 16 bytes and every lane is
 // busy (R * chunks per row is a multiple of 32 for every Inkling shape).
+// Nine chunks' weights in flight per lane (R * chunks per row is a multiple of 288 for every shape).
+constexpr int EX_U = 9;
+
+// One round of a lane's chunks (c0 = lane + 32 * EX_U * round) of rows n0 .. n0 + R - 1 of expert e.
 template <bool FP4, int R>
-SQ_DEVICE void rows_dot(const ExpertW& wt, int e, int rows_per_expert, int n0, int K, const bf16* x, float (&out)[R]) {
-    constexpr int CV = FP4 ? 32 : 16;  // values per chunk
-    const int lane = threadIdx.x & 31, cpr = K / CV, total = R * cpr;
+SQ_DEVICE void rows_load(const ExpertW& wt, int e, int rows_per_expert, int n0, int K, int c0, uint4 (&wv)[EX_U], uint16_t (&sv)[EX_U]) {
+    constexpr int CV = FP4 ? 32 : 16;
+    const int cpr = K / CV, total = R * cpr;
     const size_t row0 = (size_t)e * rows_per_expert + n0;
 #pragma unroll
+    for (int u = 0; u < EX_U; ++u) {
+        const int c = c0 + 32 * u, r = c / cpr, cc = c % cpr;
+        const bool ok = c < total;
+        wv[u] = ok ? ld_stream(wt.w + (row0 + r) * (FP4 ? K / 2 : K) + (size_t)cc * 16) : make_uint4(0, 0, 0, 0);
+        if constexpr (FP4)
+            sv[u] = ok ? *reinterpret_cast<const uint16_t*>(wt.sc + (row0 + r) * (K / 16) + cc * 2) : 0;
+        else
+            sv[u] = ok ? wt.sc[(row0 + r) * (K / 32) + cc / 2] : 0;
+    }
+}
+
+// With `pre`, the first round's chunks are already loaded (rows_load at c0 = lane).
+template <bool FP4, int R>
+SQ_DEVICE void rows_dot(const ExpertW& wt, int e, int rows_per_expert, int n0, int K, const bf16* x, float (&out)[R],
+                        const uint4* pre_w = nullptr, const uint16_t* pre_s = nullptr) {
+    constexpr int CV = FP4 ? 32 : 16;  // values per chunk
+    constexpr int U = EX_U;
+    const int lane = threadIdx.x & 31, cpr = K / CV, total = R * cpr;
+#pragma unroll
     for (int r = 0; r < R; ++r) out[r] = 0.0f;
-    // Three chunks' weights in flight per lane (R * chunks per row is a multiple of 96 for every shape).
-    constexpr int U = 3;
     for (int c0 = lane; c0 < total; c0 += 32 * U) {
         uint4 wv[U];
         uint16_t sv[U];
+        if (pre_w && c0 == lane) {
 #pragma unroll
-        for (int u = 0; u < U; ++u) {
-            const int c = c0 + 32 * u, r = c / cpr, cc = c % cpr;
-            const bool ok = c < total;
-            wv[u] = ok ? ld_stream(wt.w + (row0 + r) * (FP4 ? K / 2 : K) + (size_t)cc * 16) : make_uint4(0, 0, 0, 0);
-            if constexpr (FP4)
-                sv[u] = ok ? *reinterpret_cast<const uint16_t*>(wt.sc + (row0 + r) * (K / 16) + cc * 2) : 0;
-            else
-                sv[u] = ok ? wt.sc[(row0 + r) * (K / 32) + cc / 2] : 0;
+            for (int u = 0; u < U; ++u) {
+                wv[u] = pre_w[u];
+                sv[u] = pre_s[u];
+            }
+        } else {
+            rows_load<FP4, R>(wt, e, rows_per_expert, n0, K, c0, wv, sv);
         }
 #pragma unroll
         for (int u = 0; u < U; ++u) {
             const int c = c0 + 32 * u;
             if (c >= total) break;
             const int r = c / cpr, cc = c % cpr;
-            const size_t row = row0 + r;
             const uint4 w = wv[u];
             float xs[CV];
             const uint4* src = reinterpret_cast<const uint4*>(x + cc * CV);
@@ -1133,8 +1152,10 @@ constexpr int EX_R = 8;
 template <bool FP4>
 __global__ void __launch_bounds__(256) experts_gate_up_kernel(const bf16* __restrict__ x, const int* __restrict__ sel_e, const int* __restrict__ order,
                                                               ExpertW wt, int pairs, float gcap, float ucap, bf16* act) {
-    pdl_launch_dependents();
+    // Dependents launch only after this kernel's wait: the down kernel may then read the routing (complete)
+    // and load its weights before its own wait.
     pdl_wait();
+    pdl_launch_dependents();
     const int lane = threadIdx.x & 31;
     const int warps = gridDim.x * 8, items = pairs * (2 * FF / EX_R);
     for (int item = blockIdx.x * 8 + (threadIdx.x >> 5); item < items; item += warps) {
@@ -1162,14 +1183,26 @@ template <bool FP4>
 __global__ void __launch_bounds__(256) experts_down_kernel(const bf16* __restrict__ act, const int* __restrict__ sel_e, const int* __restrict__ order,
                                                            ExpertW wt, int pairs, float* y) {
     pdl_launch_dependents();
-    pdl_wait();
     const int lane = threadIdx.x & 31;
     const int warps = gridDim.x * 8, items = pairs * (D / EX_R);
-    for (int item = blockIdx.x * 8 + (threadIdx.x >> 5); item < items; item += warps) {
+    // The first item's weights before the dependency wait (the routing is complete: see the gate/up kernel;
+    // read past L1, which may hold the previous visit's routing).
+    const int first = blockIdx.x * 8 + (threadIdx.x >> 5);
+    uint4 pw[EX_U];
+    uint16_t ps[EX_U];
+    if (first < items) {
+        const int e = __ldcg(sel_e + __ldcg(order + first % pairs));
+        rows_load<FP4, EX_R>(wt, e, D, first / pairs * EX_R, FF, lane, pw, ps);
+    }
+    pdl_wait();
+    for (int item = first; item < items; item += warps) {
         const int pair = order[item % pairs], n0 = item / pairs * EX_R;
         const int e = sel_e[pair];
         float v[EX_R];
-        rows_dot<FP4, EX_R>(wt, e, D, n0, FF, act + (size_t)pair * FF, v);
+        if (item == first)
+            rows_dot<FP4, EX_R>(wt, e, D, n0, FF, act + (size_t)pair * FF, v, pw, ps);
+        else
+            rows_dot<FP4, EX_R>(wt, e, D, n0, FF, act + (size_t)pair * FF, v);
         const float s2 = FP4 ? wt.s2[e] : 1.0f;
         if (lane < EX_R) {
             float vv = 0.0f;
