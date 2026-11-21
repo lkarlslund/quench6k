@@ -5,7 +5,7 @@
 //! of its four causal convolutions (key and value projections, attention and MoE outputs). Chunks hold at
 //! most `max_t` tokens (`max_t + WINDOW <= RING`).
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use quench6k_cuda::inkling::{self as ik, KvSide, RmsSet};
 use quench6k_cuda::kernels as k;
 use quench6k_cuda::{DeviceBuffer, PinnedBuffer, Stream};
@@ -72,6 +72,9 @@ pub struct State {
     /// features, block rows from its own passes.
     draft_kv: Vec<(u64, u64)>,
     pub last_t: usize,
+    /// Every ring (sliding keys and values, convolution inputs) at snap_pos, the end of the last prompt.
+    snap: Option<DeviceBuffer>,
+    snap_pos: Option<usize>,
     _alloc: Alloc,
 }
 
@@ -110,6 +113,8 @@ impl State {
             dgraph: None,
             draft_kv,
             last_t: 0,
+            snap: None,
+            snap_pos: None,
             _alloc: a,
         })
     }
@@ -117,6 +122,7 @@ impl State {
     pub fn reset(&mut self) {
         self.pos = 0;
         self.history.clear();
+        self.snap_pos = None;
     }
 
     /// Drops positions from `pos` on. The rings keep the last RING positions, so `pos` must be within
@@ -128,14 +134,73 @@ impl State {
 
     /// Keeps the longest cached prefix of `prompt` that can be reused (at most prompt.len() - 1 tokens, so
     /// the last prompt token runs again for its logits) and returns its length: the common prefix with the
-    /// history if the rings still hold its last WINDOW positions, else 0.
-    pub fn rewind(&mut self, prompt: &[i32]) -> usize {
+    /// history if the rings still hold its last WINDOW positions, else the snapshot's position (after
+    /// restoring the rings) if it is within reach, else 0.
+    pub fn rewind(&mut self, prompt: &[i32], s: &Stream) -> Result<usize> {
         const REACH: usize = RING - WINDOW;
         let common = self.history.iter().zip(prompt).take_while(|(a, b)| a == b).count();
         let p = common.min(prompt.len().saturating_sub(1));
-        let keep = if self.pos <= p + REACH { p } else { 0 };
+        let live = if self.pos <= p + REACH { p } else { 0 };
+        let snap = match self.snap_pos {
+            Some(e) if e <= self.pos && e <= common + REACH => p.min(e),
+            _ => 0,
+        };
+        let keep = if snap > live {
+            self.restore(s)?;
+            snap
+        } else {
+            live
+        };
+        if self.snap_pos.is_some_and(|e| keep < e) {
+            self.snap_pos = None;
+        }
         self.truncate(keep);
-        keep
+        Ok(keep)
+    }
+
+    /// The (address, bytes) of every ring: per visit the convolution inputs, and the sliding layers' keys
+    /// and values.
+    fn rings(&self) -> Vec<(u64, usize)> {
+        let mut v = Vec::new();
+        for c in &self.caches {
+            v.push((c.k_ring, RING * KVD * 2));
+            v.push((c.v_ring, RING * KVD * 2));
+            v.push((c.attn_ring, RING * D * 2));
+            v.push((c.mlp_ring, RING * D * 2));
+            if c.rows == RING {
+                v.push((c.k, RING * KVD * 2));
+                v.push((c.v, RING * KVD * 2));
+            }
+        }
+        v
+    }
+
+    /// Copies the rings at the current position (the end of a prompt), for [`State::rewind`].
+    pub fn snapshot(&mut self, s: &Stream) -> Result<()> {
+        let rings = self.rings();
+        let total: usize = rings.iter().map(|r| r.1).sum();
+        if self.snap.is_none() {
+            self.snap = Some(DeviceBuffer::new(total)?);
+        }
+        let mut at = self.snap.as_ref().unwrap().addr();
+        for (addr, bytes) in rings {
+            s.copy_d2d(at, addr, bytes)?;
+            at += bytes as u64;
+        }
+        self.snap_pos = Some(self.pos);
+        Ok(())
+    }
+
+    fn restore(&mut self, s: &Stream) -> Result<()> {
+        let mut at = self.snap.as_ref().context("no snapshot")?.addr();
+        for (addr, bytes) in self.rings() {
+            s.copy_d2d(addr, at, bytes)?;
+            at += bytes as u64;
+        }
+        let e = self.snap_pos.context("no snapshot")?;
+        self.pos = e;
+        self.history.truncate(e);
+        Ok(())
     }
 }
 

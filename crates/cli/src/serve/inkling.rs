@@ -95,7 +95,7 @@ pub(super) fn schedule(
         metrics.running.store(1, Ordering::Relaxed);
         let result = (|| -> Result<(Finish, usize, usize, f64, f64)> {
             let p = &job.params;
-            let reused = st.rewind(&job.ids);
+            let reused = st.rewind(&job.ids, s)?;
             metrics.live[0].prefill(reused, reused);
             let mut at = reused;
             while at < job.ids.len() {
@@ -109,6 +109,7 @@ pub(super) fn schedule(
                     (cb.0)(at, reused);
                 }
             }
+            st.snapshot(s)?;
             let prefill = t0.elapsed().as_secs_f64();
             metrics.live[0].decoding();
             let budget = p.max_tokens.min(context - job.ids.len()).max(1);
