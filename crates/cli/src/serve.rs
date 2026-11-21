@@ -26,6 +26,7 @@ use crate::chat::{Chat, TextStream};
 mod atlas;
 mod dashboard;
 mod hy4;
+mod inkling;
 
 pub struct ServeOptions {
     pub model: PathBuf,
@@ -420,7 +421,10 @@ impl App {
 pub fn run(opts: ServeOptions) -> Result<()> {
     let chat = Chat::load(&opts.model, opts.chat_template.as_deref())?;
     // The token a tool-call block starts with (rewinding to it drops the whole block).
-    let tool_call_token = if chat.hy4 {
+    let tool_call_token = if chat.inkling {
+        // A call's message header precedes its JSON token: no rewinding to the block's start.
+        None
+    } else if chat.hy4 {
         chat.token_id("<tool_calls:opensource>")
     } else {
         chat.token_id("<tool_call>")
@@ -447,9 +451,10 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     };
     let steering = steer.steering.is_some();
     let hy4 = quench6k_engine::hy4::Hy4Model::is_hy4(&opts.model);
-    // Flint and Hy4-flash run one sequence through their own worker loops, without the session's
-    // features (steering, adapters, vision, edits, stored contexts).
-    let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model) || hy4;
+    let inkling = quench6k_engine::inkling::InklingModel::is_inkling(&opts.model);
+    // Flint, Hy4-flash and Inkling 2 run one sequence through their own worker loops, without the
+    // session's features (steering, adapters, vision, edits, stored contexts).
+    let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model) || hy4 || inkling;
     anyhow::ensure!(
         !(flint && steering),
         "steering packs are not supported for this model"
@@ -479,7 +484,29 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                     println!("model loaded again in {:.1}s", t0.elapsed().as_secs_f64());
                 }
             };
-            let run = if hy4 {
+            let run = if inkling {
+                crate::inkling::load(&model_dir).map(|(model, stream)| {
+                    if let Some(tx) = ready.take() {
+                        let _ = tx.send(Ok(0.0));
+                    }
+                    loaded(&metrics);
+                    for slot in &metrics.live {
+                        slot.end(false);
+                    }
+                    let exit = inkling::schedule(
+                        &model,
+                        &stream,
+                        context,
+                        &jobs_rx,
+                        &metrics,
+                        std::mem::take(&mut waiting),
+                        unload_idle,
+                    );
+                    drop(model);
+                    drop(stream);
+                    exit
+                })
+            } else if hy4 {
                 crate::hy4::load(&model_dir).map(|(model, stream)| {
                     if let Some(tx) = ready.take() {
                         let _ = tx.send(Ok(0.0));
@@ -2029,7 +2056,8 @@ fn parse_tool_call(body: &str, tools: Option<&Value>) -> Option<Value> {
     if body.trim_start().starts_with('{') {
         let v: Value = serde_json::from_str(body.trim()).ok()?;
         let name = v.get("name")?.as_str()?.to_string();
-        let args = match v.get("arguments") {
+        // Inkling names them "args".
+        let args = match v.get("arguments").or_else(|| v.get("args")) {
             Some(Value::String(a)) => serde_json::from_str::<Value>(a).ok()?,
             Some(a @ Value::Object(_)) => a.clone(),
             None => json!({}),

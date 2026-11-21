@@ -2,6 +2,7 @@ mod bench;
 mod chat;
 mod flint;
 mod hy4;
+mod inkling;
 mod gpumon;
 mod kbench;
 mod mtp;
@@ -518,6 +519,9 @@ enum Command {
     /// Hy4-flash (hy_v4_flash) commands.
     #[command(subcommand)]
     Hy4(hy4::Hy4Cmd),
+    /// Inkling 2 (inkling2_loop) commands.
+    #[command(subcommand)]
+    Inkling(inkling::InklingCmd),
     Gate {
         /// Fixture root containing one directory per fixture.
         #[arg(long, default_value = "oracle/fixtures")]
@@ -907,6 +911,7 @@ fn main() -> Result<()> {
         } => sass::run(binary.as_deref(), &file, kernel.as_deref(), top, &check)?,
         Command::Flint(cmd) => flint::run(cmd)?,
         Command::Hy4(cmd) => hy4::run(cmd)?,
+        Command::Inkling(cmd) => inkling::run(cmd)?,
         Command::Gate {
             fixtures,
             candidates,

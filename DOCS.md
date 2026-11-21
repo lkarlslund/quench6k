@@ -81,6 +81,57 @@ quench6k gate --fixtures out/hy4-fixtures --candidates out/hy4-eng --ref-a ref-b
 `quench6k hy4 generate` and `quench6k hy4 bench` run greedy generation and throughput measurements
 (`--dfly`: drafted decoding).
 
+### Inkling 2
+
+Thinking Machines' Inkling 2 Mini (`inkling2_loop`: 24 layers of which 6 .. 17 run three times, 128
+experts per layer, sliding-window and full attention with a learned relative-position bias instead of
+rotary embeddings, causal convolutions on keys, values and both sublayer outputs, and "block attention
+residuals" that mix earlier block sums into each sublayer's input) runs from its original release:
+
+| Checkpoint | |
+|---|---|
+| [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | NVFP4 experts (MXFP8 in the last four layers), BF16 elsewhere, DSpark drafter in `mtp.safetensors` (20 GB) |
+
+`quench6k serve --model DIR` detects the model and serves one sequence at a time (prefix reuse while
+the rings still hold it, drafted decoding, tool calls, reasoning efforts `none` .. `max`); steering,
+adapters, vision, edits and stored contexts are not available for it, and the vision tower is not
+supported yet. The model's message tokens (`<|message_model|>`, `<|content_thinking|>`,
+`<|content_invoke_tool_json|>`, ...) are decoded to the `<think>` and `<tool_call>` text the server parses,
+so `reasoning_content` and `tool_calls` work as for the Qwen models. About 18 GiB of weights load onto
+the GPU; the LM head is quantized to FP8 at load (`QUENCH6K_INK_FP8`): it does not move the gate's
+distributions measurably, while FP8 layer projections move them by about half the BF16 noise floor.
+
+The residual stream and the block sums are kept in FP32, where the transformers model keeps them in
+BF16. The looped model amplifies rounding: its BF16 and FP32 references differ by 0.1 to 0.2 nats per
+position on average (Qwen and Hy4-flash: under 0.04), and the engine's generated positions are at least
+as close to the FP32 reference as the BF16 reference is. With differences that large, a fixture of a
+few hundred positions can fail the gate on a single position where the two references themselves
+disagree by nats.
+
+The DSpark drafter (3 dense layers and a recurrent "Markov" head) drafts seven tokens after each step:
+the accepted token and seven mask tokens attend, bidirectionally within the block, to context keys and
+values computed from four target features of every earlier position (the inputs of layer visits 5, 23
+and 41 and the final norm's output, mixed per drafter layer); then the Markov head picks the drafts in
+order, biasing the LM head's logits of each block row by a state carried from the previous pick. Each
+step verifies as many drafts as are expected to pay off (`QUENCH6K_INK_DRAFTS=N` fixes the count in
+`quench6k inkling`; `QUENCH6K_INK_DRAFT=0` does not load the drafter). Decoding stays exact.
+
+Its correctness gate compares teacher-forced distributions against `tools/ref/inkling_ref.py`, which
+drives the transformers implementation's decoder layers (transformers 5.24 or later) one layer at a time
+on the GPU, in BF16 (reference A) and FP32 (B):
+
+```
+python3 -I tools/ref/inkling_fixtures.py --model $M --qwen $SWIFT --out out/inkling-fixtures
+python3 -I tools/ref/inkling_ref.py --model $M --fixture out/inkling-fixtures/* --out out/inkling-ref --suffix=-bf16
+python3 -I tools/ref/inkling_ref.py --model $M --dtype fp32 --fixture out/inkling-fixtures/* --out out/inkling-ref --suffix=-fp32
+# copy each <fixture>-bf16/-fp32 pair into its fixture directory as ref-bf16 / ref-fp32, then
+quench6k inkling score --model $M --fixture out/inkling-fixtures/* --out out/inkling-eng
+quench6k gate --fixtures out/inkling-fixtures --candidates out/inkling-eng --ref-a ref-bf16 --ref-b ref-fp32
+```
+
+`quench6k inkling generate` and `quench6k inkling bench` run greedy generation and throughput
+measurements (`--draft`: drafted decoding).
+
 Keep the PLE n-gram table's files (Swift: 92 GiB of BF16 in `embedding-model-*.safetensors`) on
 storage without filesystem compression. The table is memory-mapped and gathered on the host, 16 random
 rows per token, and most of it is never in the page cache; on a compressed file (btrfs
@@ -387,3 +438,8 @@ the inspector's edits.
 | `QUENCH6K_HY4_DRAFTS=N` | Hy4-flash, `quench6k hy4 ... --dfly`: verify N drafts per step instead of choosing the count |
 | `QUENCH6K_HY4_W4A4=1` | Hy4-flash: prefill experts with NVFP4 activations on the FP4 tensor cores (faster; fails the gate) |
 | `QUENCH6K_HY4_DUMP=DIR`, `QUENCH6K_HY4_TIMING=1` | Hy4-flash debugging: per-layer hidden states, per-step host timings |
+| `QUENCH6K_INK_FP8=LIST` | Inkling 2: BF16 projections quantized to FP8 at load, as name fragments (`all`, `none`; default `model.llm.unembed`, the LM head) |
+| `QUENCH6K_INK_GRAPHS=0` | Inkling 2: run small steps and the drafter eagerly instead of as CUDA graphs |
+| `QUENCH6K_INK_DRAFT=0` | Inkling 2: do not load the DSpark drafter (the server then drafts by prompt lookup) |
+| `QUENCH6K_INK_DRAFTS=N` | Inkling 2, `quench6k inkling ... --draft`: verify N drafts per step instead of choosing the count |
+| `QUENCH6K_INK_DUMP=DIR`, `QUENCH6K_INK_DUMP_DRAFT=DIR`, `QUENCH6K_INK_TIMING=1` | Inkling 2 debugging: the stream after each layer visit, the drafter's inputs and outputs, per-step timings |
