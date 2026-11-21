@@ -170,6 +170,7 @@ mod ffi {
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_msg_apply_rows(hs: *const f32, m: *const f32, fg: *const f32, t: c_int, out: *mut f32, st: Stream) -> Error;
+        pub fn quench6k_ink_nop(n: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_to_bf16_rows(src: *const f32, t: c_int, dst: *mut c_void, ldd: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_mix(
             feats: *const c_void,
@@ -743,4 +744,9 @@ pub fn mx8_grouped_gemm(
 /// out = (1 - tanh(f)) * hs + tanh(g) * m from fg F32 [t, 2 * 2304] (forget | gain).
 pub fn msg_apply_rows(s: &Stream, hs: u64, m: u64, fg: u64, t: usize, out: u64) -> Result<()> {
     go!("ink_msg_apply_rows", ffi::quench6k_ink_msg_apply_rows(f(hs), f(m), f(fg), n(t), fm(out), s.raw()))
+}
+
+/// `n` empty kernels (measurement of the per-kernel cost).
+pub fn nop(s: &Stream, nn: usize) -> Result<()> {
+    go!("ink_nop", ffi::quench6k_ink_nop(n(nn), s.raw()))
 }

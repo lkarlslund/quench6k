@@ -625,6 +625,9 @@ impl InklingModel {
                 s.copy_d2d(h, ws.slots[nb], td as usize)?;
             }
             let msg = layer.looped && pass > 0;
+            if let Some(n) = std::env::var("QUENCH6K_INK_NOP").ok().and_then(|v| v.parse().ok()) {
+                ik::nop(s, n)?;
+            }
             if msg {
                 let q = self.msg_queries + ((li - cfg.loop_start) * 4 * D * 4) as u64;
                 ik::attn_res(s, &[ws.slots[PREV_BLOCK], ws.slots[PREV_PARTIAL]], q, 4, t, ws.msgs, &[], 0)?;

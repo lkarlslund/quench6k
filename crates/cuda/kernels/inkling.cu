@@ -48,10 +48,12 @@ SQ_DEVICE float e4m3_value(uint8_t b) {
 SQ_DEVICE float ue8m0(uint8_t b) { return b == 0 ? 5.877471754e-39f : __uint_as_float((uint32_t)b << 23); }
 
 // Sums the values v[i] with live(i) (block-uniform) over the block; every thread gets the sums. `red`
-// holds 32 * N floats.
+// holds 33 * N floats. Warp w finishes the values w, w + warps, ... (one warp sum each, not every warp
+// every value).
 template <int N, typename Live>
 SQ_DEVICE void block_sums(float (&v)[N], Live live, float* red) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    float* fin = red + 32 * N;
 #pragma unroll
     for (int i = 0; i < N; ++i)
         if (live(i)) v[i] = warp_sum(v[i]);
@@ -60,9 +62,14 @@ SQ_DEVICE void block_sums(float (&v)[N], Live live, float* red) {
         for (int i = 0; i < N; ++i)
             if (live(i)) red[i * 32 + warp] = v[i];
     __syncthreads();
+    for (int i = warp; i < N; i += warps) {
+        const float x = warp_sum(lane < warps ? red[i * 32 + lane] : 0.0f);
+        if (lane == 0) fin[i] = x;
+    }
+    __syncthreads();
 #pragma unroll
     for (int i = 0; i < N; ++i)
-        if (live(i)) v[i] = warp_sum(lane < warps ? red[i * 32 + lane] : 0.0f);
+        if (live(i)) v[i] = fin[i];
     __syncthreads();
 }
 
@@ -140,51 +147,52 @@ struct ResNorms {
     int ldo;
 };
 
-__global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, int ns, const float* __restrict__ queries, int nq, float* out, size_t qstride,
-                                                       ResNorms norms) {
+template <int NS, int NQ>
+__global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, const float* __restrict__ queries, float* out, size_t qstride, ResNorms norms) {
+    constexpr int ns = NS, nq = NQ;
     pdl_launch_dependents();
     pdl_wait();
-    __shared__ float red[32 * (MAX_SRC + MAX_SRC * MAX_Q)];
+    __shared__ float red[33 * (NS + NS * NQ)];
     const int t = blockIdx.x;
-    float x[MAX_SRC][ARPT];
-    float acc[MAX_SRC + MAX_SRC * MAX_Q];
+    float x[NS][ARPT];
+    float acc[NS + NS * NQ];
 #pragma unroll
-    for (int i = 0; i < MAX_SRC + MAX_SRC * MAX_Q; ++i) acc[i] = 0.0f;
+    for (int i = 0; i < NS + NS * NQ; ++i) acc[i] = 0.0f;
 #pragma unroll
-    for (int s = 0; s < MAX_SRC; ++s)
+    for (int s = 0; s < NS; ++s)
 #pragma unroll
         for (int i = 0; i < ARPT; ++i) x[s][i] = s < ns ? src.p[s][(size_t)t * D + threadIdx.x + ART * i] : 0.0f;
 #pragma unroll
     for (int i = 0; i < ARPT; ++i) {
         const int c = threadIdx.x + ART * i;
-        float qv[MAX_Q];
+        float qv[NQ];
 #pragma unroll
-        for (int q = 0; q < MAX_Q; ++q) qv[q] = q < nq ? queries[q * D + c] : 0.0f;
+        for (int q = 0; q < NQ; ++q) qv[q] = q < nq ? queries[q * D + c] : 0.0f;
 #pragma unroll
-        for (int s = 0; s < MAX_SRC; ++s) {
+        for (int s = 0; s < NS; ++s) {
             acc[s] += x[s][i] * x[s][i];
 #pragma unroll
-            for (int q = 0; q < MAX_Q; ++q) acc[MAX_SRC + s * MAX_Q + q] += qv[q] * x[s][i];
+            for (int q = 0; q < NQ; ++q) acc[NS + s * NQ + q] += qv[q] * x[s][i];
         }
     }
-    block_sums(acc, [&](int i) { return i < MAX_SRC ? i < ns : ((i - MAX_SRC) / MAX_Q < ns && (i - MAX_SRC) % MAX_Q < nq); }, red);
-    float r[MAX_SRC];
+    block_sums(acc, [&](int i) { return i < NS ? i < ns : ((i - NS) / NQ < ns && (i - NS) % NQ < nq); }, red);
+    float r[NS];
 #pragma unroll
-    for (int s = 0; s < MAX_SRC; ++s) r[s] = s < ns ? rsqrtf(acc[s] / D + EPS) : 0.0f;
+    for (int s = 0; s < NS; ++s) r[s] = s < ns ? rsqrtf(acc[s] / D + EPS) : 0.0f;
     const float scale = rsqrtf((float)D);
-    float o[MAX_Q][ARPT], ss[MAX_Q];
+    float o[NQ][ARPT], ss[NQ];
 #pragma unroll
-    for (int q = 0; q < MAX_Q; ++q) {
+    for (int q = 0; q < NQ; ++q) {
         ss[q] = 0.0f;
-        float l[MAX_SRC], m = -INFINITY;
+        float l[NS], m = -INFINITY;
 #pragma unroll
-        for (int s = 0; s < MAX_SRC; ++s) {
-            l[s] = s < ns && q < nq ? acc[MAX_SRC + s * MAX_Q + q] * r[s] * scale : -INFINITY;
+        for (int s = 0; s < NS; ++s) {
+            l[s] = s < ns && q < nq ? acc[NS + s * NQ + q] * r[s] * scale : -INFINITY;
             m = fmaxf(m, l[s]);
         }
         float sum = 0.0f;
 #pragma unroll
-        for (int s = 0; s < MAX_SRC; ++s) {
+        for (int s = 0; s < NS; ++s) {
             l[s] = s < ns && q < nq ? __expf(l[s] - m) : 0.0f;
             sum += l[s];
         }
@@ -193,7 +201,7 @@ __global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, int ns, const f
         for (int i = 0; i < ARPT; ++i) {
             float v = 0.0f;
 #pragma unroll
-            for (int s = 0; s < MAX_SRC; ++s)
+            for (int s = 0; s < NS; ++s)
                 if (s < ns) v += l[s] * inv * (x[s][i] * r[s]);
             o[q][i] = v;
             ss[q] += v * v;
@@ -202,7 +210,7 @@ __global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, int ns, const f
     }
     block_sums(ss, [&](int q) { return q < nq && norms.o[q] != nullptr; }, red);
 #pragma unroll
-    for (int q = 0; q < MAX_Q; ++q) {
+    for (int q = 0; q < NQ; ++q) {
         if (q >= nq || !norms.o[q]) continue;
         const float rn = rsqrtf(ss[q] / D + EPS);
 #pragma unroll
@@ -1466,6 +1474,11 @@ __global__ void __launch_bounds__(256) markov_pick_kernel(const float* best_v, c
     }
 }
 
+__global__ void nop_kernel() {
+    pdl_launch_dependents();
+    pdl_wait();
+}
+
 int sm_count() {
     static int sms = 0;
     if (sms == 0) {
@@ -1515,7 +1528,17 @@ cudaError_t quench6k_ink_attn_res(const float* const* src, int ns, const float* 
         n.w[i] = static_cast<const bf16*>(norm_w[i]);
         n.o[i] = static_cast<bf16*>(norm_o[i]);
     }
-    SQ_CHECK_LAUNCH(sq_launch(attn_res_kernel, T, ART, 0, st, s, ns, queries, nq, out, (size_t)T * D, n));
+    // One instance per (sources, queries) the model uses, so every loop has a compile-time count.
+#define SQ_AR(S_, Q_)                                                                                          \
+    if (ns == S_ && nq == Q_) {                                                                                \
+        SQ_CHECK_LAUNCH(sq_launch(attn_res_kernel<S_, Q_>, T, ART, 0, st, s, queries, out, (size_t)T * D, n)); \
+        SQ_RETURN_LAUNCH();                                                                                    \
+    }
+    SQ_AR(1, 1) SQ_AR(2, 1) SQ_AR(3, 1) SQ_AR(4, 1) SQ_AR(5, 1) SQ_AR(6, 1)
+    SQ_AR(1, 3) SQ_AR(2, 3) SQ_AR(3, 3) SQ_AR(4, 3) SQ_AR(5, 3) SQ_AR(6, 3)
+    SQ_AR(2, 4)
+#undef SQ_AR
+    return cudaErrorInvalidValue;
     SQ_RETURN_LAUNCH();
 }
 
@@ -1736,6 +1759,11 @@ cudaError_t quench6k_ink_mx8_grouped_gemm(const void* xs, const uint8_t* w, cons
 cudaError_t quench6k_ink_msg_apply_rows(const float* hs, const float* m, const float* fg, int T, float* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(msg_apply_rows_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, hs, m, fg, T, out));
+    SQ_RETURN_LAUNCH();
+}
+
+cudaError_t quench6k_ink_nop(int n, cudaStream_t st) {
+    for (int i = 0; i < n; ++i) SQ_CHECK_LAUNCH(sq_launch(nop_kernel, 1, 32, 0, st));
     SQ_RETURN_LAUNCH();
 }
 
