@@ -133,7 +133,15 @@ struct Srcs {
 
 constexpr int ART = 768, ARPT = D / ART;  // 3 values per thread
 
-__global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, int ns, const float* __restrict__ queries, int nq, float* out, size_t qstride) {
+// Optional RMSNorm outputs of the mixtures: o[q] (BF16 rows at stride ldo) = w[q] * rmsnorm(out q).
+struct ResNorms {
+    const bf16* w[MAX_Q];
+    bf16* o[MAX_Q];
+    int ldo;
+};
+
+__global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, int ns, const float* __restrict__ queries, int nq, float* out, size_t qstride,
+                                                       ResNorms norms) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float red[32 * (MAX_SRC + MAX_SRC * MAX_Q)];
@@ -164,29 +172,43 @@ __global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, int ns, const f
 #pragma unroll
     for (int s = 0; s < MAX_SRC; ++s) r[s] = s < ns ? rsqrtf(acc[s] / D + EPS) : 0.0f;
     const float scale = rsqrtf((float)D);
+    float o[MAX_Q][ARPT], ss[MAX_Q];
 #pragma unroll
     for (int q = 0; q < MAX_Q; ++q) {
-        if (q >= nq) break;
+        ss[q] = 0.0f;
         float l[MAX_SRC], m = -INFINITY;
 #pragma unroll
         for (int s = 0; s < MAX_SRC; ++s) {
-            l[s] = s < ns ? acc[MAX_SRC + s * MAX_Q + q] * r[s] * scale : -INFINITY;
+            l[s] = s < ns && q < nq ? acc[MAX_SRC + s * MAX_Q + q] * r[s] * scale : -INFINITY;
             m = fmaxf(m, l[s]);
         }
         float sum = 0.0f;
 #pragma unroll
         for (int s = 0; s < MAX_SRC; ++s) {
-            l[s] = s < ns ? __expf(l[s] - m) : 0.0f;
+            l[s] = s < ns && q < nq ? __expf(l[s] - m) : 0.0f;
             sum += l[s];
         }
-        const float inv = 1.0f / sum;
+        const float inv = q < nq ? 1.0f / sum : 0.0f;
 #pragma unroll
         for (int i = 0; i < ARPT; ++i) {
-            float o = 0.0f;
+            float v = 0.0f;
 #pragma unroll
             for (int s = 0; s < MAX_SRC; ++s)
-                if (s < ns) o += l[s] * inv * (x[s][i] * r[s]);
-            out[q * qstride + (size_t)t * D + threadIdx.x + ART * i] = o;
+                if (s < ns) v += l[s] * inv * (x[s][i] * r[s]);
+            o[q][i] = v;
+            ss[q] += v * v;
+            if (out && q < nq) out[q * qstride + (size_t)t * D + threadIdx.x + ART * i] = v;
+        }
+    }
+    block_sums(ss, [&](int q) { return q < nq && norms.o[q] != nullptr; }, red);
+#pragma unroll
+    for (int q = 0; q < MAX_Q; ++q) {
+        if (q >= nq || !norms.o[q]) continue;
+        const float rn = rsqrtf(ss[q] / D + EPS);
+#pragma unroll
+        for (int i = 0; i < ARPT; ++i) {
+            const int c = threadIdx.x + ART * i;
+            norms.o[q][(size_t)t * norms.ldo + c] = f2bf(bf2f(norms.w[q][c]) * (o[q][i] * rn));
         }
     }
 }
@@ -262,82 +284,79 @@ SQ_DEVICE float log_tau(int pos) {
     return 1.0f + 0.1f * logf(fmaxf((float)(pos + 1) / 8192.0f, 1.0f));
 }
 
-__global__ void __launch_bounds__(256) q_prep_kernel(const float* __restrict__ lin, int ld, const bf16* __restrict__ qscale,
-                                                     const bf16* __restrict__ rscale, float qclip, float rclip, int full,
-                                                     const int* __restrict__ start_ptr, bf16* q, float* rel, float* sink) {
-    pdl_launch_dependents();
-    pdl_wait();
-    const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const float tau = full ? log_tau(*start_ptr + t) : 1.0f;
-    const float* row = lin + (size_t)t * ld;
-    for (int h = warp; h < H; h += 8) {
-        float v[4], ss = 0.0f;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int d = lane * 4 + i;
-            v[i] = row[h * HD + d] * bf2f(qscale[h * HD + d]);
-            ss += v[i] * v[i];
-        }
-        const float c = fminf(qclip / (sqrtf(warp_sum(ss)) + 1e-6f), 1.0f);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float y = v[i] * c * tau;
-            q[(size_t)t * QD + h * HD + lane * 4 + i] = f2bf(y);
-        }
-        // Relative states: lanes 0..15.
-        float r = lane < DREL ? row[2 * QD + h * DREL + lane] * bf2f(rscale[h * DREL + lane]) : 0.0f;
-        const float rc = fminf(rclip / (sqrtf(warp_sum(r * r)) + 1e-6f), 1.0f);
-        if (lane < DREL) {
-            rel[((size_t)t * H + h) * DREL + lane] = r * rc * tau;
-        }
-        if (lane == 0) sink[(size_t)t * H + h] = row[2 * QD + H * DREL + h];
-    }
-}
-
-// Stores rb(src) rows (F32 [T, lds], `width` columns) into a ring of BF16 rows at position start + t.
-__global__ void ring_store_kernel(const float* __restrict__ src, int lds, int width, bf16* ring, int ring_rows, const int* __restrict__ start_ptr,
-                                  int T) {
-    pdl_launch_dependents();
-    pdl_wait();
-    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (size_t)T * width) return;
-    const int t = (int)(i / width), c = (int)(i % width);
-    const int pos = *start_ptr + t;
-    ring[(size_t)(pos % ring_rows) * width + c] = f2bf(src[(size_t)t * lds + c]);
-}
-
-// Keys (blockIdx.y 0) or values (1): causal convolution of the ring's projection rows, then per head the
-// L2 clip (keys) or RMS normalization (values); stored into the cache (row pos % cache_rows). Static taps
-// conv [KVD, 4] (tap 3 = current position) or, with `dyn`, static_w [4, KVD] (tap 0 = current) plus the
-// token's per-head taps rb(dyn[t, h * 4 + lag]).
+// Keys (blockIdx.y 0) or values (1): the causal convolution of the projection rows (this step's from
+// `lin`, earlier positions' from the ring, both as BF16), then per head the L2 clip (keys) or RMS
+// normalization (values); stored into the cache (row pos % cache_rows); the step's rows join the ring.
+// Static taps conv [KVD, 4] (tap 3 = current position) or, with `dyn`, static_w [4, KVD] (tap 0 = current)
+// plus the token's per-head taps dyn[t, h * 4 + lag]. blockIdx.y 2: the query side (q_prep).
 struct KvConv {
-    const bf16* ring;
+    const float* lin;
+    int ld;
+    bf16* ring;
     const bf16* conv;
     const bf16* static_w;
     const float* dyn;
-    int ld_dyn;
     bf16* cache;
 };
 
-__global__ void __launch_bounds__(256) kv_conv_kernel(KvConv k, KvConv v, int ring_rows, int cache_rows, float clip, const int* __restrict__ start_ptr) {
+struct QPrep {
+    const float* lin;
+    int ld;
+    const bf16* qscale;
+    const bf16* rscale;
+    float qclip, rclip;
+    int full;
+    bf16* q;
+    float* rel;
+    float* sink;
+};
+
+__global__ void __launch_bounds__(256) qkv_prep_kernel(QPrep qp, KvConv k, KvConv v, int ring_rows, int cache_rows, float clip,
+                                                       const int* __restrict__ start_ptr) {
     pdl_launch_dependents();
     pdl_wait();
-    const KvConv& a = blockIdx.y == 0 ? k : v;
     const int t = blockIdx.x, lane = threadIdx.x & 31, h = threadIdx.x >> 5;
     const int pos = *start_ptr + t;
+    if (blockIdx.y == 2) {
+        const float tau = qp.full ? log_tau(pos) : 1.0f;
+        const float* row = qp.lin + (size_t)t * qp.ld;
+        for (int hh = h; hh < H; hh += 8) {
+            float vq[4], ss = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int d = lane * 4 + i;
+                vq[i] = row[hh * HD + d] * bf2f(qp.qscale[hh * HD + d]);
+                ss += vq[i] * vq[i];
+            }
+            const float c = fminf(qp.qclip / (sqrtf(warp_sum(ss)) + 1e-6f), 1.0f);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) qp.q[(size_t)t * QD + hh * HD + lane * 4 + i] = f2bf(vq[i] * c * tau);
+            float r = lane < DREL ? row[2 * QD + hh * DREL + lane] * bf2f(qp.rscale[hh * DREL + lane]) : 0.0f;
+            const float rc = fminf(qp.rclip / (sqrtf(warp_sum(r * r)) + 1e-6f), 1.0f);
+            if (lane < DREL) qp.rel[((size_t)t * H + hh) * DREL + lane] = r * rc * tau;
+            if (lane == 0) qp.sink[(size_t)t * H + hh] = row[2 * QD + H * DREL + hh];
+        }
+        return;
+    }
+    const KvConv& a = blockIdx.y == 0 ? k : v;
     float y[4], ss = 0.0f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int c = h * HD + lane * 4 + i;
         float xs[CONVK];
 #pragma unroll
-        for (int lag = 0; lag < CONVK; ++lag)
-            xs[lag] = pos - lag >= 0 ? bf2f(a.ring[(size_t)((pos - lag) % ring_rows) * KVD + c]) : 0.0f;
+        for (int lag = 0; lag < CONVK; ++lag) {
+            if (t - lag >= 0)
+                xs[lag] = rb(a.lin[(size_t)(t - lag) * a.ld + c]);
+            else
+                xs[lag] = pos - lag >= 0 ? bf2f(a.ring[(size_t)((pos - lag) % ring_rows) * KVD + c]) : 0.0f;
+        }
+        a.ring[(size_t)(pos % ring_rows) * KVD + c] = f2bf(xs[0]);
         float acc = 0.0f, norm;
         if (a.dyn) {
 #pragma unroll
             for (int lag = 0; lag < CONVK; ++lag) {
-                const float wl = bf2f(a.static_w[lag * KVD + c]) + a.dyn[(size_t)t * a.ld_dyn + h * CONVK + lag];
+                const float wl = bf2f(a.static_w[lag * KVD + c]) + a.dyn[(size_t)t * a.ld + h * CONVK + lag];
                 acc += wl * xs[lag];
             }
             norm = 3.0f;  // sqrt(2 * 4 + 1)
@@ -356,10 +375,20 @@ __global__ void __launch_bounds__(256) kv_conv_kernel(KvConv k, KvConv v, int ri
     for (int i = 0; i < 4; ++i) dst[i] = f2bf(y[i] * f);
 }
 
-// Hidden-width causal convolution of a sublayer output (ring of BF16 rows, conv [D, 4]):
-// out = base + rb((conv + x) / sqrt(5)) (base null: 0).
-__global__ void hidden_conv_kernel(const bf16* __restrict__ ring, int ring_rows, const bf16* __restrict__ conv, const float* base,
-                                   const int* __restrict__ start_ptr, int T, float* out) {
+// Hidden-width causal convolution of a sublayer output x (this step's rows from `src`, or with `cy` the
+// experts' combine sum_k w[t, k] cy[t * 8 + k]; earlier positions' from the ring; all as BF16, conv
+// [D, 4]): out = base + (conv + x) / sqrt(5) (base null: 0); the step's rows join the ring.
+SQ_DEVICE float hidden_x(const float* src, const float* cy, const float* cw, int t, int c) {
+    if (!cy) return rb(src[(size_t)t * D + c]);
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) acc += cw[t * TOPK + k] * cy[((size_t)t * TOPK + k) * D + c];
+    return rb(acc);
+}
+
+__global__ void hidden_conv_kernel(const float* __restrict__ src, const float* __restrict__ cy, const float* __restrict__ cw, bf16* ring,
+                                   int ring_rows, const bf16* __restrict__ conv, const float* base, const int* __restrict__ start_ptr, int T,
+                                   float* out) {
     pdl_launch_dependents();
     pdl_wait();
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -369,10 +398,15 @@ __global__ void hidden_conv_kernel(const bf16* __restrict__ ring, int ring_rows,
     float acc = 0.0f, cur = 0.0f;
 #pragma unroll
     for (int lag = 0; lag < CONVK; ++lag) {
-        const float x = pos - lag >= 0 ? bf2f(ring[(size_t)((pos - lag) % ring_rows) * D + c]) : 0.0f;
+        float x;
+        if (t - lag >= 0)
+            x = hidden_x(src, cy, cw, t - lag, c);
+        else
+            x = pos - lag >= 0 ? bf2f(ring[(size_t)((pos - lag) % ring_rows) * D + c]) : 0.0f;
         if (lag == 0) cur = x;
         acc += bf2f(conv[c * CONVK + CONVK - 1 - lag]) * x;
     }
+    ring[(size_t)(pos % ring_rows) * D + c] = f2bf(cur);
     const float y = (acc + cur) / 2.2360679775f;
     out[i] = (base ? base[i] : 0.0f) + y;
 }
@@ -719,6 +753,50 @@ __global__ void __launch_bounds__(E) route_kernel(const float* __restrict__ logi
     }
 }
 
+// Routing of up to 16 tokens and the pairs' order by expert (ties by pair), one block of 1024 threads
+// (8 tokens at a time, 128 threads a token).
+__global__ void __launch_bounds__(1024) route_order_kernel(const float* __restrict__ logits, const float* __restrict__ bias, float scale, int T,
+                                                           int* sel_e, float* sel_w, int* order) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ float key[8][E], picked[8][TOPK];
+    __shared__ int se[16 * TOPK];
+    const int g = threadIdx.x / E, e = threadIdx.x % E;
+    for (int t0 = 0; t0 < T; t0 += 8) {
+        const int t = t0 + g;
+        float sc = 0.0f;
+        if (t < T) {
+            sc = sigmoidf(logits[(size_t)t * E + e]);
+            key[g][e] = sc + bias[e];
+        }
+        __syncthreads();
+        if (t < T) {
+            const float me = key[g][e];
+            int rank = 0;
+            for (int f = 0; f < E; ++f) rank += key[g][f] > me || (key[g][f] == me && f < e);
+            if (rank < TOPK) {
+                se[t * TOPK + rank] = e;
+                picked[g][rank] = sc;
+            }
+        }
+        __syncthreads();
+        if (t < T && e < TOPK) {
+            float total = 0.0f;
+            for (int k = 0; k < TOPK; ++k) total += picked[g][k];
+            sel_e[t * TOPK + e] = se[t * TOPK + e];
+            sel_w[t * TOPK + e] = picked[g][e] / (total + 1e-20f) * scale;
+        }
+        __syncthreads();
+    }
+    const int pairs = T * TOPK;
+    if (threadIdx.x < pairs) {
+        const int p = threadIdx.x, ep = se[p];
+        int rank = 0;
+        for (int q = 0; q < pairs; ++q) rank += se[q] < ep || (se[q] == ep && q < p);
+        order[rank] = p;
+    }
+}
+
 // Pairs (t * 8 + k) ordered by expert: order[...] (one block).
 __global__ void __launch_bounds__(1024) moe_order_kernel(const int* __restrict__ sel_e, int pairs, int* order) {
     pdl_launch_dependents();
@@ -747,57 +825,81 @@ struct ExpertW {
     const float* s2;
 };
 
-template <bool FP4>
-SQ_DEVICE float chunk_dot(const ExpertW& wt, size_t row, int K, int chunk, const float* x) {
-    float acc = 0.0f;
-    if constexpr (FP4) {
-        const uint2 codes = *reinterpret_cast<const uint2*>(wt.w + row * (K / 2) + chunk * 8);
-        const uint8_t* b = reinterpret_cast<const uint8_t*>(&codes);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const __half2_raw hr = __nv_cvt_fp4x2_to_halfraw2(b[i], __NV_E2M1);
-            const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
-            acc = fmaf(f.x, x[2 * i], acc);
-            acc = fmaf(f.y, x[2 * i + 1], acc);
-        }
-        return acc * e4m3_value(wt.sc[row * (K / 16) + chunk]);
-    } else {
-        const uint4* src = reinterpret_cast<const uint4*>(wt.w + row * K + chunk * 32);
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const uint4 v = src[h];
-            const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(*reinterpret_cast<const __nv_fp8x2_storage_t*>(b + 2 * i), __NV_E4M3);
-                const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
-                acc = fmaf(f.x, x[h * 16 + 2 * i], acc);
-                acc = fmaf(f.y, x[h * 16 + 2 * i + 1], acc);
-            }
-        }
-        return acc * ue8m0(wt.sc[row * (K / 32) + chunk]);
-    }
-}
-
 // Rows n0 .. n0 + R - 1 of expert e times the BF16 vector x (length K): one warp, F32 sums in all lanes.
+// The rows are one contiguous run of 16-byte chunks (NVFP4: 32 values and 2 scale bytes; MXFP8: 16 values
+// and half a scale byte); lane l takes chunks l, l + 32, ..., so every load is 16 bytes and every lane is
+// busy (R * chunks per row is a multiple of 32 for every Inkling shape).
 template <bool FP4, int R>
 SQ_DEVICE void rows_dot(const ExpertW& wt, int e, int rows_per_expert, int n0, int K, const bf16* x, float (&out)[R]) {
-    constexpr int CW = FP4 ? 16 : 32;
-    const int lane = threadIdx.x & 31, chunks = K / CW;
+    constexpr int CV = FP4 ? 32 : 16;  // values per chunk
+    const int lane = threadIdx.x & 31, cpr = K / CV, total = R * cpr;
+    const size_t row0 = (size_t)e * rows_per_expert + n0;
 #pragma unroll
     for (int r = 0; r < R; ++r) out[r] = 0.0f;
-    for (int c = lane; c < chunks; c += 32) {
-        float xs[CW];
-        const uint4* src = reinterpret_cast<const uint4*>(x + c * CW);
+    // Three chunks' weights in flight per lane (R * chunks per row is a multiple of 96 for every shape).
+    constexpr int U = 3;
+    for (int c0 = lane; c0 < total; c0 += 32 * U) {
+        uint4 wv[U];
+        uint16_t sv[U];
 #pragma unroll
-        for (int h = 0; h < CW / 8; ++h) {
-            const uint4 v = src[h];
-            const bf16* pv = reinterpret_cast<const bf16*>(&v);
-#pragma unroll
-            for (int i = 0; i < 8; ++i) xs[h * 8 + i] = bf2f(pv[i]);
+        for (int u = 0; u < U; ++u) {
+            const int c = c0 + 32 * u, r = c / cpr, cc = c % cpr;
+            const bool ok = c < total;
+            wv[u] = ok ? ld_stream(wt.w + (row0 + r) * (FP4 ? K / 2 : K) + (size_t)cc * 16) : make_uint4(0, 0, 0, 0);
+            if constexpr (FP4)
+                sv[u] = ok ? *reinterpret_cast<const uint16_t*>(wt.sc + (row0 + r) * (K / 16) + cc * 2) : 0;
+            else
+                sv[u] = ok ? wt.sc[(row0 + r) * (K / 32) + cc / 2] : 0;
         }
 #pragma unroll
-        for (int r = 0; r < R; ++r) out[r] += chunk_dot<FP4>(wt, (size_t)e * rows_per_expert + n0 + r, K, c, xs);
+        for (int u = 0; u < U; ++u) {
+            const int c = c0 + 32 * u;
+            if (c >= total) break;
+            const int r = c / cpr, cc = c % cpr;
+            const size_t row = row0 + r;
+            const uint4 w = wv[u];
+            float xs[CV];
+            const uint4* src = reinterpret_cast<const uint4*>(x + cc * CV);
+#pragma unroll
+            for (int h = 0; h < CV / 8; ++h) {
+                const uint4 v = src[h];
+                const bf16* pv = reinterpret_cast<const bf16*>(&v);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) xs[h * 8 + i] = bf2f(pv[i]);
+            }
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(&w);
+            float acc;
+            if constexpr (FP4) {
+                const uint16_t sc2 = sv[u];
+                float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const __half2_raw hr = __nv_cvt_fp4x2_to_halfraw2(b[i], __NV_E2M1);
+                    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+                    if (i < 8) {
+                        a0 = fmaf(f.x, xs[2 * i], a0);
+                        a0 = fmaf(f.y, xs[2 * i + 1], a0);
+                    } else {
+                        a1 = fmaf(f.x, xs[2 * i], a1);
+                        a1 = fmaf(f.y, xs[2 * i + 1], a1);
+                    }
+                }
+                acc = a0 * e4m3_value(sc2 & 0xff) + a1 * e4m3_value(sc2 >> 8);
+            } else {
+                acc = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(*reinterpret_cast<const __nv_fp8x2_storage_t*>(b + 2 * i), __NV_E4M3);
+                    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+                    acc = fmaf(f.x, xs[2 * i], acc);
+                    acc = fmaf(f.y, xs[2 * i + 1], acc);
+                }
+                acc *= ue8m0((uint8_t)sv[u]);
+            }
+#pragma unroll
+            for (int q = 0; q < R; ++q)
+                if (q == r) out[q] += acc;
+        }
     }
 #pragma unroll
     for (int r = 0; r < R; ++r) out[r] = warp_sum(out[r]);
@@ -942,6 +1044,111 @@ __global__ void moe_combine_rows_kernel(const float* __restrict__ y, const int* 
 #pragma unroll
     for (int k = 0; k < TOPK; ++k) acc += sel_w[t * TOPK + k] * y[(size_t)pair_row[t * TOPK + k] * D + n];
     out[i] = acc;
+}
+
+// Grouped MXFP8 GEMM (prefill experts of the MXFP8 layers), the layout of moe.cu's NVFP4 GEMM: Y[row, N] =
+// Xs[row, K] . W_e[N, K]^T for the rows of expert e's tiles; W_e E4M3 [N, K] at w + e N K, UE8M0 scales
+// [N, K / 32] at sc + e N K / 32. E4M3 times a power of two is exact in BF16, so the B tiles are exact.
+constexpr int MXG_BM = 64, MXG_BN = 128, MXG_BK = 32, MXG_LDS = MXG_BK + 8;
+
+__global__ void __launch_bounds__(256) mx8_grouped_gemm_kernel(const bf16* __restrict__ X, const uint8_t* __restrict__ w, const uint8_t* __restrict__ sc,
+                                                               const int* __restrict__ offsets, const int* __restrict__ tile_expert,
+                                                               const int* __restrict__ tile_row, const int* __restrict__ num_tiles, float* Y, int N,
+                                                               int K) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ __align__(16) bf16 sA[2][MXG_BM * MXG_LDS];
+    __shared__ __align__(16) bf16 sB[2][MXG_BN * MXG_LDS];
+    if ((int)blockIdx.y >= *num_tiles) return;
+    const int e = tile_expert[blockIdx.y], r0 = tile_row[blockIdx.y];
+    const int r_end = min(r0 + MXG_BM, offsets[e + 1]);
+    const uint8_t* W = w + (size_t)e * N * K;
+    const uint8_t* Sc = sc + (size_t)e * N * (K / 32);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int warp_m = warp >> 2, warp_n = warp & 3;
+    const int n0 = blockIdx.x * MXG_BN;
+    const int k_tiles = K / MXG_BK;
+    auto load_a = [&](int stage, int kt) {
+        const int r = tid >> 2, c = (tid & 3) * 8;
+        const bool ok = r0 + r < r_end;
+        cp_async16(&sA[stage][r * MXG_LDS + c], X + (size_t)(ok ? r0 + r : r0) * K + kt * MXG_BK + c, ok);
+    };
+    uint4 b0 = make_uint4(0, 0, 0, 0), b1 = b0;
+    uint8_t bsc = 0;
+    const bool b_row = tid < MXG_BN && n0 + tid < N;
+    auto fetch_b = [&](int kt) {
+        if (b_row) {
+            const uint4* src = reinterpret_cast<const uint4*>(W + (size_t)(n0 + tid) * K + kt * MXG_BK);
+            b0 = src[0];
+            b1 = src[1];
+            bsc = Sc[(size_t)(n0 + tid) * (K / 32) + kt];
+        }
+    };
+    auto store_b = [&](int stage) {
+        if (tid >= MXG_BN) return;
+        bf16* dst = &sB[stage][tid * MXG_LDS];
+        uint32_t packed[16];
+        const float scale = ue8m0(bsc);
+        const uint8_t* bb[2] = {reinterpret_cast<const uint8_t*>(&b0), reinterpret_cast<const uint8_t*>(&b1)};
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            if (b_row) {
+                const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(*reinterpret_cast<const __nv_fp8x2_storage_t*>(bb[i / 8] + 2 * (i % 8)), __NV_E4M3);
+                const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+                const __nv_bfloat162 v = __floats2bfloat162_rn(f.x * scale, f.y * scale);
+                packed[i] = *reinterpret_cast<const uint32_t*>(&v);
+            } else {
+                packed[i] = 0;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            *reinterpret_cast<uint4*>(dst + 8 * i) = make_uint4(packed[4 * i], packed[4 * i + 1], packed[4 * i + 2], packed[4 * i + 3]);
+    };
+    float acc[2][4][4] = {};
+    load_a(0, 0);
+    cp_async_commit();
+    fetch_b(0);
+    store_b(0);
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        cp_async_wait<0>();
+        __syncthreads();
+        const bool more = kt + 1 < k_tiles;
+        if (more) {
+            load_a((kt + 1) % 2, kt + 1);
+            fetch_b(kt + 1);
+        }
+        cp_async_commit();
+        const bf16* a_tile = sA[kt % 2];
+        const bf16* b_tile = sB[kt % 2];
+#pragma unroll
+        for (int kk = 0; kk < MXG_BK; kk += 16) {
+            uint32_t a[2][4], b[2][4];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) ldmatrix_x4(a[i], &a_tile[(warp_m * 32 + i * 16 + (lane & 15)) * MXG_LDS + kk + (lane >> 4) * 8]);
+#pragma unroll
+            for (int j = 0; j < 2; ++j)
+                ldmatrix_x4(b[j], &b_tile[(warp_n * 32 + j * 16 + (lane & 7) + ((lane >> 4) << 3)) * MXG_LDS + kk + ((lane >> 3) & 1) * 8]);
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) mma_bf16(acc[i][j], a[i], &b[j >> 1][(j & 1) * 2]);
+        }
+        if (more) store_b((kt + 1) % 2);
+    }
+    const int g = lane >> 2, t4 = lane & 3;
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int r = r0 + warp_m * 32 + i * 16 + g + h * 8;
+                const int n = n0 + warp_n * 32 + j * 8 + t4 * 2;
+                if (r >= r_end) continue;
+                if (n < N) Y[(size_t)r * N + n] = acc[i][j][h * 2];
+                if (n + 1 < N) Y[(size_t)r * N + n + 1] = acc[i][j][h * 2 + 1];
+            }
 }
 
 // x = cap * tanh(x / cap) over rows of n values (row stride ld).
@@ -1284,12 +1491,20 @@ cudaError_t quench6k_ink_rms(int sets, const float* const* x, const void* const*
     SQ_RETURN_LAUNCH();
 }
 
-cudaError_t quench6k_ink_attn_res(const float* const* src, int ns, const float* queries, int nq, int T, float* out, cudaStream_t st) {
+// out (null: none) F32 [nq][T, D]; norm_o[q] (null: none) BF16 rows at stride ldo = norm_w[q] * rmsnorm(out q).
+cudaError_t quench6k_ink_attn_res(const float* const* src, int ns, const float* queries, int nq, int T, float* out, const void* const* norm_w,
+                                  void* const* norm_o, int ldo, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     if (ns < 1 || ns > MAX_SRC || nq < 1 || nq > MAX_Q) return cudaErrorInvalidValue;
     Srcs s{};
     for (int i = 0; i < ns; ++i) s.p[i] = src[i];
-    SQ_CHECK_LAUNCH(sq_launch(attn_res_kernel, T, ART, 0, st, s, ns, queries, nq, out, (size_t)T * D));
+    ResNorms n{};
+    n.ldo = ldo;
+    for (int i = 0; i < nq && norm_o; ++i) {
+        n.w[i] = static_cast<const bf16*>(norm_w[i]);
+        n.o[i] = static_cast<bf16*>(norm_o[i]);
+    }
+    SQ_CHECK_LAUNCH(sq_launch(attn_res_kernel, T, ART, 0, st, s, ns, queries, nq, out, (size_t)T * D, n));
     SQ_RETURN_LAUNCH();
 }
 
@@ -1319,38 +1534,30 @@ cudaError_t quench6k_ink_msg_gates(int n, const float* const* hs, const float* c
     SQ_RETURN_LAUNCH();
 }
 
-cudaError_t quench6k_ink_q_prep(const float* lin, int ld, const void* qscale, const void* rscale, float qclip, float rclip, int full,
-                                const int* start, int T, void* q, float* rel, float* sink, cudaStream_t st) {
+// The query side (lin_q [T, ldq]: q | gate | relative states | sinks) and the key and value convolutions
+// (lin_k / lin_v [T, ldk]: projections, then the full layers' per-token taps): conv static taps [KVD, 4]
+// (sliding layers) or null with static_w [4, KVD] (full layers).
+cudaError_t quench6k_ink_qkv_prep(const float* lin_q, int ldq, const void* qscale, const void* rscale, float qclip, float rclip, int full,
+                                  void* q, float* rel, float* sink, const float* lin_k, const float* lin_v, int ldk, void* kring, void* vring,
+                                  const void* kconv, const void* vconv, const void* kstatic, const void* vstatic, void* kcache, void* vcache,
+                                  int ring_rows, int cache_rows, const int* start, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(q_prep_kernel, T, 256, 0, st, lin, ld, static_cast<const bf16*>(qscale), static_cast<const bf16*>(rscale), qclip,
-                              rclip, full, start, static_cast<bf16*>(q), rel, sink));
+    const QPrep qp{lin_q, ldq, static_cast<const bf16*>(qscale), static_cast<const bf16*>(rscale), qclip, rclip, full, static_cast<bf16*>(q),
+                   rel, sink};
+    const bool dyn = kconv == nullptr;
+    const KvConv k{lin_k, ldk, static_cast<bf16*>(kring), static_cast<const bf16*>(kconv), static_cast<const bf16*>(kstatic),
+                   dyn ? lin_k + KVD : nullptr, static_cast<bf16*>(kcache)};
+    const KvConv v{lin_v, ldk, static_cast<bf16*>(vring), static_cast<const bf16*>(vconv), static_cast<const bf16*>(vstatic),
+                   dyn ? lin_v + KVD : nullptr, static_cast<bf16*>(vcache)};
+    SQ_CHECK_LAUNCH(sq_launch(qkv_prep_kernel, dim3(T, 3), 256, 0, st, qp, k, v, ring_rows, cache_rows, qclip, start));
     SQ_RETURN_LAUNCH();
 }
 
-cudaError_t quench6k_ink_ring_store(const float* src, int lds, int width, void* ring, int ring_rows, const int* start, int T, cudaStream_t st) {
+// x from src F32 [T, D], or (cy non-null) the combine sum_k cw[t, k] cy[t * 8 + k]; see hidden_conv_kernel.
+cudaError_t quench6k_ink_hidden_conv(const float* src, const float* cy, const float* cw, void* ring, int ring_rows, const void* conv,
+                                     const float* base, const int* start, int T, float* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(ring_store_kernel, blocks_for((size_t)T * width, 256), 256, 0, st, src, lds, width, static_cast<bf16*>(ring),
-                              ring_rows, start, T));
-    SQ_RETURN_LAUNCH();
-}
-
-// conv: static taps [KVD, 4] (sliding layers) or null with static_w [4, KVD] and dyn F32 rows (full layers).
-cudaError_t quench6k_ink_kv_conv(const void* kring, const void* kconv, const void* kstatic, const float* kdyn, void* kcache,
-                                 const void* vring, const void* vconv, const void* vstatic, const float* vdyn, void* vcache, int ld_dyn,
-                                 int ring_rows, int cache_rows, float clip, const int* start, int T, cudaStream_t st) {
-    if (T == 0) return cudaSuccess;
-    const KvConv k{static_cast<const bf16*>(kring), static_cast<const bf16*>(kconv), static_cast<const bf16*>(kstatic), kdyn, ld_dyn,
-                   static_cast<bf16*>(kcache)};
-    const KvConv v{static_cast<const bf16*>(vring), static_cast<const bf16*>(vconv), static_cast<const bf16*>(vstatic), vdyn, ld_dyn,
-                   static_cast<bf16*>(vcache)};
-    SQ_CHECK_LAUNCH(sq_launch(kv_conv_kernel, dim3(T, 2), 256, 0, st, k, v, ring_rows, cache_rows, clip, start));
-    SQ_RETURN_LAUNCH();
-}
-
-cudaError_t quench6k_ink_hidden_conv(const void* ring, int ring_rows, const void* conv, const float* base, const int* start, int T, float* out,
-                                     cudaStream_t st) {
-    if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(hidden_conv_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, static_cast<const bf16*>(ring), ring_rows,
+    SQ_CHECK_LAUNCH(sq_launch(hidden_conv_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, src, cy, cw, static_cast<bf16*>(ring), ring_rows,
                               static_cast<const bf16*>(conv), base, start, T, out));
     SQ_RETURN_LAUNCH();
 }
@@ -1379,20 +1586,26 @@ cudaError_t quench6k_ink_attention(const void* q, const float* rel, const float*
     SQ_RETURN_LAUNCH();
 }
 
-cudaError_t quench6k_ink_route(const float* logits, const float* bias, float scale, int T, int* sel_e, float* sel_w, cudaStream_t st) {
+// order (non-null, T <= 16): also the pairs' order by expert, in the same launch.
+cudaError_t quench6k_ink_route(const float* logits, const float* bias, float scale, int T, int* sel_e, float* sel_w, int* order, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
+    if (order) {
+        if (T > 16) return cudaErrorInvalidValue;
+        SQ_CHECK_LAUNCH(sq_launch(route_order_kernel, 1, 1024, 0, st, logits, bias, scale, T, sel_e, sel_w, order));
+        SQ_RETURN_LAUNCH();
+    }
     SQ_CHECK_LAUNCH(sq_launch(route_kernel, T, E, 0, st, logits, bias, scale, sel_e, sel_w));
     SQ_RETURN_LAUNCH();
 }
 
-// The routed experts of T tokens: order (pairs in expert order), act BF16 [T * 8, 1152], y F32 [T * 8, D],
-// out F32 [T, D]. fp4: NVFP4 weights with s2, else MXFP8.
+// The routed experts of T tokens: order (pairs in expert order; computed here unless `ordered`), act BF16
+// [T * 8, 1152], y F32 [T * 8, D], out F32 [T, D] (null: no combine). fp4: NVFP4 weights with s2, else MXFP8.
 cudaError_t quench6k_ink_experts(const void* x, const int* sel_e, const float* sel_w, int fp4, const uint8_t* gu_w, const uint8_t* gu_sc,
                                  const float* gu_s2, const uint8_t* d_w, const uint8_t* d_sc, const float* d_s2, float gcap, float ucap,
-                                 int T, int* order, void* act, float* y, float* out, cudaStream_t st) {
+                                 int T, int* order, int ordered, void* act, float* y, float* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     const int pairs = T * TOPK;
-    SQ_CHECK_LAUNCH(sq_launch(moe_order_kernel, 1, 1024, 0, st, sel_e, pairs, order));
+    if (!ordered) SQ_CHECK_LAUNCH(sq_launch(moe_order_kernel, 1, 1024, 0, st, sel_e, pairs, order));
     const ExpertW gu{gu_w, gu_sc, gu_s2}, dn{d_w, d_sc, d_s2};
     const int sms = sm_count();
     const unsigned gb = (unsigned)std::min<size_t>((size_t)pairs * (2 * FF / EX_R) / 8 + 1, (size_t)sms * 8);
@@ -1406,7 +1619,7 @@ cudaError_t quench6k_ink_experts(const void* x, const int* sel_e, const float* s
                                   pairs, gcap, ucap, static_cast<bf16*>(act)));
         SQ_CHECK_LAUNCH(sq_launch(experts_down_kernel<false>, db, 256, 0, st, static_cast<const bf16*>(act), sel_e, (const int*)order, dn, pairs, y));
     }
-    SQ_CHECK_LAUNCH(sq_launch(moe_combine_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, (const float*)y, sel_w, T, out));
+    if (out) SQ_CHECK_LAUNCH(sq_launch(moe_combine_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, (const float*)y, sel_w, T, out));
     SQ_RETURN_LAUNCH();
 }
 
@@ -1497,6 +1710,15 @@ cudaError_t quench6k_ink_moe_act(const float* y, int rows, float gcap, float uca
 cudaError_t quench6k_ink_moe_combine_rows(const float* y, const int* pair_row, const float* sel_w, int T, float* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(moe_combine_rows_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, y, pair_row, sel_w, T, out));
+    SQ_RETURN_LAUNCH();
+}
+
+cudaError_t quench6k_ink_mx8_grouped_gemm(const void* xs, const uint8_t* w, const uint8_t* sc, const int* offsets, const int* tile_expert,
+                                          const int* tile_row, const int* num_tiles, int max_tiles, float* y, int N, int K, cudaStream_t st) {
+    if (K % MXG_BK != 0) return cudaErrorInvalidValue;
+    if (max_tiles == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(mx8_grouped_gemm_kernel, dim3((N + MXG_BN - 1) / MXG_BN, max_tiles), 256, 0, st, static_cast<const bf16*>(xs), w,
+                              sc, offsets, tile_expert, tile_row, num_tiles, y, N, K));
     SQ_RETURN_LAUNCH();
 }
 

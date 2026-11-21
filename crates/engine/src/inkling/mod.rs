@@ -466,6 +466,21 @@ fn fp8_at_load(name: &str) -> bool {
     spec.iter().any(|f| f == "all" || name.contains(f.as_str()))
 }
 
+/// Projections quantized to INT8 with a scale per 64 weights at load (QUENCH6K_INK_INT8 overrides): the
+/// layers' and the drafter's. On the gate's fixtures the generated positions stay as close to the FP32
+/// reference as the BF16 reference is (FP8 with a scale per 128 x 128 block: about 50% farther).
+const INT8_DEFAULT: &str = "model.llm.layers,.self_attn.,.mlp.";
+
+/// Whether `name` matches the env list `var` (comma-separated name fragments, "all", "none"; `default`
+/// when unset), never the router or the message gates (their kernels read BF16).
+fn quantized_at_load(var: &str, default: &str, name: &str) -> bool {
+    if name.ends_with("mlp.gate.weight") || name.contains("controllers.") {
+        return false;
+    }
+    let spec = std::env::var(var).unwrap_or_else(|_| default.into());
+    spec.split(',').filter(|f| !f.is_empty() && *f != "none").any(|f| f == "all" || name.contains(f))
+}
+
 struct Loader<'a> {
     ckpt: &'a Checkpoint,
     s: &'a Stream,
@@ -533,8 +548,10 @@ impl Loader<'_> {
             ensure!(info.shape.len() == 2 && info.shape[1] == k, "{name}: shape {:?}, expected [_, {k}]", info.shape);
             rows += info.shape[0];
         }
-        let fp8 = k.is_multiple_of(128) && fp8_at_load(&names[0]);
-        let tmp = if fp8 { Some(DeviceBuffer::new(rows * k * 2)?) } else { None };
+        let group = quench6k_cuda::kernels::int8_group();
+        let int8 = k.is_multiple_of(group) && quantized_at_load("QUENCH6K_INK_INT8", INT8_DEFAULT, &names[0]);
+        let fp8 = !int8 && k.is_multiple_of(128) && fp8_at_load(&names[0]);
+        let tmp = if fp8 || int8 { Some(DeviceBuffer::new(rows * k * 2)?) } else { None };
         let w = match &tmp {
             Some(b) => b.addr(),
             None => self.alloc(rows * k * 2)?,
@@ -542,6 +559,19 @@ impl Loader<'_> {
         let mut at = 0;
         for name in names {
             at += self.copy_tensor(name, w + at as u64)?;
+        }
+        if int8 {
+            let q = self.alloc(rows * k)?;
+            let scale = self.alloc(rows * (k / group) * 4)?;
+            quench6k_cuda::kernels::quantize_int8_groups(self.s, w, rows, k, q, scale)?;
+            self.s.synchronize()?;
+            return Ok(Linear {
+                w: q,
+                scale,
+                fmt: WeightFormat::Int8Group,
+                n: rows,
+                k,
+            });
         }
         if fp8 {
             let q = self.alloc(rows * k)?;

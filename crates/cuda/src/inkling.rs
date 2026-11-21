@@ -29,6 +29,9 @@ mod ffi {
             nq: c_int,
             t: c_int,
             out: *mut f32,
+            norm_w: *const *const c_void,
+            norm_o: *const *mut c_void,
+            ldo: c_int,
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_msg_gates(
@@ -43,52 +46,39 @@ mod ffi {
             z: *mut c_void,
             st: Stream,
         ) -> Error;
-        pub fn quench6k_ink_q_prep(
-            lin: *const f32,
-            ld: c_int,
+        pub fn quench6k_ink_qkv_prep(
+            lin_q: *const f32,
+            ldq: c_int,
             qscale: *const c_void,
             rscale: *const c_void,
             qclip: f32,
             rclip: f32,
             full: c_int,
-            start: *const i32,
-            t: c_int,
             q: *mut c_void,
             rel: *mut f32,
             sink: *mut f32,
-            st: Stream,
-        ) -> Error;
-        pub fn quench6k_ink_ring_store(
-            src: *const f32,
-            lds: c_int,
-            width: c_int,
-            ring: *mut c_void,
-            ring_rows: c_int,
-            start: *const i32,
-            t: c_int,
-            st: Stream,
-        ) -> Error;
-        pub fn quench6k_ink_kv_conv(
-            kring: *const c_void,
+            lin_k: *const f32,
+            lin_v: *const f32,
+            ldk: c_int,
+            kring: *mut c_void,
+            vring: *mut c_void,
             kconv: *const c_void,
-            kstatic: *const c_void,
-            kdyn: *const f32,
-            kcache: *mut c_void,
-            vring: *const c_void,
             vconv: *const c_void,
+            kstatic: *const c_void,
             vstatic: *const c_void,
-            vdyn: *const f32,
+            kcache: *mut c_void,
             vcache: *mut c_void,
-            ld_dyn: c_int,
             ring_rows: c_int,
             cache_rows: c_int,
-            clip: f32,
             start: *const i32,
             t: c_int,
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_hidden_conv(
-            ring: *const c_void,
+            src: *const f32,
+            cy: *const f32,
+            cw: *const f32,
+            ring: *mut c_void,
             ring_rows: c_int,
             conv: *const c_void,
             base: *const f32,
@@ -119,7 +109,16 @@ mod ffi {
             out: *mut c_void,
             st: Stream,
         ) -> Error;
-        pub fn quench6k_ink_route(logits: *const f32, bias: *const f32, scale: f32, t: c_int, sel_e: *mut i32, sel_w: *mut f32, st: Stream) -> Error;
+        pub fn quench6k_ink_route(
+            logits: *const f32,
+            bias: *const f32,
+            scale: f32,
+            t: c_int,
+            sel_e: *mut i32,
+            sel_w: *mut f32,
+            order: *mut i32,
+            st: Stream,
+        ) -> Error;
         pub fn quench6k_ink_experts(
             x: *const c_void,
             sel_e: *const i32,
@@ -135,6 +134,7 @@ mod ffi {
             ucap: f32,
             t: c_int,
             order: *mut i32,
+            ordered: c_int,
             act: *mut c_void,
             y: *mut f32,
             out: *mut f32,
@@ -155,6 +155,20 @@ mod ffi {
         pub fn quench6k_ink_moe_gather(x: *const c_void, pair_row: *const i32, t: c_int, xs: *mut c_void, st: Stream) -> Error;
         pub fn quench6k_ink_moe_act(y: *const f32, rows: c_int, gcap: f32, ucap: f32, act: *mut c_void, st: Stream) -> Error;
         pub fn quench6k_ink_moe_combine_rows(y: *const f32, pair_row: *const i32, sel_w: *const f32, t: c_int, out: *mut f32, st: Stream) -> Error;
+        pub fn quench6k_ink_mx8_grouped_gemm(
+            xs: *const c_void,
+            w: *const u8,
+            sc: *const u8,
+            offsets: *const i32,
+            tile_expert: *const i32,
+            tile_row: *const i32,
+            num_tiles: *const i32,
+            max_tiles: c_int,
+            y: *mut f32,
+            n: c_int,
+            k: c_int,
+            st: Stream,
+        ) -> Error;
         pub fn quench6k_ink_to_bf16_rows(src: *const f32, t: c_int, dst: *mut c_void, ldd: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_mix(
             feats: *const c_void,
@@ -284,12 +298,27 @@ pub fn rms_bf16(s: &Stream, x: u64, w: u64, out: u64, t: usize) -> Result<()> {
 }
 
 /// Block attention residual of `t` tokens: `nq` queries (F32 [nq, 2304]) over the sources (F32 [t, 2304]
-/// each, the partial sum last); out F32 [nq][t, 2304].
-pub fn attn_res(s: &Stream, src: &[u64], queries: u64, nq: usize, t: usize, out: u64) -> Result<()> {
+/// each, the partial sum last); out F32 [nq][t, 2304] (0: none); `norms`: per query (weight, BF16 output
+/// rows at stride `ldo`) of its RMSNorm, or empty.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_res(s: &Stream, src: &[u64], queries: u64, nq: usize, t: usize, out: u64, norms: &[(u64, u64)], ldo: usize) -> Result<()> {
     let ptrs: Vec<*const f32> = src.iter().map(|&a| f(a)).collect();
+    let w: Vec<*const c_void> = norms.iter().map(|x| p(x.0)).collect();
+    let o: Vec<*mut c_void> = norms.iter().map(|x| pm(x.1)).collect();
     go!(
         "ink_attn_res",
-        ffi::quench6k_ink_attn_res(ptrs.as_ptr(), n(src.len()), f(queries), n(nq), n(t), fm(out), s.raw())
+        ffi::quench6k_ink_attn_res(
+            ptrs.as_ptr(),
+            n(src.len()),
+            f(queries),
+            n(nq),
+            n(t),
+            fm(out),
+            if norms.is_empty() { std::ptr::null() } else { w.as_ptr() },
+            if norms.is_empty() { std::ptr::null() } else { o.as_ptr() },
+            n(ldo),
+            s.raw()
+        )
     )
 }
 
@@ -328,90 +357,67 @@ pub fn msg_gates(s: &Stream, gates: &[MsgGate], t: usize, cat: u64, z: u64) -> R
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn q_prep(
-    s: &Stream,
-    lin: u64,
-    ld: usize,
-    qscale: u64,
-    rscale: u64,
-    qclip: f32,
-    rclip: f32,
-    full: bool,
-    start: u64,
-    t: usize,
-    q: u64,
-    rel: u64,
-    sink: u64,
-) -> Result<()> {
-    go!(
-        "ink_q_prep",
-        ffi::quench6k_ink_q_prep(
-            f(lin),
-            n(ld),
-            p(qscale),
-            p(rscale),
-            qclip,
-            rclip,
-            full as c_int,
-            i(start),
-            n(t),
-            pm(q),
-            fm(rel),
-            fm(sink),
-            s.raw()
-        )
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn ring_store(s: &Stream, src: u64, lds: usize, width: usize, ring: u64, ring_rows: usize, start: u64, t: usize) -> Result<()> {
-    go!(
-        "ink_ring_store",
-        ffi::quench6k_ink_ring_store(f(src), n(lds), n(width), pm(ring), n(ring_rows), i(start), n(t), s.raw())
-    )
-}
-
-/// One side (keys or values) of [`kv_conv`]: projection ring, static taps (sliding: `conv` [1024, 4]; full:
-/// `static_w` [4, 1024] plus per-token taps `dyn_` F32 rows), cache.
+/// Keys or values of [`qkv_prep`]: projection ring, static taps (sliding: `conv`; full: `static_w`), cache.
 #[derive(Clone, Copy)]
 pub struct KvSide {
     pub ring: u64,
     pub conv: u64,
     pub static_w: u64,
-    pub dyn_: u64,
     pub cache: u64,
 }
 
+/// The query side of an attention layer (q | gate | relative states | sinks rows) and the key and value
+/// convolutions into the caches (`KvSide.conv` [1024, 4] for sliding layers, else `static_w` [4, 1024] with
+/// the per-token taps after the projections in `lin_k` / `lin_v`).
 #[allow(clippy::too_many_arguments)]
-pub fn kv_conv(
+pub fn qkv_prep(
     s: &Stream,
+    lin_q: u64,
+    ldq: usize,
+    qscale: u64,
+    rscale: u64,
+    qclip: f32,
+    rclip: f32,
+    full: bool,
+    q: u64,
+    rel: u64,
+    sink: u64,
+    lin_k: u64,
+    lin_v: u64,
+    ldk: usize,
     k: KvSide,
     v: KvSide,
-    ld_dyn: usize,
     ring_rows: usize,
     cache_rows: usize,
-    clip: f32,
     start: u64,
     t: usize,
 ) -> Result<()> {
     go!(
-        "ink_kv_conv",
-        ffi::quench6k_ink_kv_conv(
-            p(k.ring),
+        "ink_qkv_prep",
+        ffi::quench6k_ink_qkv_prep(
+            f(lin_q),
+            n(ldq),
+            p(qscale),
+            p(rscale),
+            qclip,
+            rclip,
+            full as c_int,
+            pm(q),
+            fm(rel),
+            fm(sink),
+            f(lin_k),
+            f(lin_v),
+            n(ldk),
+            pm(k.ring),
+            pm(v.ring),
             p(k.conv),
-            p(k.static_w),
-            f(k.dyn_),
-            pm(k.cache),
-            p(v.ring),
             p(v.conv),
+            p(k.static_w),
             p(v.static_w),
-            f(v.dyn_),
+            pm(k.cache),
             pm(v.cache),
-            n(ld_dyn),
             n(ring_rows),
             n(cache_rows),
-            clip,
             i(start),
             n(t),
             s.raw()
@@ -419,12 +425,25 @@ pub fn kv_conv(
     )
 }
 
-/// out F32 [t, 2304] = base + bf16((conv(ring) + x) / sqrt(5)) (base 0: none).
+/// out F32 [t, 2304] = base + (conv(x) + x) / sqrt(5) (base 0: none), x from `src` or, with `cy` (F32
+/// [t * 8, 2304]) and `cw` (F32 [t * 8]), the experts' combine; the step's rows join the ring.
 #[allow(clippy::too_many_arguments)]
-pub fn hidden_conv(s: &Stream, ring: u64, ring_rows: usize, conv: u64, base: u64, start: u64, t: usize, out: u64) -> Result<()> {
+pub fn hidden_conv(
+    s: &Stream,
+    src: u64,
+    cy: u64,
+    cw: u64,
+    ring: u64,
+    ring_rows: usize,
+    conv: u64,
+    base: u64,
+    start: u64,
+    t: usize,
+    out: u64,
+) -> Result<()> {
     go!(
         "ink_hidden_conv",
-        ffi::quench6k_ink_hidden_conv(p(ring), n(ring_rows), p(conv), f(base), i(start), n(t), fm(out), s.raw())
+        ffi::quench6k_ink_hidden_conv(f(src), f(cy), f(cw), pm(ring), n(ring_rows), p(conv), f(base), i(start), n(t), fm(out), s.raw())
     )
 }
 
@@ -483,8 +502,10 @@ pub fn attention(
     )
 }
 
-pub fn route(s: &Stream, logits: u64, bias: u64, scale: f32, t: usize, sel_e: u64, sel_w: u64) -> Result<()> {
-    go!("ink_route", ffi::quench6k_ink_route(f(logits), f(bias), scale, n(t), im(sel_e), fm(sel_w), s.raw()))
+/// Routing; with `order` != 0 (t <= 16) also the pairs' order by expert for [`experts`].
+#[allow(clippy::too_many_arguments)]
+pub fn route(s: &Stream, logits: u64, bias: u64, scale: f32, t: usize, sel_e: u64, sel_w: u64, order: u64) -> Result<()> {
+    go!("ink_route", ffi::quench6k_ink_route(f(logits), f(bias), scale, n(t), im(sel_e), fm(sel_w), im(order), s.raw()))
 }
 
 /// One expert stack: weights, block scales and (NVFP4) per-expert scales.
@@ -495,7 +516,8 @@ pub struct ExpertStack {
     pub s2: u64,
 }
 
-/// The routed experts of `t` tokens (x BF16 [t, 2304]) into out F32 [t, 2304].
+/// The routed experts of `t` tokens (x BF16 [t, 2304]) into y (per pair) and out F32 [t, 2304] (0: no
+/// combine); `ordered`: `order` already holds the pairs' order ([`route`]).
 #[allow(clippy::too_many_arguments)]
 pub fn experts(
     s: &Stream,
@@ -509,6 +531,7 @@ pub fn experts(
     ucap: f32,
     t: usize,
     order: u64,
+    ordered: bool,
     act: u64,
     y: u64,
     out: u64,
@@ -530,6 +553,7 @@ pub fn experts(
             ucap,
             n(t),
             im(order),
+            ordered as c_int,
             pm(act),
             fm(y),
             fm(out),
@@ -679,4 +703,38 @@ pub fn moe_act(s: &Stream, y: u64, rows: usize, gcap: f32, ucap: f32, act: u64) 
 
 pub fn moe_combine_rows(s: &Stream, y: u64, pair_row: u64, sel_w: u64, t: usize, out: u64) -> Result<()> {
     go!("ink_moe_combine_rows", ffi::quench6k_ink_moe_combine_rows(f(y), i(pair_row), f(sel_w), n(t), fm(out), s.raw()))
+}
+
+/// Grouped MXFP8 expert GEMM over a [`moe_plan`] (tiles of 64 rows): y [rows, n] = xs [rows, k] . W_e^T.
+#[allow(clippy::too_many_arguments)]
+pub fn mx8_grouped_gemm(
+    s: &Stream,
+    xs: u64,
+    w: ExpertStack,
+    offsets: u64,
+    tile_expert: u64,
+    tile_row: u64,
+    num_tiles: u64,
+    max_tiles: usize,
+    y: u64,
+    nn: usize,
+    k: usize,
+) -> Result<()> {
+    go!(
+        "ink_mx8_grouped_gemm",
+        ffi::quench6k_ink_mx8_grouped_gemm(
+            p(xs),
+            u8p(w.w),
+            u8p(w.sc),
+            i(offsets),
+            i(tile_expert),
+            i(tile_row),
+            i(num_tiles),
+            n(max_tiles),
+            fm(y),
+            n(nn),
+            n(k),
+            s.raw()
+        )
+    )
 }

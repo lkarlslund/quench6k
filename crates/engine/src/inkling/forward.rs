@@ -546,7 +546,7 @@ impl InklingModel {
             let msg = layer.looped && pass > 0;
             if msg {
                 let q = self.msg_queries + ((li - cfg.loop_start) * 4 * D * 4) as u64;
-                ik::attn_res(s, &[ws.slots[PREV_BLOCK], ws.slots[PREV_PARTIAL]], q, 4, t, ws.msgs)?;
+                ik::attn_res(s, &[ws.slots[PREV_BLOCK], ws.slots[PREV_PARTIAL]], q, 4, t, ws.msgs, &[], 0)?;
             }
             let msgs = |i: usize| ws.msgs + i as u64 * td;
             // Attention inputs.
@@ -558,20 +558,19 @@ impl InklingModel {
                 (ws.x[0], ws.x[0], ws.x[0])
             } else {
                 let full = !layer.sliding;
-                ik::attn_res(s, &src, layer.attn_query, if full { 3 } else { 1 }, t, ws.res[0])?;
+                let nq = if full { 3 } else { 1 };
                 let r = |i: usize| if full { ws.res[0] + i as u64 * td } else { ws.res[0] };
                 if msg {
+                    ik::attn_res(s, &src, layer.attn_query, nq, t, ws.res[0], &[], 0)?;
                     self.gates(ws, s, layer, &[0, 1, 2], &[r(0), r(1), r(2)], &[msgs(0), msgs(1), msgs(2)], t)?;
                     let sets: Vec<RmsSet> = (0..3).map(|i| set(ws.gated[i], layer.in_norm[i], ws.x[i])).collect();
                     ik::rms(s, &sets, t)?;
                     (ws.x[0], ws.x[1], ws.x[2])
-                } else if full {
-                    let sets: Vec<RmsSet> = (0..3).map(|i| set(r(i), layer.in_norm[i], ws.x[i])).collect();
-                    ik::rms(s, &sets, t)?;
-                    (ws.x[0], ws.x[1], ws.x[2])
                 } else {
-                    ik::rms_bf16(s, ws.res[0], layer.in_norm[0], ws.x[0], t)?;
-                    (ws.x[0], ws.x[0], ws.x[0])
+                    // The mixtures normalized straight into the projections' inputs.
+                    let norms: Vec<(u64, u64)> = (0..nq).map(|i| (layer.in_norm[i], ws.x[i])).collect();
+                    ik::attn_res(s, &src, layer.attn_query, nq, t, 0, &norms, D)?;
+                    if full { (ws.x[0], ws.x[1], ws.x[2]) } else { (ws.x[0], ws.x[0], ws.x[0]) }
                 }
             };
             // Attention.
@@ -580,36 +579,32 @@ impl InklingModel {
             linear(s, xq, D, t, &a.qg, ws.lin_q, QG)?;
             linear(s, xk, D, t, &a.kg, ws.lin_k, ldk)?;
             linear(s, xv, D, t, &a.vg, ws.lin_v, ldk)?;
-            ik::q_prep(s, ws.lin_q, QG, a.qscale, a.rscale, cfg.qk_clip, cfg.rel_clip, !layer.sliding, start, t, ws.q, ws.rel, ws.sink)?;
-            ik::ring_store(s, ws.lin_k, ldk, KVD, c.k_ring, RING, start, t)?;
-            ik::ring_store(s, ws.lin_v, ldk, KVD, c.v_ring, RING, start, t)?;
-            let side = |ring: u64, conv: u64, lin: u64, cache: u64| {
+            let side = |ring: u64, conv: u64, cache: u64| {
                 if layer.sliding {
-                    KvSide {
-                        ring,
-                        conv,
-                        static_w: 0,
-                        dyn_: 0,
-                        cache,
-                    }
+                    KvSide { ring, conv, static_w: 0, cache }
                 } else {
-                    KvSide {
-                        ring,
-                        conv: 0,
-                        static_w: conv,
-                        dyn_: lin + (KVD * 4) as u64,
-                        cache,
-                    }
+                    KvSide { ring, conv: 0, static_w: conv, cache }
                 }
             };
-            ik::kv_conv(
+            ik::qkv_prep(
                 s,
-                side(c.k_ring, a.kconv, ws.lin_k, c.k),
-                side(c.v_ring, a.vconv, ws.lin_v, c.v),
+                ws.lin_q,
+                QG,
+                a.qscale,
+                a.rscale,
+                cfg.qk_clip,
+                cfg.rel_clip,
+                !layer.sliding,
+                ws.q,
+                ws.rel,
+                ws.sink,
+                ws.lin_k,
+                ws.lin_v,
                 ldk,
+                side(c.k_ring, a.kconv, c.k),
+                side(c.v_ring, a.vconv, c.v),
                 RING,
                 c.rows,
-                cfg.qk_clip,
                 start,
                 t,
             )?;
@@ -636,36 +631,43 @@ impl InklingModel {
                 ws.attn,
             )?;
             linear(s, ws.attn, QD, t, &a.o, ws.o, D)?;
-            ik::ring_store(s, ws.o, D, D, c.attn_ring, RING, start, t)?;
             let boundary = li.is_multiple_of(BLOCK);
             if boundary {
                 // The block ends: its sum joins the sources; the new block starts from the attention output.
                 s.copy_d2d(ws.slots[nb], h, td as usize)?;
                 nb += 1;
             }
-            ik::hidden_conv(s, c.attn_ring, RING, layer.attn_conv, if boundary { 0 } else { h }, start, t, ws.r)?;
+            ik::hidden_conv(s, ws.o, 0, 0, c.attn_ring, RING, layer.attn_conv, if boundary { 0 } else { h }, start, t, ws.r)?;
             // MoE.
             let mut src: Vec<u64> = ws.slots[..nb].to_vec();
             src.push(ws.r);
-            ik::attn_res(s, &src, layer.mlp_query, 1, t, ws.res[0])?;
-            let mlp_in = if msg {
+            if msg {
+                ik::attn_res(s, &src, layer.mlp_query, 1, t, ws.res[0], &[], 0)?;
                 self.gates(ws, s, layer, &[3], &[ws.res[0]], &[msgs(3)], t)?;
-                ws.gated[0]
+                ik::rms_bf16(s, ws.gated[0], layer.post_norm, ws.xm, t)?;
             } else {
-                ws.res[0]
-            };
-            ik::rms_bf16(s, mlp_in, layer.post_norm, ws.xm, t)?;
+                ik::attn_res(s, &src, layer.mlp_query, 1, t, 0, &[(layer.post_norm, ws.xm)], D)?;
+            }
             linear(s, ws.xm, D, t, &layer.router, ws.rlogits, EXPERTS)?;
-            ik::route(s, ws.rlogits, layer.bias, cfg.route_scale, t, ws.sel_e, ws.sel_w)?;
-            if let (Some(tb), true) = (&layer.tables, t > SMALL_T) {
+            // Small steps route and order the pairs in one launch and fold the combine into the
+            // convolution; larger ones group the pairs for the tensor-core GEMMs (NVFP4 layers).
+            let small = t <= SMALL_T;
+            ik::route(s, ws.rlogits, layer.bias, cfg.route_scale, t, ws.sel_e, ws.sel_w, if small { ws.order } else { 0 })?;
+            if !small {
                 ik::moe_plan(s, ws.sel_e, t, MOE_BM, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
                 ik::moe_gather(s, ws.xm, ws.pair_row, t, ws.xs)?;
-                let gemm = |x: u64, tab: (u64, u64), s2: u64, n: usize, kk: usize| {
-                    k::moe_nvfp4_gemm(s, x, tab.0, tab.1, s2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.max_tiles, ws.y, n, kk)
+                let gemm = |x: u64, which: usize, n: usize, kk: usize| {
+                    let st = if which == 0 { layer.gate_up } else { layer.down };
+                    match &layer.tables {
+                        Some(tb) => k::moe_nvfp4_gemm(
+                            s, x, tb[which].0, tb[which].1, st.s2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.max_tiles, ws.y, n, kk,
+                        ),
+                        None => ik::mx8_grouped_gemm(s, x, st, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.max_tiles, ws.y, n, kk),
+                    }
                 };
-                gemm(ws.xs, tb[0], layer.gate_up.s2, 2 * FF, D)?;
+                gemm(ws.xs, 0, 2 * FF, D)?;
                 ik::moe_act(s, ws.y, t * TOPK, cfg.gate_cap, cfg.up_cap, ws.act)?;
-                gemm(ws.act, tb[1], layer.down.s2, D, FF)?;
+                gemm(ws.act, 1, D, FF)?;
                 ik::moe_combine_rows(s, ws.y, ws.pair_row, ws.sel_w, t, ws.moe)?;
             } else {
             ik::experts(
@@ -680,14 +682,15 @@ impl InklingModel {
                 cfg.up_cap,
                 t,
                 ws.order,
+                small,
                 ws.act,
                 ws.y,
-                ws.moe,
+                if small { 0 } else { ws.moe },
             )?;
             }
-            ik::ring_store(s, ws.moe, D, D, c.mlp_ring, RING, start, t)?;
             hi ^= 1;
-            ik::hidden_conv(s, c.mlp_ring, RING, layer.mlp_conv, ws.r, start, t, ws.h[hi])?;
+            let (src_x, cy, cw) = if small { (0, ws.y, ws.sel_w) } else { (ws.moe, 0, 0) };
+            ik::hidden_conv(s, src_x, cy, cw, c.mlp_ring, RING, layer.mlp_conv, ws.r, start, t, ws.h[hi])?;
             if let Some(dir) = std::env::var_os("QUENCH6K_INK_DUMP") {
                 // Debugging: the stream after each layer visit, appended per chunk (F32 [t, 2304]).
                 use std::io::Write;
@@ -701,8 +704,7 @@ impl InklingModel {
         if want != Logits::None || self.drafter.is_some() {
             let mut src: Vec<u64> = ws.slots[..nb].to_vec();
             src.push(ws.h[hi]);
-            ik::attn_res(s, &src, self.final_query, 1, t, ws.res[0])?;
-            ik::rms(s, &[RmsSet { x: ws.res[0], w: self.norm, out: hidden, ldo: 4 * D }], t)?;
+            ik::attn_res(s, &src, self.final_query, 1, t, 0, &[(self.norm, hidden)], 4 * D)?;
         }
         if want != Logits::None {
             let (rows, first) = if want == Logits::All { (t, 0) } else { (1, t - 1) };
