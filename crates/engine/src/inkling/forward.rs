@@ -6,7 +6,7 @@
 //! most `max_t` tokens (`max_t + WINDOW <= RING`).
 
 use anyhow::{Context, Result, ensure};
-use quench6k_cuda::inkling::{self as ik, KvSide, RmsSet};
+use quench6k_cuda::inkling::{self as ik, ConvSrc, KvSide, RmsSet};
 use quench6k_cuda::kernels as k;
 use quench6k_cuda::{DeviceBuffer, PinnedBuffer, Stream};
 
@@ -607,16 +607,22 @@ impl InklingModel {
         let mut hi = 0;
         ik::embed(s, ws.tokens, t, self.embed, self.embed_norm, ws.h[0])?;
         let mut nb = 0usize;
+        // The previous visit's MoE convolution (output ws.h[hi]), computed by the next consumer of the
+        // stream (its input mixture) or on its own (`flush`).
+        let mut pending: Option<ConvSrc> = None;
+        let flush = |pending: &mut Option<ConvSrc>, out: u64| -> Result<()> {
+            if let Some(c) = pending.take() {
+                ik::hidden_conv(s, c.src, c.cy, c.cw, c.ring, c.ring_rows, c.conv, c.base, c.start, t, out)?;
+            }
+            Ok(())
+        };
+        let dump = std::env::var_os("QUENCH6K_INK_DUMP");
         for (v, &(li, pass)) in cfg.visits().iter().enumerate() {
             let layer = &self.layers[li];
             let c = &state.caches[v];
             let h = ws.h[hi];
-            if let Some(d) = &self.drafter
-                && let Some(tap) = d.visits.iter().position(|&x| x == v)
-            {
-                ik::to_bf16_rows(s, h, t, ws.feats + (tap * D * 2) as u64, 4 * D)?;
-            }
             if li == cfg.loop_start && pass > 0 {
+                flush(&mut pending, h)?;
                 // Messages of this pass come from the previous one's last block and partial sum; the pass
                 // restarts from the stream before the loop (the embedding and the first block's sum).
                 s.copy_d2d(ws.slots[PREV_BLOCK], ws.slots[nb - 1], td as usize)?;
@@ -625,12 +631,9 @@ impl InklingModel {
                 s.copy_d2d(h, ws.slots[nb], td as usize)?;
             }
             let msg = layer.looped && pass > 0;
-            if let Some(n) = std::env::var("QUENCH6K_INK_NOP").ok().and_then(|v| v.parse().ok()) {
-                ik::nop(s, n)?;
-            }
             if msg {
                 let q = self.msg_queries + ((li - cfg.loop_start) * 4 * D * 4) as u64;
-                ik::attn_res(s, &[ws.slots[PREV_BLOCK], ws.slots[PREV_PARTIAL]], q, 4, t, ws.msgs, &[], 0)?;
+                ik::attn_res(s, &[ws.slots[PREV_BLOCK], ws.slots[PREV_PARTIAL]], q, 4, t, ws.msgs, &[], 0, None)?;
             }
             let msgs = |i: usize| ws.msgs + i as u64 * td;
             // Attention inputs.
@@ -645,7 +648,7 @@ impl InklingModel {
                 let nq = if full { 3 } else { 1 };
                 let r = |i: usize| if full { ws.res[0] + i as u64 * td } else { ws.res[0] };
                 if msg {
-                    ik::attn_res(s, &src, layer.attn_query, nq, t, ws.res[0], &[], 0)?;
+                    ik::attn_res(s, &src, layer.attn_query, nq, t, ws.res[0], &[], 0, pending.take())?;
                     self.gates(ws, s, layer, &[0, 1, 2], &[r(0), r(1), r(2)], &[msgs(0), msgs(1), msgs(2)], t)?;
                     let sets: Vec<RmsSet> = (0..3).map(|i| set(ws.gated[i], layer.in_norm[i], ws.x[i])).collect();
                     ik::rms(s, &sets, t)?;
@@ -653,10 +656,16 @@ impl InklingModel {
                 } else {
                     // The mixtures normalized straight into the projections' inputs.
                     let norms: Vec<(u64, u64)> = (0..nq).map(|i| (layer.in_norm[i], ws.x[i])).collect();
-                    ik::attn_res(s, &src, layer.attn_query, nq, t, 0, &norms, D)?;
+                    ik::attn_res(s, &src, layer.attn_query, nq, t, 0, &norms, D, pending.take())?;
                     if full { (ws.x[0], ws.x[1], ws.x[2]) } else { (ws.x[0], ws.x[0], ws.x[0]) }
                 }
             };
+            debug_assert!(pending.is_none());
+            if let Some(d) = &self.drafter
+                && let Some(tap) = d.visits.iter().position(|&x| x == v)
+            {
+                ik::to_bf16_rows(s, h, t, ws.feats + (tap * D * 2) as u64, 4 * D)?;
+            }
             // Attention.
             let a = &layer.attn;
             let ldk = a.kg.n;
@@ -721,16 +730,24 @@ impl InklingModel {
                 s.copy_d2d(ws.slots[nb], h, td as usize)?;
                 nb += 1;
             }
-            ik::hidden_conv(s, ws.o, 0, 0, c.attn_ring, RING, layer.attn_conv, if boundary { 0 } else { h }, start, t, ws.r)?;
+            let attn_conv = ConvSrc {
+                src: ws.o,
+                ring: c.attn_ring,
+                ring_rows: RING,
+                conv: layer.attn_conv,
+                base: if boundary { 0 } else { h },
+                start,
+                ..Default::default()
+            };
             // MoE.
             let mut src: Vec<u64> = ws.slots[..nb].to_vec();
             src.push(ws.r);
             if msg {
-                ik::attn_res(s, &src, layer.mlp_query, 1, t, ws.res[0], &[], 0)?;
+                ik::attn_res(s, &src, layer.mlp_query, 1, t, ws.res[0], &[], 0, Some(attn_conv))?;
                 self.gates(ws, s, layer, &[3], &[ws.res[0]], &[msgs(3)], t)?;
                 ik::rms_bf16(s, ws.gated[0], layer.post_norm, ws.xm, t)?;
             } else {
-                ik::attn_res(s, &src, layer.mlp_query, 1, t, 0, &[(layer.post_norm, ws.xm)], D)?;
+                ik::attn_res(s, &src, layer.mlp_query, 1, t, 0, &[(layer.post_norm, ws.xm)], D, Some(attn_conv))?;
             }
             linear(s, ws.xm, D, t, &layer.router, ws.rlogits, EXPERTS)?;
             // Small steps route and order the pairs in one launch and fold the combine into the
@@ -774,13 +791,23 @@ impl InklingModel {
             }
             hi ^= 1;
             let (src_x, cy, cw) = if small { (0, ws.y, ws.sel_w) } else { (ws.moe, 0, 0) };
-            ik::hidden_conv(s, src_x, cy, cw, c.mlp_ring, RING, layer.mlp_conv, ws.r, start, t, ws.h[hi])?;
-            if let Some(dir) = std::env::var_os("QUENCH6K_INK_DUMP") {
+            pending = Some(ConvSrc {
+                src: src_x,
+                cy,
+                cw,
+                ring: c.mlp_ring,
+                ring_rows: RING,
+                conv: layer.mlp_conv,
+                base: ws.r,
+                start,
+            });
+            if let Some(dir) = &dump {
+                flush(&mut pending, ws.h[hi])?;
                 // Debugging: the stream after each layer visit, appended per chunk (F32 [t, 2304]).
                 use std::io::Write;
                 let v32: Vec<f32> = s.download(ws.h[hi], t * D)?;
                 let bytes: Vec<u8> = v32.iter().flat_map(|x| x.to_le_bytes()).collect();
-                let path = std::path::Path::new(&dir).join(format!("hidden-{v:02}.bin"));
+                let path = std::path::Path::new(dir).join(format!("hidden-{v:02}.bin"));
                 std::fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(&bytes)?;
             }
         }
@@ -788,8 +815,9 @@ impl InklingModel {
         if want != Logits::None || self.drafter.is_some() {
             let mut src: Vec<u64> = ws.slots[..nb].to_vec();
             src.push(ws.h[hi]);
-            ik::attn_res(s, &src, self.final_query, 1, t, 0, &[(self.norm, hidden)], 4 * D)?;
+            ik::attn_res(s, &src, self.final_query, 1, t, 0, &[(self.norm, hidden)], 4 * D, pending.take())?;
         }
+        flush(&mut pending, ws.h[hi])?;
         if want != Logits::None {
             let (rows, first) = if want == Logits::All { (t, 0) } else { (1, t - 1) };
             linear(s, hidden + (first * 4 * D * 2) as u64, 4 * D, rows, &self.lm_head, ws.out_logits, cfg.vocab)?;

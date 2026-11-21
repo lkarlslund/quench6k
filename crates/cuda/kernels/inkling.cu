@@ -25,6 +25,8 @@
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
+#include <cooperative_groups.h>
+
 #include "mma.cuh"
 
 namespace {
@@ -134,6 +136,58 @@ __global__ void __launch_bounds__(RT) rms_kernel(RmsSets sets) {
 // Block attention residual: for each of nq queries, out[q][t] = sum_s softmax_s(Q_q . n_s / sqrt(D)) n_s,
 // n_s = x_s * rsqrt(mean x_s^2 + eps), over the sources x_0 .. x_{ns-1} (F32 [T, D] rows; the last one is
 // the partial sum). Outputs F32 [nq][T, D] at out + q * qstride.
+// Hidden-width causal convolution of a sublayer output x (this step's rows from `src`, or with `cy` the
+// experts' combine sum_k w[t, k] cy[t * 8 + k]; earlier positions' from the ring; all as BF16, conv
+// [D, 4]): out = base + (conv + x) / sqrt(5) (base null: 0); the step's rows join the ring.
+struct ConvSrc {
+    const float* src;
+    const float* cy;
+    const float* cw;
+    bf16* ring;  // null: no convolution
+    int ring_rows;
+    const bf16* conv;
+    const float* base;
+    const int* start;
+    float* out;
+};
+
+SQ_DEVICE float hidden_x(const ConvSrc& v, int t, int c) {
+    if (!v.cy) return rb(v.src[(size_t)t * D + c]);
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) acc += v.cw[t * TOPK + k] * v.cy[((size_t)t * TOPK + k) * D + c];
+    return rb(acc);
+}
+
+// The convolution's output at (t, c), also stored to v.out and (its input) to the ring.
+SQ_DEVICE float conv_value(const ConvSrc& v, int t, int c) {
+    const int pos = *v.start + t;
+    float acc = 0.0f, cur = 0.0f;
+#pragma unroll
+    for (int lag = 0; lag < CONVK; ++lag) {
+        float x;
+        if (t - lag >= 0)
+            x = hidden_x(v, t - lag, c);
+        else
+            x = pos - lag >= 0 ? bf2f(v.ring[(size_t)((pos - lag) % v.ring_rows) * D + c]) : 0.0f;
+        if (lag == 0) cur = x;
+        acc += bf2f(v.conv[c * CONVK + CONVK - 1 - lag]) * x;
+    }
+    v.ring[(size_t)(pos % v.ring_rows) * D + c] = f2bf(cur);
+    const size_t i = (size_t)t * D + c;
+    const float y = (v.base ? v.base[i] : 0.0f) + (acc + cur) / 2.2360679775f;
+    v.out[i] = y;
+    return y;
+}
+
+__global__ void hidden_conv_kernel(ConvSrc v, int T) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)T * D) return;
+    conv_value(v, (int)(i / D), (int)(i % D));
+}
+
 struct Srcs {
     const float* p[MAX_SRC];
 };
@@ -148,7 +202,9 @@ struct ResNorms {
 };
 
 template <int NS, int NQ>
-__global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, const float* __restrict__ queries, float* out, size_t qstride, ResNorms norms) {
+// With cv.ring set, the last source (the partial sum) is the output of convolution cv, computed here.
+__global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, const float* __restrict__ queries, float* out, size_t qstride, ResNorms norms,
+                                                       ConvSrc cv) {
     constexpr int ns = NS, nq = NQ;
     pdl_launch_dependents();
     pdl_wait();
@@ -161,7 +217,10 @@ __global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, const float* __
 #pragma unroll
     for (int s = 0; s < NS; ++s)
 #pragma unroll
-        for (int i = 0; i < ARPT; ++i) x[s][i] = s < ns ? src.p[s][(size_t)t * D + threadIdx.x + ART * i] : 0.0f;
+        for (int i = 0; i < ARPT; ++i) {
+            const int c = threadIdx.x + ART * i;
+            x[s][i] = s == ns - 1 && cv.ring ? conv_value(cv, t, c) : src.p[s][(size_t)t * D + c];
+        }
 #pragma unroll
     for (int i = 0; i < ARPT; ++i) {
         const int c = threadIdx.x + ART * i;
@@ -219,6 +278,91 @@ __global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, const float* __
             norms.o[q][(size_t)t * norms.ldo + c] = f2bf(bf2f(norms.w[q][c]) * (o[q][i] * rn));
         }
     }
+}
+
+// The same mixture for small steps over a cluster of CL blocks per token (CL_T channels each, one per
+// thread): each block sums its channels, the cluster adds the blocks' sums through distributed shared
+// memory (in block order), so the loads (and a fused convolution's) spread over CL SMs.
+constexpr int CL = 8, CL_T = D / CL;  // 288 threads
+
+template <int NS, int NQ>
+__global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(CL_T) attn_res_cl_kernel(Srcs src, const float* __restrict__ queries, float* out,
+                                                                                        size_t qstride, ResNorms norms, ConvSrc cv) {
+    namespace cg = cooperative_groups;
+    pdl_launch_dependents();
+    pdl_wait();
+    constexpr int NV = NS + NS * NQ;
+    __shared__ float red[33 * NV];
+    __shared__ float part[NV], tot[NV], part2[NQ], tot2[NQ];
+    cg::cluster_group cl = cg::this_cluster();
+    const int rank = (int)cl.block_rank(), t = blockIdx.x / CL, c = rank * CL_T + threadIdx.x;
+    float x[NS], acc[NV];
+#pragma unroll
+    for (int i = 0; i < NV; ++i) acc[i] = 0.0f;
+    float qv[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) qv[q] = queries[q * D + c];
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+        x[s] = s == NS - 1 && cv.ring ? conv_value(cv, t, c) : src.p[s][(size_t)t * D + c];
+        acc[s] = x[s] * x[s];
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) acc[NS + s * NQ + q] = qv[q] * x[s];
+    }
+    block_sums(acc, [](int) { return true; }, red);
+    if (threadIdx.x < NV) part[threadIdx.x] = acc[threadIdx.x < NV ? threadIdx.x : 0];
+    cl.sync();
+    if (threadIdx.x < NV) {
+        float v = 0.0f;
+        for (int b = 0; b < CL; ++b) v += cl.map_shared_rank(part, b)[threadIdx.x];
+        tot[threadIdx.x] = v;
+    }
+    __syncthreads();
+    float r[NS];
+#pragma unroll
+    for (int s = 0; s < NS; ++s) r[s] = rsqrtf(tot[s] / D + EPS);
+    const float scale = rsqrtf((float)D);
+    float o[NQ], ss[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+        float l[NS], m = -INFINITY;
+#pragma unroll
+        for (int s = 0; s < NS; ++s) {
+            l[s] = tot[NS + s * NQ + q] * r[s] * scale;
+            m = fmaxf(m, l[s]);
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (int s = 0; s < NS; ++s) {
+            l[s] = __expf(l[s] - m);
+            sum += l[s];
+        }
+        float v = 0.0f;
+#pragma unroll
+        for (int s = 0; s < NS; ++s) v += l[s] / sum * (x[s] * r[s]);
+        o[q] = v;
+        ss[q] = v * v;
+        if (out) out[q * qstride + (size_t)t * D + c] = v;
+    }
+    bool any = false;
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) any |= norms.o[q] != nullptr;
+    if (any) {
+        block_sums(ss, [](int) { return true; }, red);
+        if (threadIdx.x < NQ) part2[threadIdx.x] = ss[threadIdx.x < NQ ? threadIdx.x : 0];
+        cl.sync();
+        if (threadIdx.x < NQ) {
+            float v = 0.0f;
+            for (int b = 0; b < CL; ++b) v += cl.map_shared_rank(part2, b)[threadIdx.x];
+            tot2[threadIdx.x] = v;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int q = 0; q < NQ; ++q)
+            if (norms.o[q]) norms.o[q][(size_t)t * norms.ldo + c] = f2bf(bf2f(norms.w[q][c]) * (o[q] * rsqrtf(tot2[q] / D + EPS)));
+    }
+    // No block may leave while others still read its shared memory.
+    cl.sync();
 }
 
 // Message gates (up to MAX_Q, blockIdx of the group): out_g = (1 - tanh(F_g z)) hs_g + tanh(G_g z) m_g with
@@ -392,42 +536,6 @@ __global__ void __launch_bounds__(256) qkv_prep_kernel(QPrep qp, KvConv k, KvCon
     bf16* dst = a.cache + (size_t)(pos % cache_rows) * KVD + h * HD + lane * 4;
 #pragma unroll
     for (int i = 0; i < 4; ++i) dst[i] = f2bf(y[i] * f);
-}
-
-// Hidden-width causal convolution of a sublayer output x (this step's rows from `src`, or with `cy` the
-// experts' combine sum_k w[t, k] cy[t * 8 + k]; earlier positions' from the ring; all as BF16, conv
-// [D, 4]): out = base + (conv + x) / sqrt(5) (base null: 0); the step's rows join the ring.
-SQ_DEVICE float hidden_x(const float* src, const float* cy, const float* cw, int t, int c) {
-    if (!cy) return rb(src[(size_t)t * D + c]);
-    float acc = 0.0f;
-#pragma unroll
-    for (int k = 0; k < TOPK; ++k) acc += cw[t * TOPK + k] * cy[((size_t)t * TOPK + k) * D + c];
-    return rb(acc);
-}
-
-__global__ void hidden_conv_kernel(const float* __restrict__ src, const float* __restrict__ cy, const float* __restrict__ cw, bf16* ring,
-                                   int ring_rows, const bf16* __restrict__ conv, const float* base, const int* __restrict__ start_ptr, int T,
-                                   float* out) {
-    pdl_launch_dependents();
-    pdl_wait();
-    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (size_t)T * D) return;
-    const int t = (int)(i / D), c = (int)(i % D);
-    const int pos = *start_ptr + t;
-    float acc = 0.0f, cur = 0.0f;
-#pragma unroll
-    for (int lag = 0; lag < CONVK; ++lag) {
-        float x;
-        if (t - lag >= 0)
-            x = hidden_x(src, cy, cw, t - lag, c);
-        else
-            x = pos - lag >= 0 ? bf2f(ring[(size_t)((pos - lag) % ring_rows) * D + c]) : 0.0f;
-        if (lag == 0) cur = x;
-        acc += bf2f(conv[c * CONVK + CONVK - 1 - lag]) * x;
-    }
-    ring[(size_t)(pos % ring_rows) * D + c] = f2bf(cur);
-    const float y = (acc + cur) / 2.2360679775f;
-    out[i] = (base ? base[i] : 0.0f) + y;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1474,11 +1582,6 @@ __global__ void __launch_bounds__(256) markov_pick_kernel(const float* best_v, c
     }
 }
 
-__global__ void nop_kernel() {
-    pdl_launch_dependents();
-    pdl_wait();
-}
-
 int sm_count() {
     static int sms = 0;
     if (sms == 0) {
@@ -1517,11 +1620,15 @@ cudaError_t quench6k_ink_rms(int sets, const float* const* x, const void* const*
 
 // out (null: none) F32 [nq][T, D]; norm_o[q] (null: none) BF16 rows at stride ldo = norm_w[q] * rmsnorm(out q).
 cudaError_t quench6k_ink_attn_res(const float* const* src, int ns, const float* queries, int nq, int T, float* out, const void* const* norm_w,
-                                  void* const* norm_o, int ldo, cudaStream_t st) {
+                                  void* const* norm_o, int ldo, const float* cv_src, const float* cv_cy, const float* cv_cw, void* cv_ring,
+                                  int cv_ring_rows, const void* cv_conv, const float* cv_base, const int* cv_start, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     if (ns < 1 || ns > MAX_SRC || nq < 1 || nq > MAX_Q) return cudaErrorInvalidValue;
     Srcs s{};
     for (int i = 0; i < ns; ++i) s.p[i] = src[i];
+    // With a convolution, the last source's address is where its output goes.
+    const ConvSrc cv{cv_src, cv_cy, cv_cw, static_cast<bf16*>(cv_ring), cv_ring_rows, static_cast<const bf16*>(cv_conv), cv_base, cv_start,
+                     cv_ring ? const_cast<float*>(src[ns - 1]) : nullptr};
     ResNorms n{};
     n.ldo = ldo;
     for (int i = 0; i < nq && norm_o; ++i) {
@@ -1531,9 +1638,25 @@ cudaError_t quench6k_ink_attn_res(const float* const* src, int ns, const float* 
     // One instance per (sources, queries) the model uses, so every loop has a compile-time count.
 #define SQ_AR(S_, Q_)                                                                                          \
     if (ns == S_ && nq == Q_) {                                                                                \
-        SQ_CHECK_LAUNCH(sq_launch(attn_res_kernel<S_, Q_>, T, ART, 0, st, s, queries, out, (size_t)T * D, n)); \
+        SQ_CHECK_LAUNCH(sq_launch(attn_res_kernel<S_, Q_>, T, ART, 0, st, s, queries, out, (size_t)T * D, n, cv)); \
         SQ_RETURN_LAUNCH();                                                                                    \
     }
+    // Small steps: clusters of CL blocks a token (QUENCH6K_INK_CLUSTER=0: one block a token).
+    static const bool cluster = []() {
+        const char* v = getenv("QUENCH6K_INK_CLUSTER");
+        return !(v && v[0] == '0');
+    }();
+#define SQ_ARC(S_, Q_)                                                                                               \
+    if (ns == S_ && nq == Q_) {                                                                                      \
+        SQ_CHECK_LAUNCH(sq_launch(attn_res_cl_kernel<S_, Q_>, T * CL, CL_T, 0, st, s, queries, out, (size_t)T * D, n, cv)); \
+        SQ_RETURN_LAUNCH();                                                                                          \
+    }
+    if (cluster && T <= 16) {
+        SQ_ARC(1, 1) SQ_ARC(2, 1) SQ_ARC(3, 1) SQ_ARC(4, 1) SQ_ARC(5, 1) SQ_ARC(6, 1)
+        SQ_ARC(1, 3) SQ_ARC(2, 3) SQ_ARC(3, 3) SQ_ARC(4, 3) SQ_ARC(5, 3) SQ_ARC(6, 3)
+        SQ_ARC(2, 4)
+    }
+#undef SQ_ARC
     SQ_AR(1, 1) SQ_AR(2, 1) SQ_AR(3, 1) SQ_AR(4, 1) SQ_AR(5, 1) SQ_AR(6, 1)
     SQ_AR(1, 3) SQ_AR(2, 3) SQ_AR(3, 3) SQ_AR(4, 3) SQ_AR(5, 3) SQ_AR(6, 3)
     SQ_AR(2, 4)
@@ -1591,8 +1714,8 @@ cudaError_t quench6k_ink_qkv_prep(const float* lin_q, int ldq, const void* qscal
 cudaError_t quench6k_ink_hidden_conv(const float* src, const float* cy, const float* cw, void* ring, int ring_rows, const void* conv,
                                      const float* base, const int* start, int T, float* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(hidden_conv_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, src, cy, cw, static_cast<bf16*>(ring), ring_rows,
-                              static_cast<const bf16*>(conv), base, start, T, out));
+    const ConvSrc v{src, cy, cw, static_cast<bf16*>(ring), ring_rows, static_cast<const bf16*>(conv), base, start, out};
+    SQ_CHECK_LAUNCH(sq_launch(hidden_conv_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, v, T));
     SQ_RETURN_LAUNCH();
 }
 
@@ -1759,11 +1882,6 @@ cudaError_t quench6k_ink_mx8_grouped_gemm(const void* xs, const uint8_t* w, cons
 cudaError_t quench6k_ink_msg_apply_rows(const float* hs, const float* m, const float* fg, int T, float* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(msg_apply_rows_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, hs, m, fg, T, out));
-    SQ_RETURN_LAUNCH();
-}
-
-cudaError_t quench6k_ink_nop(int n, cudaStream_t st) {
-    for (int i = 0; i < n; ++i) SQ_CHECK_LAUNCH(sq_launch(nop_kernel, 1, 32, 0, st));
     SQ_RETURN_LAUNCH();
 }
 

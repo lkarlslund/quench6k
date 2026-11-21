@@ -32,6 +32,14 @@ mod ffi {
             norm_w: *const *const c_void,
             norm_o: *const *mut c_void,
             ldo: c_int,
+            cv_src: *const f32,
+            cv_cy: *const f32,
+            cv_cw: *const f32,
+            cv_ring: *mut c_void,
+            cv_ring_rows: c_int,
+            cv_conv: *const c_void,
+            cv_base: *const f32,
+            cv_start: *const i32,
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_msg_gates(
@@ -170,7 +178,6 @@ mod ffi {
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_msg_apply_rows(hs: *const f32, m: *const f32, fg: *const f32, t: c_int, out: *mut f32, st: Stream) -> Error;
-        pub fn quench6k_ink_nop(n: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_to_bf16_rows(src: *const f32, t: c_int, dst: *mut c_void, ldd: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_mix(
             feats: *const c_void,
@@ -299,14 +306,39 @@ pub fn rms_bf16(s: &Stream, x: u64, w: u64, out: u64, t: usize) -> Result<()> {
     rms(s, &[RmsSet { x, w, out, ldo: 2304 }], t)
 }
 
+/// A sublayer output's convolution (see [`hidden_conv`]) computed inside [`attn_res`] as its last source.
+#[derive(Clone, Copy, Default)]
+pub struct ConvSrc {
+    pub src: u64,
+    pub cy: u64,
+    pub cw: u64,
+    pub ring: u64,
+    pub ring_rows: usize,
+    pub conv: u64,
+    pub base: u64,
+    pub start: u64,
+}
+
 /// Block attention residual of `t` tokens: `nq` queries (F32 [nq, 2304]) over the sources (F32 [t, 2304]
 /// each, the partial sum last); out F32 [nq][t, 2304] (0: none); `norms`: per query (weight, BF16 output
-/// rows at stride `ldo`) of its RMSNorm, or empty.
+/// rows at stride `ldo`) of its RMSNorm, or empty. With `conv`, the last source is that convolution's
+/// output, computed here and stored at the last source's address.
 #[allow(clippy::too_many_arguments)]
-pub fn attn_res(s: &Stream, src: &[u64], queries: u64, nq: usize, t: usize, out: u64, norms: &[(u64, u64)], ldo: usize) -> Result<()> {
+pub fn attn_res(
+    s: &Stream,
+    src: &[u64],
+    queries: u64,
+    nq: usize,
+    t: usize,
+    out: u64,
+    norms: &[(u64, u64)],
+    ldo: usize,
+    conv: Option<ConvSrc>,
+) -> Result<()> {
     let ptrs: Vec<*const f32> = src.iter().map(|&a| f(a)).collect();
     let w: Vec<*const c_void> = norms.iter().map(|x| p(x.0)).collect();
     let o: Vec<*mut c_void> = norms.iter().map(|x| pm(x.1)).collect();
+    let c = conv.unwrap_or_default();
     go!(
         "ink_attn_res",
         ffi::quench6k_ink_attn_res(
@@ -319,6 +351,14 @@ pub fn attn_res(s: &Stream, src: &[u64], queries: u64, nq: usize, t: usize, out:
             if norms.is_empty() { std::ptr::null() } else { w.as_ptr() },
             if norms.is_empty() { std::ptr::null() } else { o.as_ptr() },
             n(ldo),
+            f(c.src),
+            f(c.cy),
+            f(c.cw),
+            pm(c.ring),
+            n(c.ring_rows),
+            p(c.conv),
+            f(c.base),
+            i(c.start),
             s.raw()
         )
     )
@@ -744,9 +784,4 @@ pub fn mx8_grouped_gemm(
 /// out = (1 - tanh(f)) * hs + tanh(g) * m from fg F32 [t, 2 * 2304] (forget | gain).
 pub fn msg_apply_rows(s: &Stream, hs: u64, m: u64, fg: u64, t: usize, out: u64) -> Result<()> {
     go!("ink_msg_apply_rows", ffi::quench6k_ink_msg_apply_rows(f(hs), f(m), f(fg), n(t), fm(out), s.raw()))
-}
-
-/// `n` empty kernels (measurement of the per-kernel cost).
-pub fn nop(s: &Stream, nn: usize) -> Result<()> {
-    go!("ink_nop", ffi::quench6k_ink_nop(n(nn), s.raw()))
 }
