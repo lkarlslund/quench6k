@@ -377,45 +377,72 @@ struct MsgGates {
 };
 constexpr int RANK = 64;
 
-// Block (gate, 8 rows of down, token): warp r computes row r.
-__global__ void __launch_bounds__(256) msg_down_kernel(MsgGates g, const bf16* __restrict__ cat, int T, bf16* z) {
+// Block (gate, 8 rows of down, token): warp r computes row r of z = bf16(down [rms(hs), rms(m)]), the
+// norms taken by each warp itself. The row's weights (constants) load before the dependency wait.
+__global__ void __launch_bounds__(256) msg_down_kernel(MsgGates g, int T, bf16* z) {
     pdl_launch_dependents();
-    pdl_wait();
-    const int gi = blockIdx.x, lane = threadIdx.x & 31, r = blockIdx.y * 8 + (threadIdx.x >> 5);
+    constexpr int J = 2 * D / 256;  // 18 chunks of 8 a lane
+    const int gi = blockIdx.x, lane = threadIdx.x & 31, r = blockIdx.y * 8 + (threadIdx.x >> 5), t = blockIdx.z;
     const bf16* w = g.down[gi] + (size_t)r * 2 * D;
-    {
-        const int t = blockIdx.z;
-        const bf16* x = cat + ((size_t)gi * T + t) * 2 * D;
-        float acc = 0.0f;
-        for (int c = lane * 8; c < 2 * D; c += 256) {
-            const uint4 wv = *reinterpret_cast<const uint4*>(w + c);
-            const uint4 xv = *reinterpret_cast<const uint4*>(x + c);
-            const bf16* wp = reinterpret_cast<const bf16*>(&wv);
-            const bf16* xp = reinterpret_cast<const bf16*>(&xv);
+    uint4 wv[J];
 #pragma unroll
-            for (int e = 0; e < 8; ++e) acc += bf2f(wp[e]) * bf2f(xp[e]);
+    for (int j = 0; j < J; ++j) wv[j] = ld_stream(w + lane * 8 + 256 * j);
+    pdl_wait();
+    const float* hs = g.hs[gi] + (size_t)t * D;
+    const float* m = g.m[gi] + (size_t)t * D;
+    auto xval = [&](int j, int e) {
+        const int c = lane * 8 + 256 * j + e;
+        return c < D ? hs[c] : m[c - D];
+    };
+    float sh = 0.0f, sm = 0.0f;
+#pragma unroll
+    for (int j = 0; j < J; ++j)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float v = xval(j, e);
+            if (lane * 8 + 256 * j < D)
+                sh += v * v;
+            else
+                sm += v * v;
         }
-        acc = warp_sum(acc);
-        if (lane == 0) z[((size_t)gi * T + t) * RANK + r] = f2bf(acc);
+    const float rh = rsqrtf(warp_sum(sh) / D + EPS), rm = rsqrtf(warp_sum(sm) / D + EPS);
+    float acc = 0.0f;
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+        const bf16* wp = reinterpret_cast<const bf16*>(&wv[j]);
+        const float rr = lane * 8 + 256 * j < D ? rh : rm;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc += bf2f(wp[e]) * rb(xval(j, e) * rr);
     }
+    acc = warp_sum(acc);
+    if (lane == 0) z[((size_t)gi * T + t) * RANK + r] = f2bf(acc);
 }
 
 // Block (gate * T + t, 256 channels).
 __global__ void __launch_bounds__(256) msg_apply_kernel(MsgGates g, const bf16* __restrict__ z, int T) {
     pdl_launch_dependents();
-    pdl_wait();
     __shared__ float zs[RANK];
     const int gi = blockIdx.x / T, t = blockIdx.x % T, c = blockIdx.y * 256 + threadIdx.x;
+    // The channel's forget and gain rows (constants) load before the dependency wait.
+    uint4 fa[RANK / 8], fb[RANK / 8];
+    if (c < D) {
+        const bf16* wf = g.fg[gi] + (size_t)c * RANK;
+        const bf16* wg = g.fg[gi] + (size_t)(D + c) * RANK;
+#pragma unroll
+        for (int r = 0; r < RANK / 8; ++r) {
+            fa[r] = ld_stream(wf + 8 * r);
+            fb[r] = ld_stream(wg + 8 * r);
+        }
+    }
+    pdl_wait();
     if (threadIdx.x < RANK) zs[threadIdx.x] = bf2f(z[((size_t)gi * T + t) * RANK + threadIdx.x]);
     __syncthreads();
     if (c >= D) return;
-    const bf16* wf = g.fg[gi] + (size_t)c * RANK;
-    const bf16* wg = g.fg[gi] + (size_t)(D + c) * RANK;
     float f = 0.0f, gg = 0.0f;
 #pragma unroll
     for (int r = 0; r < RANK; r += 8) {
-        const uint4 a = *reinterpret_cast<const uint4*>(wf + r);
-        const uint4 b = *reinterpret_cast<const uint4*>(wg + r);
+        const uint4 a = fa[r / 8];
+        const uint4 b = fb[r / 8];
         const bf16* ap = reinterpret_cast<const bf16*>(&a);
         const bf16* bp = reinterpret_cast<const bf16*>(&b);
 #pragma unroll
@@ -1685,8 +1712,9 @@ cudaError_t quench6k_ink_msg_gates(int n, const float* const* hs, const float* c
         r.out[2 * i + 1] = c + D;
         r.ldo[2 * i] = r.ldo[2 * i + 1] = 2 * D;
     }
-    SQ_CHECK_LAUNCH(sq_launch(rms_kernel, dim3(T, 2 * n), RT, 0, st, r));
-    SQ_CHECK_LAUNCH(sq_launch(msg_down_kernel, dim3(n, RANK / 8, T), 256, 0, st, g, static_cast<const bf16*>(cat), T, static_cast<bf16*>(z)));
+    (void)r;
+    (void)cat;
+    SQ_CHECK_LAUNCH(sq_launch(msg_down_kernel, dim3(n, RANK / 8, T), 256, 0, st, g, T, static_cast<bf16*>(z)));
     SQ_CHECK_LAUNCH(sq_launch(msg_apply_kernel, dim3(n * T, (D + 255) / 256), 256, 0, st, g, static_cast<const bf16*>(z), T));
     SQ_RETURN_LAUNCH();
 }
