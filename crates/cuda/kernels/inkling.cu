@@ -276,6 +276,17 @@ __global__ void __launch_bounds__(256) msg_apply_kernel(MsgGates g, const bf16* 
     g.out[gi][i] = (1.0f - tanhf(f)) * g.hs[gi][i] + tanhf(gg) * g.m[gi][i];
 }
 
+// Message gate from precomputed projections (prefill): out = (1 - tanh(f)) hs + tanh(g) m, fg F32 [T, 2D]
+// (forget | gain).
+__global__ void msg_apply_rows_kernel(const float* __restrict__ hs, const float* __restrict__ m, const float* __restrict__ fg, int T, float* out) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)T * D) return;
+    const size_t t = i / D, c = i % D;
+    out[i] = (1.0f - tanhf(fg[t * 2 * D + c])) * hs[i] + tanhf(fg[t * 2 * D + D + c]) * m[i];
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Query side of an attention layer from the fused projection lin [T, ld] (q | gate | relative states |
 // sinks): q BF16 [T, 24, 128] scaled, L2-clipped (and log-scaled in full layers); rel F32 [T, 24, 16]
@@ -1719,6 +1730,12 @@ cudaError_t quench6k_ink_mx8_grouped_gemm(const void* xs, const uint8_t* w, cons
     if (max_tiles == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(mx8_grouped_gemm_kernel, dim3((N + MXG_BN - 1) / MXG_BN, max_tiles), 256, 0, st, static_cast<const bf16*>(xs), w,
                               sc, offsets, tile_expert, tile_row, num_tiles, y, N, K));
+    SQ_RETURN_LAUNCH();
+}
+
+cudaError_t quench6k_ink_msg_apply_rows(const float* hs, const float* m, const float* fg, int T, float* out, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(msg_apply_rows_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, hs, m, fg, T, out));
     SQ_RETURN_LAUNCH();
 }
 

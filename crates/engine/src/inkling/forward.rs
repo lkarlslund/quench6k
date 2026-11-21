@@ -152,6 +152,8 @@ pub struct Workspace {
     msgs: u64,
     cat: u64,
     z: u64,
+    zf: u64,
+    fg: u64,
     gated: [u64; 3],
     x: [u64; 3],
     xm: u64,
@@ -226,6 +228,8 @@ impl Workspace {
             msgs: a.get(4 * td)?,
             cat: a.get(3 * t * 2 * D * 2)?,
             z: a.get(3 * t * RANK * 2)?,
+            zf: a.get(t * RANK * 4)?,
+            fg: a.get(t * 2 * D * 4)?,
             gated: [a.get(td)?, a.get(td)?, a.get(td)?],
             x: [a.get(t * D * 2)?, a.get(t * D * 2)?, a.get(t * D * 2)?],
             xm: a.get(t * D * 2)?,
@@ -500,6 +504,18 @@ impl InklingModel {
     /// ws.gated.
     fn gates(&self, ws: &Workspace, s: &Stream, layer: &Layer, which: &[usize], hs: &[u64], m: &[u64], t: usize) -> Result<()> {
         let g = layer.gates.as_ref().unwrap();
+        if t > SMALL_T {
+            // Prefill: the projections as GEMMs (the fused kernels re-read the weights per token).
+            for (j, &i) in which.iter().enumerate() {
+                let cat = ws.cat;
+                ik::rms(s, &[RmsSet { x: hs[j], w: 0, out: cat, ldo: 2 * D }, RmsSet { x: m[j], w: 0, out: cat + (D * 2) as u64, ldo: 2 * D }], t)?;
+                linear(s, cat, 2 * D, t, &g[i].down, ws.zf, RANK)?;
+                k::f32_to_bf16(s, ws.zf, ws.z, t * RANK)?;
+                linear(s, ws.z, RANK, t, &g[i].fg, ws.fg, 2 * D)?;
+                ik::msg_apply_rows(s, hs[j], m[j], ws.fg, t, ws.gated[j])?;
+            }
+            return Ok(());
+        }
         let v: Vec<ik::MsgGate> = which
             .iter()
             .enumerate()
