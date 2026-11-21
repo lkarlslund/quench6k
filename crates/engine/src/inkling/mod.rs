@@ -276,7 +276,43 @@ pub struct InklingModel {
     _buffers: Vec<DeviceBuffer>,
 }
 
+impl Linear {
+    /// (address, bytes) of the weights and of their scales.
+    pub fn ranges(&self) -> Vec<(u64, usize)> {
+        let w = match self.fmt {
+            WeightFormat::Bf16 => self.n * self.k * 2,
+            _ => self.n * self.k,
+        };
+        let sc = match self.fmt {
+            WeightFormat::Int8Group => self.n * (self.k / quench6k_cuda::kernels::int8_group()) * 4,
+            WeightFormat::Fp8Block => self.n.div_ceil(128) * (self.k / 128) * 4,
+            _ => 0,
+        };
+        let mut v = vec![(self.w, w)];
+        if sc > 0 {
+            v.push((self.scale, sc));
+        }
+        v
+    }
+}
+
 impl InklingModel {
+    /// The dense projections a visit of layer `li` reads (for L2 prefetch).
+    pub fn layer_ranges(&self, li: usize, msg: bool) -> Vec<(u64, usize)> {
+        let l = &self.layers[li];
+        let mut v = Vec::new();
+        for lin in [&l.attn.qg, &l.attn.kg, &l.attn.vg, &l.attn.o, &l.router] {
+            v.extend(lin.ranges());
+        }
+        if msg && let Some(g) = &l.gates {
+            for gate in g {
+                v.extend(gate.down.ranges());
+                v.extend(gate.fg.ranges());
+            }
+        }
+        v
+    }
+
     pub fn is_inkling(dir: &Path) -> bool {
         std::fs::read(dir.join("config.json"))
             .ok()

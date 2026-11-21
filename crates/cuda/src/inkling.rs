@@ -178,6 +178,7 @@ mod ffi {
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_msg_apply_rows(hs: *const f32, m: *const f32, fg: *const f32, t: c_int, out: *mut f32, st: Stream) -> Error;
+        pub fn quench6k_ink_prefetch(p: *const *const c_void, bytes: *const usize, n: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_to_bf16_rows(src: *const f32, t: c_int, dst: *mut c_void, ldd: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_mix(
             feats: *const c_void,
@@ -784,4 +785,11 @@ pub fn mx8_grouped_gemm(
 /// out = (1 - tanh(f)) * hs + tanh(g) * m from fg F32 [t, 2 * 2304] (forget | gain).
 pub fn msg_apply_rows(s: &Stream, hs: u64, m: u64, fg: u64, t: usize, out: u64) -> Result<()> {
     go!("ink_msg_apply_rows", ffi::quench6k_ink_msg_apply_rows(f(hs), f(m), f(fg), n(t), fm(out), s.raw()))
+}
+
+/// Requests up to 16 (address, bytes) ranges of constants into L2 (asynchronous, no result).
+pub fn prefetch(s: &Stream, ranges: &[(u64, usize)]) -> Result<()> {
+    let ptrs: Vec<*const c_void> = ranges.iter().map(|r| p(r.0)).collect();
+    let bytes: Vec<usize> = ranges.iter().map(|r| r.1).collect();
+    go!("ink_prefetch", ffi::quench6k_ink_prefetch(ptrs.as_ptr(), bytes.as_ptr(), n(ranges.len()), s.raw()))
 }

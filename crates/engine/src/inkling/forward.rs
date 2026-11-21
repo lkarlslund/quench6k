@@ -260,6 +260,10 @@ pub struct Workspace {
     pub argmax: u64,
     pub argmax_scratch: u64,
     pinned: PinnedBuffer,
+    /// The side stream of the L2 prefetches (forked from and joined into the step's stream).
+    side: Stream,
+    fork: quench6k_cuda::Event,
+    join: quench6k_cuda::Event,
     pub device_bytes: usize,
     _alloc: Alloc,
 }
@@ -333,6 +337,9 @@ impl Workspace {
             argmax: a.get(t * 4)?,
             argmax_scratch: a.get(k::argmax_scratch(t, vocab))?,
             pinned: PinnedBuffer::new(t * 4 + 64)?,
+            side: Stream::new()?,
+            fork: quench6k_cuda::Event::new()?,
+            join: quench6k_cuda::Event::new()?,
             device_bytes: 0,
             _alloc: Alloc::new(),
         };
@@ -408,6 +415,11 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
     } else {
         k::gemm_f32(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, 1.0, false)
     }
+}
+
+fn prefetch_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QUENCH6K_INK_PREFETCH").map_or(true, |v| v != "0"))
 }
 
 /// Which positions' logits a forward pass produces.
@@ -617,6 +629,7 @@ impl InklingModel {
             Ok(())
         };
         let dump = std::env::var_os("QUENCH6K_INK_DUMP");
+        let mut prefetched = false;
         for (v, &(li, pass)) in cfg.visits().iter().enumerate() {
             let layer = &self.layers[li];
             let c = &state.caches[v];
@@ -631,6 +644,17 @@ impl InklingModel {
                 s.copy_d2d(h, ws.slots[nb], td as usize)?;
             }
             let msg = layer.looped && pass > 0;
+            // Small steps: the next visit's dense weights into L2 while this visit runs (QUENCH6K_INK_PREFETCH=0: off).
+            if t <= SMALL_T && prefetch_on() && let Some(&(nl, np)) = cfg.visits().get(v + 1) {
+                // On a side branch: the prefetch kernel stays until its data arrives.
+                let r = self.layer_ranges(nl, self.layers[nl].looped && np > 0);
+                ws.fork.record(s)?;
+                ws.side.wait(&ws.fork)?;
+                for chunk in r.chunks(16) {
+                    ik::prefetch(&ws.side, chunk)?;
+                }
+                prefetched = true;
+            }
             if msg {
                 let q = self.msg_queries + ((li - cfg.loop_start) * 4 * D * 4) as u64;
                 ik::attn_res(s, &[ws.slots[PREV_BLOCK], ws.slots[PREV_PARTIAL]], q, 4, t, ws.msgs, &[], 0, None)?;
@@ -818,6 +842,10 @@ impl InklingModel {
             ik::attn_res(s, &src, self.final_query, 1, t, 0, &[(self.norm, hidden)], 4 * D, pending.take())?;
         }
         flush(&mut pending, ws.h[hi])?;
+        if prefetched {
+            ws.join.record(&ws.side)?;
+            s.wait(&ws.join)?;
+        }
         if want != Logits::None {
             let (rows, first) = if want == Logits::All { (t, 0) } else { (1, t - 1) };
             linear(s, hidden + (first * 4 * D * 2) as u64, 4 * D, rows, &self.lm_head, ws.out_logits, cfg.vocab)?;

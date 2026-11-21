@@ -1707,6 +1707,24 @@ __global__ void __launch_bounds__(256) markov_pick_kernel(const float* best_v, c
     }
 }
 
+// L2 prefetch of up to 16 ranges (constants: the next visit's weights), in pieces of 64 KB.
+struct Ranges {
+    const char* p[16];
+    unsigned bytes[16];
+};
+
+__global__ void prefetch_kernel(Ranges r, int n) {
+    pdl_launch_dependents();
+    for (int i = 0; i < n; ++i) {
+        const unsigned pieces = (r.bytes[i] + 65535) / 65536;
+        for (unsigned k = threadIdx.x + blockIdx.x * blockDim.x; k < pieces; k += blockDim.x * gridDim.x) {
+            const unsigned off = k * 65536, len = min(65536u, r.bytes[i] - off) & ~15u;
+            if (len) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(r.p[i] + off), "r"(len) : "memory");
+        }
+    }
+    pdl_wait();
+}
+
 int sm_count() {
     static int sms = 0;
     if (sms == 0) {
@@ -2008,6 +2026,18 @@ cudaError_t quench6k_ink_mx8_grouped_gemm(const void* xs, const uint8_t* w, cons
 cudaError_t quench6k_ink_msg_apply_rows(const float* hs, const float* m, const float* fg, int T, float* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(msg_apply_rows_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, hs, m, fg, T, out));
+    SQ_RETURN_LAUNCH();
+}
+
+cudaError_t quench6k_ink_prefetch(const void* const* p, const size_t* bytes, int n, cudaStream_t st) {
+    if (n == 0) return cudaSuccess;
+    if (n > 16) return cudaErrorInvalidValue;
+    Ranges r{};
+    for (int i = 0; i < n; ++i) {
+        r.p[i] = static_cast<const char*>(p[i]);
+        r.bytes[i] = (unsigned)bytes[i];
+    }
+    SQ_CHECK_LAUNCH(sq_launch(prefetch_kernel, 4, 128, 0, st, r, n));
     SQ_RETURN_LAUNCH();
 }
 
