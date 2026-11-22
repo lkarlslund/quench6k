@@ -60,6 +60,10 @@ impl<'m> SlotEngine for Engine<'m> {
     }
     fn new_state(&mut self, capacity: usize) -> Result<fl::FlintSeq> {
         let seq = fl::FlintSeq::new(self.model, capacity)?;
+        // FlintSeq::new leaves its caches uninitialized; start from zeros as the other engines' states do.
+        for b in seq.k.iter().chain(&seq.v) {
+            self.s.memset(b.addr(), 0, b.bytes())?;
+        }
         self.state_bytes = seq_bytes(&seq);
         Ok(seq)
     }
