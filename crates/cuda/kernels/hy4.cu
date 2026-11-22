@@ -128,7 +128,7 @@ __global__ void __launch_bounds__(512) hc_pre_kernel(const float* __restrict__ l
         // Lane j sums mix row j (lane NM: flat^2) over the slices, in slice order.
         float m = 0.0f;
         if (tid <= NM)
-            for (int sl = 0; sl < HC_SLICES; ++sl) m += partial[((size_t)t * HC_SLICES + sl) * (NM + 1) + tid];
+            for (int sl = 0; sl < HC_SLICES; ++sl) m += __ldcg(partial + ((size_t)t * HC_SLICES + sl) * (NM + 1) + tid);
         const float r = rsqrtf(__shfl_sync(0xffffffff, m, NM) / (float)(HC * D) + eps);
         if (tid < HC) coef[tid] = 1.0f / (1.0f + expf(-(m * r * scale[0] + base[tid]))) + hc_eps;
         if (NM == 2 * HC && tid >= HC && tid < 2 * HC)
@@ -149,13 +149,19 @@ __global__ void __launch_bounds__(512) hc_pre_kernel(const float* __restrict__ l
 }
 
 // lanes[t, c, d] += post[t, c] * y[t, d]; y BF16 rows of stride ldy.
-__global__ void hc_post_kernel(float* lanes, const float* __restrict__ post, const bf16* __restrict__ y, int ldy, int T) {
+// A block of 256 lies within one token (HC * D is a multiple of 256): its 4 post weights are read once,
+// through L2 (hc_pre rewrote them just before).
+__global__ void hc_post_kernel(float* lanes, const float* post, const bf16* __restrict__ y, int ldy, int T) {
     pdl_launch_dependents();
     pdl_wait();
+    __shared__ float pw[HC];
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = (int)((size_t)blockIdx.x * blockDim.x / (HC * D));
+    if (threadIdx.x < HC && t < T) pw[threadIdx.x] = __ldcg(post + t * HC + threadIdx.x);
+    __syncthreads();
     if (i >= (size_t)T * HC * D) return;
-    const int t = (int)(i / (HC * D)), c = (int)(i / D % HC), d = (int)(i % D);
-    lanes[i] = post[t * HC + c] * bf2f(y[(size_t)t * ldy + d]) + lanes[i];
+    const int c = (int)(i / D % HC), d = (int)(i % D);
+    lanes[i] = pw[c] * bf2f(y[(size_t)t * ldy + d]) + lanes[i];
 }
 
 // lanes[t, c, :] = emb[t, :] for every lane.
@@ -404,12 +410,13 @@ __global__ void __launch_bounds__(128 * G) mla_attn_kernel(const bf16* __restric
     } else if (MODE == 1) {
         n_keys = p + 1;
     } else {
-        n_keys = sel_n[t];
+        n_keys = __ldcg(sel_n + t);
     }
     const int tiles = (n_keys + AT_KT - 1) / AT_KT;
     const int per = (tiles + splits - 1) / splits;
     const int tile0 = split * per, tile1 = min(tiles, tile0 + per);
-    auto key_pos = [&](int j) { return MODE == 2 ? sel[(size_t)t * SEL + j] : k_first + j; };
+    // Key lists and positions are rewritten in place every layer and step: read through L2.
+    auto key_pos = [&](int j) { return MODE == 2 ? __ldcg(sel + (size_t)t * SEL + j) : k_first + j; };
     auto load_tile = [&](int tile, int stage) {
         bf16* dst = Ks + stage * AT_KT * AT_LD;
         for (int c = tid; c < AT_KT * (KROW / 8); c += NT) {
@@ -557,16 +564,17 @@ __global__ void __launch_bounds__(128) mla_merge_kernel(const float* __restrict_
     pdl_wait();
     const int t = blockIdx.x / H, h = blockIdx.x % H;
     float m = -INFINITY;
-    for (int s = 0; s < splits; ++s) m = fmaxf(m, part_ml[(((size_t)s * T + t) * H + h) * 2]);
+    for (int s = 0; s < splits; ++s) m = fmaxf(m, __ldcg(part_ml + (((size_t)s * T + t) * H + h) * 2));
     float l = 0.0f, acc[4] = {};
     for (int s = 0; s < splits; ++s) {
         const float* ml = part_ml + (((size_t)s * T + t) * H + h) * 2;
-        if (ml[0] == -INFINITY) continue;
-        const float w = __expf(ml[0] - m);
-        l += w * ml[1];
+        const float m_s = __ldcg(ml);
+        if (m_s == -INFINITY) continue;
+        const float w = __expf(m_s - m);
+        l += w * __ldcg(ml + 1);
         const float* po = part_o + (((size_t)s * T + t) * H + h) * KVL;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) acc[j] += w * po[threadIdx.x + 128 * j];
+        for (int j = 0; j < 4; ++j) acc[j] += w * __ldcg(po + threadIdx.x + 128 * j);
     }
     const float inv = 1.0f / (l + (m == -INFINITY ? __expf(sinks[h]) : __expf(sinks[h] - m)));
 #pragma unroll
@@ -627,7 +635,7 @@ __global__ void __launch_bounds__(128) idx_pool_kernel(SeqRows tk_cache, const f
     if ((p + 1) % GRP != 0) return;
     const int g = p / GRP;
 #pragma unroll
-    for (int s = 0; s < GRP; ++s) ks[s][d] = bf2f(seq_row<const bf16>(tk_cache, sq, g * GRP + s)[d]);
+    for (int s = 0; s < GRP; ++s) ks[s][d] = bf2f(__ldcg(seq_row<const bf16>(tk_cache, sq, g * GRP + s) + d));
     __syncthreads();
     float val[GRP] = {}, gate[GRP] = {};
     for (int k = 0; k < ID; ++k) {
@@ -678,8 +686,8 @@ __global__ void __launch_bounds__(256) idx_scores_kernel(const bf16* __restrict_
     // Queries within the first 2048 positions do not select (idx_expand lists their keys densely).
     if (qg <= TOPG - 1) return;
     const int sq = seq[t];
-    for (int j = threadIdx.x; j < IH * ID; j += 256) qs[j / ID][j % ID] = bf2f(iq[(size_t)t * IH * ID + j]);
-    if (threadIdx.x < IH) ws[threadIdx.x] = hw[t * IH + threadIdx.x];
+    for (int j = threadIdx.x; j < IH * ID; j += 256) qs[j / ID][j % ID] = bf2f(__ldcg(iq + (size_t)t * IH * ID + j));
+    if (threadIdx.x < IH) ws[threadIdx.x] = __ldcg(hw + t * IH + threadIdx.x);
     __syncthreads();
     for (int gi = warp; gi < 64; gi += 8) {
         const int g = blockIdx.x * 64 + gi;
@@ -688,7 +696,7 @@ __global__ void __launch_bounds__(256) idx_scores_kernel(const bf16* __restrict_
             if (lane == 0) scores[(size_t)t * ld + g] = -INFINITY;
             continue;
         }
-        const uint2 raw = *reinterpret_cast<const uint2*>(seq_row<const bf16>(pooled, sq, g) + lane * 4);
+        const uint2 raw = __ldcg(reinterpret_cast<const uint2*>(seq_row<const bf16>(pooled, sq, g) + lane * 4));
         const __nv_bfloat162* pk = reinterpret_cast<const __nv_bfloat162*>(&raw);
         const float2 k01 = __bfloat1622float2(pk[0]), k23 = __bfloat1622float2(pk[1]);
         float total = 0.0f;
@@ -721,7 +729,7 @@ __global__ void idx_expand_kernel(const int* __restrict__ picked, int npick, con
     } else {
         for (int base = 0; base < npick; base += 32) {
             const int j = base + lane;
-            const int g = j < npick ? picked[(size_t)t * npick + j] : -1;
+            const int g = j < npick ? __ldcg(picked + (size_t)t * npick + j) : -1;
             const bool ok = g >= 0 && g < qg;
             const unsigned mask = __ballot_sync(0xffffffff, ok);
             const int before = __popc(mask & ((1u << lane) - 1));
@@ -748,7 +756,7 @@ __global__ void __launch_bounds__(E) route_kernel(const float* __restrict__ logi
     __shared__ int ci[E / 32];
     __shared__ int picked[TOPK];
     const int t = blockIdx.x, e = threadIdx.x, lane = e & 31, warp = e >> 5;
-    const float score = 1.0f / (1.0f + expf(-logits[(size_t)t * ld + e]));
+    const float score = 1.0f / (1.0f + expf(-__ldcg(logits + (size_t)t * ld + e)));
     float choice = score + bias[e];
     bool taken = false;
     for (int k = 0; k < TOPK; ++k) {
@@ -889,7 +897,7 @@ __global__ void pair_order_kernel(const int* __restrict__ sel_e, int pairs, int*
     pdl_launch_dependents();
     pdl_wait();
     __shared__ int es[1024];
-    for (int q = threadIdx.x; q < pairs; q += blockDim.x) es[q] = sel_e[q];
+    for (int q = threadIdx.x; q < pairs; q += blockDim.x) es[q] = __ldcg(sel_e + q);
     __syncthreads();
     const int p = threadIdx.x;
     if (p >= pairs) return;
@@ -915,8 +923,8 @@ __global__ void __launch_bounds__(256) experts_gate_up_kernel(const bf16* __rest
     const int lane = threadIdx.x & 31;
     const int warps = gridDim.x * 8, items = pairs * (LAT / EX_ROWS);
     for (int item = blockIdx.x * 8 + (threadIdx.x >> 5); item < items; item += warps) {
-        const int pair = order[item % pairs], n0 = item / pairs * EX_ROWS;
-        const int t = pair / TOPK, e = sel_e[pair];
+        const int pair = __ldcg(order + item % pairs), n0 = item / pairs * EX_ROWS;
+        const int t = pair / TOPK, e = __ldcg(sel_e + pair);
         const size_t row0 = (size_t)e * LAT + n0;
         Fp4Rows<EX_ROWS> wg, wu;
         fp4_rows_load(gate.codes, gate.scales, row0, lane, wg);
@@ -947,8 +955,8 @@ __global__ void __launch_bounds__(256) experts_down_kernel(const bf16* act, cons
     const int warps = gridDim.x * 8, items = pairs * (LAT / R);
     bool first = true;
     for (int item = blockIdx.x * 8 + (threadIdx.x >> 5); item < items; item += warps) {
-        const int pair = order[item % pairs], n0 = item / pairs * R;
-        const int e = sel_e[pair];
+        const int pair = __ldcg(order + item % pairs), n0 = item / pairs * R;
+        const int e = __ldcg(sel_e + pair);
         Fp4Rows<R> wd;
         fp4_rows_load(down.codes, down.scales, (size_t)e * LAT + n0, lane, wd);
         if (first) {
@@ -995,8 +1003,8 @@ __global__ void experts_combine_kernel(const float* __restrict__ y, const int* _
     float acc = 0.0f;
     for (int k = 0; k < TOPK; ++k) {
         const int pair = t * TOPK + k;
-        const int row = pair_row ? pair_row[pair] : pair;
-        acc = rb(acc + rb(rb(y[(size_t)row * LAT + n]) * sel_w[pair]));
+        const int row = pair_row ? __ldcg(pair_row + pair) : pair;
+        acc = rb(acc + rb(rb(__ldcg(y + (size_t)row * LAT + n)) * __ldcg(sel_w + pair)));
     }
     out[i] = f2bf(acc);
 }
@@ -1006,7 +1014,7 @@ __global__ void moe_count_kernel(const int* __restrict__ sel_e, int pairs, int* 
     pdl_launch_dependents();
     pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < pairs) atomicAdd(&counts[sel_e[i]], 1);
+    if (i < pairs) atomicAdd(&counts[__ldcg(sel_e + i)], 1);
 }
 
 __global__ void __launch_bounds__(E) moe_plan_kernel(const int* __restrict__ counts, int bm, int* offsets, int* cursor,
@@ -1020,8 +1028,9 @@ __global__ void __launch_bounds__(E) moe_plan_kernel(const int* __restrict__ cou
         for (int e = 0; e < E; ++e) {
             off[e] = o;
             toff[e] = to;
-            o += counts[e];
-            to += (counts[e] + bm - 1) / bm;
+            const int c = __ldcg(counts + e);
+            o += c;
+            to += (c + bm - 1) / bm;
         }
         off[E] = o;
         toff[E] = to;
@@ -1042,7 +1051,7 @@ __global__ void moe_scatter_kernel(const int* __restrict__ sel_e, int pairs, int
     pdl_launch_dependents();
     pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < pairs) pair_row[i] = atomicAdd(&cursor[sel_e[i]], 1);
+    if (i < pairs) pair_row[i] = atomicAdd(&cursor[__ldcg(sel_e + i)], 1);
 }
 
 // xs[pair_row[pair]] = x[pair / 16] (BF16 rows of 1536).
@@ -1051,7 +1060,7 @@ __global__ void moe_gather_kernel(const bf16* __restrict__ x, const int* __restr
     pdl_wait();
     const int pair = blockIdx.x;
     const uint4* src = reinterpret_cast<const uint4*>(x + (size_t)(pair / TOPK) * LAT);
-    uint4* dst = reinterpret_cast<uint4*>(xs + (size_t)pair_row[pair] * LAT);
+    uint4* dst = reinterpret_cast<uint4*>(xs + (size_t)__ldcg(pair_row + pair) * LAT);
     for (int i = threadIdx.x; i < LAT / 8; i += blockDim.x) dst[i] = src[i];
 }
 
@@ -1502,8 +1511,8 @@ __global__ void dfly_sel_kernel(const unsigned long long* keep_tab, long long ke
         if (threadIdx.x == 0) sel_n[blockIdx.x] = anchor + j + 1;
         return;
     }
-    const int n = keep_n[krow];
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = keep[(size_t)krow * SEL + i];
+    const int n = __ldcg(keep_n + krow);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = __ldcg(keep + (size_t)krow * SEL + i);
     for (int i = threadIdx.x; i <= j; i += blockDim.x) dst[n + i] = anchor + i;
     if (threadIdx.x == 0) sel_n[blockIdx.x] = n + j + 1;
 }

@@ -724,6 +724,17 @@ to tell tie effects from other differences.
   with many sequences fewer drafts per sequence should be verified.
 - Dropped: routed experts per run of pairs of one expert (each work item loading its expert's weight rows
   once for up to 8 pairs, the same arithmetic): 4 x 4-row steps 171 ms instead of 41 ms.
+- PDL and served short prompts (2026-11-22): a server with 8 slots, drafts on, gave 1 in 12-24 short prompts
+  (9-16 tokens, run as one CUDA graph step with the grouped NVFP4 expert GEMM) a different output 8 at once
+  than alone. Cause: the grouped GEMM read its tile tables, which the planning kernels rewrite in place just
+  before, through the non-coherent path (the Flint fix in moe.cu, already merged; the server builds
+  predated it). With that fix reverted, `scratch` trials (58 prompts alone, then shuffled rounds 8 at once,
+  120 tokens each) showed 1 of 258 different; with it 0 of 606. The Hy4 kernels' own in-place tables and
+  small per-step buffers (routing, pair order, tile planning, key lists and their lengths, attention split
+  partials, hyper-connection weights, the drafter's kept lists) are now read through L2 as well: the same
+  bits (teacher-forced scores in 12-token steps byte-identical), decode 97.5 / 98.1 tok/s against 97.5 / 99.8.
+  `QUENCH6K_HY4_STAGGER_DRAFTS=N` in batch-check runs short prompts started between N running sequences'
+  verified steps and drafter passes, the server's order.
 
 ## 2026-11-22: Inkling 2, several sequences per step
 
