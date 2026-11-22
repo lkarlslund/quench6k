@@ -35,6 +35,8 @@ pub const RANK: usize = 64;
 pub const CONVK: usize = 4;
 /// Columns of the fused query-side projection: q, output gate, relative states, sinks.
 pub const QG: usize = 2 * QD + H * DREL + H;
+/// QG rounded up to 16 rows: where the keys start in the fused attention projection (zero rows between).
+pub const QGP: usize = QG.next_multiple_of(16);
 pub const GATE_OFF: usize = QD;
 
 pub struct Config {
@@ -386,10 +388,11 @@ impl InklingModel {
             };
             // One matrix for the three projections when its format allows row views (BF16, INT8 groups).
             let all: Vec<String> = qn.iter().chain(&kn).chain(&vn).cloned().collect();
+            // The keys start at row QGP (zero rows after the query side), a multiple of 16.
             let (qkv, qg, kg, vg) = if l.row_viewable(&all[0], D) {
-                let m = l.concat(&all, D)?;
-                let ldk = (m.n - QG) / 2;
-                (Some(m), m.rows(0, QG), m.rows(QG, ldk), m.rows(QG + ldk, ldk))
+                let m = l.concat_gap(&all, D, qn.len(), QGP - QG)?;
+                let ldk = (m.n - QGP) / 2;
+                (Some(m), m.rows(0, QG), m.rows(QGP, ldk), m.rows(QGP + ldk, ldk))
             } else {
                 (None, l.concat(&qn, D)?, l.concat(&kn, D)?, l.concat(&vn, D)?)
             };
@@ -611,7 +614,12 @@ impl Loader<'_> {
     }
 
     fn concat(&mut self, names: &[String], k: usize) -> Result<Linear> {
-        let mut rows = 0;
+        self.concat_gap(names, k, 0, 0)
+    }
+
+    /// [`concat`] with `gap` zero rows after the first `gap_at` tensors.
+    fn concat_gap(&mut self, names: &[String], k: usize, gap_at: usize, gap: usize) -> Result<Linear> {
+        let mut rows = gap;
         for name in names {
             let info = self.ckpt.get(name)?;
             ensure!(info.dtype == DType::BF16, "{name}: {:?}, expected BF16", info.dtype);
@@ -627,7 +635,11 @@ impl Loader<'_> {
             None => self.alloc(rows * k * 2)?,
         };
         let mut at = 0;
-        for name in names {
+        for (i, name) in names.iter().enumerate() {
+            if i == gap_at && gap > 0 {
+                self.s.memset(w + at as u64, 0, gap * k * 2)?;
+                at += gap * k * 2;
+            }
             at += self.copy_tensor(name, w + at as u64)?;
         }
         if int8 {

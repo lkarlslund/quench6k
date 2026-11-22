@@ -200,6 +200,27 @@ mod ffi {
             ucap: f32,
             st: Stream,
         ) -> Error;
+        pub fn quench6k_ink_skinny_i8(
+            m: c_int,
+            x0: *const c_void,
+            x1: *const c_void,
+            x2: *const c_void,
+            ldx: c_int,
+            w: *const c_void,
+            scale: *const f32,
+            y0: *mut f32,
+            y1: *mut f32,
+            y2: *mut f32,
+            ldy0: c_int,
+            ldy1: c_int,
+            ldy2: c_int,
+            end0: c_int,
+            end1: c_int,
+            nseg: c_int,
+            n: c_int,
+            k: c_int,
+            st: Stream,
+        ) -> Error;
         pub fn quench6k_ink_to_bf16_rows(src: *const f32, t: c_int, dst: *mut c_void, ldd: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_mix(
             feats: *const c_void,
@@ -874,6 +895,39 @@ pub fn nv4_gemm(
             pm(a),
             gcap,
             ucap,
+            s.raw()
+        )
+    )
+}
+
+/// Skinny tensor-core GEMM for m <= 16 activation rows of INT8 group-64 weights [n, k]: `segs` = (rows, x,
+/// y, ldy) in row order (1 to 3; rows multiples of 16), shared `ldx`.
+#[allow(clippy::too_many_arguments)]
+pub fn skinny_i8(s: &Stream, m: usize, w: u64, scale: u64, ldx: usize, segs: &[(usize, u64, u64, usize)], k: usize) -> Result<()> {
+    let g = |i: usize| segs.get(i).copied().unwrap_or((0, 0, 0, 0));
+    let (end0, end1) = (g(0).0, g(0).0 + g(1).0);
+    let nn: usize = segs.iter().map(|x| x.0).sum();
+    go!(
+        "ink_skinny_i8",
+        ffi::quench6k_ink_skinny_i8(
+            n(m),
+            p(g(0).1),
+            p(g(1).1),
+            p(g(2).1),
+            n(ldx),
+            p(w),
+            f(scale),
+            fm(g(0).2),
+            fm(g(1).2),
+            fm(g(2).2),
+            n(g(0).3),
+            n(g(1).3),
+            n(g(2).3),
+            n(end0),
+            n(end1),
+            n(segs.len()),
+            n(nn),
+            n(k),
             s.raw()
         )
     )

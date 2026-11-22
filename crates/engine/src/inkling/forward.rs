@@ -305,7 +305,7 @@ impl Workspace {
             x: [a.get(t * D * 2)?, a.get(t * D * 2)?, a.get(t * D * 2)?],
             xm: a.get(t * D * 2)?,
             // Also the three projections' outputs together [t, QG + 2 * ldk] (prefill, one input).
-            lin_q: a.get(t * (QG + 2 * (KVD + 32)) * 4)?,
+            lin_q: a.get(t * (QGP + 2 * (KVD + 32)) * 4)?,
             lin_k: a.get(t * (KVD + 32) * 4)?,
             lin_v: a.get(t * (KVD + 32) * 4)?,
             q: a.get(t * QD * 2)?,
@@ -417,6 +417,9 @@ struct DraftWs {
 
 /// Y [m, l.n] F32 = X [m, l.k] BF16 . W^T.
 fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usize) -> Result<()> {
+    if skinny(m, l) {
+        return ik::skinny_i8(s, m, l.w, l.scale, ldx, &[(l.n, x, y, ldy)], l.k);
+    }
     if m <= k::gemv_max_m() {
         k::gemv(s, m, x, ldx, l.fmt, l.w, l.scale, y, ldy, 0, l.n, l.k, 1, 1.0, false)
     } else {
@@ -434,6 +437,15 @@ fn linear_narrow(s: &Stream, ws: &Workspace, x: u64, ldx: usize, m: usize, l: &L
         return linear(s, x, ldx, m, l, y, ldy);
     }
     k::gemm_f32_split(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, 1.0, false, ws.splitk, SPLIT_K)
+}
+
+/// Whether a step of m tokens runs `l` as the skinny tensor-core GEMM (INT8 group weights) instead of
+/// the GEMV: from QUENCH6K_INK_SKINNY tokens (default 1: every small step, so that a token's result does
+/// not depend on the step's width and drafted decoding gives the plain tokens; 0: never).
+fn skinny(m: usize, l: &Linear) -> bool {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let min = *V.get_or_init(|| std::env::var("QUENCH6K_INK_SKINNY").ok().and_then(|v| v.parse().ok()).unwrap_or(1));
+    min > 0 && m >= min && m <= 16 && l.fmt == WeightFormat::Int8Group && l.n.is_multiple_of(16) && l.k.is_multiple_of(64)
 }
 
 const MARKOV_CAND_MAX: usize = 8;
@@ -754,14 +766,20 @@ impl InklingModel {
             match &a.qkv {
                 // Small steps: one GEMV launch over the three projections, each with its input.
                 Some(m) if t <= k::gemv_max_m() => {
-                    let segs = [(QG, xq, ws.lin_q, QG), (ldk, xk, ws.lin_k, ldk), (ldk, xv, ws.lin_v, ldk)];
-                    k::gemv_seg(s, t, m.fmt, m.w, m.scale, D, &segs, D)?;
+                    // Query-side rows (and the zero rows after them) with a row stride of QGP.
+                    let segs = [(QGP, xq, ws.lin_q, QGP), (ldk, xk, ws.lin_k, ldk), (ldk, xv, ws.lin_v, ldk)];
+                    ldq = QGP;
+                    if skinny(t, m) {
+                        ik::skinny_i8(s, t, m.w, m.scale, D, &segs, D)?;
+                    } else {
+                        k::gemv_seg(s, t, m.fmt, m.w, m.scale, D, &segs, D)?;
+                    }
                 }
                 // One input (sliding layers outside the message gates): one GEMM, outputs side by side.
                 Some(m) if xq == xk && xk == xv => {
                     linear(s, xq, D, t, m, ws.lin_q, m.n)?;
                     ldq = m.n;
-                    lin_k = ws.lin_q + (QG * 4) as u64;
+                    lin_k = ws.lin_q + (QGP * 4) as u64;
                     lin_v = lin_k + (ldk * 4) as u64;
                     ldk = m.n;
                 }

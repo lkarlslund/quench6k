@@ -444,6 +444,7 @@ the inspector's edits.
 | `QUENCH6K_INK_INT8=LIST` | Inkling 2: BF16 projections quantized to INT8 (a scale per 64 weights) at load, as name fragments (`all`, `none`; default the layers' and the drafter's attention and MLP projections) |
 | `QUENCH6K_INK_FP8=LIST` | Inkling 2: BF16 projections quantized to FP8 at load, as name fragments (`all`, `none`; default `model.llm.unembed`, the LM head) |
 | `QUENCH6K_INK_FP4_TC=1`, `QUENCH6K_INK_FP4_TERMS=N` | Inkling 2: prefill experts of the NVFP4 layers with NVFP4 activations of N terms (default 2; 3 for the experts' input) on the FP4 tensor cores (faster; fails the gate) |
+| `QUENCH6K_INK_SKINNY=N` | Inkling 2: small steps of N or more tokens run the INT8 projections as a tensor-core GEMM (default 1: every step, so a token's result never depends on the step's width; 0: the GEMV) |
 | `QUENCH6K_INK_MARKOV_CAND=N` | Inkling 2: the drafter's Markov head picks among each 256-token block's N best tokens (default 4; 0: the whole vocabulary) |
 | `QUENCH6K_INK_PREFETCH=0`, `QUENCH6K_INK_CLUSTER=0` | Inkling 2: small steps without the L2 prefetch of the next visit's weights / without the 8-block cluster residual mixture |
 | `QUENCH6K_INK_GRAPHS=0` | Inkling 2: run small steps and the drafter eagerly instead of as CUDA graphs |

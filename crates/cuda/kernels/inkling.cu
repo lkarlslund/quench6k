@@ -1381,6 +1381,135 @@ __global__ void __launch_bounds__(256) nv4_gemm_kernel(const bf16* __restrict__ 
             }
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Skinny GEMM on the tensor cores for small steps (M <= 16 rows of activations): Y[m, n] = X[m] . W[n]
+// with INT8 weights and an FP32 scale per 64 of a row (weights dequantized to BF16 in the fragments).
+// A block takes 16 weight rows; its 4 warps split K (64-column chunks) and add through shared memory.
+// Each lane reads 16 contiguous weights of its rows per chunk: the chunk's K order is permuted the same way
+// for both operands (lane t4 of a k16 step s holds columns t4 * 16 + s * 4 .. + 3). Up to three row
+// segments with their own inputs and outputs (boundaries multiples of 16).
+struct SkinnyArgs {
+    const int8_t* w;
+    const float* scale;
+    const bf16* x[3];
+    float* y[3];
+    int ldy[3];
+    int end[2];
+    int nseg, ldx, M, N, K;
+};
+
+SQ_DEVICE uint32_t pack_bf16(float a, float b) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
+    return *reinterpret_cast<const uint32_t*>(&v);
+}
+
+constexpr int SK_W = 4;  // warps a block (K split; 8 measured no faster)
+
+template <int NT>
+__global__ void __launch_bounds__(SK_W * 32) skinny_i8_kernel(SkinnyArgs a) {
+    pdl_launch_dependents();
+    __shared__ float red[SK_W][NT][32][4];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, gq = lane >> 2, t4 = lane & 3;
+    const int row0 = blockIdx.x * 16;
+    int sg = 0;
+    if (a.nseg > 1) sg = row0 < a.end[0] ? 0 : (a.nseg > 2 && row0 >= a.end[1] ? 2 : 1);
+    const int nb = sg ? a.end[sg - 1] : 0;
+    const bf16* X = a.x[sg];
+    const int chunks = a.K / 64, per = (chunks + SK_W - 1) / SK_W, c0 = warp * per, c1 = min(chunks, c0 + per);
+    const int ra = min(row0 + gq, a.N - 1), rb_ = min(row0 + gq + 8, a.N - 1);
+    const int8_t* wa = a.w + (size_t)ra * a.K + t4 * 16;
+    const int8_t* wb = a.w + (size_t)rb_ * a.K + t4 * 16;
+    const float* sa = a.scale + (size_t)ra * chunks;
+    const float* sb = a.scale + (size_t)rb_ * chunks;
+    // SK_D chunks' weights in flight per lane (constants: the first ones before the dependency wait).
+    constexpr int SK_D = 4;
+    uint4 pwa[SK_D], pwb[SK_D];
+    float psa[SK_D], psb[SK_D];
+#pragma unroll
+    for (int d = 0; d < SK_D; ++d) {
+        const int ch = c0 + d;
+        if (ch < c1) {
+            pwa[d] = ld_stream(reinterpret_cast<const uint4*>(wa + (size_t)ch * 64));
+            pwb[d] = ld_stream(reinterpret_cast<const uint4*>(wb + (size_t)ch * 64));
+            psa[d] = sa[ch];
+            psb[d] = sb[ch];
+        }
+    }
+    pdl_wait();
+    float c[NT][4] = {};
+    for (int ch0 = c0; ch0 < c1; ch0 += SK_D)
+#pragma unroll
+    for (int d = 0; d < SK_D; ++d) {
+        const int ch = ch0 + d;
+        if (ch >= c1) break;
+        const uint4 qa = pwa[d], qb = pwb[d];
+        const float fa = psa[d], fb = psb[d];
+        if (ch + SK_D < c1) {
+            pwa[d] = ld_stream(reinterpret_cast<const uint4*>(wa + (size_t)(ch + SK_D) * 64));
+            pwb[d] = ld_stream(reinterpret_cast<const uint4*>(wb + (size_t)(ch + SK_D) * 64));
+            psa[d] = sa[ch + SK_D];
+            psb[d] = sb[ch + SK_D];
+        }
+        // Activations: token n = nt * 8 + gq, columns ch * 64 + t4 * 16 .. + 15 (zero past M).
+        uint4 xv[NT][2];
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const int n = nt * 8 + gq;
+            if (n < a.M) {
+                const uint4* xp = reinterpret_cast<const uint4*>(X + (size_t)n * a.ldx + ch * 64 + t4 * 16);
+                xv[nt][0] = xp[0];
+                xv[nt][1] = xp[1];
+            } else {
+                xv[nt][0] = xv[nt][1] = make_uint4(0, 0, 0, 0);
+            }
+        }
+        // The chunk is one scale group: the MMAs take the integer codes (exact in BF16) and the sums are
+        // scaled per row afterwards (rows gq: c0, c1; gq + 8: c2, c3), so no weight is rounded.
+        const int8_t* ba = reinterpret_cast<const int8_t*>(&qa);
+        const int8_t* bb = reinterpret_cast<const int8_t*>(&qb);
+        float tc[NT][4] = {};
+#pragma unroll
+        for (int st = 0; st < 4; ++st) {
+            uint32_t af[4];
+            af[0] = pack_bf16((float)ba[st * 4], (float)ba[st * 4 + 1]);
+            af[1] = pack_bf16((float)bb[st * 4], (float)bb[st * 4 + 1]);
+            af[2] = pack_bf16((float)ba[st * 4 + 2], (float)ba[st * 4 + 3]);
+            af[3] = pack_bf16((float)bb[st * 4 + 2], (float)bb[st * 4 + 3]);
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const uint32_t* xw = reinterpret_cast<const uint32_t*>(&xv[nt][st >> 1]);
+                const uint32_t bf[2] = {xw[(st & 1) * 2], xw[(st & 1) * 2 + 1]};
+                mma_bf16(tc[nt], af, bf);
+            }
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            c[nt][0] = fmaf(fa, tc[nt][0], c[nt][0]);
+            c[nt][1] = fmaf(fa, tc[nt][1], c[nt][1]);
+            c[nt][2] = fmaf(fb, tc[nt][2], c[nt][2]);
+            c[nt][3] = fmaf(fb, tc[nt][3], c[nt][3]);
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) red[warp][nt][lane][e] = c[nt][e];
+    __syncthreads();
+    if (warp != 0) return;
+    float* Y = a.y[sg];
+    const int ldy = a.ldy[sg];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < SK_W; ++w) v += red[w][nt][lane][e];
+            const int row = row0 + gq + (e >> 1) * 8, n = nt * 8 + t4 * 2 + (e & 1);
+            if (n < a.M && row < a.N) Y[(size_t)n * ldy + row - nb] = v;
+        }
+}
+
 // out[t, n] = rb(sum_k w[t, k] * y[t * 8 + k, n]) (F32).
 __global__ void moe_combine_kernel(const float* __restrict__ y, const float* __restrict__ sel_w, int T, float* out) {
     pdl_launch_dependents();
@@ -2363,6 +2492,22 @@ cudaError_t quench6k_ink_nv4_gemm(const void* xs, const uint64_t* w_ptr, const u
     else if (bm == 64) e = act ? go(nv4_gemm_kernel<64, 32, true>, 64, 32) : go(nv4_gemm_kernel<64, 32, false>, 64, 32);
     else return cudaErrorInvalidValue;
     if (e != cudaSuccess) return e;
+    SQ_RETURN_LAUNCH();
+}
+
+// The skinny tensor-core GEMM (INT8 group-64 weights): segments as quench6k_gemv_seg (nseg 1: x0 / y0).
+cudaError_t quench6k_ink_skinny_i8(int M, const void* x0, const void* x1, const void* x2, int ldx, const void* w, const float* scale, float* y0,
+                                   float* y1, float* y2, int ldy0, int ldy1, int ldy2, int end0, int end1, int nseg, int N, int K,
+                                   cudaStream_t st) {
+    if (M == 0) return cudaSuccess;
+    if (M > 16 || K % 64 != 0 || ldx % 8 != 0 || end0 % 16 != 0 || end1 % 16 != 0) return cudaErrorInvalidValue;
+    SkinnyArgs a{static_cast<const int8_t*>(w), scale, {static_cast<const bf16*>(x0), static_cast<const bf16*>(x1 ? x1 : x0),
+                 static_cast<const bf16*>(x2 ? x2 : x0)}, {y0, y1, y2}, {ldy0, ldy1, ldy2}, {end0, end1}, nseg, ldx, M, N, K};
+    const unsigned grid = (N + 15) / 16;
+    if (M <= 8)
+        SQ_CHECK_LAUNCH(sq_launch(skinny_i8_kernel<1>, grid, SK_W * 32, 0, st, a));
+    else
+        SQ_CHECK_LAUNCH(sq_launch(skinny_i8_kernel<2>, grid, SK_W * 32, 0, st, a));
     SQ_RETURN_LAUNCH();
 }
 
