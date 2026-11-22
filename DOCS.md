@@ -214,25 +214,39 @@ These models run in a scheduler of their own over their engines (`crates/cli/src
 the same policies:
 
 - Up to `--slots` requests at once, each slot with its own sequence state and cached prefix. A request
-  goes to the free slot whose state holds the longest prefix of its prompt, else to the least recently
-  used one. `--context` is each slot's capacity (prompt + completion).
+  goes to the free slot whose conversation it continues (the slot holds the most of its prompt, and at
+  least half of what the slot holds is that prompt's beginning), else to the least recently used one:
+  a conversation's slot is not taken by another that only shares its beginning (a system prompt, a
+  template header). `--context` is each slot's capacity (prompt + completion).
 - One prompt is prefilled at a time, in the engine's chunks; while other requests decode, in slices of
   about 4096 tokens that take turns with their steps by `--prefill-share`.
 - The decoding requests step together, each with its own drafts (the checkpoint's drafter as each
   request's own draft policy decides, or prompt lookup; request field `mtp`) and sampling. A request's
   tokens never depend on which others share its steps: concurrent greedy requests give the same text
   as alone.
+- Drafts under batching: a batched step's time is shared out by what each sequence costs it (the
+  scheduler fits step time = a + b x rows over recent steps: each sequence pays the fixed part split
+  evenly plus its own rows), which is the time its draft policy sees; and while several sequences step
+  together, a sequence verifies no more drafts than pay for their rows at the batch's plain rate
+  (seqs / (a + b seqs) tokens per second), from its own acceptance rate. Alone, the draft policy
+  decides as before.
 - Memory: a request starts when its plan fits next to the running requests' plans in free device
-  memory and what idle slots hold; when the device is full, the least recently used idle slot gives
-  its memory up (its cached prefix is lost; these models have no context store). A request that does
-  not fit waits for running ones to finish; one that does not fit with nothing else on the device
-  fails. Cancellation, stop tokens and budgets are per request, and an error in one slot resets only
-  that slot.
-- For now each slot's state holds its whole `--context` from the start (made when the slot first
-  serves a request), and a step runs the slots' sequences one after another: so `--slots` states of
-  `--context` positions must fit next to each other for all slots to run at once, and concurrent
-  requests share the GPU's time rather than speeding up together. The server log prints each state's
-  size (`slot N: state X GiB for N tokens`).
+  memory and what idle slots hold; when the device is full, idle slots give memory up, least recently
+  used first (memory mapped past what a slot holds, then its whole context: its cached prefix is lost;
+  these models have no context store). A request that does not fit waits for running ones to finish.
+  With growable states the per-request limit is device memory as well as `--context`: a prompt that
+  cannot fit even alone fails at once, and a request that runs out of memory with nothing else
+  holding it fails, both with the positions one sequence fits on the device. Cancellation, stop
+  tokens and budgets are per request, and an error in one slot resets only that slot.
+- Hy4-flash: one batched step (`forward_batch`) and one drafter pass (`draft_batch`) for all decoding
+  sequences, and growable states (caches mapped as a sequence grows: about 17 KB per position plus
+  about 106 MB per sequence). With the weights loaded, about 4.5 GB remain on a 96 GB card: some
+  260K positions for one sequence, or 27K each for eight.
+- Inkling 2 and Flint for now: each slot's state holds its whole `--context` from the start (made when
+  the slot first serves a request), and a step runs the slots' sequences one after another, so
+  `--slots` states of `--context` positions must fit next to each other for all slots to run at
+  once, and concurrent requests share the GPU's time rather than speeding up together. The server log
+  prints each state's size (`slot N: state X GiB for N tokens`).
 
 ## HTTP API
 

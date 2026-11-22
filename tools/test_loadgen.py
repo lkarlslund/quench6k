@@ -29,6 +29,8 @@ class Fake(http.server.BaseHTTPRequestHandler):
     late_progress = False  # no progress chunk at the prefill's start (as the one-sequence loops)
     seen = {}  # messages JSON prefix -> prompt tokens, for cached_tokens
     bodies = []
+    unloads = 0
+    no_unload = False  # POST /v1/unload answers 404
 
     def log_message(self, *a):
         pass
@@ -52,6 +54,13 @@ class Fake(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         cls = type(self)
+        if self.path == "/v1/unload":
+            if cls.no_unload:
+                return self.send_json(404, {"error": {"message": "not found"}})
+            with cls.lock:
+                cls.unloads += 1
+                cls.seen = {}
+            return self.send_json(200, {"status": "unloaded"})
         with cls.lock:
             cls.bodies.append(body)
             if cls.blocked > 0:
@@ -108,6 +117,7 @@ class Fake(http.server.BaseHTTPRequestHandler):
 class Server:
     def __enter__(self):
         Fake.blocked, Fake.diverge, Fake.seen, Fake.bodies, Fake.inflight = 0, False, {}, [], 0
+        Fake.unloads, Fake.no_unload = 0, False
         Fake.late_progress = False
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fake)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -213,6 +223,19 @@ class AgainstFake(unittest.TestCase):
             rc, out = run_main(args)
             self.assertEqual(rc, 0, out)
             self.assertIn("3/3 conversations identical", out)
+            # A system prompt per conversation, the cache dropped between the phases: both phases reuse
+            # the same prefixes.
+            self.assertEqual(Fake.unloads, 1)
+            systems = {b["messages"][0]["content"] for b in Fake.bodies if "messages" in b}
+            self.assertEqual(len(systems), 3)
+            self.assertNotIn("served from cache differently", out)
+        with Server() as s:
+            # No unload endpoint and no isolation: the second phase finds the first's prompts cached.
+            Fake.no_unload = True
+            rc, out = run_main(["--url", s.url] + args[2:] + ["--shared-system"])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("could not unload", out)
+            self.assertIn("served from cache differently in the two phases", out)
         with Server() as s:
             Fake.diverge = True
             args[1] = s.url

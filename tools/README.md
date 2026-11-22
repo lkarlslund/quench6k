@@ -42,8 +42,11 @@ kernels only.
   percentiles, and the reused share of prompt tokens. `consistency` runs each conversation alone, one
   after another, then all at once, and compares the texts turn by turn: the first differing turn and
   character with both versions around it, exit status 1 on any difference (batch invariance end to
-  end; the second phase may find the first phase's prompts in the server's cache, `--order
-  together-first` swaps them). `fill` grows `--conversations` concurrently to `--target` tokens each, a
+  end). Each conversation has a system prompt of its own and the model is unloaded between the
+  phases (`--shared-system`, `--between none` turn that off), so both phases start from an empty cache
+  and each turn reuses the same cached prefix: give the server at least as many slots as
+  conversations; turns served from cache differently in the two phases are counted. `--order
+  together-first` swaps the phases. `fill` grows `--conversations` concurrently to `--target` tokens each, a
   row per request (prompt, reused, new, wait, prefill, decode), then one short revisit turn per
   conversation, one at a time, showing how much of each the server kept. `--json FILE` appends JSON
   lines (a header with the corpus digest, one record per request, the summaries); `-v` prints a row

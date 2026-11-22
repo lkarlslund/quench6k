@@ -168,7 +168,10 @@ several at once, each turn appending the reply and a new task with filler so the
 a target. `sweep --levels 1,2,4,8` gives aggregate and per-conversation throughput and latency per
 concurrency, with the wait for a slot measured separately from prefill (a one-slot model shows its
 queue as waits that grow with the level while aggregate tok/s stays flat); `consistency` compares the
-greedy texts of each conversation alone and all at once, turn by turn; `fill` grows N conversations to
+greedy texts of each conversation alone and all at once, turn by turn (each conversation with a
+system prompt of its own, the model unloaded between the phases, so both reuse the same cached
+prefixes: prefill bits depend on where a chunk starts, so a different reuse is a different
+computation, not a batching effect); `fill` grows N conversations to
 a target each (e.g. 4 x 256K) and reports per turn how much of the prompt the server reused, then
 revisits each to show what was evicted. Qwen picks MTP draft widths from timing and its numerics
 depend on the width, so its greedy text varies with load: compare with the server started under

@@ -665,15 +665,18 @@ impl<E: SlotEngine> Sched<'_, E> {
                 let _ = job.tx.send(Msg::Error(msg));
                 continue;
             }
-            // The free slot holding the most of the prompt, else the least recently used one.
+            // The free slot whose conversation the request continues (it holds the most of the prompt,
+            // at least half of what it holds), else the least recently used one: a slot is not taken
+            // from another conversation for a shared beginning (a system prompt, a template header).
             let free = (0..self.cfg.slots)
                 .filter(|&i| self.reqs[i].is_none())
                 .max_by_key(|&i| {
-                    let common = self.states[i].as_ref().map_or(0, |st| {
+                    let (common, held) = self.states[i].as_ref().map_or((0, 0), |st| {
                         let h = self.e.history(st);
-                        h.iter().zip(&job.ids).take_while(|(a, b)| a == b).count()
+                        (h.iter().zip(&job.ids).take_while(|(a, b)| a == b).count(), h.len())
                     });
-                    (common.min(job.ids.len() - 1), Reverse(self.used[i]), Reverse(i))
+                    let continues = if 2 * common >= held { common.min(job.ids.len() - 1) } else { 0 };
+                    (continues, Reverse(self.used[i]), Reverse(i))
                 });
             let Some(slot) = free else {
                 break;
@@ -833,7 +836,9 @@ impl<E: SlotEngine> Sched<'_, E> {
             if computed >= limit {
                 return Ok(None);
             }
-            let end = (at + chunk).min(len);
+            // Chunks end at multiples of the chunk size (or the prompt's end) whatever was reused, so a
+            // prompt's prefill is the same computation however much of it was cached.
+            let end = ((at / chunk + 1) * chunk).min(len);
             let last = end == len;
             let ids = r.job.ids[at..end].to_vec();
             self.with_memory(slot, |e, st| e.reserve(st, end))?;
