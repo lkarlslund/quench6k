@@ -117,7 +117,7 @@ pub(super) fn schedule(
             // latest earlier occurrence of the last few tokens.
             let dspark = job.mtp && model.drafter.is_some();
             let lookup = job.mtp && !dspark && quench6k_cuda::variants::get("inkling.lookup", 1) != 0;
-            let mut policy = DraftPolicy::new(model.drafter.as_ref().map_or(0, |d| d.block - 1), 0.008, 0.0015, 0.0015);
+            let mut policy = DraftPolicy::new(model.drafter.as_ref().map_or(0, |d| d.block - 1), 0.0045, 0.0008, 0.0006);
             let mut row = st.last_t - 1;
             let mut hist = job.ids.clone();
             let mut generated = Vec::new();

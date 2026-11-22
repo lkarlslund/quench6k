@@ -46,12 +46,13 @@ impl DraftPolicy {
     }
 
     /// Drafts to verify in the next step. Every 8th step that would verify fewer than all of them verifies
-    /// all, so the estimates of later positions stay current.
+    /// one more, so the estimate of the next position (and of that width's cost) stays current without
+    /// paying for a full-width step.
     pub fn drafts(&self) -> usize {
         let best = (0..=self.drafts)
             .max_by(|&a, &b| self.rate(a).total_cmp(&self.rate(b)))
             .unwrap_or(0);
-        if best < self.drafts && self.steps % 8 == 7 { self.drafts } else { best }
+        if best < self.drafts && self.steps % 8 == 7 { best + 1 } else { best }
     }
 
     /// Records a step that verified `drafted` drafts, of which the first `accepted` were taken, in

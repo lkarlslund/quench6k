@@ -159,9 +159,9 @@ fn decode_draft(
     let fixed = std::env::var("QUENCH6K_INK_DRAFTS").ok().and_then(|v| v.parse::<usize>().ok());
     let mut policy = quench6k_engine::hy4::policy::DraftPolicy::new(
         model.drafter.as_ref().map_or(0, |d| d.block - 1),
-        0.008,
-        0.0015,
-        0.0015,
+        0.0045,
+        0.0008,
+        0.0006,
     );
     while out.len() < n && !stop(pending) {
         let t0 = Instant::now();
