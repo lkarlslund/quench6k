@@ -662,6 +662,16 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
         }
     }
     pdl_wait();
+    // This step's rows of the first tile.
+#pragma unroll
+    for (int u = 0; u < PRE; ++u) {
+        const int i = tid + u * AT_THREADS, j = i / (HD / 8), c = (i % (HD / 8)) * 8, key = k0 + j;
+        if (key < k1 && key >= first_new) {
+            const size_t row = (size_t)(key % a.cache_rows) * KVD + g * HD + c;
+            pk[u] = *reinterpret_cast<const uint4*>(a.kc + row);
+            pv[u] = *reinterpret_cast<const uint4*>(a.vc + row);
+        }
+    }
     for (int i = tid; i < GQ * HD; i += AT_THREADS) qs[i / HD][i % HD] = bf2f(a.q[(size_t)t * QD + (g * GQ + i / HD) * HD + i % HD]);
     if (tid < GQ * DREL) rs[tid / DREL][tid % DREL] = a.rel ? a.rel[((size_t)t * H + g * GQ + tid / DREL) * DREL + tid % DREL] : 0.0f;
     float m = -INFINITY, l = 0.0f;  // per head (warps 0..2, lane-uniform)
@@ -670,21 +680,15 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
     for (int kb = k0; kb < k1; kb += AT_T) {
         const int nk = min(AT_T, k1 - kb);
         __syncthreads();
+        // The tile's rows are in pk / pv (loaded during the previous tile); stage them, then start the next
+        // tile's loads so that they overlap this tile's scores and sums.
 #pragma unroll
         for (int u = 0; u < PRE; ++u) {
             const int i = tid + u * AT_THREADS;
             const int j = i / (HD / 8), c = (i % (HD / 8)) * 8;
             float kv[8], vv[8];
             if (j < nk) {
-                uint4 kr, vr;
-                if (kb == k0 && kb + j < first_new) {
-                    kr = pk[u];
-                    vr = pv[u];
-                } else {
-                    const size_t row = (size_t)((kb + j) % a.cache_rows) * KVD + g * HD + c;
-                    kr = *reinterpret_cast<const uint4*>(a.kc + row);
-                    vr = *reinterpret_cast<const uint4*>(a.vc + row);
-                }
+                const uint4 kr = pk[u], vr = pv[u];
                 const bf16* kp = reinterpret_cast<const bf16*>(&kr);
                 const bf16* vp = reinterpret_cast<const bf16*>(&vr);
 #pragma unroll
@@ -700,6 +704,17 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
             for (int e = 0; e < 8; ++e) {
                 ks[j][c + e] = kv[e];
                 vs[j][c + e] = vv[e];
+            }
+        }
+        if (kb + AT_T < k1) {
+#pragma unroll
+            for (int u = 0; u < PRE; ++u) {
+                const int i = tid + u * AT_THREADS, j = i / (HD / 8), c = (i % (HD / 8)) * 8, key = kb + AT_T + j;
+                if (key < k1) {
+                    const size_t row = (size_t)(key % a.cache_rows) * KVD + g * HD + c;
+                    pk[u] = *reinterpret_cast<const uint4*>(a.kc + row);
+                    pv[u] = *reinterpret_cast<const uint4*>(a.vc + row);
+                }
             }
         }
         __syncthreads();
