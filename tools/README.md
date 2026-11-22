@@ -16,6 +16,39 @@ kernels only.
 - `census.py`: per-kernel critical-path time of a decode or MTP round from an Nsight Systems trace, with
   the DRAM bandwidth sampled during each kernel; `--record` takes the trace too (dev/KBENCH.md "Census").
 - `ab.py`: interleaved A/B runs of a bench command, medians and ranges per variant (dev/KBENCH.md "A/B").
+- `loadgen.py`: synthetic multi-conversation load for an OpenAI-compatible server (Python standard
+  library only; dev/KBENCH.md "Serving load"). Each conversation is agent-like: turns of a task plus a
+  block of filler (the repository's tracked source and docs, or `--filler synthetic` generated text),
+  the reply appended before the next turn, so the prompt grows towards `--target` tokens at the last
+  turn. Prompts follow from `--seed` and the conversation's number; requests stream greedily
+  (temperature 0, thinking off) with `--max-tokens` per turn. Per request it reports the wait for a slot
+  (the first `return_progress` chunk), prompt tokens and how many were reused (`cached_tokens`), prefill
+  tok/s of the rest, time to first token, decode tok/s and the total; 503s (`model_switch_blocked` from
+  serve-models) are retried after their Retry-After, other errors (`context_length_exceeded`) end the
+  conversation. Servers that send progress only after prefill chunks (the one-sequence worker loops
+  today) get the wait extrapolated back from the chunks' rate (shown `~`), or with a single chunk none
+  (the wait is then part of the prefill), and a note says how many; decode tok/s needs at least 16
+  generated tokens (speculative decoding streams in bursts). Three modes:
+
+  ```
+  python3 tools/loadgen.py --url http://127.0.0.1:8000 --turns 3 --target 8192 sweep --levels 1,2,4,8
+  python3 tools/loadgen.py --url http://127.0.0.1:8000 --turns 3 --target 8192 consistency --conversations 8
+  python3 tools/loadgen.py --url http://127.0.0.1:8000 --turns 8 --target 262144 --max-tokens 32 fill --conversations 4
+  ```
+
+  `sweep` runs the same workload shape at each concurrency (fresh prompts per level, so one level's
+  cache does not serve the next) and prints a table of aggregate generated and prefill tok/s, median
+  decode tok/s per request, generated tok/s per conversation over its whole life, wait and TTFT
+  percentiles, and the reused share of prompt tokens. `consistency` runs each conversation alone, one
+  after another, then all at once, and compares the texts turn by turn: the first differing turn and
+  character with both versions around it, exit status 1 on any difference (batch invariance end to
+  end; the second phase may find the first phase's prompts in the server's cache, `--order
+  together-first` swaps them). `fill` grows `--conversations` concurrently to `--target` tokens each, a
+  row per request (prompt, reused, new, wait, prefill, decode), then one short revisit turn per
+  conversation, one at a time, showing how much of each the server kept. `--json FILE` appends JSON
+  lines (a header with the corpus digest, one record per request, the summaries); `-v` prints a row
+  per request in every mode; `--extra '{"mtp": false}'` merges fields into every request.
+  Tests (a fake server, no GPU): `python3 -m unittest tools/test_loadgen.py`.
 - `ref/hy4_ref.py`, `ref/hy4_fixtures.py`, `ref/hy4_compare.py`: the Hy4-flash reference (an independent
   PyTorch implementation after transformers' `hy_v4_flash`, streaming one layer of weights at a time and
   scoring several fixtures per pass), the Hy4-flash versions of the oracle fixtures, and a per-layer

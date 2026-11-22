@@ -160,6 +160,20 @@ prefill, and prefill tok/s over requests that prefilled at least 4,096 new token
 benchmark did: cold prefill went 3-5K -> 9-10K tok/s and decode ~225 -> 305-336 tok/s when the PLE
 table was stored uncompressed (2026-10-26).
 
+### Serving load
+
+`tools/loadgen.py` drives a running server from the outside with synthetic agent-like conversations
+(public filler only: the repository's tracked files or generated text, never real conversations):
+several at once, each turn appending the reply and a new task with filler so the contexts grow towards
+a target. `sweep --levels 1,2,4,8` gives aggregate and per-conversation throughput and latency per
+concurrency, with the wait for a slot measured separately from prefill (a one-slot model shows its
+queue as waits that grow with the level while aggregate tok/s stays flat); `consistency` compares the
+greedy texts of each conversation alone and all at once, turn by turn; `fill` grows N conversations to
+a target each (e.g. 4 x 256K) and reports per turn how much of the prompt the server reused, then
+revisits each to show what was evicted. Qwen picks MTP draft widths from timing and its numerics
+depend on the width, so its greedy text varies with load: compare with the server started under
+`QUENCH6K_POLICY=fixed=N`, where alone and together must match exactly. See tools/README.md.
+
 ### Census
 
 `tools/census.py` credits each kernel of an nsys trace (the command is in its docstring) with its
