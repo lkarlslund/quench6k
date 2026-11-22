@@ -27,6 +27,14 @@ pub const WINDOW: usize = 513;
 /// Sliding layers keep the last SWA_RING positions (power of two; at least WINDOW + the largest chunk).
 pub const SWA_RING: usize = 8192;
 pub const MAX_CHUNK: usize = 4096;
+/// Canonical prefill: every prompt position is computed in chunks of CANON_CHUNK tokens aligned to
+/// multiples of CANON_CHUNK from position 0 (the last chunk ends at the prompt's end), so a prompt's
+/// chunk geometry depends only on its length, and a cached prefix is reused only up to such a boundary
+/// (see [`FlintState::rewind`]): a sequence's bits then depend only on its tokens, not on what was
+/// cached before.
+pub const CANON_CHUNK: usize = MAX_CHUNK;
+/// Boundary snapshots a sequence keeps: the latest boundary and the lowest SNAPS - 1 others.
+const SNAPS: usize = 8;
 /// Most tokens of one sequence in a graph step (a speculative verification).
 pub const MAX_STEP: usize = SMALL;
 /// Most sequences of one batched step ([`FlintModel::forward_batch`]).
@@ -449,9 +457,6 @@ impl FlintModel {
 const RING_ROW: usize = HKV * HD * 2;
 /// Bytes per position of an FP8 cache's scales (K or V, FP32 [HKV]).
 const SCALE_ROW: usize = HKV * 4;
-/// Reach of a kept prefix p: the rings still hold [p - WINDOW, p) while nothing at or past p + REACH
-/// has been written.
-const REACH: usize = SWA_RING - WINDOW;
 
 fn full_row(fp8: bool) -> usize {
     if fp8 { HKV * HD } else { HKV * HD * 2 }
@@ -491,13 +496,16 @@ impl LayerCache {
     }
 }
 
-/// The sliding layers' rings at the end of a prompt (`pos` tokens): `rows` rows of each, K then V per
-/// sliding layer.
+/// The sliding layers' rows of the WINDOW positions before boundary `pos` (a multiple of CANON_CHUNK;
+/// fewer when pos < WINDOW): per sliding layer K rows, then V rows.
 struct Snap {
     pos: usize,
-    high: usize,
-    rows: usize,
     buf: DeviceBuffer,
+}
+
+/// Bytes of a boundary snapshot of `n` sliding layers.
+fn snap_bytes(n: usize) -> usize {
+    2 * n * WINDOW * RING_ROW
 }
 
 /// One sequence's state: its tokens and KV caches. Full-attention caches grow with the sequence (device
@@ -516,9 +524,16 @@ pub struct FlintState {
     /// One past the highest position ever written into the rings since they were last empty: rows of
     /// positions below `high - SWA_RING` may have been overwritten.
     high: usize,
-    /// The rings as they were after the first `pos` tokens (taken at a prompt's end), so that a
-    /// follow-up prompt diverging anywhere after it needs no full prefill.
-    snap: Option<Snap>,
+    /// The rings hold the last-written rows of positions [ring_lo, pos()).
+    ring_lo: usize,
+    /// The canonical frontier: a multiple of CANON_CHUNK below which every position was computed by
+    /// an aligned prefill chunk of CANON_CHUNK tokens (never by a smaller or unaligned step) and has
+    /// not been rewritten since. Every snapshot's boundary is at most the frontier.
+    canon: usize,
+    /// Boundary snapshots (at most SNAPS), taken when a canonical chunk reaches a boundary.
+    snaps: Vec<Snap>,
+    /// Snapshot buffers no longer used (kept for reuse: freeing device memory waits for the device).
+    spare: Vec<DeviceBuffer>,
 }
 
 impl FlintState {
@@ -565,7 +580,10 @@ impl FlintState {
             layers,
             mapped: 0,
             high: 0,
-            snap: None,
+            ring_lo: 0,
+            canon: 0,
+            snaps: Vec::new(),
+            spare: Vec::new(),
         })
     }
 
@@ -582,12 +600,18 @@ impl FlintState {
     }
 
     /// Device bytes the sliding rings take once a sequence reaches SWA_RING positions (below that,
-    /// RING_ROW per position and layer); a prompt-end snapshot of them takes as much again.
+    /// RING_ROW per position and layer). Boundary snapshots take [`FlintState::snapshot_bytes`] each.
     pub fn ring_bytes(model: &FlintModel) -> usize {
         model.layers.iter().filter(|l| l.sliding).count() * 2 * SWA_RING * RING_ROW
     }
 
-    /// Device memory this sequence holds: mapped caches and its ring snapshot.
+    /// Device bytes of one boundary snapshot (a sequence keeps up to 8, allocated as boundaries are
+    /// reached).
+    pub fn snapshot_bytes(model: &FlintModel) -> usize {
+        snap_bytes(model.layers.iter().filter(|l| l.sliding).count())
+    }
+
+    /// Device memory this sequence holds: mapped caches and its ring snapshots.
     pub fn device_bytes(&self) -> usize {
         let caches: usize = self
             .layers
@@ -599,7 +623,9 @@ impl FlintState {
                     + l.vs.as_ref().map_or(0, |b| b.mapped())
             })
             .sum();
-        caches + self.snap.as_ref().map_or(0, |s| s.buf.bytes())
+        caches
+            + self.snaps.iter().map(|s| s.buf.bytes()).sum::<usize>()
+            + self.spare.iter().map(|b| b.bytes()).sum::<usize>()
     }
 
     /// Positions [0, n) are backed in every cache (from what is mapped).
@@ -693,7 +719,8 @@ impl FlintState {
         }
         self.mapped = self.mapped_positions();
         if positions == 0 {
-            self.snap = None;
+            self.snaps.clear();
+            self.spare.clear();
         }
     }
 
@@ -718,9 +745,7 @@ impl FlintState {
     /// Forgets the cached tokens from `positions` on (their memory stays mapped).
     pub fn truncate(&mut self, positions: usize) {
         self.tokens.truncate(positions);
-        if self.snap.as_ref().is_some_and(|s| s.pos > positions) {
-            self.snap = None;
-        }
+        self.lower(self.tokens.len());
     }
 
     /// Forgets everything and releases all cache memory.
@@ -728,81 +753,151 @@ impl FlintState {
         self.trim(0);
     }
 
-    /// Keeps the longest prefix of `prompt` whose state is available and drops the rest of the cached
-    /// tokens; returns its length. The common prefix with the cached tokens is usable while the rings
-    /// still hold the WINDOW positions before it (rewriting a chunk of <= MAX_CHUNK positions never
-    /// overwrites a key its queries need); otherwise the ring snapshot is restored when it covers it.
+    /// The canonical frontier (see [`FlintState::rewind`]).
+    pub fn frontier(&self) -> usize {
+        self.canon
+    }
+
+    /// Boundaries of the kept ring snapshots, ascending.
+    pub fn snapshot_boundaries(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.snaps.iter().map(|s| s.pos).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Positions from `pos` on are (about to be) rewritten: lowers the frontier to the boundary at or
+    /// below `pos` and forgets the snapshots above it.
+    fn lower(&mut self, pos: usize) {
+        self.canon = self.canon.min(pos / CANON_CHUNK * CANON_CHUNK);
+        let canon = self.canon;
+        let mut i = 0;
+        while i < self.snaps.len() {
+            if self.snaps[i].pos > canon {
+                let sn = self.snaps.swap_remove(i);
+                self.spare.push(sn.buf);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Keeps the longest cached prefix of `prompt` that canonical prefill allows and drops the rest
+    /// of the cached tokens; returns its length B (0: start over): a multiple of CANON_CHUNK at most
+    /// the common prefix with the cached tokens, below the prompt's length (its last token is run
+    /// again for its logits) and at most the canonical frontier, for which the rings' WINDOW positions
+    /// before B are still in the rings or in a boundary snapshot (restored then). The caller computes
+    /// the prompt from B on in chunks of CANON_CHUNK tokens (the last one ends at the prompt's end),
+    /// so every position's bits are those of a cold prefill.
     pub fn rewind(&mut self, prompt: &[i32], s: &Stream) -> Result<usize> {
+        self.lower(self.tokens.len());
         let common = self
             .tokens
             .iter()
             .zip(prompt)
             .take_while(|(a, b)| a == b)
             .count();
-        let p = common.min(prompt.len().saturating_sub(1));
-        let live = if self.high <= p + REACH { p } else { 0 };
-        let snap = match &self.snap {
-            Some(sn) if sn.pos <= self.tokens.len() && p + REACH >= sn.high => p.min(sn.pos),
-            _ => 0,
-        };
-        let keep = if snap > live {
-            self.restore(s)?;
-            snap
-        } else {
-            live
-        };
-        self.truncate(keep);
-        Ok(keep)
+        let limit =
+            common.min(prompt.len().saturating_sub(1)).min(self.canon) / CANON_CHUNK * CANON_CHUNK;
+        let mut b = limit;
+        while b > 0 {
+            if b <= self.tokens.len() && self.ring_lo <= b - b.min(WINDOW) {
+                break;
+            }
+            if let Some(i) = self.snaps.iter().position(|sn| sn.pos == b) {
+                self.restore(i, s)?;
+                break;
+            }
+            b -= CANON_CHUNK;
+        }
+        self.truncate(b);
+        Ok(b)
     }
 
-    /// Remembers the rings at the current position (after a prompt).
-    pub fn snapshot(&mut self, _model: &FlintModel, s: &Stream) -> Result<()> {
-        let rows = self.high.min(SWA_RING);
-        let n = self.layers.iter().filter(|l| l.sliding).count();
-        let need = 2 * n * rows * RING_ROW;
-        let buf = match self.snap.take() {
-            Some(sn) if sn.buf.bytes() >= need => sn.buf,
-            _ => {
-                // Room for 1024 more rows, so that growing prompts reallocate rarely.
-                let rows = (rows + 1024).min(SWA_RING).max(1);
-                DeviceBuffer::new(2 * n * rows * RING_ROW)?
-            }
-        };
-        let bytes = rows * RING_ROW;
-        let mut at = 0u64;
-        for l in self.layers.iter().filter(|l| l.sliding) {
-            s.copy_d2d(buf.addr() + at, l.k.addr(), bytes)?;
-            s.copy_d2d(buf.addr() + at + bytes as u64, l.v.addr(), bytes)?;
-            at += 2 * bytes as u64;
-        }
-        self.snap = Some(Snap {
-            pos: self.tokens.len(),
-            high: self.high,
-            rows,
-            buf,
-        });
+    /// Prefix reuse needs no prompt-end snapshot any more (boundary snapshots are taken as canonical
+    /// chunks reach them); kept for the scheduler's API.
+    pub fn snapshot(&mut self, _model: &FlintModel, _s: &Stream) -> Result<()> {
         Ok(())
     }
 
-    fn restore(&mut self, s: &Stream) -> Result<()> {
-        let Some(sn) = &self.snap else {
-            return Ok(());
-        };
-        let (rows, high) = (sn.rows, sn.high);
-        let bytes = rows * RING_ROW;
+    /// The ring rows of the last `n` positions before `e`: (first row, count) runs in position order.
+    fn ring_runs(e: usize, n: usize) -> Vec<(usize, usize)> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let first = (e - n) % SWA_RING;
+        if first + n <= SWA_RING {
+            vec![(first, n)]
+        } else {
+            vec![(first, SWA_RING - first), (0, n - (SWA_RING - first))]
+        }
+    }
+
+    /// Copies the rings' rows of the WINDOW positions before `e` into `buf` (`save`) or back.
+    fn copy_window(&self, e: usize, buf: u64, save: bool, s: &Stream) -> Result<()> {
+        let n = e.min(WINDOW);
+        let mut at = buf;
+        for l in self.layers.iter().filter(|l| l.sliding) {
+            for ring in [l.k.addr(), l.v.addr()] {
+                let mut part = at;
+                for (first, count) in Self::ring_runs(e, n) {
+                    let r = ring + (first * RING_ROW) as u64;
+                    let bytes = count * RING_ROW;
+                    if save {
+                        s.copy_d2d(part, r, bytes)?;
+                    } else {
+                        s.copy_d2d(r, part, bytes)?;
+                    }
+                    part += bytes as u64;
+                }
+                at += (WINDOW * RING_ROW) as u64;
+            }
+        }
+        Ok(())
+    }
+
+    /// Restores the rings' rows before snapshot `i`'s boundary.
+    fn restore(&mut self, i: usize, s: &Stream) -> Result<()> {
+        let b = self.snaps[i].pos;
+        let rows = b.min(SWA_RING) * RING_ROW;
         for l in self.layers.iter_mut().filter(|l| l.sliding) {
-            l.k.map_to(bytes)?;
-            l.v.map_to(bytes)?;
+            if l.k.mapped() < rows {
+                l.k.map_to(rows)?;
+            }
+            if l.v.mapped() < rows {
+                l.v.map_to(rows)?;
+            }
         }
         self.clear_new(s)?;
-        let sn = self.snap.as_ref().unwrap();
-        let mut at = 0u64;
-        for l in self.layers.iter().filter(|l| l.sliding) {
-            s.copy_d2d(l.k.addr(), sn.buf.addr() + at, bytes)?;
-            s.copy_d2d(l.v.addr(), sn.buf.addr() + at + bytes as u64, bytes)?;
-            at += 2 * bytes as u64;
+        self.copy_window(b, self.snaps[i].buf.addr(), false, s)?;
+        self.ring_lo = b - b.min(WINDOW);
+        self.high = self.high.max(b);
+        Ok(())
+    }
+
+    /// Positions [start, end) were written (tokens fed at `start`; rows past the kept tokens count
+    /// too): advances the frontier when this was an aligned chunk of CANON_CHUNK tokens right at it,
+    /// and then snapshots the rings at the new boundary (skipped when no memory is left for it).
+    fn wrote(&mut self, start: usize, end: usize, s: &Stream) -> Result<()> {
+        self.high = self.high.max(end);
+        self.ring_lo = self.ring_lo.min(start).max(end.saturating_sub(SWA_RING));
+        if start == self.canon && start.is_multiple_of(CANON_CHUNK) && end - start == CANON_CHUNK {
+            self.canon = end;
+            let n = self.layers.iter().filter(|l| l.sliding).count();
+            // A spare or new buffer, else the highest boundary's (the previous latest; the lowest
+            // ones stay).
+            let buf = if self.snaps.len() >= SNAPS {
+                let i = (0..self.snaps.len()).max_by_key(|&i| self.snaps[i].pos).unwrap();
+                Some(self.snaps.swap_remove(i).buf)
+            } else if let Some(b) = self.spare.pop() {
+                Some(b)
+            } else {
+                DeviceBuffer::new(snap_bytes(n)).ok()
+            };
+            if let Some(buf) = buf {
+                self.copy_window(end, buf.addr(), true, s)?;
+                self.snaps.push(Snap { pos: end, buf });
+            }
         }
-        self.high = high;
         Ok(())
     }
 
@@ -811,10 +906,6 @@ impl FlintState {
         self.layers[li].kv()
     }
 
-    /// Records that positions [start, end) were written.
-    fn wrote(&mut self, end: usize) {
-        self.high = self.high.max(end);
-    }
 }
 
 /// The single-sequence server loop's handle on a [`FlintState`] (its constructor without a stream).
@@ -1038,12 +1129,12 @@ pub fn forward(
     );
     seq.reserve(start + t)?;
     seq.clear_new(s)?;
+    seq.lower(start);
     s.upload_to(ws.tok, tokens)?;
     s.upload_to(ws.start, &[start as i32])?;
     body(model, ws, seq, t, Some(start), all_logits, s)?;
     seq.tokens.extend_from_slice(tokens);
-    seq.wrote(start + t);
-    Ok(())
+    seq.wrote(start, start + t, s)
 }
 
 /// One decode token (a batched step of one sequence); logits in `ws.logits`.
@@ -1120,6 +1211,8 @@ impl FlintModel {
         }
         for st in states.iter_mut() {
             st.clear_new(s)?;
+            let pos = st.tokens.len();
+            st.lower(pos);
         }
         // Rows and cache tables into pinned staging (after the previous upload has been consumed).
         ws.io_done.synchronize()?;
@@ -1159,9 +1252,9 @@ impl FlintModel {
         }
         ws.graphs[&(rows, fp8)].launch(s)?;
         for (st, t) in states.iter_mut().zip(tokens) {
+            let start = st.tokens.len();
             st.tokens.extend_from_slice(t);
-            let end = st.tokens.len();
-            st.wrote(end);
+            st.wrote(start, start + t.len(), s)?;
         }
         Ok(())
     }
@@ -1636,7 +1729,8 @@ pub fn argmax(ws: &Workspace, rows: usize, s: &Stream) -> Result<Vec<i32>> {
     s.download::<i32>(ws.argmax_out, rows)
 }
 
-/// Prefills `prompt` beyond the reusable prefix in chunks; logits of the last token are left in `ws`.
+/// Rewinds `seq` to the canonical reuse point of `prompt` ([`FlintState::rewind`]) and prefills the
+/// rest ([`FlintModel::prefill`]); logits of the last token are left in `ws`. Returns the reuse point.
 pub fn prefill(
     model: &FlintModel,
     ws: &Workspace,
@@ -1645,12 +1739,23 @@ pub fn prefill(
     s: &Stream,
 ) -> Result<usize> {
     let keep = seq.rewind(prompt, s)?;
-    let mut at = keep;
-    while at < prompt.len() {
-        let end = (at + MAX_CHUNK).min(prompt.len());
-        forward(model, ws, seq, &prompt[at..end], false, s)
-            .with_context(|| format!("prefill chunk at {at}"))?;
-        at = end;
-    }
+    model.prefill(seq, ws, s, &prompt[keep..])?;
     Ok(keep)
+}
+
+impl FlintModel {
+    /// Canonical prefill of `tokens` at seq.pos() (after [`FlintState::rewind`]): chunks end at
+    /// multiples of [`CANON_CHUNK`] (absolute positions) and at the tokens' end; logits of the last
+    /// token are left in `ws` (row 0).
+    pub fn prefill(&self, seq: &mut FlintState, ws: &Workspace, s: &Stream, tokens: &[i32]) -> Result<()> {
+        let mut at = 0;
+        while at < tokens.len() {
+            let start = seq.pos();
+            let n = (CANON_CHUNK - start % CANON_CHUNK).min(tokens.len() - at);
+            forward(self, ws, seq, &tokens[at..at + n], false, s)
+                .with_context(|| format!("prefill chunk at {start}"))?;
+            at += n;
+        }
+        Ok(())
+    }
 }

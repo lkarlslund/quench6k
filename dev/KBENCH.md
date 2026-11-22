@@ -771,3 +771,42 @@ last turn, so that turn restores the boundary snapshot): every turn's prompt log
 tokens are bit-identical in the three. Reuse stops at the last 2048 boundary the previous turns
 prefilled whole: warm turn 2 reused 4096 of 5623 cached tokens (1527 recomputed beyond the new ones),
 turn 3 6144 of 6344 (200).
+
+## 2026-11-22: canonical prefill for Hy4-flash and Recursive Flint
+
+`quench6k hy4 canon-check` / `quench6k flint canon-check --model M --text DOCS.md dev/KBENCH.md`: three
+conversations of three turns (a shared system prompt of 3109 / 6181 tokens, user turns of 500 to 950
+tokens from the text, 12 greedy reply tokens per turn). Cold computes every turn on a fresh sequence and
+defines the replies; warm runs each conversation on one sequence, decoding in verification steps of up to
+3 tokens whose last draft is wrong (so rows past the kept position are written and dropped), and before
+the last turn feeds RING + CANON_CHUNK tokens in unaligned chunks (a discarded generation), so that turn
+restores the boundary snapshot; cross runs the turns turn by turn on two sequences, so most turns land on
+a sequence that held another conversation (reuse up to the shared system prompt's boundary, from a live
+ring or a lower snapshot), with a third sequence stepping after every prefill chunk and decoding batched
+with the turn. Every turn's rows (the prompt's last and each reply token's: FNV/SipHash of the F32 logits)
+and tokens are compared with cold.
+
+Result (450 W): all 18 warm and cross turns bit-identical to cold for both models. Reuse and extra prefill
+(tokens recomputed beyond what reusing the whole cached common prefix would have recomputed):
+
+| | turn 1 (warm) | turn 2 (warm, snapshot restored) | cross turns |
+|---|---|---|---|
+| Hy4 (C = 2048) | reused 2048 of 3620..3882, +1572..1834 | reused 4096 of 4229..4753, +133..657 | reused 2048 of 3109, +1061 |
+| Flint (C = 4096) | reused 4096 of 6692..6954, +2596..2858 | reused 4096 of 7301..7825, +3205..3729 | reused 4096 of 6181, +2085 |
+
+The extra cost per turn is the cached tokens past the last whole chunk: up to C - 1 prompt tokens plus the
+previous reply, on average about C / 2 (Hy4 about 0.26 s at 3.9K tokens/s, Flint about 0.1 s at 19.7K).
+Halving the chunk would halve it but slows all prefill: 4096 Hy4 tokens prefill at 3922 tokens/s in chunks
+of 2048 and 3212 in chunks of 1024 (-18%); 8192 Flint tokens at 19,660 in chunks of 4096 and 17,306 in
+chunks of 2048 (-12%). So C stays the largest chunk each engine runs (Hy4's ring holds a 2048-token chunk
+plus the window).
+
+A row's bits do not depend on its chunk's length in either engine: positions 0..776 and 2048..2824 (Flint:
+4096..4872) computed as a 776-token chunk or as the start of a full chunk (then truncated) give a
+bit-identical next-token row. Only the chunk's start matters (attention splits and selection depend on
+where a chunk begins), which canonical geometry fixes.
+
+Snapshot costs: Hy4 copies 30 sliding layers x 512 rows x 1152 bytes (17.7 MB) per 2048-token chunk, Flint
+35 x 2 x 513 x 1 KiB (35 MiB) per 4096-token chunk, both as device copies on the prefill's stream (tens of
+microseconds of copy per chunk of hundreds of milliseconds); the prompt-end snapshots they replace copied
+17.7 MB (Hy4) and up to 560 MiB (Flint) per prompt.
