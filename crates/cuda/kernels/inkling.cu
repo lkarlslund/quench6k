@@ -538,6 +538,63 @@ struct QPrep {
     float* sink;
 };
 
+// One query head hh of row `row` (a warp; lane: channels lane * 4 .. + 3): the scaled, L2-clipped query
+// (log-scaled by tau) and, in lanes < DREL, its relative state likewise.
+SQ_DEVICE void q_head(const QPrep& qp, const float* row, int hh, int lane, const float (&qs)[4], float rsc, float tau, bf16 (&q)[4],
+                      float& rel) {
+    float vq[4], ss = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        vq[i] = row[hh * HD + lane * 4 + i] * qs[i];
+        ss += vq[i] * vq[i];
+    }
+    const float c = fminf(qp.qclip / (sqrtf(warp_sum(ss)) + 1e-6f), 1.0f);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) q[i] = f2bf(vq[i] * c * tau);
+    const float r = lane < DREL ? row[2 * QD + hh * DREL + lane] * rsc : 0.0f;
+    const float rc = fminf(qp.rclip / (sqrtf(warp_sum(r * r)) + 1e-6f), 1.0f);
+    rel = r * rc * tau;
+}
+
+// Key or value head h of step row t (position pos), a warp (lane: channels lane * 4 .. + 3). kv_pre: the
+// taps and earlier steps' ring rows (before the dependency wait); kv_finish: this step's projection rows,
+// the convolution and the head's clip (keys) or RMS normalization (values); with `store`, the row joins
+// the ring.
+SQ_DEVICE void kv_pre(const KvConv& a, int t, int pos, int h, int lane, int ring_rows, float (&xs)[4][CONVK], float (&w)[4][CONVK]) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int c = h * HD + lane * 4 + i;
+#pragma unroll
+        for (int lag = 0; lag < CONVK; ++lag) {
+            xs[i][lag] = t - lag < 0 && pos - lag >= 0 ? bf2f(a.ring[(size_t)((pos - lag) % ring_rows) * KVD + c]) : 0.0f;
+            // Static taps by lag (tap 0 = current position).
+            w[i][lag] = a.dyn ? bf2f(a.static_w[lag * KVD + c]) : bf2f(a.conv[c * CONVK + CONVK - 1 - lag]);
+        }
+    }
+}
+
+SQ_DEVICE void kv_finish(const KvConv& a, bool key, int t, int pos, int h, int lane, int ring_rows, float clip, float (&xs)[4][CONVK],
+                         const float (&w)[4][CONVK], bool store, bf16 (&out)[4]) {
+    float y[4], ss = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int c = h * HD + lane * 4 + i;
+#pragma unroll
+        for (int lag = 0; lag < CONVK; ++lag)
+            if (t - lag >= 0) xs[i][lag] = rb(a.lin[(size_t)(t - lag) * a.ld + c]);
+        if (store) a.ring[(size_t)(pos % ring_rows) * KVD + c] = f2bf(xs[i][0]);
+        float acc = 0.0f;
+#pragma unroll
+        for (int lag = 0; lag < CONVK; ++lag) acc += (w[i][lag] + (a.dyn ? a.dyn[(size_t)t * a.ld + h * CONVK + lag] : 0.0f)) * xs[i][lag];
+        y[i] = (acc + xs[i][0]) / (a.dyn ? 3.0f : 2.2360679775f);  // sqrt(2 * 4 + 1), sqrt(4 + 1)
+        ss += y[i] * y[i];
+    }
+    ss = warp_sum(ss);
+    const float f = key ? fminf(clip / (sqrtf(ss) + 1e-6f), 1.0f) : rsqrtf(ss / HD + EPS);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) out[i] = f2bf(y[i] * f);
+}
+
 __global__ void __launch_bounds__(256) qkv_prep_kernel(QPrep qp, KvConv k, KvConv v, int ring_rows, int cache_rows, float clip,
                                                        const int* __restrict__ start_ptr) {
     pdl_launch_dependents();
@@ -559,54 +616,25 @@ __global__ void __launch_bounds__(256) qkv_prep_kernel(QPrep qp, KvConv k, KvCon
 #pragma unroll
         for (int u = 0; u < 3; ++u) {
             const int hh = h + 8 * u;
-            float vq[4], ss = 0.0f;
+            bf16 q[4];
+            float rel;
+            q_head(qp, row, hh, lane, qs[u], rsc[u], tau, q, rel);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                vq[i] = row[hh * HD + lane * 4 + i] * qs[u][i];
-                ss += vq[i] * vq[i];
-            }
-            const float c = fminf(qp.qclip / (sqrtf(warp_sum(ss)) + 1e-6f), 1.0f);
-#pragma unroll
-            for (int i = 0; i < 4; ++i) qp.q[(size_t)t * QD + hh * HD + lane * 4 + i] = f2bf(vq[i] * c * tau);
-            float r = lane < DREL ? row[2 * QD + hh * DREL + lane] * rsc[u] : 0.0f;
-            const float rc = fminf(qp.rclip / (sqrtf(warp_sum(r * r)) + 1e-6f), 1.0f);
-            if (lane < DREL) qp.rel[((size_t)t * H + hh) * DREL + lane] = r * rc * tau;
+            for (int i = 0; i < 4; ++i) qp.q[(size_t)t * QD + hh * HD + lane * 4 + i] = q[i];
+            if (lane < DREL) qp.rel[((size_t)t * H + hh) * DREL + lane] = rel;
             if (lane == 0) qp.sink[(size_t)t * H + hh] = row[2 * QD + H * DREL + hh];
         }
         return;
     }
     const KvConv& a = blockIdx.y == 0 ? k : v;
     float xs[4][CONVK], w[4][CONVK];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int c = h * HD + lane * 4 + i;
-#pragma unroll
-        for (int lag = 0; lag < CONVK; ++lag) {
-            xs[i][lag] = t - lag < 0 && pos - lag >= 0 ? bf2f(a.ring[(size_t)((pos - lag) % ring_rows) * KVD + c]) : 0.0f;
-            // Static taps by lag (tap 0 = current position).
-            w[i][lag] = a.dyn ? bf2f(a.static_w[lag * KVD + c]) : bf2f(a.conv[c * CONVK + CONVK - 1 - lag]);
-        }
-    }
+    kv_pre(a, t, pos, h, lane, ring_rows, xs, w);
     pdl_wait();
-    float y[4], ss = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int c = h * HD + lane * 4 + i;
-#pragma unroll
-        for (int lag = 0; lag < CONVK; ++lag)
-            if (t - lag >= 0) xs[i][lag] = rb(a.lin[(size_t)(t - lag) * a.ld + c]);
-        a.ring[(size_t)(pos % ring_rows) * KVD + c] = f2bf(xs[i][0]);
-        float acc = 0.0f;
-#pragma unroll
-        for (int lag = 0; lag < CONVK; ++lag) acc += (w[i][lag] + (a.dyn ? a.dyn[(size_t)t * a.ld + h * CONVK + lag] : 0.0f)) * xs[i][lag];
-        y[i] = (acc + xs[i][0]) / (a.dyn ? 3.0f : 2.2360679775f);  // sqrt(2 * 4 + 1), sqrt(4 + 1)
-        ss += y[i] * y[i];
-    }
-    ss = warp_sum(ss);
-    const float f = blockIdx.y == 0 ? fminf(clip / (sqrtf(ss) + 1e-6f), 1.0f) : rsqrtf(ss / HD + EPS);
+    bf16 out[4];
+    kv_finish(a, blockIdx.y == 0, t, pos, h, lane, ring_rows, clip, xs, w, true, out);
     bf16* dst = a.cache + (size_t)(pos % cache_rows) * KVD + h * HD + lane * 4;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) dst[i] = f2bf(y[i] * f);
+    for (int i = 0; i < 4; ++i) dst[i] = out[i];
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -631,51 +659,29 @@ struct AttnArgs {
     float* part;
 };
 
-__global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
-    pdl_launch_dependents();
-    __shared__ float qs[GQ][HD];
-    __shared__ float rs[GQ][DREL];
-    __shared__ float ks[AT_T][HD + 1];
-    __shared__ float vs[AT_T][HD];
-    __shared__ float ps[GQ][AT_T];
-    __shared__ float scl[GQ];
-    const int t = blockIdx.x, g = blockIdx.y, split = blockIdx.z, splits = gridDim.z, tid = threadIdx.x;
-    const int lane = tid & 31, warp = tid >> 5;
-    const int p = *a.start + t;
-    const int hi = a.block ? *a.start + a.block - 1 : p;
-    const int lo = a.window ? max(0, hi - a.window + 1) : 0;
-    const int n = hi + 1 - lo;
-    const int per = max(a.min_keys, (n + splits - 1) / splits);
-    const int k0 = lo + split * per, k1 = min(hi + 1, k0 + per);
-    // The first tile's keys and values of earlier steps' positions (before start: no kernel of this step
-    // writes them) load before the dependency wait; this step's rows after it.
-    constexpr int PRE = AT_T * (HD / 8) / AT_THREADS;  // 4 chunks a thread
-    uint4 pk[PRE], pv[PRE];
-    const int first_new = *a.start;
-#pragma unroll
-    for (int u = 0; u < PRE; ++u) {
-        const int i = tid + u * AT_THREADS, j = i / (HD / 8), c = (i % (HD / 8)) * 8, key = k0 + j;
-        if (key < k1 && key < first_new) {
-            const size_t row = (size_t)(key % a.cache_rows) * KVD + g * HD + c;
-            pk[u] = *reinterpret_cast<const uint4*>(a.kc + row);
-            pv[u] = *reinterpret_cast<const uint4*>(a.vc + row);
-        }
-    }
-    pdl_wait();
-    // This step's rows of the first tile.
-#pragma unroll
-    for (int u = 0; u < PRE; ++u) {
-        const int i = tid + u * AT_THREADS, j = i / (HD / 8), c = (i % (HD / 8)) * 8, key = k0 + j;
-        if (key < k1 && key >= first_new) {
-            const size_t row = (size_t)(key % a.cache_rows) * KVD + g * HD + c;
-            pk[u] = *reinterpret_cast<const uint4*>(a.kc + row);
-            pv[u] = *reinterpret_cast<const uint4*>(a.vc + row);
-        }
-    }
-    for (int i = tid; i < GQ * HD; i += AT_THREADS) qs[i / HD][i % HD] = bf2f(a.q[(size_t)t * QD + (g * GQ + i / HD) * HD + i % HD]);
-    if (tid < GQ * DREL) rs[tid / DREL][tid % DREL] = a.rel ? a.rel[((size_t)t * H + g * GQ + tid / DREL) * DREL + tid % DREL] : 0.0f;
+// Shared memory of one attention range (see attn_range).
+struct AtSmem {
+    float qs[GQ][HD];
+    float rs[GQ][DREL];
+    float ks[AT_T][HD + 1];
+    float vs[AT_T][HD];
+    float ps[GQ][AT_T];
+    float scl[GQ];
+    float ml[GQ][2];
+};
+constexpr int AT_PRE = AT_T * (HD / 8) / AT_THREADS;  // 4 chunks of a tile a thread
+
+// Keys k0 .. k1 - 1 of query position p (KV head g) against the queries in sm.qs / sm.rs: per head the
+// running maximum and sum (sm.ml) and o[i] (channel threadIdx.x, unnormalized). pk / pv hold the first
+// tile's rows (chunk i = tid + u * AT_THREADS: key i / 16, channels (i % 16) * 8); load(key, c, k, v)
+// fetches a later tile's.
+template <typename Load>
+SQ_DEVICE void attn_range(AtSmem& sm, const bf16* __restrict__ proj, bool rel, int p, int k0, int k1, uint4 (&pk)[AT_PRE],
+                          uint4 (&pv)[AT_PRE], Load load, float (&o)[GQ]) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     float m = -INFINITY, l = 0.0f;  // per head (warps 0..2, lane-uniform)
-    float o[GQ] = {0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int i = 0; i < GQ; ++i) o[i] = 0.0f;
     const float scale = rsqrtf((float)HD);
     for (int kb = k0; kb < k1; kb += AT_T) {
         const int nk = min(AT_T, k1 - kb);
@@ -683,7 +689,7 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
         // The tile's rows are in pk / pv (loaded during the previous tile); stage them, then start the next
         // tile's loads so that they overlap this tile's scores and sums.
 #pragma unroll
-        for (int u = 0; u < PRE; ++u) {
+        for (int u = 0; u < AT_PRE; ++u) {
             const int i = tid + u * AT_THREADS;
             const int j = i / (HD / 8), c = (i % (HD / 8)) * 8;
             float kv[8], vv[8];
@@ -702,19 +708,15 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
             }
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                ks[j][c + e] = kv[e];
-                vs[j][c + e] = vv[e];
+                sm.ks[j][c + e] = kv[e];
+                sm.vs[j][c + e] = vv[e];
             }
         }
         if (kb + AT_T < k1) {
 #pragma unroll
-            for (int u = 0; u < PRE; ++u) {
+            for (int u = 0; u < AT_PRE; ++u) {
                 const int i = tid + u * AT_THREADS, j = i / (HD / 8), c = (i % (HD / 8)) * 8, key = kb + AT_T + j;
-                if (key < k1) {
-                    const size_t row = (size_t)(key % a.cache_rows) * KVD + g * HD + c;
-                    pk[u] = *reinterpret_cast<const uint4*>(a.kc + row);
-                    pv[u] = *reinterpret_cast<const uint4*>(a.vc + row);
-                }
+                if (key < k1) load(key, c, pk[u], pv[u]);
             }
         }
         __syncthreads();
@@ -724,13 +726,13 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
             if (j < nk) {
                 float acc = 0.0f;
 #pragma unroll 16
-                for (int d = 0; d < HD; ++d) acc += qs[warp][d] * ks[j][d];
+                for (int d = 0; d < HD; ++d) acc += sm.qs[warp][d] * sm.ks[j][d];
                 s = acc * scale;
                 const int dist = p - key;
-                if (a.rel && dist >= 0 && dist < EXT) {
+                if (rel && dist >= 0 && dist < EXT) {
                     float b = 0.0f;
 #pragma unroll
-                    for (int r = 0; r < DREL; ++r) b += rs[warp][r] * bf2f(a.proj[r * EXT + dist]);
+                    for (int r = 0; r < DREL; ++r) b += sm.rs[warp][r] * bf2f(proj[r * EXT + dist]);
                     s += b;
                 }
             }
@@ -739,31 +741,86 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
             const float c = __expf(m - mx);
             l = l * c + warp_sum(pr);
             m = mx;
-            ps[warp][j] = pr;
-            if (lane == 0) scl[warp] = c;
+            sm.ps[warp][j] = pr;
+            if (lane == 0) sm.scl[warp] = c;
         }
         __syncthreads();
+        // Each head's sum in key order; the heads' chains interleaved (and a full tile unrolled) so that
+        // the shared-memory loads and FMAs overlap.
+        float acc[GQ];
 #pragma unroll
-        for (int i = 0; i < GQ; ++i) {
-            float acc = o[i] * scl[i];
-            for (int j = 0; j < nk; ++j) acc += ps[i][j] * vs[j][tid];
-            o[i] = acc;
+        for (int i = 0; i < GQ; ++i) acc[i] = o[i] * sm.scl[i];
+        auto pv = [&](int j) {
+            const float v = sm.vs[j][tid];
+#pragma unroll
+            for (int i = 0; i < GQ; ++i) acc[i] += sm.ps[i][j] * v;
+        };
+        if (nk == AT_T) {
+#pragma unroll
+            for (int j = 0; j < AT_T; ++j) pv(j);
+        } else {
+            for (int j = 0; j < nk; ++j) pv(j);
         }
+#pragma unroll
+        for (int i = 0; i < GQ; ++i) o[i] = acc[i];
     }
     __syncthreads();
     // Warps 0..2 hold their head's (m, l); share them.
-    __shared__ float ml[GQ][2];
     if (warp < GQ && lane == 0) {
-        ml[warp][0] = m;
-        ml[warp][1] = l;
+        sm.ml[warp][0] = m;
+        sm.ml[warp][1] = l;
     }
     __syncthreads();
+}
+
+// The key range of split `split` of `splits` for query position p: keys up to hi = p (or, with `block`,
+// start + block - 1), from max(0, hi - window + 1) (window 0: from 0), ranges of at least min_keys.
+SQ_DEVICE void attn_split_keys(int p, int start, int block, int window, int min_keys, int split, int splits, int& k0, int& k1) {
+    const int hi = block ? start + block - 1 : p;
+    const int lo = window ? max(0, hi - window + 1) : 0;
+    const int n = hi + 1 - lo;
+    const int per = max(min_keys, (n + splits - 1) / splits);
+    k0 = lo + split * per;
+    k1 = min(hi + 1, k0 + per);
+}
+
+__global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
+    pdl_launch_dependents();
+    __shared__ AtSmem sm;
+    const int t = blockIdx.x, g = blockIdx.y, split = blockIdx.z, splits = gridDim.z, tid = threadIdx.x;
+    const int p = *a.start + t;
+    int k0, k1;
+    attn_split_keys(p, *a.start, a.block, a.window, a.min_keys, split, splits, k0, k1);
+    // The first tile's keys and values of earlier steps' positions (before start: no kernel of this step
+    // writes them) load before the dependency wait; this step's rows after it.
+    uint4 pk[AT_PRE], pv[AT_PRE];
+    const int first_new = *a.start;
+    auto load = [&](int key, int c, uint4& k, uint4& v) {
+        const size_t row = (size_t)(key % a.cache_rows) * KVD + g * HD + c;
+        k = *reinterpret_cast<const uint4*>(a.kc + row);
+        v = *reinterpret_cast<const uint4*>(a.vc + row);
+    };
+#pragma unroll
+    for (int u = 0; u < AT_PRE; ++u) {
+        const int i = tid + u * AT_THREADS, j = i / (HD / 8), c = (i % (HD / 8)) * 8, key = k0 + j;
+        if (key < k1 && key < first_new) load(key, c, pk[u], pv[u]);
+    }
+    pdl_wait();
+#pragma unroll
+    for (int u = 0; u < AT_PRE; ++u) {
+        const int i = tid + u * AT_THREADS, j = i / (HD / 8), c = (i % (HD / 8)) * 8, key = k0 + j;
+        if (key < k1 && key >= first_new) load(key, c, pk[u], pv[u]);
+    }
+    for (int i = tid; i < GQ * HD; i += AT_THREADS) sm.qs[i / HD][i % HD] = bf2f(a.q[(size_t)t * QD + (g * GQ + i / HD) * HD + i % HD]);
+    if (tid < GQ * DREL) sm.rs[tid / DREL][tid % DREL] = a.rel ? a.rel[((size_t)t * H + g * GQ + tid / DREL) * DREL + tid % DREL] : 0.0f;
+    float o[GQ];
+    attn_range(sm, a.proj, a.rel != nullptr, p, k0, k1, pk, pv, load, o);
 #pragma unroll
     for (int i = 0; i < GQ; ++i) {
         float* dst = a.part + (((size_t)t * H + g * GQ + i) * splits + split) * (2 + HD);
         if (tid == 0) {
-            dst[0] = ml[i][0];
-            dst[1] = ml[i][1];
+            dst[0] = sm.ml[i][0];
+            dst[1] = sm.ml[i][1];
         }
         dst[2 + tid] = o[i];
     }
@@ -1089,13 +1146,13 @@ struct ExpertW {
 constexpr int EX_U = 9;
 
 // One round of a lane's chunks (c0 = lane + 32 * EX_U * round) of rows n0 .. n0 + R - 1 of expert e.
-template <bool FP4, int R>
-SQ_DEVICE void rows_load(const ExpertW& wt, int e, int rows_per_expert, int n0, int K, int c0, uint4 (&wv)[EX_U], uint16_t (&sv)[EX_U]) {
+template <bool FP4, int R, int U = EX_U>
+SQ_DEVICE void rows_load(const ExpertW& wt, int e, int rows_per_expert, int n0, int K, int c0, uint4 (&wv)[U], uint16_t (&sv)[U]) {
     constexpr int CV = FP4 ? 32 : 16;
     const int cpr = K / CV, total = R * cpr;
     const size_t row0 = (size_t)e * rows_per_expert + n0;
 #pragma unroll
-    for (int u = 0; u < EX_U; ++u) {
+    for (int u = 0; u < U; ++u) {
         const int c = c0 + 32 * u, r = c / cpr, cc = c % cpr;
         const bool ok = c < total;
         wv[u] = ok ? ld_stream(wt.w + (row0 + r) * (FP4 ? K / 2 : K) + (size_t)cc * 16) : make_uint4(0, 0, 0, 0);
@@ -1107,11 +1164,11 @@ SQ_DEVICE void rows_load(const ExpertW& wt, int e, int rows_per_expert, int n0, 
 }
 
 // With `pre`, the first round's chunks are already loaded (rows_load at c0 = lane).
-template <bool FP4, int R>
+// U chunks a lane in flight per round (the sums run in chunk order whatever U).
+template <bool FP4, int R, int U = EX_U>
 SQ_DEVICE void rows_dot(const ExpertW& wt, int e, int rows_per_expert, int n0, int K, const bf16* x, float (&out)[R],
                         const uint4* pre_w = nullptr, const uint16_t* pre_s = nullptr) {
     constexpr int CV = FP4 ? 32 : 16;  // values per chunk
-    constexpr int U = EX_U;
     const int lane = threadIdx.x & 31, cpr = K / CV, total = R * cpr;
 #pragma unroll
     for (int r = 0; r < R; ++r) out[r] = 0.0f;
@@ -1125,7 +1182,7 @@ SQ_DEVICE void rows_dot(const ExpertW& wt, int e, int rows_per_expert, int n0, i
                 sv[u] = pre_s[u];
             }
         } else {
-            rows_load<FP4, R>(wt, e, rows_per_expert, n0, K, c0, wv, sv);
+            rows_load<FP4, R, U>(wt, e, rows_per_expert, n0, K, c0, wv, sv);
         }
 #pragma unroll
         for (int u = 0; u < U; ++u) {
