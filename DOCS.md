@@ -279,15 +279,17 @@ the same policies:
   cannot fit even alone fails at once, and a request that runs out of memory with nothing else
   holding it fails, both with the positions one sequence fits on the device. Cancellation, stop
   tokens and budgets are per request, and an error in one slot resets only that slot.
-- Hy4-flash: one batched step (`forward_batch`) and one drafter pass (`draft_batch`) for all decoding
-  sequences, and growable states (caches mapped as a sequence grows: about 17 KB per position plus
-  about 106 MB per sequence). With the weights loaded, about 4.5 GB remain on a 96 GB card: some
-  260K positions for one sequence, or 27K each for eight.
-- Inkling 2 and Flint for now: each slot's state holds its whole `--context` from the start (made when
-  the slot first serves a request), and a step runs the slots' sequences one after another, so
-  `--slots` states of `--context` positions must fit next to each other for all slots to run at
-  once, and concurrent requests share the GPU's time rather than speeding up together. The server log
-  prints each state's size (`slot N: state X GiB for N tokens`).
+- All three engines run one batched step (`forward_batch`) for the decoding sequences (and Inkling's
+  and Hy4-flash's drafters one pass, `draft_batch`), with growable states: a sequence's full-length
+  caches are mapped as it grows, so slots share the device memory by their actual lengths.
+  - Hy4-flash: about 17 KB per position plus about 106 MB per sequence. With the weights loaded, about
+    4.5 GB remain on a 96 GB card: some 260K positions for one sequence, or 27K each for eight.
+  - Inkling 2: 36 KB per position plus 3.1 GB per sequence (rings) and a boundary snapshot; with eight
+    sequences about 51 GB stay for positions (some 1.4M in all: one of 1M, or eight of 128K).
+    Prompts prefill canonically (chunks at multiples of 2048 positions), so output depends only on a
+    conversation's tokens, not on what was cached.
+  - Flint: 28 KB per position (BF16 caches; about half with `--kv fp8`) plus the sliding rings (up to
+    560 MB per sequence).
 
 ## HTTP API
 

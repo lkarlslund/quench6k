@@ -817,28 +817,6 @@ impl FlintState {
     }
 }
 
-/// The single-sequence server loop's handle on a [`FlintState`] (its constructor without a stream).
-pub struct FlintSeq(pub FlintState);
-
-impl FlintSeq {
-    pub fn new(model: &FlintModel, capacity: usize) -> Result<Self> {
-        Ok(Self(FlintState::create(model, capacity)?))
-    }
-}
-
-impl std::ops::Deref for FlintSeq {
-    type Target = FlintState;
-    fn deref(&self) -> &FlintState {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for FlintSeq {
-    fn deref_mut(&mut self) -> &mut FlintState {
-        &mut self.0
-    }
-}
-
 /// Scratch for steps of up to MAX_CHUNK tokens.
 pub struct Workspace {
     _bufs: Vec<DeviceBuffer>,

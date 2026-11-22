@@ -12,7 +12,8 @@ use quench6k_engine::hy4::forward::{Logits, MAX_SEQS, MAX_STEP, State, Workspace
 
 use super::slots::{After, Draft, Drafter, Drafting, Fed, GpuSampler, SlotEngine, SlotSampler};
 
-/// Prefill chunk (tokens per forward step).
+/// Prefill chunk (tokens per forward step); the scheduler aligns chunks to it. The engine's canonical
+/// chunk (hy4::forward::CANON_CHUNK, 2048) once that is on this branch.
 const CHUNK: usize = 2048;
 
 pub(super) struct Engine<'m> {
