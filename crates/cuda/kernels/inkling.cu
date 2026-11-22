@@ -471,7 +471,8 @@ __global__ void __launch_bounds__(256) msg_apply_kernel(MsgGates g, const bf16* 
         }
     }
     pdl_wait();
-    if (threadIdx.x < RANK) zs[threadIdx.x] = bf2f(z[((size_t)gi * T + t) * RANK + threadIdx.x]);
+    // z is rewritten at the same addresses every visit: read past L1.
+    if (threadIdx.x < RANK) zs[threadIdx.x] = bf2f(__ldcg(z + ((size_t)gi * T + t) * RANK + threadIdx.x));
     __syncthreads();
     if (c >= D) return;
     float f = 0.0f, gg = 0.0f;

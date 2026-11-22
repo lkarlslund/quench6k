@@ -1,5 +1,6 @@
 // Shared device helpers.
 #pragma once
+#include <cstdlib>
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -82,12 +83,21 @@ SQ_DEVICE float block_max(float v, float* scratch) {
 SQ_DEVICE void pdl_launch_dependents() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 SQ_DEVICE void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 
+// QUENCH6K_PDL=0 launches without it (plain stream order): a check for reads that race their producer.
+inline int sq_pdl_allowed() {
+    static const int v = [] {
+        const char* e = getenv("QUENCH6K_PDL");
+        return e && e[0] == '0' ? 0 : 1;
+    }();
+    return v;
+}
+
 // Launches with the PDL attribute so the successor's blocks may start while this kernel finishes.
 template <typename... Exp, typename... Act>
 cudaError_t sq_launch(void (*kernel)(Exp...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, Act&&... args) {
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    attr[0].val.programmaticStreamSerializationAllowed = sq_pdl_allowed();
     cudaLaunchConfig_t cfg{};
     cfg.gridDim = grid;
     cfg.blockDim = block;
