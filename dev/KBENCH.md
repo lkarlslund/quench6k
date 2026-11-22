@@ -646,16 +646,18 @@ after 3300 more positions and compares against a fresh sequence. It then times b
 prompts' ends: plain steps (one greedy token per sequence, argmax and download included), verify steps
 of 4 tokens per sequence (the corpus's next tokens as drafts, one kept) and drafter passes.
 
-600 W, max clock 3090 MHz, aggregate tokens per second of plain decode (step time):
+600 W, max clock 3090 MHz, aggregate tokens per second of plain decode (step time); 32K measured before
+the grouped expert kernels (plain steps of up to 8 rows do not use them):
 
 | context | 1 | 2 | 4 | 8 sequences |
 |---|---|---|---|---|
-| 512 | 238 (4.21 ms) | 363 (5.51) | 533 (7.51) | 671 (11.92) |
-| 8192 | 229 (4.37) | 337 (5.94) | 468 (8.55) | 558 (14.34) |
+| 512 | 233 (4.30 ms) | 356 (5.62) | 526 (7.60) | 672 (11.91) |
+| 8192 | 227 (4.41) | 337 (5.93) | 468 (8.55) | 559 (14.30) |
 | 32768 | 197 (5.09) | 276 (7.23) | 368 (10.88) | 428 (18.69) |
 
-Verify steps of 4 tokens per sequence: 557 / 667 / 787 / 825 rows/s at 512 (7.2 / 12.0 / 20.3 / 38.8 ms),
-428 / 507 / 545 / 563 at 32K; drafter passes 0.85 / 1.17 / 2.08 / 3.98 ms at 512. A plain step's extra
+Verify steps of 4 tokens per sequence: 550 / 667 / 800 / 911 rows/s at 512 (7.3 / 12.0 / 20.0 / 35.1 ms),
+520 / 610 / 713 / 797 at 8K; 32K (before grouping) 428 / 507 / 545 / 563. Drafter passes for 1 / 2 / 4 /
+8 sequences: 0.86 / 1.18 / 2.07 / 3.96 ms at 512, 1.3 / 2.1 / 4.0 / 7.9 ms at 32K. A plain step's extra
 sequence costs about 1.1 ms at 512: its 8 experts per layer visit (48 visits x 8 x 4 MB of NVFP4 weights,
 about 1.5 GB) are new DRAM traffic. Verify steps grow with their pairs (the per-pair expert kernels
 re-read and re-decode an expert's rows for every pair routed to it), not with the experts read: in an nsys
