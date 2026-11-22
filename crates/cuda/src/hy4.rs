@@ -80,12 +80,12 @@ mod ffi {
             eps: f32,
             theta: f32,
             h: c_int,
-            start: *const i32,
-            ring: c_int,
+            pos: *const i32,
+            seq: *const i32,
+            cache: SeqRows,
             t: c_int,
             qn: *mut c_void,
             qa: *mut c_void,
-            cache: *mut c_void,
             st: Stream,
         ) -> Error;
         pub fn quench6k_hy4_heads_gemv_max_t() -> c_int;
@@ -112,12 +112,12 @@ mod ffi {
             mode: c_int,
             qa: *const c_void,
             h: c_int,
-            cache: *const c_void,
-            ring: c_int,
+            cache: SeqRows,
             sel: *const i32,
             sel_n: *const i32,
             sinks: *const f32,
-            start: *const i32,
+            pos: *const i32,
+            seq: *const i32,
             t: c_int,
             splits: c_int,
             heads_per_block: c_int,
@@ -135,31 +135,34 @@ mod ffi {
             hw: *const f32,
             ldw: c_int,
             theta: f32,
-            start: *const i32,
+            pos: *const i32,
+            seq: *const i32,
             t: c_int,
-            tk_cache: *mut c_void,
+            tk_cache: SeqRows,
             iq_out: *mut c_void,
             hw_out: *mut f32,
             st: Stream,
         ) -> Error;
         pub fn quench6k_hy4_idx_pool(
-            tk_cache: *const c_void,
+            tk_cache: SeqRows,
             wv: *const f32,
             wg: *const f32,
             ape: *const f32,
             key_norm: *const f32,
             eps: f32,
             theta: f32,
-            start: *const i32,
+            pos: *const i32,
+            seq: *const i32,
             t: c_int,
-            pooled: *mut c_void,
+            pooled: SeqRows,
             st: Stream,
         ) -> Error;
         pub fn quench6k_hy4_idx_scores(
             iq: *const c_void,
             hw: *const f32,
-            pooled: *const c_void,
-            start: *const i32,
+            pooled: SeqRows,
+            pos: *const i32,
+            seq: *const i32,
             t: c_int,
             g: c_int,
             scores: *mut f32,
@@ -170,7 +173,7 @@ mod ffi {
         pub fn quench6k_hy4_idx_expand(
             picked: *const i32,
             npick: c_int,
-            start: *const i32,
+            pos: *const i32,
             t: c_int,
             sel: *mut i32,
             sel_n: *mut i32,
@@ -216,6 +219,7 @@ mod ffi {
         pub fn quench6k_hy4_to_bf16(x: *const f32, y: *mut c_void, count: usize, st: Stream) -> Error;
         pub fn quench6k_hy4_dfly_norm(
             src: *const c_void,
+            src_tab: *const u64,
             lds: usize,
             idx: *const i32,
             w: *const c_void,
@@ -228,20 +232,38 @@ mod ffi {
         pub fn quench6k_hy4_dfly_embed(table: *const c_void, idx: *const i32, rows: c_int, x: *mut f32, st: Stream) -> Error;
         pub fn quench6k_hy4_dfly_add(
             x: *mut f32,
+            xs: c_int,
             yb: *const c_void,
             yf: *const f32,
+            ys: c_int,
             gate: *const c_void,
             out: *mut c_void,
             rows: c_int,
             st: Stream,
         ) -> Error;
         pub fn quench6k_hy4_dfly_sel(
-            keep: *const i32,
-            keep_n: *const i32,
-            stage: *const i32,
+            keep_tab: *const u64,
+            keep_off: i64,
+            keep_n_off: i64,
+            anchors: *const i32,
+            krows: *const i32,
+            seqs: c_int,
             w: c_int,
             sel: *mut i32,
             sel_n: *mut i32,
+            st: Stream,
+        ) -> Error;
+        pub fn quench6k_hy4_seq_scatter(
+            src: *const c_void,
+            lds: usize,
+            bytes: c_int,
+            count: *const i32,
+            slot: *const i32,
+            seq: *const i32,
+            t: c_int,
+            seq_tab: *const u64,
+            off: i64,
+            ld: i64,
             st: Stream,
         ) -> Error;
         pub fn quench6k_hy4_nvfp4_to_bf16(
@@ -302,6 +324,29 @@ mod ffi {
             lanes: *mut c_void,
             st: Stream,
         ) -> Error;
+    }
+}
+
+/// One kind of per-sequence cache of a layer (kernels/hy4.cu SeqRows): the row of position p of sequence s
+/// starts at element `base[s] + off + (ring > 0 ? p % ring : p) * ld`, `base` a device table of addresses.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SeqRows {
+    pub base: *const u64,
+    pub off: i64,
+    pub ld: i32,
+    pub ring: i32,
+}
+
+impl SeqRows {
+    /// Rows at element offset `off` of the buffers listed (device addresses) in the table at `tab`.
+    pub fn new(tab: u64, off: usize, ld: usize, ring: usize) -> Self {
+        Self {
+            base: tab as *const u64,
+            off: off as i64,
+            ld: ld as i32,
+            ring: ring as i32,
+        }
     }
 }
 
@@ -462,12 +507,12 @@ pub fn mla_prep(
     eps: f32,
     theta: f32,
     heads: usize,
-    start: u64,
-    ring: usize,
+    pos: u64,
+    seq: u64,
+    cache: SeqRows,
     t: usize,
     qn: u64,
     qa: u64,
-    cache: u64,
 ) -> Result<()> {
     go!(
         "hy4_mla_prep",
@@ -480,12 +525,12 @@ pub fn mla_prep(
             eps,
             theta,
             n(heads),
-            i(start),
-            n(ring),
+            i(pos),
+            i(seq),
+            cache,
             n(t),
             pm(qn),
             pm(qa),
-            pm(cache),
             s.raw()
         )
     )
@@ -562,12 +607,12 @@ pub fn mla_attention(
     mode: AttnMode,
     qa: u64,
     heads: usize,
-    cache: u64,
-    ring: usize,
+    cache: SeqRows,
     sel: u64,
     sel_n: u64,
     sinks: u64,
-    start: u64,
+    pos: u64,
+    seq: u64,
     t: usize,
     splits: usize,
     heads_per_block: usize,
@@ -580,12 +625,12 @@ pub fn mla_attention(
             mode as c_int,
             p(qa),
             n(heads),
-            p(cache),
-            n(ring),
+            cache,
             i(sel),
             i(sel_n),
             f(sinks),
-            i(start),
+            i(pos),
+            i(seq),
             n(t),
             n(splits),
             n(heads_per_block),
@@ -608,9 +653,10 @@ pub fn idx_prep(
     hw: u64,
     ldw: usize,
     theta: f32,
-    start: u64,
+    pos: u64,
+    seq: u64,
     t: usize,
-    tk_cache: u64,
+    tk_cache: SeqRows,
     iq_out: u64,
     hw_out: u64,
 ) -> Result<()> {
@@ -626,9 +672,10 @@ pub fn idx_prep(
             f(hw),
             n(ldw),
             theta,
-            i(start),
+            i(pos),
+            i(seq),
             n(t),
-            pm(tk_cache),
+            tk_cache,
             pm(iq_out),
             fm(hw_out),
             s.raw()
@@ -637,44 +684,37 @@ pub fn idx_prep(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Pools the group each of the `t` rows completes (rows at positions 4g + 3) from the token-key cache.
 pub fn idx_pool(
     s: &Stream,
-    tk_cache: u64,
+    tk_cache: SeqRows,
     wv: u64,
     wg: u64,
     ape: u64,
     key_norm: u64,
     eps: f32,
     theta: f32,
-    start: u64,
+    pos: u64,
+    seq: u64,
     t: usize,
-    pooled: u64,
+    pooled: SeqRows,
 ) -> Result<()> {
     go!(
         "hy4_idx_pool",
-        ffi::quench6k_hy4_idx_pool(
-            p(tk_cache),
-            f(wv),
-            f(wg),
-            f(ape),
-            f(key_norm),
-            eps,
-            theta,
-            i(start),
-            n(t),
-            pm(pooled),
-            s.raw()
-        )
+        ffi::quench6k_hy4_idx_pool(tk_cache, f(wv), f(wg), f(ape), f(key_norm), eps, theta, i(pos), i(seq), n(t), pooled, s.raw())
     )
 }
 
+/// Indexer scores of the `t` rows over `groups` columns (groups the row's sequence has not completed
+/// before its own: -inf); rows within the first 2048 positions are left unwritten.
 #[allow(clippy::too_many_arguments)]
 pub fn idx_scores(
     s: &Stream,
     iq: u64,
     hw: u64,
-    pooled: u64,
-    start: u64,
+    pooled: SeqRows,
+    pos: u64,
+    seq: u64,
     t: usize,
     groups: usize,
     scores: u64,
@@ -682,7 +722,7 @@ pub fn idx_scores(
 ) -> Result<()> {
     go!(
         "hy4_idx_scores",
-        ffi::quench6k_hy4_idx_scores(p(iq), f(hw), p(pooled), i(start), n(t), n(groups), fm(scores), n(ld), s.raw())
+        ffi::quench6k_hy4_idx_scores(p(iq), f(hw), pooled, i(pos), i(seq), n(t), n(groups), fm(scores), n(ld), s.raw())
     )
 }
 
@@ -691,10 +731,10 @@ pub fn sel_width() -> usize {
     unsafe { ffi::quench6k_hy4_sel_width() as usize }
 }
 
-pub fn idx_expand(s: &Stream, picked: u64, npick: usize, start: u64, t: usize, sel: u64, sel_n: u64) -> Result<()> {
+pub fn idx_expand(s: &Stream, picked: u64, npick: usize, pos: u64, t: usize, sel: u64, sel_n: u64) -> Result<()> {
     go!(
         "hy4_idx_expand",
-        ffi::quench6k_hy4_idx_expand(i(picked), n(npick), i(start), n(t), im(sel), im(sel_n), s.raw())
+        ffi::quench6k_hy4_idx_expand(i(picked), n(npick), i(pos), n(t), im(sel), im(sel_n), s.raw())
     )
 }
 
@@ -861,12 +901,12 @@ pub fn engram_apply(
 }
 
 /// out[r, :3072] = bf16(w * rmsnorm(x)) for BF16 rows x = src + (idx ? idx[r] : r) * lds elements (idx: device
-/// I32 indices, 0 for none).
+/// I32 indices, 0 for none); with `src_tab` (device u64 [rows], 0 for none) row r's src is src_tab[r].
 #[allow(clippy::too_many_arguments)]
-pub fn dfly_norm(s: &Stream, src: u64, lds: usize, idx: u64, w: u64, eps: f32, out: u64, ldo: usize, rows: usize) -> Result<()> {
+pub fn dfly_norm(s: &Stream, src: u64, src_tab: u64, lds: usize, idx: u64, w: u64, eps: f32, out: u64, ldo: usize, rows: usize) -> Result<()> {
     go!(
         "hy4_dfly_norm",
-        ffi::quench6k_hy4_dfly_norm(p(src), lds, i(idx), p(w), eps, pm(out), n(ldo), n(rows), s.raw())
+        ffi::quench6k_hy4_dfly_norm(p(src), src_tab as *const u64, lds, i(idx), p(w), eps, pm(out), n(ldo), n(rows), s.raw())
     )
 }
 
@@ -875,21 +915,80 @@ pub fn dfly_embed(s: &Stream, table: u64, idx: u64, rows: usize, x: u64) -> Resu
     go!("hy4_dfly_embed", ffi::quench6k_hy4_dfly_embed(p(table), i(idx), n(rows), fm(x), s.raw()))
 }
 
-/// x (F32 [rows, 3072]) += y, y BF16 (`yb`) or F32 (`yf`; 0 for the other), times bf16 `gate` [3072] when
-/// given; `out` (when not 0) gets bf16(x).
-pub fn dfly_add(s: &Stream, x: u64, yb: u64, yf: u64, gate: u64, out: u64, rows: usize) -> Result<()> {
+/// x row r * xs (F32 rows of 3072) += y row r * ys, y BF16 (`yb`) or F32 (`yf`; 0 for the other), times
+/// bf16 `gate` [3072] when given; `out` (when not 0) row r gets bf16(x).
+#[allow(clippy::too_many_arguments)]
+pub fn dfly_add(s: &Stream, x: u64, xs: usize, yb: u64, yf: u64, ys: usize, gate: u64, out: u64, rows: usize) -> Result<()> {
     go!(
         "hy4_dfly_add",
-        ffi::quench6k_hy4_dfly_add(fm(x), p(yb), f(yf), p(gate), pm(out), n(rows), s.raw())
+        ffi::quench6k_hy4_dfly_add(fm(x), n(xs), p(yb), f(yf), n(ys), p(gate), pm(out), n(rows), s.raw())
     )
 }
 
-/// Key lists (sel [w, sel_width()], sel_n [w]) of the drafter's query block from the target's kept lists;
-/// `stage`: device I32 [anchor, hidden row, kept row].
-pub fn dfly_sel(s: &Stream, keep: u64, keep_n: u64, stage: u64, w: usize, sel: u64, sel_n: u64) -> Result<()> {
+/// Key lists (sel [seqs * w, sel_width()], sel_n [seqs * w]) of the drafter's query blocks from the target's
+/// kept lists: sequence s's lists at I32 offset `keep_off` (lengths `keep_n_off`) of the buffer at
+/// keep_tab[s], its block anchored at anchors[s] with source row krows[s] (device I32).
+#[allow(clippy::too_many_arguments)]
+pub fn dfly_sel(
+    s: &Stream,
+    keep_tab: u64,
+    keep_off: usize,
+    keep_n_off: usize,
+    anchors: u64,
+    krows: u64,
+    seqs: usize,
+    w: usize,
+    sel: u64,
+    sel_n: u64,
+) -> Result<()> {
     go!(
         "hy4_dfly_sel",
-        ffi::quench6k_hy4_dfly_sel(i(keep), i(keep_n), i(stage), n(w), im(sel), im(sel_n), s.raw())
+        ffi::quench6k_hy4_dfly_sel(
+            keep_tab as *const u64,
+            keep_off as i64,
+            keep_n_off as i64,
+            i(anchors),
+            i(krows),
+            n(seqs),
+            n(w),
+            im(sel),
+            im(sel_n),
+            s.raw()
+        )
+    )
+}
+
+/// Copies row t (`bytes` bytes at src + t * lds, or 4 * count[t] bytes with `count`) of the `t` rows with
+/// slot[t] >= 0 to byte offset off + slot[t] * ld of the buffer at seq_tab[seq[t]].
+#[allow(clippy::too_many_arguments)]
+pub fn seq_scatter(
+    s: &Stream,
+    src: u64,
+    lds: usize,
+    bytes: usize,
+    count: u64,
+    slot: u64,
+    seq: u64,
+    t: usize,
+    seq_tab: u64,
+    off: usize,
+    ld: usize,
+) -> Result<()> {
+    go!(
+        "hy4_seq_scatter",
+        ffi::quench6k_hy4_seq_scatter(
+            p(src),
+            lds,
+            n(bytes),
+            i(count),
+            i(slot),
+            i(seq),
+            n(t),
+            seq_tab as *const u64,
+            off as i64,
+            ld as i64,
+            s.raw()
+        )
     )
 }
 

@@ -1,32 +1,65 @@
-//! Hy4-flash forward pass over a chunk of new tokens of one sequence.
+//! Hy4-flash forward pass: steps over new tokens of one sequence (prefill chunks of up to `max_t` tokens,
+//! `max_t + 511 <= RING`) or of up to [`MAX_SEQS`] sequences at once (up to [`MAX_STEP`] tokens each).
 //!
-//! Per sequence the indexed layers keep every position's cache row (`[ctx, 576]` BF16), token key
-//! (`[ctx, 128]`) and pooled group key (`[ctx / 4, 128]`); the sliding layers keep a ring of the last
-//! `RING` rows. Chunks hold at most `max_t` tokens (`max_t + 511 <= RING`).
+//! Per sequence the indexed layers keep every position's cache row (576 BF16), token key (128) and pooled
+//! group key (128 per four positions), the indexed layers interleaved per position in three buffers whose
+//! addresses are reserved for the sequence's capacity and backed by memory as it grows
+//! ([`State::reserve`]); the sliding layers keep a ring of the last `RING` rows.
+//!
+//! Kernels find a row's sequence through per-row descriptors (position, sequence index) and per-sequence
+//! address tables in device memory, so the CUDA graphs of small steps belong to the workspace and serve any
+//! sequences. Small steps (at most 16 tokens per sequence) run every row through kernels whose arithmetic
+//! does not depend on the step's other rows (GEMVs, per-head GEMVs, attention with a fixed split of each
+//! row's keys), so a sequence gets the same bits alone or batched, at any width.
+
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, ensure};
-use quench6k_cuda::hy4::{self as hk, AttnMode};
+use quench6k_cuda::hy4::{self as hk, AttnMode, SeqRows};
 use quench6k_cuda::kernels as k;
-use quench6k_cuda::{DeviceBuffer, PinnedBuffer, Stream};
+use quench6k_cuda::{DeviceBuffer, PinnedBuffer, Stream, VmBuffer};
 
 use super::*;
 
-const RING: usize = 4096;
+/// Rows of a sliding layer's ring: a prefill chunk (at most 2048 tokens) plus the window before it.
+const RING: usize = 2560;
 const MAX_SPLITS: usize = 32;
+/// Small steps split each row's keys over a fixed number of blocks (sliding layers: 512 keys, indexed
+/// layers: up to 2048 selected keys), merged in split order: a row's result does not depend on the step.
+const SPLITS_SLIDING: usize = 16;
+const SPLITS_INDEXED: usize = 32;
+/// Rows per launch of the small steps' attention and per-head GEMVs (and of the GEMV for more rows).
+const SMALL_ROWS: usize = 16;
 /// Chunks of up to this many tokens run the routed experts per (token, expert) pair; larger ones group
 /// the pairs by expert for the tensor-core GEMM.
 const SMALL_T: usize = 8;
 /// Tile rows of the grouped NVFP4 GEMM (moe.cu BM).
 const MOE_BM: usize = 64;
-/// Rows of a step whose key lists the drafter can reuse: the last DFLY_KEEP (a verification step's rows, or
-/// a prefill chunk's last).
+/// Indexer score matrix (floats): rows of a step scored at once over its groups.
+const SCORE_FLOATS: usize = 16 << 20;
+/// Rows of a step whose key lists and hidden states the drafter can reuse: the last DFLY_KEEP (a
+/// verification step's rows, or a prefill chunk's last).
 pub const DFLY_KEEP: usize = 8;
+/// Most tokens per sequence in a step of several sequences.
+pub const MAX_STEP: usize = 8;
+/// Most sequences in one step.
+pub const MAX_SEQS: usize = 8;
+/// Positions a sequence's cache mapping grows by at least (about 14 MB).
+const RESERVE_STEP: usize = 1024;
+/// Most CUDA graphs of steps a workspace keeps.
+const MAX_GRAPHS: usize = 512;
+/// Per-sequence address tables: indexed rows, token keys, pooled keys, rings, drafter buffers.
+const TABS: usize = 5;
 
 /// Prefill chunks run the routed experts W4A4 (NVFP4 activations, FP4 tensor cores) when
 /// QUENCH6K_HY4_W4A4 is set to 1.
 fn w4a4() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("QUENCH6K_HY4_W4A4").is_ok_and(|v| v == "1"))
+}
+
+fn graphs_enabled() -> bool {
+    std::env::var("QUENCH6K_HY4_GRAPHS").map_or(true, |v| v != "0") && std::env::var_os("QUENCH6K_HY4_DUMP").is_none()
 }
 
 struct Alloc {
@@ -50,63 +83,180 @@ impl Alloc {
     }
 }
 
-enum Cache {
-    Sliding { rows: u64 },
-    Indexed { rows: u64, tk: u64, pooled: u64 },
+/// Byte layout of a sequence's drafter buffer: per target layer the drafter reuses, the key lists
+/// ([DFLY_KEEP, sel_width] I32) and their lengths of the last step's last rows, then those rows' hidden
+/// states (BF16 [DFLY_KEEP, 3072]).
+struct KeepLayout {
+    lists: usize,
+    lens: usize,
+    hidden: usize,
+    bytes: usize,
+}
+
+impl KeepLayout {
+    fn of(model: &Hy4Model) -> Self {
+        let slots = model.dfly.as_ref().map_or(0, |f| f.index_layers.len());
+        let sw = hk::sel_width();
+        let lens = slots * DFLY_KEEP * sw * 4;
+        let hidden = (lens + slots * DFLY_KEEP * 4).next_multiple_of(256);
+        Self {
+            lists: 0,
+            lens,
+            hidden,
+            bytes: hidden + DFLY_KEEP * D * 2,
+        }
+    }
+    /// I32 offsets of slot `k`'s key lists and lengths.
+    fn ints(&self, k: usize) -> (usize, usize) {
+        ((self.lists + k * DFLY_KEEP * hk::sel_width() * 4) / 4, (self.lens + k * DFLY_KEEP * 4) / 4)
+    }
 }
 
 /// One sequence's caches and token history.
 pub struct State {
     pub pos: usize,
-    pub ctx: usize,
-    caches: Vec<Cache>,
+    /// Most positions the sequence may reach.
+    pub capacity: usize,
     pub history: Vec<i32>,
-    pub device_bytes: usize,
-    /// CUDA graphs of small steps by token count and logits kind; they capture this state's caches.
-    graphs: Vec<Option<quench6k_cuda::Graph>>,
-    /// The drafter's pass as a CUDA graph (it captures this state's caches).
-    dgraph: Option<quench6k_cuda::Graph>,
     /// Tokens of the last step.
     pub last_t: usize,
-    /// Sliding rings at snap_pos (the end of the last prompt).
-    snap: Option<DeviceBuffer>,
+    /// Device bytes when created (the fixed buffers); [`State::device_bytes`] counts what is mapped now.
+    pub device_bytes: usize,
+    /// Whether the last step produced hidden states (the drafter's source).
+    hidden: bool,
+    /// Indexed layers' cache rows [capacity, n_indexed, 576], token keys [capacity, n_indexed, 128] and
+    /// pooled keys [capacity / 4, n_indexed, 128] (BF16).
+    rows: VmBuffer,
+    tk: VmBuffer,
+    pooled: VmBuffer,
+    /// Sliding layers' rings [n_sliding, RING, 576].
+    rings: DeviceBuffer,
+    /// The drafter's key lists and hidden states (KeepLayout).
+    keep: DeviceBuffer,
+    /// The rings' last WINDOW positions before snap_pos (the end of the last prompt) [n_sliding, WINDOW, 576].
+    snap: DeviceBuffer,
     snap_pos: Option<usize>,
-    _alloc: Alloc,
+    n_indexed: usize,
+    n_sliding: usize,
 }
 
 impl State {
-    pub fn new(model: &Hy4Model, ctx: usize, s: &Stream) -> Result<Self> {
-        let ctx = ctx.div_ceil(GROUP) * GROUP;
-        let mut a = Alloc::new();
-        let mut caches = Vec::new();
-        for layer in &model.layers {
-            if layer.attn.sliding {
-                caches.push(Cache::Sliding {
-                    rows: a.get(RING * KROW * 2)?,
-                });
-            } else {
-                let rows = a.get(ctx * KROW * 2)?;
-                let tk = a.get(ctx * ID * 2)?;
-                let pooled = a.get(ctx / GROUP * ID * 2)?;
-                caches.push(Cache::Indexed { rows, tk, pooled });
-            }
-        }
-        for b in &a.buffers {
-            s.memset(b.addr(), 0, b.bytes())?;
-        }
+    /// A sequence of up to `capacity` positions (at most the model's maximum). Its full-length caches are
+    /// reserved as addresses and mapped as positions are written ([`State::reserve`]); the rings and the
+    /// drafter's buffers are allocated now.
+    pub fn new(model: &Hy4Model, capacity: usize, s: &Stream) -> Result<Self> {
+        let capacity = capacity.div_ceil(GROUP) * GROUP;
+        ensure!(
+            capacity <= model.cfg.max_positions.next_multiple_of(GROUP),
+            "capacity {capacity} exceeds the model's {} positions",
+            model.cfg.max_positions
+        );
+        let (ni, ns) = (model.n_indexed, model.n_sliding);
+        let rows = VmBuffer::reserve(capacity * ni * KROW * 2)?;
+        let tk = VmBuffer::reserve(capacity * ni * ID * 2)?;
+        let pooled = VmBuffer::reserve(capacity / GROUP * ni * ID * 2)?;
+        let rings = DeviceBuffer::new((ns * RING * KROW * 2).max(16))?;
+        s.memset(rings.addr(), 0, rings.bytes())?;
+        let keep = DeviceBuffer::new(KeepLayout::of(model).bytes)?;
+        s.memset(keep.addr(), 0, keep.bytes())?;
+        let snap = DeviceBuffer::new((ns * WINDOW * KROW * 2).max(16))?;
+        let device_bytes = rings.bytes() + keep.bytes() + snap.bytes();
         Ok(Self {
             pos: 0,
-            ctx,
-            caches,
+            capacity,
             history: Vec::new(),
-            device_bytes: a.bytes,
-            graphs: Vec::new(),
-            dgraph: None,
             last_t: 0,
-            snap: None,
+            device_bytes,
+            hidden: false,
+            rows,
+            tk,
+            pooled,
+            rings,
+            keep,
+            snap,
             snap_pos: None,
-            _alloc: a,
+            n_indexed: ni,
+            n_sliding: ns,
         })
+    }
+
+    /// Device bytes per position of the full-length caches.
+    pub fn bytes_per_position(model: &Hy4Model) -> usize {
+        model.n_indexed * (KROW * 2 + ID * 2) + model.n_indexed * ID * 2 / GROUP
+    }
+
+    /// Device memory the sequence holds now: its fixed buffers and the mapped part of its caches.
+    pub fn device_bytes(&self) -> usize {
+        self.rings.bytes() + self.keep.bytes() + self.snap.bytes() + self.rows.mapped() + self.tk.mapped() + self.pooled.mapped()
+    }
+
+    /// Positions whose full-length cache memory is mapped.
+    pub fn mapped_positions(&self) -> usize {
+        let (ni, rb, tb) = (self.n_indexed.max(1), KROW * 2, ID * 2);
+        (self.rows.mapped() / (ni * rb))
+            .min(self.tk.mapped() / (ni * tb))
+            .min(self.pooled.mapped() / (ni * tb) * GROUP)
+            .min(self.capacity)
+    }
+
+    /// Maps memory for the full-length caches of positions < `positions` (at most the capacity; RESERVE_STEP
+    /// positions ahead when that fits). Out of device memory: an error whose message contains "out of
+    /// memory", and nothing changed.
+    pub fn reserve(&mut self, positions: usize) -> Result<()> {
+        let want = positions.min(self.capacity);
+        let have = self.mapped_positions();
+        if want <= have {
+            return Ok(());
+        }
+        // Grow by at least RESERVE_STEP positions (fewer, larger mappings), or exactly when that fails.
+        let ahead = want.max(have + RESERVE_STEP).min(self.capacity);
+        match self.map(ahead) {
+            Err(_) if ahead > want => self.map(want),
+            r => r,
+        }
+    }
+
+    fn map(&mut self, want: usize) -> Result<()> {
+        let ni = self.n_indexed;
+        let before = (self.rows.mapped(), self.tk.mapped(), self.pooled.mapped());
+        let r = (|| -> Result<()> {
+            self.rows.map_to(want * ni * KROW * 2)?;
+            self.tk.map_to(want * ni * ID * 2)?;
+            self.pooled.map_to(want.div_ceil(GROUP) * ni * ID * 2)
+        })();
+        if let Err(e) = r {
+            // Chunks mapped by this call lie past the old ends and were never used.
+            let _ = self.rows.unmap_to(before.0);
+            let _ = self.tk.unmap_to(before.1);
+            let _ = self.pooled.unmap_to(before.2);
+            return Err(e.context(format!("caches for {want} positions")));
+        }
+        Ok(())
+    }
+
+    /// Unmaps the full-length cache memory beyond `positions` and forgets the cached tokens there. Waits
+    /// for the device when it releases memory.
+    pub fn trim(&mut self, positions: usize) {
+        let positions = positions.min(self.capacity);
+        if positions < self.pos {
+            self.pos = positions;
+            self.history.truncate(positions);
+            self.last_t = 0;
+            self.hidden = false;
+        }
+        if self.snap_pos.is_some_and(|e| e > positions) {
+            self.snap_pos = None;
+        }
+        let ni = self.n_indexed;
+        let keep = (positions * ni * KROW * 2, positions * ni * ID * 2, positions.div_ceil(GROUP) * ni * ID * 2);
+        if (self.rows.mapped() > keep.0 || self.tk.mapped() > keep.1 || self.pooled.mapped() > keep.2)
+            && let Err(e) = quench6k_cuda::synchronize()
+                .and_then(|_| self.rows.unmap_to(keep.0))
+                .and_then(|_| self.tk.unmap_to(keep.1))
+                .and_then(|_| self.pooled.unmap_to(keep.2))
+        {
+            eprintln!("hy4: releasing cache memory: {e:#}");
+        }
     }
 
     /// Forgets the sequence (the caches are overwritten as positions are refilled).
@@ -114,6 +264,8 @@ impl State {
         self.pos = 0;
         self.history.clear();
         self.snap_pos = None;
+        self.last_t = 0;
+        self.hidden = false;
     }
 
     /// Drops positions from `pos` on. The sliding layers keep the last RING rows, so `pos` must be within
@@ -149,58 +301,108 @@ impl State {
         Ok(keep)
     }
 
-    /// Copies the sliding rings at the current position (the end of a prompt), for [`State::rewind`].
+    /// The ring slots of the last `n` positions before `e`: (first slot, count) runs in position order.
+    fn ring_runs(e: usize, n: usize) -> Vec<(usize, usize)> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let first = (e - n) % RING;
+        if first + n <= RING { vec![(first, n)] } else { vec![(first, RING - first), (0, n - (RING - first))] }
+    }
+
+    /// Copies the sliding rings' last WINDOW positions (the end of a prompt), for [`State::rewind`].
     pub fn snapshot(&mut self, s: &Stream) -> Result<()> {
-        let rings: Vec<u64> = self
-            .caches
-            .iter()
-            .filter_map(|c| match c {
-                Cache::Sliding { rows } => Some(*rows),
-                _ => None,
-            })
-            .collect();
-        let bytes = RING * KROW * 2;
-        if self.snap.is_none() {
-            self.snap = Some(DeviceBuffer::new(rings.len() * bytes)?);
+        let e = self.pos;
+        let n = e.min(WINDOW);
+        let row = KROW * 2;
+        for l in 0..self.n_sliding {
+            let ring = self.rings.addr() + (l * RING * row) as u64;
+            let mut at = self.snap.addr() + (l * WINDOW * row) as u64;
+            for (first, count) in Self::ring_runs(e, n) {
+                s.copy_d2d(at, ring + (first * row) as u64, count * row)?;
+                at += (count * row) as u64;
+            }
         }
-        let dst = self.snap.as_ref().unwrap().addr();
-        for (i, r) in rings.iter().enumerate() {
-            s.copy_d2d(dst + (i * bytes) as u64, *r, bytes)?;
-        }
-        self.snap_pos = Some(self.pos);
+        self.snap_pos = Some(e);
         Ok(())
     }
 
     fn restore(&mut self, s: &Stream) -> Result<()> {
-        let src = self.snap.as_ref().context("no snapshot")?.addr();
-        let bytes = RING * KROW * 2;
-        let mut i = 0;
-        for c in &self.caches {
-            if let Cache::Sliding { rows } = c {
-                s.copy_d2d(*rows, src + (i * bytes) as u64, bytes)?;
-                i += 1;
+        let e = self.snap_pos.context("no snapshot")?;
+        let n = e.min(WINDOW);
+        let row = KROW * 2;
+        for l in 0..self.n_sliding {
+            let ring = self.rings.addr() + (l * RING * row) as u64;
+            let mut at = self.snap.addr() + (l * WINDOW * row) as u64;
+            for (first, count) in Self::ring_runs(e, n) {
+                s.copy_d2d(ring + (first * row) as u64, at, count * row)?;
+                at += (count * row) as u64;
             }
         }
-        let e = self.snap_pos.context("no snapshot")?;
         self.pos = e;
         self.history.truncate(e);
+        self.last_t = 0;
+        self.hidden = false;
         Ok(())
+    }
+
+    /// Checksums (quench6k_cuda::device_checksum) of the caches of positions < pos: indexed rows, token
+    /// keys, pooled keys (complete groups), and the rings. For bitwise comparisons of sequences.
+    pub fn checksums(&self, s: &Stream) -> Result<[u64; 4]> {
+        let ni = self.n_indexed;
+        let p = self.pos;
+        let sum = |a: u64, bytes: usize| if bytes == 0 { Ok(0) } else { quench6k_cuda::device_checksum(a, bytes, s) };
+        Ok([
+            sum(self.rows.addr(), p * ni * KROW * 2)?,
+            sum(self.tk.addr(), p * ni * ID * 2)?,
+            sum(self.pooled.addr(), p / GROUP * ni * ID * 2)?,
+            sum(self.rings.addr(), self.rings.bytes())?,
+        ])
+    }
+
+    /// Device addresses of the per-sequence tables (rows, token keys, pooled keys, rings, drafter buffers).
+    fn table(&self) -> [u64; TABS] {
+        [self.rows.addr(), self.tk.addr(), self.pooled.addr(), self.rings.addr(), self.keep.addr()]
     }
 }
 
-/// Scratch buffers for chunks of up to `max_t` tokens.
+/// Shapes of a step: what the enqueued work depends on besides device data.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Plan {
+    /// Rows (tokens of all sequences).
+    r: usize,
+    /// Every sequence has at most 16 rows: row-wise kernels throughout.
+    small: bool,
+    /// Every sequence has at most SMALL_T rows: experts per (token, expert) pair.
+    ex_small: bool,
+    /// Indexer score columns, when any row selects its keys.
+    groups: Option<usize>,
+    /// Large steps (one sequence) without selection attend densely in the indexed layers.
+    dense: bool,
+    want: Logits,
+}
+
+/// Columns scored for rows whose sequences have completed up to `g` groups before their own: about 4 to 8
+/// buckets per doubling (a CUDA graph per bucket).
+fn group_bucket(g: usize) -> usize {
+    let q = (g.next_power_of_two() / 4).max(TOPG);
+    g.div_ceil(q) * q
+}
+
+/// Scratch buffers for steps of up to `max_t` tokens of one sequence, or of several sequences.
 pub struct Workspace {
     pub max_t: usize,
     pub logit_rows: usize,
-    /// Indexer groups (context / 4) the score rows hold.
-    groups: usize,
-    pub start: u64,
+    /// Rows the step buffers hold: max(max_t, MAX_SEQS * MAX_STEP).
+    rows_cap: usize,
+    /// Row descriptors and tables: I32 pos [r], seq [r], keep slot [r], then (8-aligned) u64 [TABS, MAX_SEQS].
+    desc: u64,
     emb: u64,
     lanes: u64,
     x: u64,
     post: u64,
     hc_part: u64,
-    f_a: u64,  // F32 scratch [T, max(16384, 13824 ...)]
+    f_a: u64, // F32 scratch [T, max(16384, 13824 ...)]
     f_b: u64,
     f_c: u64,
     bf_a: u64, // BF16 scratch
@@ -256,54 +458,142 @@ pub struct Workspace {
     pinned: PinnedBuffer,
     /// The drafter's buffers (when the model has one).
     dfly: Option<DflyWs>,
+    /// CUDA graphs of small steps by plan, and of the drafter's pass by sequence count.
+    graphs: HashMap<Plan, quench6k_cuda::Graph>,
+    dgraphs: HashMap<usize, quench6k_cuda::Graph>,
     pub device_bytes: usize,
     _alloc: Alloc,
 }
 
-/// Buffers of the drafter's pass over a query block of `width` rows.
+/// Buffers of the drafter's pass over the query blocks (`width` rows each) of up to MAX_SEQS sequences.
 struct DflyWs {
-    /// I32: the block's embedding rows (the accepted token, then mask tokens), then anchor (the accepted
-    /// token's position), the hidden row and the kept key-list row of its source (the step's row before it).
+    /// Staged inputs (DraftLayout).
     stage: u64,
-    /// I32 [width - 1]: the drafted tokens.
+    /// I32 [width - 1, sequences]: the drafted tokens.
     drafts: u64,
-    /// Per target layer the drafter reuses: key lists [DFLY_KEEP, sel_width] and their lengths.
-    keep: Vec<(u64, u64)>,
     sel: u64,
     sel_n: u64,
-    /// F32 [width, 3072] residual stream, BF16 [width, 3072] final hidden states, BF16 [width, 6144] norm pairs.
+    /// F32 [rows, 3072] residual stream, BF16 [rows, 3072] final hidden states, BF16 [MAX_SEQS, 6144] norm pairs.
     x: u64,
     h: u64,
     cat: u64,
-    /// BF16 [3072] corrected hidden state; F32 [vocab] its logits.
+    /// BF16 [MAX_SEQS, 3072] corrected hidden states; F32 [MAX_SEQS, vocab] their logits.
     corr: u64,
     logits: u64,
     pinned: PinnedBuffer,
 }
 
+/// Byte offsets of the drafter's staged inputs for `n` sequences of `w`-row blocks: I32 tokens [n * w],
+/// positions [n * w], sequences [n * w], first tokens [n], anchors [n], kept source rows [n], hidden rows of
+/// the corrections [w - 1, n]; then (8-aligned) u64 tables [n] of cache rows, drafter buffers, and hidden
+/// source rows. The drafts [w - 1, n] are read back after them.
+struct DraftLayout {
+    tok: usize,
+    pos: usize,
+    seq: usize,
+    tok0: usize,
+    anchor: usize,
+    krow: usize,
+    hidx: usize,
+    rows_tab: usize,
+    keep_tab: usize,
+    hsrc_tab: usize,
+    bytes: usize,
+    out: usize,
+}
+
+impl DraftLayout {
+    fn new(n: usize, w: usize) -> Self {
+        let rows = n * w;
+        let tok = 0;
+        let pos = tok + rows * 4;
+        let seq = pos + rows * 4;
+        let tok0 = seq + rows * 4;
+        let anchor = tok0 + n * 4;
+        let krow = anchor + n * 4;
+        let hidx = krow + n * 4;
+        let rows_tab = (hidx + (w - 1) * n * 4).next_multiple_of(8);
+        let keep_tab = rows_tab + n * 8;
+        let hsrc_tab = keep_tab + n * 8;
+        let bytes = hsrc_tab + n * 8;
+        Self {
+            tok,
+            pos,
+            seq,
+            tok0,
+            anchor,
+            krow,
+            hidx,
+            rows_tab,
+            keep_tab,
+            hsrc_tab,
+            bytes,
+            out: bytes.next_multiple_of(16),
+        }
+    }
+}
+
+/// Byte offsets of a step's staged inputs for `r` rows: embedding rows, Engram rows (q8 [layers, r, 16, 96],
+/// scales [layers, r, 16]), mask [r], then the descriptors (copied to `desc`): I32 pos [r], seq [r], keep
+/// slot [r], (8-aligned) u64 tables [TABS, MAX_SEQS].
+struct StepLayout {
+    q8: usize,
+    sc: usize,
+    mask: usize,
+    desc: usize,
+    /// Within the descriptors.
+    seq: usize,
+    kslot: usize,
+    tab: usize,
+    desc_bytes: usize,
+}
+
+impl StepLayout {
+    fn new(r: usize, n_eng: usize) -> Self {
+        let q8 = r * D * 2;
+        let sc = q8 + n_eng * r * ENGRAM_HEADS * ENGRAM_DIM;
+        let mask = sc + n_eng * r * ENGRAM_HEADS * 4;
+        let desc = (mask + r).next_multiple_of(16);
+        let seq = r * 4;
+        let kslot = seq + r * 4;
+        let tab = (kslot + r * 4).next_multiple_of(8);
+        Self {
+            q8,
+            sc,
+            mask,
+            desc,
+            seq,
+            kslot,
+            tab,
+            desc_bytes: tab + TABS * MAX_SEQS * 8,
+        }
+    }
+}
+
 pub const TOP_K: usize = 32;
 
 impl Workspace {
-    /// Chunks of up to `max_t` tokens over contexts of up to `ctx`; `logit_rows`: most rows of logits a
-    /// step produces (1 for generation; max_t for scoring every position).
-    pub fn new(model: &Hy4Model, max_t: usize, ctx: usize, logit_rows: usize) -> Result<Self> {
-        ensure!(max_t + WINDOW <= RING, "chunks of {max_t} tokens exceed the sliding ring");
+    /// Steps of up to `max_t` tokens of one sequence (and of up to MAX_SEQS sequences of up to MAX_STEP
+    /// tokens each); `logit_rows`: most rows of logits a step produces (1 for plain generation; the rows of
+    /// a verification step, of all its sequences). `_ctx` is not used (contexts are the states' business).
+    pub fn new(model: &Hy4Model, max_t: usize, _ctx: usize, logit_rows: usize) -> Result<Self> {
+        ensure!(max_t + WINDOW <= RING, "chunks of {max_t} tokens exceed the sliding ring ({} at most)", RING - WINDOW);
         let mut a = Alloc::new();
-        let t = max_t;
+        let t = max_t.max(MAX_SEQS * MAX_STEP);
         let hmax = model.cfg.heads_sliding.max(model.cfg.heads_indexed);
         let f_width = (hmax * QK).max(13824).max((HC + 1) * D);
         let pairs = t * TOPK;
-        let groups = ctx.div_ceil(GROUP);
         let max_tiles = pairs / MOE_BM + EXPERTS;
         let vocab = model.cfg.vocab;
-        let small = hk::heads_gemv_max_t().min(t);
-        let part = hk::attn_part_floats(small, hmax, MAX_SPLITS);
-        let pinned_bytes = t * D * 2 + model.engram_layers.len() * t * ENGRAM_HEADS * (ENGRAM_DIM + 4) + t + 64;
+        let part = hk::attn_part_floats(SMALL_ROWS, hmax, MAX_SPLITS);
+        let n_eng = model.engram_layers.len();
+        let lay = StepLayout::new(t, n_eng);
+        let pinned_bytes = lay.desc + lay.desc_bytes;
         let ws = Self {
             max_t,
             logit_rows: logit_rows.max(16),
-            groups,
-            start: a.get(16)?,
+            rows_cap: t,
+            desc: a.get(lay.desc_bytes)?,
             emb: a.get(t * D * 2)?,
             lanes: a.get(t * HC * D * 4)?,
             x: a.get(t * D * 2)?,
@@ -321,7 +611,7 @@ impl Workspace {
             part: a.get(part * 4)?,
             iq: a.get(t * IH * ID * 2)?,
             hw: a.get(t * IH * 4)?,
-            scores: a.get(t * groups * 4)?,
+            scores: a.get(SCORE_FLOATS * 4)?,
             picked: a.get(t * (TOPG - 1) * 4)?,
             sel: a.get(t * hk::sel_width() * 4)?,
             sel_n: a.get(t * 4)?,
@@ -344,8 +634,8 @@ impl Workspace {
             pair_row: a.get(pairs * 4)?,
             max_tiles,
             fp4_rows: a.get(k::fp4_rows_bytes(pairs, LAT))?,
-            q8: a.get(model.engram_layers.len().max(1) * t * ENGRAM_HEADS * ENGRAM_DIM)?,
-            q8_sc: a.get(model.engram_layers.len().max(1) * t * ENGRAM_HEADS * 4)?,
+            q8: a.get(n_eng.max(1) * t * ENGRAM_HEADS * ENGRAM_DIM)?,
+            q8_sc: a.get(n_eng.max(1) * t * ENGRAM_HEADS * 4)?,
             mask: a.get(t)?,
             eemb: a.get(t * ENGRAM_W * 2)?,
             hidden: a.get(t * D * 2)?,
@@ -359,34 +649,36 @@ impl Workspace {
             argmax_scratch: a.get(k::argmax_scratch(t, vocab))?,
             pinned: PinnedBuffer::new(pinned_bytes)?,
             dfly: None,
+            graphs: HashMap::new(),
+            dgraphs: HashMap::new(),
             device_bytes: 0,
             _alloc: Alloc::new(),
         };
         let dfly = match &model.dfly {
             Some(f) => {
                 let w = f.width;
+                let rows = MAX_SEQS * w;
                 let sw = hk::sel_width();
-                let mut keep = Vec::new();
-                for _ in 0..f.index_layers.len() {
-                    keep.push((a.get(DFLY_KEEP * sw * 4)?, a.get(DFLY_KEEP * 4)?));
-                }
+                let lay = DraftLayout::new(MAX_SEQS, w);
                 Some(DflyWs {
-                    stage: a.get((w + 3) * 4)?,
-                    drafts: a.get(w * 4)?,
-                    keep,
-                    sel: a.get(w * sw * 4)?,
-                    sel_n: a.get(w * 4)?,
-                    x: a.get(w * D * 4)?,
-                    h: a.get(w * D * 2)?,
-                    cat: a.get(w * 2 * D * 2)?,
-                    corr: a.get(D * 2)?,
-                    logits: a.get(vocab * 4)?,
-                    pinned: PinnedBuffer::new(4 * (2 * w + 3))?,
+                    stage: a.get(lay.bytes)?,
+                    drafts: a.get(MAX_SEQS * w * 4)?,
+                    sel: a.get(rows * sw * 4)?,
+                    sel_n: a.get(rows * 4)?,
+                    x: a.get(rows * D * 4)?,
+                    h: a.get(rows * D * 2)?,
+                    cat: a.get(MAX_SEQS * 2 * D * 2)?,
+                    corr: a.get(MAX_SEQS * D * 2)?,
+                    logits: a.get(MAX_SEQS * vocab * 4)?,
+                    pinned: PinnedBuffer::new(lay.out + MAX_SEQS * w * 4)?,
                 })
             }
             None => None,
         };
-        ensure!(dfly.is_none() || max_t >= model.dfly.as_ref().unwrap().width, "chunks shorter than the drafter's block");
+        ensure!(
+            dfly.is_none() || MAX_SEQS * model.dfly.as_ref().unwrap().width <= t,
+            "step buffers smaller than the drafter's blocks"
+        );
         let bytes = a.bytes;
         Ok(Self {
             dfly,
@@ -395,19 +687,33 @@ impl Workspace {
             ..ws
         })
     }
+
+    /// Device addresses of a step's descriptors for `r` rows: (pos, seq, keep slot, tables).
+    fn desc_addrs(&self, r: usize) -> (u64, u64, u64, u64) {
+        let lay = StepLayout::new(r, 0);
+        let d = self.desc;
+        (d, d + lay.seq as u64, d + lay.kslot as u64, d + lay.tab as u64)
+    }
 }
 
-/// Y [m, l.n] F32 = X [m, l.k] BF16 . W^T.
-fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usize) -> Result<()> {
-    if m <= k::gemv_max_m() {
-        k::gemv(s, m, x, ldx, l.fmt, l.w, l.scale, y, ldy, 0, l.n, l.k, 1, 1.0, false)
+/// Y [m, l.n] F32 = X [m, l.k] BF16 . W^T: the GEMV (per-row arithmetic independent of m) for small steps
+/// and any m <= 16, in launches of 16 rows; the tensor-core GEMM otherwise.
+#[allow(clippy::too_many_arguments)]
+fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usize, small: bool) -> Result<()> {
+    let gm = k::gemv_max_m();
+    if m <= gm || small {
+        for r0 in (0..m).step_by(gm) {
+            let rows = gm.min(m - r0);
+            k::gemv(s, rows, x + (r0 * ldx * 2) as u64, ldx, l.fmt, l.w, l.scale, y + (r0 * ldy * 4) as u64, ldy, 0, l.n, l.k, 1, 1.0, false)?;
+        }
+        Ok(())
     } else {
         k::gemm_f32(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, 1.0, false)
     }
 }
 
 /// Which positions' logits a forward pass produces.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Logits {
     None,
     Last,
@@ -415,44 +721,45 @@ pub enum Logits {
 }
 
 impl Hy4Model {
-    /// Host side of the Engram layers for `tokens` at positions `state.pos ..`: hashed rows gathered
-    /// into the pinned buffer (per engram layer: q8 [t, 16, 96] then scales [t, 16]), and the mask.
-    fn engram_inputs(&self, state: &State, tokens: &[i32], ws: &mut Workspace) -> (usize, usize) {
-        let t = tokens.len();
+    /// Host side of the Engram layers for each sequence's tokens (at its positions pos ..), rows in sequence
+    /// order: hashed rows gathered into the pinned buffer (per engram layer: q8 [r, 16, 96] then scales
+    /// [r, 16]), and the mask.
+    fn engram_inputs(&self, seqs: &[(&[i32], &[i32])], ws: &mut Workspace, lay: &StepLayout) {
+        let r: usize = seqs.iter().map(|(_, t)| t.len()).sum();
         let pad = self.cfg.engram_pad;
         let n_layers = self.engram_layers.len();
-        let q8_bytes = n_layers * t * ENGRAM_HEADS * ENGRAM_DIM;
-        let base = t * D * 2;
-        let full: Vec<i64> = state.history.iter().chain(tokens).map(|&x| x as i64).collect();
-        let off = state.history.len();
         // Rows of every (layer, token, head), then read-ahead for all of them before any copy: the reads
         // of rows not in the page cache overlap.
-        let mut rows: Vec<i64> = Vec::with_capacity(n_layers * t * ENGRAM_HEADS);
+        let mut rows: Vec<i64> = Vec::with_capacity(n_layers * r * ENGRAM_HEADS);
         for &layer in &self.engram_layers {
             let eng = self.layers[layer].engram.as_ref().unwrap();
-            for j in 0..t {
-                let p = off + j;
-                let ngram: Vec<i64> = (0..self.cfg.engram_max_ngram)
-                    .map(|o| if p >= o { full[p - o] } else { pad })
-                    .collect();
-                eng.hash.rows(&ngram, &mut rows);
+            for (history, tokens) in seqs {
+                let full: Vec<i64> = history.iter().chain(tokens.iter()).map(|&x| x as i64).collect();
+                let off = history.len();
+                for j in 0..tokens.len() {
+                    let p = off + j;
+                    let ngram: Vec<i64> = (0..self.cfg.engram_max_ngram)
+                        .map(|o| if p >= o { full[p - o] } else { pad })
+                        .collect();
+                    eng.hash.rows(&ngram, &mut rows);
+                }
             }
         }
         // Small steps (decode): read-ahead hints for every row, so cold rows load concurrently. Larger
         // chunks fault rows in from the copy threads instead (a hint per row costs a system call).
-        if t <= 16 {
+        if r <= MAX_SEQS * MAX_STEP {
             for (li, &layer) in self.engram_layers.iter().enumerate() {
                 let eng = self.layers[layer].engram.as_ref().unwrap();
-                for &r in &rows[li * t * ENGRAM_HEADS..(li + 1) * t * ENGRAM_HEADS] {
-                    eng.prefetch(r as usize);
+                for &row in &rows[li * r * ENGRAM_HEADS..(li + 1) * r * ENGRAM_HEADS] {
+                    eng.prefetch(row as usize);
                 }
             }
         }
         let buf = ws.pinned.as_mut_slice();
-        let (head, rest) = buf.split_at_mut(base + q8_bytes);
-        let q8 = &mut head[base..];
-        let sc = &mut rest[..n_layers * t * ENGRAM_HEADS * 4];
-        let per_layer = t * ENGRAM_HEADS;
+        let (head, rest) = buf.split_at_mut(lay.sc);
+        let q8 = &mut head[lay.q8..];
+        let sc = &mut rest[..n_layers * r * ENGRAM_HEADS * 4];
+        let per_layer = r * ENGRAM_HEADS;
         let copy = |li: usize, idx: std::ops::Range<usize>, q8: &mut [u8], sc: &mut [u8]| {
             let eng = self.layers[self.engram_layers[li]].engram.as_ref().unwrap();
             for (k, i) in idx.enumerate() {
@@ -463,7 +770,7 @@ impl Hy4Model {
         };
         // Up to 16 threads over contiguous ranges of each layer's rows: cold rows fault in parallel.
         let threads = per_layer.div_ceil(512).clamp(1, 16 / n_layers.max(1)).max(1);
-        let span = per_layer.div_ceil(threads);
+        let span = per_layer.div_ceil(threads).max(1);
         std::thread::scope(|scope| {
             let mut q8_rest = q8;
             let mut sc_rest = sc;
@@ -482,56 +789,138 @@ impl Hy4Model {
                 }
             }
         });
-        let mask_at = base + q8_bytes + n_layers * t * ENGRAM_HEADS * 4;
-        for (j, &tok) in tokens.iter().enumerate() {
-            let tok = tok as i64;
-            let keep = tok != pad && Some(tok) != self.cfg.image_token && Some(tok) != self.cfg.video_token;
-            buf[mask_at + j] = keep as u8;
+        let mut j = 0;
+        for (_, tokens) in seqs {
+            for &tok in tokens.iter() {
+                let tok = tok as i64;
+                let keep = tok != pad && Some(tok) != self.cfg.image_token && Some(tok) != self.cfg.video_token;
+                buf[lay.mask + j] = keep as u8;
+                j += 1;
+            }
         }
-        (q8_bytes, mask_at)
+    }
+
+    /// Host inputs of a step in the pinned buffer: embedding rows, Engram rows and mask, row descriptors
+    /// and the sequences' tables.
+    fn stage(&self, states: &[&mut State], ws: &mut Workspace, tokens: &[&[i32]], lay: &StepLayout) -> Result<()> {
+        let mut j = 0;
+        for toks in tokens {
+            for &tok in toks.iter() {
+                ensure!(tok >= 0 && (tok as usize) < self.cfg.vocab, "token {tok} out of range");
+                ws.pinned.as_mut_slice()[j * D * 2..(j + 1) * D * 2].copy_from_slice(self.embed_row(tok as usize));
+                j += 1;
+            }
+        }
+        let seqs: Vec<(&[i32], &[i32])> = states.iter().zip(tokens).map(|(st, t)| (st.history.as_slice(), *t)).collect();
+        self.engram_inputs(&seqs, ws, lay);
+        let buf = &mut ws.pinned.as_mut_slice()[lay.desc..lay.desc + lay.desc_bytes];
+        let mut put = |at: usize, v: i32| buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let mut j = 0;
+        for (si, (st, toks)) in states.iter().zip(tokens).enumerate() {
+            let t = toks.len();
+            let kept = t.min(DFLY_KEEP);
+            for i in 0..t {
+                put(j * 4, (st.pos + i) as i32);
+                put(lay.seq + j * 4, si as i32);
+                put(lay.kslot + j * 4, i as i32 - (t - kept) as i32);
+                j += 1;
+            }
+        }
+        for (si, st) in states.iter().enumerate() {
+            for (ti, addr) in st.table().into_iter().enumerate() {
+                let at = lay.tab + (ti * MAX_SEQS + si) * 8;
+                buf[at..at + 8].copy_from_slice(&addr.to_le_bytes());
+            }
+        }
+        Ok(())
     }
 
     /// Runs `tokens` (at positions state.pos ..) through the model, appending them to the caches.
     /// Logits (F32 [rows, vocab]) land in ws.out_logits: one row for `Last`, one per token for `All`.
-    /// Steps of at most 16 tokens that want no more than the last logits run as a CUDA graph captured
-    /// once per token count (QUENCH6K_HY4_GRAPHS=0: eager).
+    /// Steps of at most 16 tokens run as CUDA graphs captured once per shape (QUENCH6K_HY4_GRAPHS=0: eager).
     pub fn forward(&self, state: &mut State, ws: &mut Workspace, s: &Stream, tokens: &[i32], want: Logits) -> Result<()> {
-        let t = tokens.len();
-        ensure!(t > 0 && t <= ws.max_t, "chunk of {t} tokens (max {})", ws.max_t);
-        ensure!(state.pos + t <= state.ctx, "context full ({} + {t} > {})", state.pos, state.ctx);
-        ensure!(state.ctx / GROUP <= ws.groups, "workspace sized for a smaller context than the state's");
-        ensure!(want != Logits::All || t <= ws.logit_rows, "{t} rows of logits (workspace holds {})", ws.logit_rows);
+        self.step(&mut [state], ws, s, &[tokens], want)
+    }
+
+    /// One step for 1..=MAX_SEQS sequences, 1..=MAX_STEP tokens each; logits for every fed token land in
+    /// ws.out_logits sequence by sequence, row by row. Each sequence's results (caches, hidden states,
+    /// logits) are bit-identical to `forward(state_i, tokens_i, Logits::All)` run alone.
+    pub fn forward_batch(&self, states: &mut [&mut State], ws: &mut Workspace, s: &Stream, tokens: &[&[i32]]) -> Result<()> {
+        ensure!(
+            states.len() == tokens.len() && (1..=MAX_SEQS).contains(&states.len()),
+            "{} sequences, {} token lists (1 to {MAX_SEQS} sequences)",
+            states.len(),
+            tokens.len()
+        );
+        for t in tokens {
+            ensure!((1..=MAX_STEP).contains(&t.len()), "{} tokens in a batched step (1 to {MAX_STEP})", t.len());
+        }
+        self.step(states, ws, s, tokens, Logits::All)
+    }
+
+    fn step(&self, states: &mut [&mut State], ws: &mut Workspace, s: &Stream, tokens: &[&[i32]], want: Logits) -> Result<()> {
+        let nseq = states.len();
+        ensure!(nseq == tokens.len() && (1..=MAX_SEQS).contains(&nseq), "{nseq} sequences");
+        let r: usize = tokens.iter().map(|t| t.len()).sum();
+        let tmax = tokens.iter().map(|t| t.len()).max().unwrap_or(0);
+        ensure!(tokens.iter().all(|t| !t.is_empty()), "a sequence without tokens");
+        let small = tmax <= hk::heads_gemv_max_t();
+        ensure!(small || nseq == 1, "steps of several sequences take at most {} tokens each", hk::heads_gemv_max_t());
+        ensure!(r <= ws.rows_cap && (small || r <= ws.max_t), "step of {r} tokens (max {})", ws.max_t);
+        ensure!(want != Logits::Last || nseq == 1, "last-row logits of several sequences");
+        ensure!(want != Logits::All || r <= ws.logit_rows, "{r} rows of logits (workspace holds {})", ws.logit_rows);
+        for (st, t) in states.iter_mut().zip(tokens) {
+            ensure!(st.pos + t.len() <= st.capacity, "context full ({} + {} > {})", st.pos, t.len(), st.capacity);
+            st.reserve(st.pos + t.len())?;
+        }
         // The pinned buffer may still feed the previous step's uploads.
         let timing = std::env::var_os("QUENCH6K_HY4_TIMING").is_some();
         let t0 = std::time::Instant::now();
         s.synchronize()?;
         let t1 = std::time::Instant::now();
-        self.stage(state, ws, tokens)?;
+        let lay = StepLayout::new(r, self.engram_layers.len());
+        self.stage(states, ws, tokens, &lay)?;
         if timing {
             eprintln!(
-                "hy4 step t={t}: wait {:.1} ms, stage {:.1} ms",
+                "hy4 step r={r}: wait {:.1} ms, stage {:.1} ms",
                 (t1 - t0).as_secs_f64() * 1e3,
                 t1.elapsed().as_secs_f64() * 1e3
             );
         }
-        let graphs = std::env::var("QUENCH6K_HY4_GRAPHS").map_or(true, |v| v != "0")
-            && std::env::var_os("QUENCH6K_HY4_DUMP").is_none();
-        if graphs && t <= hk::heads_gemv_max_t() && (want != Logits::All || t <= ws.logit_rows) {
-            let slot = t + 17 * want as usize;
-            if state.graphs.len() <= slot {
-                state.graphs.resize_with(slot + 1, || None);
-            }
-            if state.graphs[slot].is_none() {
-                let g = quench6k_cuda::Graph::capture(s, |s| self.enqueue(state, ws, s, t, None, want))?;
-                state.graphs[slot] = Some(g);
-            }
-            state.graphs[slot].as_ref().unwrap().launch(s)?;
+        let groups = if small {
+            let qg = states.iter().zip(tokens).map(|(st, t)| (st.pos + t.len() - 1) / GROUP).max().unwrap_or(0);
+            (qg >= TOPG).then(|| group_bucket(qg))
         } else {
-            self.enqueue(state, ws, s, t, Some(state.pos), want)?;
+            let end = states[0].pos + r;
+            (end > TOPG * GROUP).then_some(end / GROUP)
+        };
+        let plan = Plan {
+            r,
+            small,
+            ex_small: tmax <= SMALL_T,
+            groups,
+            dense: !small && groups.is_none(),
+            want,
+        };
+        if small && graphs_enabled() {
+            if !ws.graphs.contains_key(&plan) {
+                // Shapes come and go with the sequences' widths and lengths: keep at most MAX_GRAPHS.
+                if ws.graphs.len() >= MAX_GRAPHS {
+                    ws.graphs.clear();
+                }
+                let g = quench6k_cuda::Graph::capture(s, |s| self.enqueue(ws, s, &plan))?;
+                ws.graphs.insert(plan, g);
+            }
+            ws.graphs[&plan].launch(s)?;
+        } else {
+            self.enqueue(ws, s, &plan)?;
         }
-        state.pos += t;
-        state.last_t = t;
-        state.history.extend_from_slice(tokens);
+        for (st, t) in states.iter_mut().zip(tokens) {
+            st.pos += t.len();
+            st.last_t = t.len();
+            st.hidden = want != Logits::None;
+            st.history.extend_from_slice(t);
+        }
         Ok(())
     }
 
@@ -540,151 +929,192 @@ impl Hy4Model {
     /// block's cache rows past state.pos (the next step overwrites them). Empty without a drafter or
     /// room in the context.
     pub fn draft(&self, state: &mut State, ws: &mut Workspace, s: &Stream, token: i32, row: usize) -> Result<Vec<i32>> {
+        Ok(self.draft_batch(&mut [state], ws, s, &[token], &[row])?.pop().unwrap_or_default())
+    }
+
+    /// [`Hy4Model::draft`] for several sequences in one pass: each sequence's drafts are bit-identical to
+    /// drafting it alone. `pending[i]` and `rows[i]` are sequence i's `token` and `row`.
+    pub fn draft_batch(
+        &self,
+        states: &mut [&mut State],
+        ws: &mut Workspace,
+        s: &Stream,
+        pending: &[i32],
+        rows: &[usize],
+    ) -> Result<Vec<Vec<i32>>> {
+        ensure!(
+            states.len() == pending.len() && states.len() == rows.len() && states.len() <= MAX_SEQS,
+            "draft_batch: {} sequences, {} tokens, {} rows (at most {MAX_SEQS})",
+            states.len(),
+            pending.len(),
+            rows.len()
+        );
+        let mut out = vec![Vec::new(); states.len()];
         let (Some(f), Some(_)) = (&self.dfly, &ws.dfly) else {
-            return Ok(Vec::new());
+            return Ok(out);
         };
         let w = f.width;
-        if state.pos + w > state.ctx || state.last_t == 0 {
-            return Ok(Vec::new());
+        let mut live = Vec::new();
+        for (i, st) in states.iter_mut().enumerate() {
+            if st.pos + w > st.capacity || st.last_t == 0 || !st.hidden {
+                continue;
+            }
+            let row = rows[i];
+            ensure!(row < st.last_t, "draft source row {row} of a {}-token step", st.last_t);
+            ensure!(
+                row + DFLY_KEEP >= st.last_t,
+                "draft source row {row} of a {}-token step: only the last {DFLY_KEEP} rows are kept",
+                st.last_t
+            );
+            ensure!((pending[i] as usize) < self.cfg.vocab, "token {} out of range", pending[i]);
+            st.reserve(st.pos + w)?;
+            live.push(i);
         }
-        ensure!(row < state.last_t, "draft source row {row} of a {}-token step", state.last_t);
-        let kept = state.last_t.min(DFLY_KEEP);
-        let krow = row as i64 - (state.last_t - kept) as i64;
-        // A source row outside the kept ones only matters once its key list is selected (position 2048 on).
-        let krow = krow.max(0) as i32;
-        let d = ws.dfly.as_mut().unwrap();
+        if live.is_empty() {
+            return Ok(out);
+        }
+        let n = live.len();
+        let lay = DraftLayout::new(n, w);
+        let kl = KeepLayout::of(self);
+        s.synchronize()?;
         {
+            let d = ws.dfly.as_mut().unwrap();
             let buf = d.pinned.as_mut_slice();
-            let mut put = |i: usize, v: i32| buf[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-            put(0, token);
-            for i in 1..w {
-                put(i, f.mask);
+            let mut put = |at: usize, v: i32| buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            for (si, &i) in live.iter().enumerate() {
+                let st = &states[i];
+                let kept = st.last_t.min(DFLY_KEEP);
+                let krow = rows[i] - (st.last_t - kept);
+                for j in 0..w {
+                    let r = si * w + j;
+                    put(lay.tok + r * 4, if j == 0 { pending[i] } else { f.mask });
+                    put(lay.pos + r * 4, (st.pos + j) as i32);
+                    put(lay.seq + r * 4, si as i32);
+                }
+                put(lay.tok0 + si * 4, pending[i]);
+                put(lay.anchor + si * 4, st.pos as i32);
+                put(lay.krow + si * 4, krow as i32);
+                for j in 0..w - 1 {
+                    put(lay.hidx + (j * n + si) * 4, (si * w + j + 1) as i32);
+                }
             }
-            put(w, state.pos as i32);
-            put(w + 1, row as i32);
-            put(w + 2, krow);
+            for (si, &i) in live.iter().enumerate() {
+                let st = &states[i];
+                for (at, v) in [
+                    (lay.rows_tab, st.rows.addr()),
+                    (lay.keep_tab, st.keep.addr()),
+                    (lay.hsrc_tab, st.keep.addr() + kl.hidden as u64),
+                ] {
+                    buf[at + si * 8..at + si * 8 + 8].copy_from_slice(&v.to_le_bytes());
+                }
+            }
         }
-        let graphs = std::env::var("QUENCH6K_HY4_GRAPHS").map_or(true, |v| v != "0");
-        if graphs {
-            if state.dgraph.is_none() {
-                let g = quench6k_cuda::Graph::capture(s, |s| self.draft_enqueue(state, ws, s))?;
-                state.dgraph = Some(g);
+        if graphs_enabled() {
+            if !ws.dgraphs.contains_key(&n) {
+                let g = quench6k_cuda::Graph::capture(s, |s| self.draft_enqueue(ws, s, n))?;
+                ws.dgraphs.insert(n, g);
             }
-            state.dgraph.as_ref().unwrap().launch(s)?;
+            ws.dgraphs[&n].launch(s)?;
         } else {
-            self.draft_enqueue(state, ws, s)?;
+            self.draft_enqueue(ws, s, n)?;
         }
         s.synchronize()?;
         let d = ws.dfly.as_ref().unwrap();
-        let out = d.pinned.as_slice()[4 * (w + 3)..4 * (2 * w + 2)]
+        let drafts: Vec<i32> = d.pinned.as_slice()[lay.out..lay.out + (w - 1) * n * 4]
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
             .collect();
+        for (si, &i) in live.iter().enumerate() {
+            out[i] = (0..w - 1).map(|j| drafts[j * n + si]).collect();
+        }
         Ok(out)
     }
 
-    fn draft_enqueue(&self, state: &State, ws: &Workspace, s: &Stream) -> Result<()> {
+    fn draft_enqueue(&self, ws: &Workspace, s: &Stream, n: usize) -> Result<()> {
         let cfg = &self.cfg;
         let f = self.dfly.as_ref().unwrap();
         let d = ws.dfly.as_ref().unwrap();
         let w = f.width;
-        let anchor = d.stage + (w * 4) as u64;
-        unsafe { s.copy_h2d(d.stage, d.pinned.as_ptr(), (w + 3) * 4)? };
-        // The block's embeddings; the first fused with the target's hidden state of the source row.
-        hk::dfly_embed(s, f.embed, d.stage, w, d.x)?;
-        hk::dfly_norm(s, f.embed, D, d.stage, f.enorm, cfg.eps, d.cat, 2 * D, 1)?;
-        hk::dfly_norm(s, ws.hidden, D, d.stage + ((w + 1) * 4) as u64, f.hnorm, cfg.eps, d.cat + (D * 2) as u64, 2 * D, 1)?;
-        linear(s, d.cat, 2 * D, 1, &f.eh, ws.f_a, D)?;
-        hk::dfly_add(s, d.x, 0, ws.f_a, f.fuse_gate, 0, 1)?;
+        let r = n * w;
+        let lay = DraftLayout::new(n, w);
+        let kl = KeepLayout::of(self);
+        let at = |o: usize| d.stage + o as u64;
+        unsafe { s.copy_h2d(d.stage, d.pinned.as_ptr(), lay.bytes)? };
+        // The blocks' embeddings; each block's first fused with the target's hidden state of its source row.
+        hk::dfly_embed(s, f.embed, at(lay.tok), r, d.x)?;
+        hk::dfly_norm(s, f.embed, 0, D, at(lay.tok0), f.enorm, cfg.eps, d.cat, 2 * D, n)?;
+        hk::dfly_norm(s, 0, at(lay.hsrc_tab), D, at(lay.krow), f.hnorm, cfg.eps, d.cat + (D * 2) as u64, 2 * D, n)?;
+        linear(s, d.cat, 2 * D, n, &f.eh, ws.f_a, D, true)?;
+        hk::dfly_add(s, d.x, w, 0, ws.f_a, 1, f.fuse_gate, 0, n)?;
+        let (pos, seq) = (at(lay.pos), at(lay.seq));
         for (li, layer) in f.layers.iter().enumerate() {
-            let Cache::Indexed { rows, .. } = &state.caches[f.kv_layers[li]] else {
-                anyhow::bail!("drafter layer {li}: target layer {} has no full cache", f.kv_layers[li]);
-            };
-            hk::rms_rows(s, d.x, D, layer.in_norm, D, cfg.eps, ws.x, D, w)?;
-            self.attn_project(ws, s, &layer.attn, *rows, 0, anchor, w)?;
+            let target = f.kv_layers[li];
+            anyhow::ensure!(!self.layers[target].attn.sliding, "drafter layer {li}: target layer {target} has no full cache");
+            let cache = SeqRows::new(at(lay.rows_tab), self.cache_slot[target] * KROW, self.n_indexed * KROW, 0);
+            hk::rms_rows(s, d.x, D, layer.in_norm, D, cfg.eps, ws.x, D, r)?;
+            self.attn_project(ws, s, &layer.attn, cache, pos, seq, r, true)?;
             let slot = f.index_layers.iter().position(|&l| l == f.index_layers[li]).unwrap();
-            let (keep, keep_n) = d.keep[slot];
-            hk::dfly_sel(s, keep, keep_n, anchor, w, d.sel, d.sel_n)?;
-            self.attn_output(ws, s, &layer.attn, AttnMode::Selected, *rows, 0, d.sel, d.sel_n, anchor, w)?;
-            hk::dfly_add(s, d.x, ws.y, 0, 0, 0, w)?;
-            hk::rms_rows(s, d.x, D, layer.post_attn_norm, D, cfg.eps, ws.x, D, w)?;
-            let n = layer.gate.n;
-            linear(s, ws.x, D, w, &layer.gate, ws.f_a, n)?;
-            linear(s, ws.x, D, w, &layer.up, ws.f_b, n)?;
-            hk::swiglu(s, ws.f_a, ws.f_b, n, n, 0.0, ws.bf_a, n, w)?;
-            linear(s, ws.bf_a, n, w, &layer.down, ws.f_c, D)?;
-            hk::dfly_add(s, d.x, 0, ws.f_c, 0, 0, w)?;
+            let (ko, kno) = kl.ints(slot);
+            hk::dfly_sel(s, at(lay.keep_tab), ko, kno, at(lay.anchor), at(lay.krow), n, w, d.sel, d.sel_n)?;
+            self.attn_output(ws, s, &layer.attn, AttnMode::Selected, cache, d.sel, d.sel_n, pos, seq, r, true)?;
+            hk::dfly_add(s, d.x, 1, ws.y, 0, 1, 0, 0, r)?;
+            hk::rms_rows(s, d.x, D, layer.post_attn_norm, D, cfg.eps, ws.x, D, r)?;
+            let nn = layer.gate.n;
+            linear(s, ws.x, D, r, &layer.gate, ws.f_a, nn, true)?;
+            linear(s, ws.x, D, r, &layer.up, ws.f_b, nn, true)?;
+            hk::swiglu(s, ws.f_a, ws.f_b, nn, nn, 0.0, ws.bf_a, nn, r)?;
+            linear(s, ws.bf_a, nn, r, &layer.down, ws.f_c, D, true)?;
+            hk::dfly_add(s, d.x, 1, 0, ws.f_c, 1, 0, 0, r)?;
         }
-        hk::rms_rows(s, d.x, D, f.norm, D, cfg.eps, d.h, D, w)?;
+        hk::rms_rows(s, d.x, D, f.norm, D, cfg.eps, d.h, D, r)?;
         // The drafts in order: block row j + 1 corrected by the embedding of the token before it.
         for j in 0..w - 1 {
-            let prev = if j == 0 { d.stage } else { d.drafts + ((j - 1) * 4) as u64 };
-            hk::dfly_norm(s, d.h + ((j + 1) * D * 2) as u64, D, 0, f.c_hidden_norm, cfg.eps, d.cat, 2 * D, 1)?;
-            hk::dfly_norm(s, f.embed, D, prev, f.c_embed_norm, cfg.eps, d.cat + (D * 2) as u64, 2 * D, 1)?;
-            let n = f.c_gate.n;
-            linear(s, d.cat, 2 * D, 1, &f.c_gate, ws.f_a, n)?;
-            linear(s, d.cat, 2 * D, 1, &f.c_up, ws.f_b, n)?;
-            hk::swiglu(s, ws.f_a, ws.f_b, n, n, 0.0, ws.bf_a, n, 1)?;
-            linear(s, ws.bf_a, n, 1, &f.c_down, ws.f_c, D)?;
-            hk::dfly_add(s, ws.f_c, d.h + ((j + 1) * D * 2) as u64, 0, 0, d.corr, 1)?;
-            linear(s, d.corr, D, 1, &self.lm_head, d.logits, cfg.vocab)?;
-            k::argmax(s, d.logits, 1, cfg.vocab, cfg.vocab, ws.argmax_scratch, d.drafts + (j * 4) as u64)?;
+            let prev = if j == 0 { at(lay.tok0) } else { d.drafts + ((j - 1) * n * 4) as u64 };
+            hk::dfly_norm(s, d.h, 0, D, at(lay.hidx + j * n * 4), f.c_hidden_norm, cfg.eps, d.cat, 2 * D, n)?;
+            hk::dfly_norm(s, f.embed, 0, D, prev, f.c_embed_norm, cfg.eps, d.cat + (D * 2) as u64, 2 * D, n)?;
+            let nn = f.c_gate.n;
+            linear(s, d.cat, 2 * D, n, &f.c_gate, ws.f_a, nn, true)?;
+            linear(s, d.cat, 2 * D, n, &f.c_up, ws.f_b, nn, true)?;
+            hk::swiglu(s, ws.f_a, ws.f_b, nn, nn, 0.0, ws.bf_a, nn, n)?;
+            linear(s, ws.bf_a, nn, n, &f.c_down, ws.f_c, D, true)?;
+            hk::dfly_add(s, ws.f_c, 1, d.h + ((j + 1) * D * 2) as u64, 0, w, 0, d.corr, n)?;
+            linear(s, d.corr, D, n, &self.lm_head, d.logits, cfg.vocab, true)?;
+            k::argmax(s, d.logits, n, cfg.vocab, cfg.vocab, ws.argmax_scratch, d.drafts + (j * n * 4) as u64)?;
         }
-        unsafe {
-            s.copy_d2h(
-                (d.pinned.as_ptr() as *mut u8).add(4 * (w + 3)),
-                d.drafts,
-                (w - 1) * 4,
-            )?
-        };
+        unsafe { s.copy_d2h(d.pinned.as_ptr().add(lay.out), d.drafts, (w - 1) * n * 4)? };
         Ok(())
     }
 
-    /// Host inputs of a step in the pinned buffer: embedding rows, Engram rows and mask, start position.
-    fn stage(&self, state: &State, ws: &mut Workspace, tokens: &[i32]) -> Result<()> {
-        let buf = ws.pinned.as_mut_slice();
-        for (j, &tok) in tokens.iter().enumerate() {
-            ensure!((tok as usize) < self.cfg.vocab, "token {tok} out of range");
-            buf[j * D * 2..(j + 1) * D * 2].copy_from_slice(self.embed_row(tok as usize));
-        }
-        let (_, mask_at) = self.engram_inputs(state, tokens, ws);
-        let start_at = mask_at + tokens.len().next_multiple_of(16);
-        ws.pinned.as_mut_slice()[start_at..start_at + 4].copy_from_slice(&(state.pos as i32).to_le_bytes());
-        Ok(())
-    }
-
-    /// The step's device work for `t` staged tokens. `start`: the host position (eager steps choose
-    /// shapes by it), or None for a position-independent step (graph capture).
-    fn enqueue(&self, state: &State, ws: &Workspace, s: &Stream, t: usize, start: Option<usize>, want: Logits) -> Result<()> {
+    /// The step's device work for the staged rows (`plan`).
+    fn enqueue(&self, ws: &Workspace, s: &Stream, plan: &Plan) -> Result<()> {
         let cfg = &self.cfg;
+        let r = plan.r;
         let n_eng = self.engram_layers.len();
-        let q8_bytes = n_eng * t * ENGRAM_HEADS * ENGRAM_DIM;
-        let mask_at = t * D * 2 + q8_bytes + n_eng * t * ENGRAM_HEADS * 4;
-        let start_at = mask_at + t.next_multiple_of(16);
+        let lay = StepLayout::new(r, n_eng);
         let pin = ws.pinned.as_ptr();
         unsafe {
-            s.copy_h2d(ws.emb, pin, t * D * 2)?;
+            s.copy_h2d(ws.emb, pin, r * D * 2)?;
             if n_eng > 0 {
-                s.copy_h2d(ws.q8, pin.add(t * D * 2), q8_bytes)?;
-                s.copy_h2d(ws.q8_sc, pin.add(t * D * 2 + q8_bytes), n_eng * t * ENGRAM_HEADS * 4)?;
-                s.copy_h2d(ws.mask, pin.add(mask_at), t)?;
+                s.copy_h2d(ws.q8, pin.add(lay.q8), lay.sc - lay.q8)?;
+                s.copy_h2d(ws.q8_sc, pin.add(lay.sc), lay.mask - lay.sc)?;
+                s.copy_h2d(ws.mask, pin.add(lay.mask), r)?;
             }
-            s.copy_h2d(ws.start, pin.add(start_at), 4)?;
+            s.copy_h2d(ws.desc, pin.add(lay.desc), lay.desc_bytes)?;
         }
-        hk::hc_expand(s, ws.emb, ws.lanes, t)?;
+        hk::hc_expand(s, ws.emb, ws.lanes, r)?;
 
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(eng) = &layer.engram {
                 let li = self.engram_layers.iter().position(|&x| x == i).unwrap();
                 hk::engram_embed(
                     s,
-                    ws.q8 + (li * t * ENGRAM_HEADS * ENGRAM_DIM) as u64,
-                    ws.q8_sc + (li * t * ENGRAM_HEADS * 4) as u64,
+                    ws.q8 + (li * r * ENGRAM_HEADS * ENGRAM_DIM) as u64,
+                    ws.q8_sc + (li * r * ENGRAM_HEADS * 4) as u64,
                     eng.head_norm,
-                    t,
+                    r,
                     ws.eemb,
                 )?;
-                linear(s, ws.eemb, ENGRAM_W, t, &eng.kv, ws.f_a, eng.kv.n)?;
+                linear(s, ws.eemb, ENGRAM_W, r, &eng.kv, ws.f_a, eng.kv.n, plan.small)?;
                 hk::engram_apply(
                     s,
                     ws.f_a,
@@ -695,7 +1125,7 @@ impl Hy4Model {
                     eng.gamma,
                     eng.hc_scale,
                     ws.mask,
-                    t,
+                    r,
                     ws.lanes,
                 )?;
             }
@@ -711,13 +1141,13 @@ impl Hy4Model {
                 cfg.hc_mag,
                 cfg.eps,
                 false,
-                t,
+                r,
                 ws.hc_part,
                 ws.x,
                 ws.post,
             )?;
-            self.attention(state, ws, s, i, t, start)?;
-            hk::hc_post(s, ws.lanes, ws.post, ws.y, D, t)?;
+            self.attention(ws, s, i, plan)?;
+            hk::hc_post(s, ws.lanes, ws.post, ws.y, D, r)?;
             // MLP sublayer.
             hk::hc_pre(
                 s,
@@ -730,26 +1160,26 @@ impl Hy4Model {
                 cfg.hc_mag,
                 cfg.eps,
                 false,
-                t,
+                r,
                 ws.hc_part,
                 ws.x,
                 ws.post,
             )?;
             match &layer.mlp {
-                Mlp::Dense(m) => self.dense(ws, s, m, t)?,
-                Mlp::Moe(m) => self.moe(ws, s, m, t)?,
+                Mlp::Dense(m) => self.dense(ws, s, m, plan)?,
+                Mlp::Moe(m) => self.moe(ws, s, m, plan)?,
             }
-            hk::hc_post(s, ws.lanes, ws.post, ws.y, D, t)?;
+            hk::hc_post(s, ws.lanes, ws.post, ws.y, D, r)?;
             if let Some(dir) = std::env::var_os("QUENCH6K_HY4_DUMP") {
-                // Debugging: the lanes after each layer, appended per chunk (F32 [t, 4, 3072]).
+                // Debugging: the lanes after each layer, appended per chunk (F32 [r, 4, 3072]).
                 use std::io::Write;
-                let v: Vec<f32> = s.download(ws.lanes, t * HC * D)?;
+                let v: Vec<f32> = s.download(ws.lanes, r * HC * D)?;
                 let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
                 let path = std::path::Path::new(&dir).join(format!("lanes-{i:02}.bin"));
                 std::fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(&bytes)?;
             }
         }
-        if want != Logits::None {
+        if plan.want != Logits::None {
             hk::hc_pre(
                 s,
                 ws.lanes,
@@ -761,12 +1191,18 @@ impl Hy4Model {
                 1.0,
                 cfg.eps,
                 true,
-                t,
+                r,
                 ws.hc_part,
                 ws.hidden,
                 ws.post,
             )?;
-            let (rows, first) = if want == Logits::All { (t, 0) } else { (1, t - 1) };
+            if self.dfly.is_some() {
+                // The last rows' hidden states, for the drafter.
+                let (_, seq, kslot, tab) = ws.desc_addrs(r);
+                let kl = KeepLayout::of(self);
+                hk::seq_scatter(s, ws.hidden, D * 2, D * 2, 0, kslot, seq, r, tab + (4 * MAX_SEQS * 8) as u64, kl.hidden, D * 2)?;
+            }
+            let (rows, first) = if plan.want == Logits::All { (r, 0) } else { (1, r - 1) };
             linear(
                 s,
                 ws.hidden + (first * D * 2) as u64,
@@ -775,28 +1211,36 @@ impl Hy4Model {
                 &self.lm_head,
                 ws.out_logits,
                 cfg.vocab,
+                plan.small,
             )?;
         }
         Ok(())
     }
 
-    fn attention(&self, state: &State, ws: &Workspace, s: &Stream, i: usize, t: usize, start: Option<usize>) -> Result<()> {
+    fn attention(&self, ws: &Workspace, s: &Stream, i: usize, plan: &Plan) -> Result<()> {
         let cfg = &self.cfg;
+        let r = plan.r;
         let a = &self.layers[i].attn;
-        let (cache_rows, ring) = match &state.caches[i] {
-            Cache::Sliding { rows } => (*rows, RING),
-            Cache::Indexed { rows, .. } => (*rows, 0),
+        let slot = self.cache_slot[i];
+        let (pos, seq, kslot, tab) = ws.desc_addrs(r);
+        let tab_of = |k: usize| tab + (k * MAX_SEQS * 8) as u64;
+        let cache = if a.sliding {
+            SeqRows::new(tab_of(3), slot * RING * KROW, KROW, RING)
+        } else {
+            SeqRows::new(tab_of(0), slot * KROW, self.n_indexed * KROW, 0)
         };
-        self.attn_project(ws, s, a, cache_rows, ring, ws.start, t)?;
+        self.attn_project(ws, s, a, cache, pos, seq, r, plan.small)?;
         // Keys each query sees.
         let mut mode = if a.sliding { AttnMode::Sliding } else { AttnMode::Dense };
-        if let (Cache::Indexed { tk, pooled, .. }, Some(ix)) = (&state.caches[i], &a.indexer) {
-            linear(s, ws.x, D, t, &ix.tk, ws.f_c + (t * KROW * 4) as u64, ID)?;
-            linear(s, ws.bf_a, Q_LORA, t, &ix.q, ws.eg, IH * ID)?;
-            linear(s, ws.x, D, t, &ix.hw, ws.eu, IH)?;
+        if let Some(ix) = &a.indexer {
+            let tk = SeqRows::new(tab_of(1), slot * ID, self.n_indexed * ID, 0);
+            let pooled = SeqRows::new(tab_of(2), slot * ID, self.n_indexed * ID, 0);
+            linear(s, ws.x, D, r, &ix.tk, ws.f_c + (r * KROW * 4) as u64, ID, plan.small)?;
+            linear(s, ws.bf_a, Q_LORA, r, &ix.q, ws.eg, IH * ID, plan.small)?;
+            linear(s, ws.x, D, r, &ix.hw, ws.eu, IH, plan.small)?;
             hk::idx_prep(
                 s,
-                ws.f_c + (t * KROW * 4) as u64,
+                ws.f_c + (r * KROW * 4) as u64,
                 ID,
                 ix.tk_norm,
                 cfg.eps,
@@ -805,60 +1249,88 @@ impl Hy4Model {
                 ws.eu,
                 IH,
                 cfg.theta_indexed,
-                ws.start,
-                t,
-                *tk,
+                pos,
+                seq,
+                r,
+                tk,
                 ws.iq,
                 ws.hw,
             )?;
-            hk::idx_pool(s, *tk, ix.wv, ix.wg, ix.ape, ix.key_norm, cfg.eps, cfg.theta_indexed, ws.start, t, *pooled)?;
-            // Eager steps score only the complete groups, and only past 2048 positions; graph steps score
-            // all of the context's groups (the kernels mask by the device start) and always list the
-            // selected positions, densely while the context is short.
-            let groups = match start {
-                Some(p) if p + t > TOPG * GROUP => Some((p + t) / GROUP),
-                Some(_) => None,
-                None => Some(state.ctx / GROUP),
-            };
-            if let Some(g) = groups {
-                if g >= TOPG {
-                    hk::idx_scores(s, ws.iq, ws.hw, *pooled, ws.start, t, g, ws.scores, g)?;
-                    k::topk(s, ws.scores, t, g, g, TOPG - 1, false, ws.picked, 0)?;
+            hk::idx_pool(s, tk, ix.wv, ix.wg, ix.ape, ix.key_norm, cfg.eps, cfg.theta_indexed, pos, seq, r, pooled)?;
+            // Large steps attend densely until the context exceeds 2048 positions, then select (scoring only
+            // the complete groups); small steps always list each row's keys (densely while its context is
+            // short), scoring a bucket of groups past the longest row's (the rest score -inf).
+            if !plan.dense {
+                if let Some(g) = plan.groups {
+                    let per = (SCORE_FLOATS / g).min(r);
+                    for r0 in (0..r).step_by(per) {
+                        let rows = per.min(r - r0);
+                        hk::idx_scores(
+                            s,
+                            ws.iq + (r0 * IH * ID * 2) as u64,
+                            ws.hw + (r0 * IH * 4) as u64,
+                            pooled,
+                            pos + (r0 * 4) as u64,
+                            seq + (r0 * 4) as u64,
+                            rows,
+                            g,
+                            ws.scores,
+                            g,
+                        )?;
+                        k::topk(s, ws.scores, rows, g, g, TOPG - 1, false, ws.picked + (r0 * (TOPG - 1) * 4) as u64, 0)?;
+                    }
                 }
-                hk::idx_expand(s, ws.picked, TOPG - 1, ws.start, t, ws.sel, ws.sel_n)?;
+                hk::idx_expand(s, ws.picked, TOPG - 1, pos, r, ws.sel, ws.sel_n)?;
                 mode = AttnMode::Selected;
                 // The drafter reuses the last rows' key lists of its target layers.
-                if let (Some(d), Some(slot)) = (&ws.dfly, self.dfly.as_ref().and_then(|f| f.index_layers.iter().position(|&l| l == i))) {
-                    let rows = t.min(DFLY_KEEP);
-                    let w = hk::sel_width();
-                    let (keep, keep_n) = d.keep[slot];
-                    s.copy_d2d(keep, ws.sel + ((t - rows) * w * 4) as u64, rows * w * 4)?;
-                    s.copy_d2d(keep_n, ws.sel_n + ((t - rows) * 4) as u64, rows * 4)?;
+                if let Some(slot) = self.dfly.as_ref().and_then(|f| f.index_layers.iter().position(|&l| l == i)) {
+                    let sw = hk::sel_width();
+                    let (lists, lens) = KeepLayout::of(self).ints(slot);
+                    hk::seq_scatter(s, ws.sel, sw * 4, 0, ws.sel_n, kslot, seq, r, tab_of(4), lists * 4, sw * 4)?;
+                    hk::seq_scatter(s, ws.sel_n, 4, 4, 0, kslot, seq, r, tab_of(4), lens * 4, 4)?;
                 }
             }
         }
-        self.attn_output(ws, s, a, mode, cache_rows, ring, ws.sel, ws.sel_n, ws.start, t)
+        self.attn_output(ws, s, a, mode, cache, ws.sel, ws.sel_n, pos, seq, r, plan.small)
     }
 
-    /// Projections of an attention sublayer for the `t` rows of ws.x at positions *start ..: queries with
-    /// W_uk absorbed (ws.qa), the rows' cache entries (cache_rows), q_resid (ws.bf_a), gate (ws.f_b).
+    /// Projections of an attention sublayer for the `t` rows of ws.x (positions and sequences `pos`, `seq`):
+    /// queries with W_uk absorbed (ws.qa), the rows' cache entries (cache), q_resid (ws.bf_a), gate (ws.f_b).
     #[allow(clippy::too_many_arguments)]
-    fn attn_project(&self, ws: &Workspace, s: &Stream, a: &Attn, cache_rows: u64, ring: usize, start: u64, t: usize) -> Result<()> {
+    fn attn_project(&self, ws: &Workspace, s: &Stream, a: &Attn, cache: SeqRows, pos: u64, seq: u64, t: usize, small: bool) -> Result<()> {
         let cfg = &self.cfg;
         let h = a.heads;
         let theta = if a.sliding { cfg.theta_sliding } else { cfg.theta_indexed };
         // q_resid (BF16 [t, 1024]) in bf_a; q (F32 [t, h * 256]) in f_a; kv_a (F32 [t, 576]) in f_c; gate in f_b.
-        linear(s, ws.x, D, t, &a.q_a, ws.f_a, Q_LORA)?;
+        linear(s, ws.x, D, t, &a.q_a, ws.f_a, Q_LORA, small)?;
         hk::rms_rows(s, ws.f_a, Q_LORA, a.q_a_norm, Q_LORA, cfg.eps, ws.bf_a, Q_LORA, t)?;
-        linear(s, ws.bf_a, Q_LORA, t, &a.q_b, ws.f_a, h * QK)?;
-        linear(s, ws.x, D, t, &a.kv_a, ws.f_c, KROW)?;
-        linear(s, ws.x, D, t, &a.gate, ws.f_b, h * VD)?;
-        hk::mla_prep(s, ws.f_a, h * QK, ws.f_c, KROW, a.kv_a_norm, cfg.eps, theta, h, start, ring, t, ws.qn, ws.qa, cache_rows)?;
+        linear(s, ws.bf_a, Q_LORA, t, &a.q_b, ws.f_a, h * QK, small)?;
+        linear(s, ws.x, D, t, &a.kv_a, ws.f_c, KROW, small)?;
+        linear(s, ws.x, D, t, &a.gate, ws.f_b, h * VD, small)?;
+        hk::mla_prep(s, ws.f_a, h * QK, ws.f_c, KROW, a.kv_a_norm, cfg.eps, theta, h, pos, seq, cache, t, ws.qn, ws.qa)?;
         // Absorb W_uk into the queries: qa[t, h, 0..512) = W_uk[h]^T q_nope.
-        if t <= hk::heads_gemv_max_t() {
-            hk::heads_gemv(
-                s, ws.qn, h * NOPE, NOPE, a.wuk_t, KV_LORA * NOPE, KV_LORA, NOPE, h, t, 0, 0, ws.qa, h * KROW, KROW,
-            )
+        if small {
+            for r0 in (0..t).step_by(SMALL_ROWS) {
+                let rows = SMALL_ROWS.min(t - r0);
+                hk::heads_gemv(
+                    s,
+                    ws.qn + (r0 * h * NOPE * 2) as u64,
+                    h * NOPE,
+                    NOPE,
+                    a.wuk_t,
+                    KV_LORA * NOPE,
+                    KV_LORA,
+                    NOPE,
+                    h,
+                    rows,
+                    0,
+                    0,
+                    ws.qa + (r0 * h * KROW * 2) as u64,
+                    h * KROW,
+                    KROW,
+                )?;
+            }
+            Ok(())
         } else {
             k::gemm_bf16_batched(
                 s, ws.qn, h * NOPE, NOPE, a.wuk_t, NOPE, KV_LORA * NOPE, ws.qa, h * KROW, KROW, t, KV_LORA, NOPE, h,
@@ -866,7 +1338,7 @@ impl Hy4Model {
         }
     }
 
-    /// Attention of the projected queries over the latent cache, then W_uv, the gate, o_proj and the post
+    /// Attention of the projected queries over the latent caches, then W_uv, the gate, o_proj and the post
     /// norm: ws.y (BF16 [t, 3072]).
     #[allow(clippy::too_many_arguments)]
     fn attn_output(
@@ -875,50 +1347,63 @@ impl Hy4Model {
         s: &Stream,
         a: &Attn,
         mode: AttnMode,
-        cache_rows: u64,
-        ring: usize,
+        cache: SeqRows,
         sel: u64,
         sel_n: u64,
-        start: u64,
+        pos: u64,
+        seq: u64,
         t: usize,
+        small: bool,
     ) -> Result<()> {
         let cfg = &self.cfg;
         let h = a.heads;
-        // Attention over the latent cache.
-        let ctas = t * (h / 16);
-        // Splits of small steps: about two waves of CTAs, at most one per 32-key tile (sliding: 512 keys,
-        // selected: 2048).
-        let tiles = if a.sliding { WINDOW / 32 } else { TOPG * GROUP / 32 };
-        let splits = if t <= hk::heads_gemv_max_t() {
-            (376usize.div_ceil(ctas)).clamp(1, MAX_SPLITS.min(tiles))
-        } else {
-            1
-        };
-        // Small steps: 16 heads per block (more blocks for the splits); prefill: all of a token's heads (up
-        // to 64) share each key tile (variant hy4.attn_heads).
-        let hpb = if t <= hk::heads_gemv_max_t() { 16 } else { quench6k_cuda::variants::get("hy4.attn_heads", 16) as usize };
-        hk::mla_attention(s, mode, ws.qa, h, cache_rows, ring, sel, sel_n, a.sinks, start, t, splits, hpb, ws.part, ws.olat)?;
-        // Expand the output latents (W_uv) and gate them: bf_b [t, h * 256].
         let wuv = a.kv_b + (NOPE * KV_LORA * 2) as u64;
-        if t <= hk::heads_gemv_max_t() {
-            hk::heads_gemv(
-                s,
-                ws.olat,
-                h * KV_LORA,
-                KV_LORA,
-                wuv,
-                (NOPE + VD) * KV_LORA,
-                VD,
-                KV_LORA,
-                h,
-                t,
-                ws.f_b,
-                h * VD,
-                ws.bf_b,
-                h * VD,
-                VD,
-            )?;
+        if small {
+            // Each row's keys in a fixed number of splits, 16 heads per block, launches of SMALL_ROWS rows.
+            let splits = if a.sliding { SPLITS_SLIDING } else { SPLITS_INDEXED };
+            let sw = hk::sel_width();
+            for r0 in (0..t).step_by(SMALL_ROWS) {
+                let rows = SMALL_ROWS.min(t - r0);
+                hk::mla_attention(
+                    s,
+                    mode,
+                    ws.qa + (r0 * h * KROW * 2) as u64,
+                    h,
+                    cache,
+                    sel + (r0 * sw * 4) as u64,
+                    sel_n + (r0 * 4) as u64,
+                    a.sinks,
+                    pos + (r0 * 4) as u64,
+                    seq + (r0 * 4) as u64,
+                    rows,
+                    splits,
+                    16,
+                    ws.part,
+                    ws.olat + (r0 * h * KV_LORA * 2) as u64,
+                )?;
+                // Expand the output latents (W_uv) and gate them: bf_b [t, h * 256].
+                hk::heads_gemv(
+                    s,
+                    ws.olat + (r0 * h * KV_LORA * 2) as u64,
+                    h * KV_LORA,
+                    KV_LORA,
+                    wuv,
+                    (NOPE + VD) * KV_LORA,
+                    VD,
+                    KV_LORA,
+                    h,
+                    rows,
+                    ws.f_b + (r0 * h * VD * 4) as u64,
+                    h * VD,
+                    ws.bf_b + (r0 * h * VD * 2) as u64,
+                    h * VD,
+                    VD,
+                )?;
+            }
         } else {
+            // Prefill: all of a token's heads (up to 64) share each key tile (variant hy4.attn_heads).
+            let hpb = quench6k_cuda::variants::get("hy4.attn_heads", 16) as usize;
+            hk::mla_attention(s, mode, ws.qa, h, cache, sel, sel_n, a.sinks, pos, seq, t, 1, hpb, ws.part, ws.olat)?;
             k::gemm_bf16_batched(
                 s,
                 ws.olat,
@@ -937,27 +1422,29 @@ impl Hy4Model {
             )?;
             hk::gate_mul(s, ws.bf_b, ws.f_b, t * h * VD)?;
         }
-        linear(s, ws.bf_b, h * VD, t, &a.o, ws.f_a, D)?;
+        linear(s, ws.bf_b, h * VD, t, &a.o, ws.f_a, D, small)?;
         hk::rms_rows(s, ws.f_a, D, a.post_norm, D, cfg.eps, ws.y, D, t)
     }
 
-    fn dense(&self, ws: &Workspace, s: &Stream, m: &Dense, t: usize) -> Result<()> {
+    fn dense(&self, ws: &Workspace, s: &Stream, m: &Dense, plan: &Plan) -> Result<()> {
+        let (t, small) = (plan.r, plan.small);
         let n = m.gate.n;
-        linear(s, ws.x, D, t, &m.gate, ws.f_a, n)?;
-        linear(s, ws.x, D, t, &m.up, ws.f_b, n)?;
+        linear(s, ws.x, D, t, &m.gate, ws.f_a, n, small)?;
+        linear(s, ws.x, D, t, &m.up, ws.f_b, n, small)?;
         hk::swiglu(s, ws.f_a, ws.f_b, n, n, 0.0, ws.bf_a, n, t)?;
-        linear(s, ws.bf_a, n, t, &m.down, ws.f_a, D)?;
+        linear(s, ws.bf_a, n, t, &m.down, ws.f_a, D, small)?;
         hk::rms_rows(s, ws.f_a, D, m.norm, D, self.cfg.eps, ws.y, D, t)
     }
 
-    fn moe(&self, ws: &Workspace, s: &Stream, m: &Moe, t: usize) -> Result<()> {
+    fn moe(&self, ws: &Workspace, s: &Stream, m: &Moe, plan: &Plan) -> Result<()> {
         let cfg = &self.cfg;
-        linear(s, ws.x, D, t, &m.router, ws.logits, EXPERTS)?;
+        let (t, small) = (plan.r, plan.small);
+        linear(s, ws.x, D, t, &m.router, ws.logits, EXPERTS, small)?;
         hk::route(s, ws.logits, EXPERTS, m.bias, cfg.scaling, t, ws.sel_e, ws.sel_w)?;
-        linear(s, ws.x, D, t, &m.down_lat, ws.f_a, LAT)?;
+        linear(s, ws.x, D, t, &m.down_lat, ws.f_a, LAT, small)?;
         k::f32_to_bf16(s, ws.f_a, ws.rin, t * LAT)?;
         let ex = &m.experts;
-        if t <= SMALL_T {
+        if plan.ex_small {
             // ws.pair_row (unused by small steps) holds the pairs' expert order.
             hk::experts_small(s, ws.rin, ws.sel_e, ex.gate, ex.up, ex.down, cfg.swiglu_limit, t, ws.pair_row, ws.act, ws.ed)?;
             hk::experts_combine(s, ws.ed, 0, ws.sel_w, t, ws.fin)?;
@@ -1006,7 +1493,7 @@ impl Hy4Model {
                 k::fp4_quant_rows(s, ws.act, pairs, LAT, ws.fp4_rows)?;
                 gemm4(ex.tables[2], ex.down.s2, ws.ed)?;
                 hk::experts_combine(s, ws.ed, ws.pair_row, ws.sel_w, t, ws.fin)?;
-                return self.moe_tail(ws, s, m, t);
+                return self.moe_tail(ws, s, m, plan);
             }
             let gemm = |x: u64, table: (u64, u64), s2: u64, y: u64| {
                 k::moe_nvfp4_gemm(
@@ -1031,17 +1518,18 @@ impl Hy4Model {
             gemm(ws.act, ex.tables[2], ex.down.s2, ws.ed)?;
             hk::experts_combine(s, ws.ed, ws.pair_row, ws.sel_w, t, ws.fin)?;
         }
-        self.moe_tail(ws, s, m, t)
+        self.moe_tail(ws, s, m, plan)
     }
 
     /// Back to the model width, plus the shared expert, then the block's norm.
-    fn moe_tail(&self, ws: &Workspace, s: &Stream, m: &Moe, t: usize) -> Result<()> {
+    fn moe_tail(&self, ws: &Workspace, s: &Stream, m: &Moe, plan: &Plan) -> Result<()> {
         let cfg = &self.cfg;
-        linear(s, ws.fin, LAT, t, &m.up_lat, ws.f_c, D)?;
-        linear(s, ws.x, D, t, &m.shared_gate, ws.f_a, LAT)?;
-        linear(s, ws.x, D, t, &m.shared_up, ws.f_b, LAT)?;
+        let (t, small) = (plan.r, plan.small);
+        linear(s, ws.fin, LAT, t, &m.up_lat, ws.f_c, D, small)?;
+        linear(s, ws.x, D, t, &m.shared_gate, ws.f_a, LAT, small)?;
+        linear(s, ws.x, D, t, &m.shared_up, ws.f_b, LAT, small)?;
         hk::swiglu(s, ws.f_a, ws.f_b, LAT, LAT, 0.0, ws.bf_a, LAT, t)?;
-        linear(s, ws.bf_a, LAT, t, &m.shared_down, ws.f_a, D)?;
+        linear(s, ws.bf_a, LAT, t, &m.shared_down, ws.f_a, D, small)?;
         hk::add_rows(s, ws.f_c, D, ws.f_a, D, D, t, ws.f_b, D)?;
         hk::rms_rows(s, ws.f_b, D, m.norm, D, cfg.eps, ws.y, D, t)
     }

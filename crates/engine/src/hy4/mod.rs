@@ -64,6 +64,8 @@ pub struct Config {
     pub image_token: Option<i64>,
     pub video_token: Option<i64>,
     pub eos: Vec<i32>,
+    /// Longest context the model supports (max_position_embeddings).
+    pub max_positions: usize,
 }
 
 fn num(v: &Value, key: &str) -> Result<f64> {
@@ -182,6 +184,7 @@ impl Config {
             image_token: all.get("image_token_id").and_then(Value::as_i64),
             video_token: all.get("video_token_id").and_then(Value::as_i64),
             eos,
+            max_positions: num(t, "max_position_embeddings")? as usize,
         })
     }
 }
@@ -389,6 +392,11 @@ pub struct Hy4Model {
     pub lm_head: Linear,
     /// The DFly drafter (QUENCH6K_HY4_DFLY=0: not loaded).
     pub dfly: Option<Dfly>,
+    /// Per layer: its index among the layers of its kind (indexed or sliding), whose caches a sequence
+    /// keeps interleaved per position (indexed) or one ring after another (sliding).
+    pub cache_slot: Vec<usize>,
+    pub n_indexed: usize,
+    pub n_sliding: usize,
     embed: Mmap,
     embed_off: usize,
     pub device_bytes: usize,
@@ -554,6 +562,15 @@ impl Hy4Model {
             device_bytes as f64 / (1u64 << 30) as f64
         );
         let engram_layers: Vec<usize> = (0..layers.len()).filter(|&i| layers[i].engram.is_some()).collect();
+        let (mut n_indexed, mut n_sliding) = (0, 0);
+        let cache_slot = layers
+            .iter()
+            .map(|l| {
+                let c = if l.attn.sliding { &mut n_sliding } else { &mut n_indexed };
+                *c += 1;
+                *c - 1
+            })
+            .collect();
         if std::env::var("QUENCH6K_HY4_ENGRAM_PRELOAD").is_ok_and(|v| v != "0") {
             let t1 = std::time::Instant::now();
             for &i in &engram_layers {
@@ -569,6 +586,9 @@ impl Hy4Model {
             norm,
             lm_head,
             dfly,
+            cache_slot,
+            n_indexed,
+            n_sliding,
             embed,
             embed_off,
             device_bytes,

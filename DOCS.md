@@ -82,6 +82,25 @@ quench6k gate --fixtures out/hy4-fixtures --candidates out/hy4-eng --ref-a ref-b
 `quench6k hy4 generate` and `quench6k hy4 bench` run greedy generation and throughput measurements
 (`--dfly`: drafted decoding).
 
+The engine steps up to 8 sequences at once, up to 8 tokens each (a pending token and its drafts), and
+drafts for them in one pass; each sequence's results (logits, caches, drafts) are bit-identical to
+running it alone. Small steps use only kernels whose arithmetic for a row does not depend on the step's
+other rows (GEMVs, per-head GEMVs, routed experts per token-expert pair, attention with a fixed split of
+each row's keys), so a token's bits also do not depend on how many drafts are verified with it, and
+drafted greedy decoding gives the plain greedy tokens. `quench6k hy4 width-check` compares one-token
+steps with wider ones, `quench6k hy4 batch-check` sequences alone and batched (teacher-forced logits and
+caches, greedy decoding with drafts) bitwise, and with `--bench-ctx` measures the aggregate decode
+throughput of 1, 2, 4 and 8 batched sequences. Kernels find each row's sequence through per-row
+descriptors and per-sequence address tables in device memory, so the CUDA graphs of small steps belong
+to the workspace and serve any sequences.
+
+A sequence's indexed layers keep 17,664 bytes per position (cache row, token key and pooled key of 12
+layers), in address ranges reserved for its capacity (up to the model's 1,048,576 positions) and backed
+by memory in 2 MiB pieces as the sequence grows (`State::reserve`, released by `State::trim`); the
+sliding layers' rings and the prompt-end snapshot take a fixed 106 MB. Sequences share what the weights
+(87 GiB) and the workspace (1.85 GiB with 2048-token prefill chunks) leave: about 4.4 GiB on a 96 GB GPU,
+some 260K positions for one sequence or 27K each for eight.
+
 ### Inkling 2
 
 Thinking Machines' Inkling 2 Mini (`inkling2_loop`: 24 layers of which 6 .. 17 run three times, 128
