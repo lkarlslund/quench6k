@@ -163,10 +163,19 @@ fn decode_draft(
         0.0008,
         0.0006,
     );
+    // QUENCH6K_INK_CONF_LOG=file: the drafts' confidences and outcomes (calibration data).
+    let mut conf_log = match std::env::var_os("QUENCH6K_INK_CONF_LOG") {
+        Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
+        None => None,
+    };
     while out.len() < n && !stop(pending) {
         let t0 = Instant::now();
-        let want_drafts = fixed.unwrap_or_else(|| policy.drafts());
-        let mut drafts = if want_drafts > 0 { model.draft(st, ws, s, pending, row)? } else { Vec::new() };
+        // Fixed count (QUENCH6K_INK_DRAFTS), or the policy: run the drafter while it pays, then verify
+        // the count its stated probabilities favour.
+        let run = fixed.map_or_else(|| policy.want_draft(), |f| f > 0);
+        let mut drafts = if run { model.draft(st, ws, s, pending, row)? } else { Vec::new() };
+        let conf = model.draft_conf(ws);
+        let want_drafts = fixed.unwrap_or_else(|| if drafts.is_empty() { 0 } else { policy.drafts_conf(&conf[..drafts.len()]) });
         let t1 = Instant::now();
         t_draft += (t1 - t0).as_secs_f64();
         drafts.truncate(want_drafts.min(n - out.len()));
@@ -191,10 +200,17 @@ fn decode_draft(
             pending = tok;
             break;
         }
+        if let Some(log) = conf_log.as_mut() {
+            use std::io::Write;
+            // Each judged draft (the accepted ones and the first rejected): position, confidence, kept.
+            for k in 0..drafts.len().min(j + 1) {
+                writeln!(log, "{k} {} {}", conf[k], (k < j) as u8)?;
+            }
+        }
         st.truncate(before + 1 + j);
         row = j;
         hist[j.min(8)] += 1;
-        policy.update(drafts.len(), j, verify, (!drafts.is_empty()).then(|| (t1 - t0).as_secs_f64()));
+        policy.update_conf(&conf, drafts.len(), j, verify, run.then(|| (t1 - t0).as_secs_f64()));
     }
     if timing {
         eprintln!("draft: accepted drafts per step (0, 1, ...): {:?}", &hist);

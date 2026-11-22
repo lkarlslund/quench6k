@@ -349,7 +349,7 @@ impl Workspace {
                 let ff2 = d.layers[0].gate_up.n;
                 Some(DraftWs {
                     stage: a.get(16)?,
-                    drafts: a.get(b * 4)?,
+                    drafts: a.get(2 * b * 4)?,
                     prev: a.get(16)?,
                     x: a.get(b * D * 4)?,
                     xn: a.get(b * D * 2)?,
@@ -363,12 +363,12 @@ impl Workspace {
                     ctx: a.get(b * d.markov_hf.n * 4)?,
                     state: a.get(2 * 256 * 2)?,
                     latent: a.get(256 * 2)?,
-                    best_v: a.get(ik::markov_blocks(vocab) * 4)?,
+                    best_v: a.get(2 * ik::markov_blocks(vocab) * 4)?,
                     best_i: a.get(ik::markov_blocks(vocab) * 4)?,
                     cand: a.get(b * ik::markov_cand_blocks(vocab) * MARKOV_CAND_MAX * 4)?,
                     mixed: a.get(t * D * 2)?,
                     kv: a.get(t * 2 * KVD * 4)?,
-                    pinned: PinnedBuffer::new(64 + b * 4)?,
+                    pinned: PinnedBuffer::new(64 + 2 * b * 4)?,
                 })
             }
             None => None,
@@ -533,6 +533,18 @@ impl InklingModel {
             .collect())
     }
 
+    /// The last draft pass's per-draft probabilities under the drafter's head.
+    pub fn draft_conf(&self, ws: &Workspace) -> Vec<f32> {
+        let (Some(d), Some(dw)) = (&self.drafter, &ws.draft) else {
+            return Vec::new();
+        };
+        let n = d.block - 1;
+        dw.pinned.as_slice()[64 + n * 4..64 + 2 * n * 4]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
     fn draft_enqueue(&self, state: &State, ws: &Workspace, s: &Stream) -> Result<()> {
         let cfg = &self.cfg;
         let d = self.drafter.as_ref().unwrap();
@@ -587,10 +599,11 @@ impl InklingModel {
                 dw.best_v,
                 dw.best_i,
                 dw.drafts + (i * 4) as u64,
+                dw.drafts + ((n + i) * 4) as u64,
                 (c > 0).then(|| (dw.cand + (i * per * 4) as u64, per)),
             )?;
         }
-        unsafe { s.copy_d2h(dw.pinned.as_ptr().add(64), dw.drafts, n * 4)? };
+        unsafe { s.copy_d2h(dw.pinned.as_ptr().add(64), dw.drafts, 2 * n * 4)? };
         Ok(())
     }
 

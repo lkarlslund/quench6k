@@ -152,17 +152,21 @@ pub(super) fn schedule(
                 };
                 let room = (budget - generated.len()).min(context - st.pos - 1);
                 let td = std::time::Instant::now();
+                let mut conf = Vec::new();
                 let draft = if dspark {
-                    let n = policy.drafts().min(room);
-                    let mut d = if n > 0 { model.draft(&mut st, &mut ws, s, pending, row)? } else { Vec::new() };
-                    d.truncate(n);
+                    // Run the drafter while drafting pays; verify the count its stated probabilities favour.
+                    let mut d = if policy.want_draft() && room > 0 { model.draft(&mut st, &mut ws, s, pending, row)? } else { Vec::new() };
+                    if !d.is_empty() {
+                        conf = model.draft_conf(&ws);
+                        d.truncate(policy.drafts_conf(&conf[..d.len()]).min(room));
+                    }
                     d
                 } else if lookup {
                     crate::flint::lookup_draft(&hist, cap.min(room))
                 } else {
                     Vec::new()
                 };
-                let draft_secs = (!draft.is_empty()).then(|| td.elapsed().as_secs_f64());
+                let draft_secs = (!conf.is_empty()).then(|| td.elapsed().as_secs_f64());
                 let tv = std::time::Instant::now();
                 let mut toks = Vec::with_capacity(draft.len() + 1);
                 toks.push(pending);
@@ -190,7 +194,7 @@ pub(super) fn schedule(
                     rate = 0.8 * rate + 0.2 * (j as f64 / draft.len() as f64);
                 }
                 if dspark {
-                    policy.update(draft.len(), j, verify_secs, draft_secs);
+                    policy.update_conf(&conf, draft.len(), j, verify_secs, draft_secs);
                 }
                 // Keep the fed tokens that were accepted; the rest are overwritten later.
                 st.truncate(before + 1 + j);

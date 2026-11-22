@@ -15,6 +15,11 @@ pub struct DraftPolicy {
     /// Seconds of a drafter pass.
     draft: f64,
     steps: usize,
+    /// Calibration of drafters that state each draft's probability: kept and judged drafts (pseudo-counts
+    /// included) per tenth of the stated probability.
+    calib: [(f64, f64); 10],
+    /// Tokens per second of recent drafted steps (drafter pass included).
+    drafted_rate: f64,
 }
 
 impl DraftPolicy {
@@ -32,7 +37,59 @@ impl DraftPolicy {
             cost,
             draft,
             steps: 0,
+            // Prior: stated probabilities are taken at 80 %, worth 4 drafts per tenth.
+            calib: std::array::from_fn(|i| (4.0 * 0.8 * (i as f64 + 0.5) / 10.0, 4.0)),
+            drafted_rate: 2.0 / step,
         }
+    }
+
+    fn calibrated(&self, conf: f32) -> f64 {
+        let (kept, judged) = self.calib[((conf.max(0.0) * 10.0) as usize).min(9)];
+        kept / judged
+    }
+
+    /// Whether to run the drafter for the next step: while drafted steps have recently produced more
+    /// tokens per second than plain steps would (every 8th step drafts regardless, to keep that current).
+    pub fn want_draft(&self) -> bool {
+        self.drafts > 0 && (self.drafted_rate >= 1.0 / self.cost[1] || self.steps % 8 == 7)
+    }
+
+    /// Drafts to verify given the drafter's stated probability of each: the count with the most expected
+    /// tokens per second (the drafter pass, already spent, counted in every option).
+    pub fn drafts_conf(&self, conf: &[f32]) -> usize {
+        let n = conf.len().min(self.drafts);
+        let (mut best, mut best_rate) = (0, 1.0 / (self.cost[1] + self.draft));
+        let (mut tokens, mut p) = (1.0, 1.0);
+        for (d, &c) in conf[..n].iter().enumerate() {
+            p *= self.calibrated(c);
+            tokens += p;
+            let rate = tokens / (self.cost[d + 2] + self.draft);
+            if rate > best_rate {
+                best = d + 1;
+                best_rate = rate;
+            }
+        }
+        best
+    }
+
+    /// Records a step after `drafts_conf`: the stated probabilities of the `drafted` verified drafts, of
+    /// which the first `accepted` were taken, the verification's `seconds` and the drafter pass's.
+    pub fn update_conf(&mut self, conf: &[f32], drafted: usize, accepted: usize, seconds: f64, draft_seconds: Option<f64>) {
+        for (k, &c) in conf.iter().enumerate().take(drafted.min(accepted + 1)) {
+            let b = &mut self.calib[((c.max(0.0) * 10.0) as usize).min(9)];
+            // Recent drafts weigh more: decay the bucket's counts beyond 200 judged.
+            if b.1 > 200.0 {
+                b.0 *= 0.995;
+                b.1 *= 0.995;
+            }
+            b.0 += (k < accepted) as u8 as f64;
+            b.1 += 1.0;
+        }
+        if let Some(d) = draft_seconds {
+            let rate = (accepted + 1) as f64 / (seconds + d);
+            self.drafted_rate += 0.1 * (rate - self.drafted_rate);
+        }
+        self.update(drafted, accepted, seconds, draft_seconds);
     }
 
     /// Expected tokens per second verifying `d` drafts.
@@ -75,6 +132,20 @@ impl DraftPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confident_drafts_are_verified_and_doubtful_ones_dropped() {
+        let mut p = DraftPolicy::new(7, 0.0045, 0.0008, 0.0006);
+        // Drafts stated at 0.95 are kept, at 0.3 never.
+        for i in 0..300 {
+            let conf = if i % 2 == 0 { [0.95, 0.95, 0.3, 0.3, 0.3, 0.3, 0.3] } else { [0.3; 7] };
+            // Every draft verified (as a probe would), the 0.95 ones kept.
+            let kept = if i % 2 == 0 { 2 } else { 0 };
+            p.update_conf(&conf, 7, kept, 0.0045 + 0.0008 * 7.0, Some(0.0006));
+        }
+        assert_eq!(p.drafts_conf(&[0.95, 0.95, 0.3, 0.3, 0.3, 0.3, 0.3]), 2);
+        assert_eq!(p.drafts_conf(&[0.3; 7]), 0);
+    }
 
     #[test]
     fn verifies_fewer_drafts_when_later_ones_fail() {

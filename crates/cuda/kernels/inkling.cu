@@ -1613,10 +1613,10 @@ __global__ void __launch_bounds__(256) markov_step_kernel(const bf16* __restrict
 // one (max, index) per block (block 256 threads, warp per row, 64 rows per block).
 constexpr int MV_ROWS = 64;
 __global__ void __launch_bounds__(256) markov_vocab_kernel(const bf16* __restrict__ fold_w, const float* __restrict__ fold_b, const float* __restrict__ base,
-                                                           const bf16* latent, int V, float cap, float* best_v, int* best_i) {
+                                                           const bf16* latent, int V, float cap, float* best_v, int* best_i, int zoff) {
     pdl_launch_dependents();
     pdl_wait();
-    __shared__ float bv[8];
+    __shared__ float bv[8], bz[8];
     __shared__ int bi[8];
     __shared__ uint4 lat_s[MR / 8];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -1631,7 +1631,7 @@ __global__ void __launch_bounds__(256) markov_vocab_kernel(const bf16* __restric
 #pragma unroll
         for (int i = 0; i < 8; ++i) lat[i] = bf2f(lp[i]);
     }
-    float mv = -INFINITY;
+    float mv = -INFINITY, z = 0.0f;
     int mi = 0;
     // Each warp takes 8 consecutive rows at once (8 loads in flight per lane).
     const int r0 = blockIdx.x * MV_ROWS + warp * 8;
@@ -1648,6 +1648,7 @@ __global__ void __launch_bounds__(256) markov_vocab_kernel(const bf16* __restric
         const int r = r0 + j;
         if (r < V) {
             const float x = softcap(rb(base[r] + fold_b[r] + acc), cap);
+            z += __expf(x - cap);
             if (x > mv) {
                 mv = x;
                 mi = r;
@@ -1657,18 +1658,23 @@ __global__ void __launch_bounds__(256) markov_vocab_kernel(const bf16* __restric
     if (lane == 0) {
         bv[warp] = mv;
         bi[warp] = mi;
+        bz[warp] = z;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        float v = bv[0];
+        float v = bv[0], zz = bz[0];
         int idx = bi[0];
-        for (int w = 1; w < 8; ++w)
+        for (int w = 1; w < 8; ++w) {
+            zz += bz[w];
             if (bv[w] > v || (bv[w] == v && bi[w] < idx)) {
                 v = bv[w];
                 idx = bi[w];
             }
+        }
         best_v[blockIdx.x] = v;
         best_i[blockIdx.x] = idx;
+        // Sum of exp(logit - cap) next to the values (best_v holds markov_blocks(V) of each).
+        best_v[zoff + blockIdx.x] = zz;
     }
 }
 
@@ -1711,10 +1717,10 @@ __global__ void __launch_bounds__(MC_ROWS) markov_cand_kernel(const float* base,
 // markov_vocab_kernel over a candidate list (-1 entries skipped).
 __global__ void __launch_bounds__(256) markov_vocab_cand_kernel(const bf16* __restrict__ fold_w, const float* __restrict__ fold_b, const float* base,
                                                                 const bf16* latent, const int* cand, int ncand, float cap, float* best_v,
-                                                                int* best_i) {
+                                                                int* best_i, int zoff) {
     pdl_launch_dependents();
     pdl_wait();
-    __shared__ float bv[8];
+    __shared__ float bv[8], bz[8];
     __shared__ int bi[8];
     __shared__ uint4 lat_s[MR / 8];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -1727,7 +1733,7 @@ __global__ void __launch_bounds__(256) markov_vocab_cand_kernel(const bf16* __re
 #pragma unroll
         for (int i = 0; i < 8; ++i) lat[i] = bf2f(lp[i]);
     }
-    float mv = -INFINITY;
+    float mv = -INFINITY, z = 0.0f;
     int mi = 0x7fffffff;
     const int k0 = blockIdx.x * MV_ROWS + warp * 8;
     int rows[8];
@@ -1747,6 +1753,7 @@ __global__ void __launch_bounds__(256) markov_vocab_cand_kernel(const bf16* __re
         const int r = rows[j];
         if (r >= 0) {
             const float x = softcap(rb(__ldcg(base + r) + fold_b[r] + acc), cap);
+            z += __expf(x - cap);
             if (x > mv || (x == mv && r < mi)) {
                 mv = x;
                 mi = r;
@@ -1756,31 +1763,39 @@ __global__ void __launch_bounds__(256) markov_vocab_cand_kernel(const bf16* __re
     if (lane == 0) {
         bv[warp] = mv;
         bi[warp] = mi;
+        bz[warp] = z;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        float v = bv[0];
+        float v = bv[0], zz = bz[0];
         int idx = bi[0];
-        for (int w = 1; w < 8; ++w)
+        for (int w = 1; w < 8; ++w) {
+            zz += bz[w];
             if (bv[w] > v || (bv[w] == v && bi[w] < idx)) {
                 v = bv[w];
                 idx = bi[w];
             }
+        }
         best_v[blockIdx.x] = v;
         best_i[blockIdx.x] = idx;
+        // Sum of exp(logit - cap) next to the values (best_v holds markov_blocks(V) of each).
+        best_v[zoff + blockIdx.x] = zz;
     }
 }
 
-__global__ void __launch_bounds__(256) markov_pick_kernel(const float* best_v, const int* best_i, int n, int* out, int* prev) {
+// conf: the pick's probability under the head's softmax (over the scored rows).
+__global__ void __launch_bounds__(256) markov_pick_kernel(const float* best_v, const int* best_i, int n, int* out, int* prev, int zoff, float cap,
+                                                          float* conf) {
     pdl_launch_dependents();
     pdl_wait();
-    __shared__ float sv[256];
+    __shared__ float sv[256], sz[256];
     __shared__ int si[256];
-    float v = -INFINITY;
+    float v = -INFINITY, z = 0.0f;
     int idx = 0x7fffffff;
     for (int i = threadIdx.x; i < n; i += 256) {
         const float bv = __ldcg(best_v + i);
         const int bi = __ldcg(best_i + i);
+        z += __ldcg(best_v + zoff + i);
         if (bv > v || (bv == v && bi < idx)) {
             v = bv;
             idx = bi;
@@ -1788,9 +1803,11 @@ __global__ void __launch_bounds__(256) markov_pick_kernel(const float* best_v, c
     }
     sv[threadIdx.x] = v;
     si[threadIdx.x] = idx;
+    sz[threadIdx.x] = z;
     __syncthreads();
     for (int s = 128; s > 0; s >>= 1) {
         if (threadIdx.x < s) {
+            sz[threadIdx.x] += sz[threadIdx.x + s];
             const float ov = sv[threadIdx.x + s];
             const int oi = si[threadIdx.x + s];
             if (ov > sv[threadIdx.x] || (ov == sv[threadIdx.x] && oi < si[threadIdx.x])) {
@@ -1803,6 +1820,7 @@ __global__ void __launch_bounds__(256) markov_pick_kernel(const float* best_v, c
     if (threadIdx.x == 0) {
         *out = si[0];
         *prev = si[0];
+        *conf = __expf(sv[0] - cap) / sz[0];
     }
 }
 
@@ -2077,18 +2095,19 @@ size_t quench6k_ink_markov_blocks(int V) { return (size_t)(V + MV_ROWS - 1) / MV
 // One Markov step (see markov_step_kernel / markov_vocab_kernel): writes the pick to *out and *prev.
 cudaError_t quench6k_ink_markov(const void* w, const float* ctx, const void* bias, const void* state_in, const void* w1, int* prev, void* state_out,
                                 void* latent, const void* fold_w, const float* fold_b, const float* base, int V, float cap, float* best_v,
-                                int* best_i, int* out, const int* cand, int ncand, cudaStream_t st) {
+                                int* best_i, int* out, float* conf, const int* cand, int ncand, cudaStream_t st) {
+    const int zoff = (V + MV_ROWS - 1) / MV_ROWS;
     SQ_CHECK_LAUNCH(sq_launch(markov_step_kernel, MR / 8, 256, 0, st, static_cast<const bf16*>(w), ctx, static_cast<const bf16*>(bias),
                               static_cast<const bf16*>(state_in), static_cast<const bf16*>(w1), (const int*)prev, static_cast<bf16*>(state_out),
                               static_cast<bf16*>(latent)));
     const int nb = ((cand ? ncand : V) + MV_ROWS - 1) / MV_ROWS;
     if (cand)
         SQ_CHECK_LAUNCH(sq_launch(markov_vocab_cand_kernel, nb, 256, 0, st, static_cast<const bf16*>(fold_w), fold_b, base,
-                                  static_cast<const bf16*>(latent), cand, ncand, cap, best_v, best_i));
+                                  static_cast<const bf16*>(latent), cand, ncand, cap, best_v, best_i, zoff));
     else
         SQ_CHECK_LAUNCH(sq_launch(markov_vocab_kernel, nb, 256, 0, st, static_cast<const bf16*>(fold_w), fold_b, base,
-                                  static_cast<const bf16*>(latent), V, cap, best_v, best_i));
-    SQ_CHECK_LAUNCH(sq_launch(markov_pick_kernel, 1, 256, 0, st, (const float*)best_v, (const int*)best_i, nb, out, prev));
+                                  static_cast<const bf16*>(latent), V, cap, best_v, best_i, zoff));
+    SQ_CHECK_LAUNCH(sq_launch(markov_pick_kernel, 1, 256, 0, st, (const float*)best_v, (const int*)best_i, nb, out, prev, zoff, cap, conf));
     SQ_RETURN_LAUNCH();
 }
 

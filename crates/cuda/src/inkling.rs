@@ -242,6 +242,7 @@ mod ffi {
             best_v: *mut f32,
             best_i: *mut i32,
             out: *mut i32,
+            conf: *mut f32,
             cand: *const i32,
             ncand: c_int,
             st: Stream,
@@ -680,7 +681,8 @@ pub struct MarkovW {
     pub fold_b: u64,
 }
 
-/// One Markov step: state_in -> state_out, the pick (from `base` logits F32 [vocab]) to `out` and `prev`.
+/// One Markov step: state_in -> state_out, the pick (from `base` logits F32 [vocab]) to `out` and `prev`,
+/// its probability to `conf` (F32). `best_v` holds 2 * markov_blocks(vocab) values.
 #[allow(clippy::too_many_arguments)]
 pub fn markov(
     s: &Stream,
@@ -696,6 +698,7 @@ pub fn markov(
     best_v: u64,
     best_i: u64,
     out: u64,
+    conf: u64,
     cand: Option<(u64, usize)>,
 ) -> Result<()> {
     go!(
@@ -717,6 +720,7 @@ pub fn markov(
             fm(best_v),
             im(best_i),
             im(out),
+            fm(conf),
             cand.map_or(std::ptr::null(), |c| c.0 as *const i32),
             cand.map_or(0, |c| n(c.1)),
             s.raw()
