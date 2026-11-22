@@ -447,6 +447,7 @@ the inspector's edits.
 | `QUENCH6K_INK_SKINNY=N` | Inkling 2: small steps of N or more tokens run the INT8 projections as a tensor-core GEMM (default 1: every step, so a token's result never depends on the step's width; 0: the GEMV) |
 | `QUENCH6K_INK_MARKOV_CAND=N` | Inkling 2: the drafter's Markov head picks among each 256-token block's N best tokens (default 4; 0: the whole vocabulary) |
 | `QUENCH6K_INK_PREFETCH=0`, `QUENCH6K_INK_CLUSTER=0` | Inkling 2: small steps without the L2 prefetch of the next visit's weights / without the 8-block cluster residual mixture |
+| `QUENCH6K_INK_GUESS=0` | Inkling 2: one-token steps without the guessed experts (the next visit's router on this visit's MLP input; the 3 best experts' gate/up weights requested into L2 after the next visit's output projection, `QUENCH6K_VARIANTS=ink.guess_k=N` for N) |
 | `QUENCH6K_INK_GRAPHS=0` | Inkling 2: run small steps and the drafter eagerly instead of as CUDA graphs |
 | `QUENCH6K_INK_DRAFT=0` | Inkling 2: do not load the DSpark drafter (the server then drafts by prompt lookup) |
 | `QUENCH6K_INK_DRAFTS=N` | Inkling 2, `quench6k inkling ... --draft`: verify N drafts per step instead of choosing the count |

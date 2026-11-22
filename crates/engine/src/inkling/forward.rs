@@ -266,6 +266,17 @@ pub struct Workspace {
     side: Stream,
     fork: quench6k_cuda::Event,
     join: quench6k_cuda::Event,
+    /// One-token steps: the next visit's experts guessed (its router on this visit's MLP input) and the
+    /// best ones' gate/up weights requested into L2 after that visit's output projection, on a second
+    /// side stream.
+    guess: Stream,
+    guess_x: quench6k_cuda::Event,
+    guess_done: quench6k_cuda::Event,
+    guess_moe: quench6k_cuda::Event,
+    guess_join: quench6k_cuda::Event,
+    guess_logits: u64,
+    guess_e: u64,
+    guess_w: u64,
     pub device_bytes: usize,
     _alloc: Alloc,
 }
@@ -344,6 +355,14 @@ impl Workspace {
             side: Stream::new()?,
             fork: quench6k_cuda::Event::new()?,
             join: quench6k_cuda::Event::new()?,
+            guess: Stream::new()?,
+            guess_x: quench6k_cuda::Event::new()?,
+            guess_done: quench6k_cuda::Event::new()?,
+            guess_moe: quench6k_cuda::Event::new()?,
+            guess_join: quench6k_cuda::Event::new()?,
+            guess_logits: a.get(EXPERTS * 4)?,
+            guess_e: a.get(TOPK * 4)?,
+            guess_w: a.get(TOPK * 4)?,
             device_bytes: 0,
             _alloc: Alloc::new(),
         };
@@ -463,6 +482,11 @@ fn fp4_tc() -> bool {
 fn fp4_terms() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("QUENCH6K_INK_FP4_TERMS").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
+}
+
+fn guess_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QUENCH6K_INK_GUESS").map_or(true, |v| v != "0"))
 }
 
 fn prefetch_on() -> bool {
@@ -699,6 +723,8 @@ impl InklingModel {
         };
         let dump = std::env::var_os("QUENCH6K_INK_DUMP");
         let mut prefetched = false;
+        let mut guessed = false;
+        let mut pending_guess: Option<&Layer> = None;
         for (v, &(li, pass)) in cfg.visits().iter().enumerate() {
             let layer = &self.layers[li];
             let c = &state.caches[v];
@@ -841,6 +867,15 @@ impl InklingModel {
                 ws.attn,
             )?;
             linear(s, ws.attn, QD, t, &a.o, ws.o, D)?;
+            if let Some(g) = pending_guess.take() {
+                // The guessed experts' gate/up weights into L2 between the projections and the experts: earlier
+                // they compete with the projections' reads, more than three crowd out the prefetched weights
+                // (decode +3% at 512 to 32K).
+                ws.guess_moe.record(s)?;
+                ws.guess.wait(&ws.guess_moe)?;
+                let (wb, sb) = if g.fp4 { (2 * FF * D / 2, 2 * FF * D / 16) } else { (2 * FF * D, 2 * FF * D / 32) };
+                ik::prefetch_experts(&ws.guess, ws.guess_e, TOPK, g.gate_up.w, wb, g.gate_up.sc, sb)?;
+            }
             let boundary = li.is_multiple_of(BLOCK);
             if boundary {
                 // The block ends: its sum joins the sources; the new block starts from the attention output.
@@ -865,6 +900,16 @@ impl InklingModel {
                 ik::rms_bf16(s, ws.gated[0], layer.post_norm, ws.xm, t)?;
             } else {
                 ik::attn_res(s, &src, layer.mlp_query, 1, t, 0, &[(layer.post_norm, ws.xm)], D, Some(attn_conv))?;
+            }
+            // One-token steps: guess the next visit's experts beside this visit's routing (QUENCH6K_INK_GUESS=0: off).
+            let next = cfg.visits().get(v + 1).map(|&(nl, _)| &self.layers[nl]).filter(|_| t == 1 && guess_on());
+            if let Some(next) = next {
+                ws.guess_x.record(s)?;
+                ws.guess.wait(&ws.guess_x)?;
+                linear(&ws.guess, ws.xm, D, 1, &next.router, ws.guess_logits, EXPERTS)?;
+                ik::route(&ws.guess, ws.guess_logits, next.bias, cfg.route_scale, 1, ws.guess_e, ws.guess_w, 0)?;
+                ws.guess_done.record(&ws.guess)?;
+                guessed = true;
             }
             linear_narrow(s, ws, ws.xm, D, t, &layer.router, ws.rlogits, EXPERTS)?;
             // Small steps route and order the pairs in one launch and fold the combine into the
@@ -952,6 +997,12 @@ impl InklingModel {
                 if small { 0 } else { ws.moe },
             )?;
             }
+            if let Some(next) = next {
+                // The next visit rewrites the MLP input only after the guess has read it; the guessed experts'
+                // weights go into L2 after the next visit's output projection.
+                pending_guess = Some(next);
+                s.wait(&ws.guess_done)?;
+            }
             hi ^= 1;
             let (src_x, cy, cw) = if small { (0, ws.y, ws.sel_w) } else { (ws.moe, 0, 0) };
             pending = Some(ConvSrc {
@@ -984,6 +1035,10 @@ impl InklingModel {
         if prefetched {
             ws.join.record(&ws.side)?;
             s.wait(&ws.join)?;
+        }
+        if guessed {
+            ws.guess_join.record(&ws.guess)?;
+            s.wait(&ws.guess_join)?;
         }
         if want != Logits::None {
             let (rows, first) = if want == Logits::All { (t, 0) } else { (1, t - 1) };
