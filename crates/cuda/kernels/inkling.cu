@@ -799,6 +799,19 @@ __global__ void __launch_bounds__(TC_W * 32) attn_tc_kernel(AttnArgs a, int T, c
     const float scale = rsqrtf((float)HD);
     float* b2 = B2 + w * TC_Q * TC_B2;
     const float* rs = Rs + w * TC_Q * DREL;
+    // The relative states as the A fragment of the bias MMA (16 rows x 16 states, BF16).
+    __syncthreads();
+    uint32_t ra[4];
+    {
+        auto pk = [&](int row, int col) {
+            const __nv_bfloat162 v = __floats2bfloat162_rn(rs[row * DREL + col], rs[row * DREL + col + 1]);
+            return *reinterpret_cast<const uint32_t*>(&v);
+        };
+        ra[0] = pk(gq, t4 * 2);
+        ra[1] = pk(gq + 8, t4 * 2);
+        ra[2] = pk(gq, t4 * 2 + 8);
+        ra[3] = pk(gq + 8, t4 * 2 + 8);
+    }
     for (int kb = lo; kb <= p_last; kb += TC_K) {
         __syncthreads();
         for (int i = tid; i < TC_K * (HD / 8); i += TC_W * 32) {
@@ -814,14 +827,22 @@ __global__ void __launch_bounds__(TC_W * 32) attn_tc_kernel(AttnArgs a, int T, c
         const int dmin = p_first - (kb + TC_K - 1);
         const bool bias = dmin < EXT;
         if (bias) {
-            for (int e = lane; e < TC_Q * (TC_B2 - 1); e += 32) {
-                const int i = e / (TC_B2 - 1), x = e % (TC_B2 - 1), d = dmin + x;
-                float v = 0.0f;
-                if (d >= 0 && d < EXT) {
+            // b2[i, x] = rel[i] . proj[:, dmin + x] (zero outside 0 .. EXT - 1) for x < 80: MMAs of
+            // 16 rows x 8 distances over the 16 states.
 #pragma unroll
-                    for (int r = 0; r < DREL; ++r) v += rs[i * DREL + r] * bf2f(a.proj[r * EXT + d]);
-                }
-                b2[i * TC_B2 + x] = v;
+            for (int nt = 0; nt < TC_B2 / 8; ++nt) {
+                const int d = dmin + nt * 8 + gq;
+                const bool ok = d >= 0 && d < EXT;
+                auto pv = [&](int r) { return ok ? a.proj[r * EXT + d] : __float2bfloat16(0.0f); };
+                const __nv_bfloat162 b01 = __halves2bfloat162(pv(t4 * 2), pv(t4 * 2 + 1));
+                const __nv_bfloat162 b23 = __halves2bfloat162(pv(t4 * 2 + 8), pv(t4 * 2 + 9));
+                const uint32_t bb[2] = {*reinterpret_cast<const uint32_t*>(&b01), *reinterpret_cast<const uint32_t*>(&b23)};
+                float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                mma_bf16(c, ra, bb);
+                b2[gq * TC_B2 + nt * 8 + t4 * 2] = c[0];
+                b2[gq * TC_B2 + nt * 8 + t4 * 2 + 1] = c[1];
+                b2[(gq + 8) * TC_B2 + nt * 8 + t4 * 2] = c[2];
+                b2[(gq + 8) * TC_B2 + nt * 8 + t4 * 2 + 1] = c[3];
             }
         }
         cp_async_wait<0>();
