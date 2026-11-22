@@ -427,6 +427,16 @@ fn markov_cand() -> usize {
     *V.get_or_init(|| std::env::var("QUENCH6K_INK_MARKOV_CAND").ok().and_then(|v| v.parse().ok()).unwrap_or(4).min(MARKOV_CAND_MAX))
 }
 
+fn fp4_tc() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QUENCH6K_INK_FP4_TC").is_ok_and(|v| v == "1"))
+}
+
+fn fp4_terms() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QUENCH6K_INK_FP4_TERMS").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
+}
+
 fn prefetch_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("QUENCH6K_INK_PREFETCH").map_or(true, |v| v != "0"))
@@ -810,6 +820,44 @@ impl InklingModel {
             let small = t <= SMALL_T;
             ik::route(s, ws.rlogits, layer.bias, cfg.route_scale, t, ws.sel_e, ws.sel_w, if small { ws.order } else { 0 })?;
             if !small {
+                // QUENCH6K_INK_FP4_TC=1: NVFP4 layers on the FP4 tensor cores, activations quantized to NVFP4
+                // per row (each token's row once, gathered into pair order; the activation rows in place) as
+                // QUENCH6K_INK_FP4_TERMS terms (default 2: x ~ q1 + q2, the residual quantized at the same row
+                // scale; 3 for the experts' input). Prefill +16% (2 terms) / +5% (3), but further from the FP32
+                // reference than BF16 activations (gate distance 0.037 / 0.029, the short fixture fails).
+                if let (Some(tb), true) = (&layer.tables, fp4_tc()) {
+                    let pairs = t * TOPK;
+                    ik::moe_plan(s, ws.sel_e, t, k::fp4_tile_rows(), ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
+                    let (gu, dn) = (layer.gate_up, layer.down);
+                    let (o, ty, tt, mt) = (ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles);
+                    if fp4_terms() >= 2 {
+                        // Two terms: the residual of the first quantization quantized again (same row scale).
+                        // Second terms after the first ones' buffers (16-byte aligned for the GEMM's copies).
+                        let at = |rows: usize, kk: usize| k::fp4_rows_bytes(rows, kk).next_multiple_of(256) as u64;
+                        let (q2, g2) = (ws.act + at(t, D), ws.xs + at(pairs, D));
+                        let three = fp4_terms() >= 3;
+                        let (q3, g3) = if three { (q2 + at(t, D), g2 + at(pairs, D)) } else { (0, 0) };
+                        k::fp4_quant_rows2(s, ws.xm, t, D, ws.act, q2, q3)?;
+                        k::fp4_gather2(s, ws.act, q2, t, D, TOPK, ws.pair_row, ws.xs, g2)?;
+                        if three {
+                            // The third terms' codes and block scales (row scales already gathered).
+                            k::fp4_gather2(s, q3, q3, t, D, TOPK, ws.pair_row, g3, g3)?;
+                        }
+                        k::moe_fp4_gemm2(s, ws.xs, g2, g3, pairs, tb[0].0, tb[0].1, gu.s2, o, ty, tt, mt, ws.max_tiles, ws.y, 2 * FF, D)?;
+                        ik::moe_act(s, ws.y, pairs, cfg.gate_cap, cfg.up_cap, ws.act)?;
+                        let a2 = ws.xs + at(pairs, FF);
+                        k::fp4_quant_rows2(s, ws.act, pairs, FF, ws.xs, a2, 0)?;
+                        k::moe_fp4_gemm2(s, ws.xs, a2, 0, pairs, tb[1].0, tb[1].1, dn.s2, o, ty, tt, mt, ws.max_tiles, ws.y, D, FF)?;
+                    } else {
+                        k::fp4_quant_rows(s, ws.xm, t, D, ws.act)?;
+                        k::fp4_gather(s, ws.act, t, D, TOPK, ws.pair_row, ws.xs)?;
+                        k::moe_fp4_gemm(s, ws.xs, pairs, tb[0].0, tb[0].1, gu.s2, o, ty, tt, mt, ws.max_tiles, ws.y, 2 * FF, D)?;
+                        ik::moe_act(s, ws.y, pairs, cfg.gate_cap, cfg.up_cap, ws.act)?;
+                        k::fp4_quant_rows(s, ws.act, pairs, FF, ws.xs)?;
+                        k::moe_fp4_gemm(s, ws.xs, pairs, tb[1].0, tb[1].1, dn.s2, o, ty, tt, mt, ws.max_tiles, ws.y, D, FF)?;
+                    }
+                    ik::moe_combine_rows(s, ws.y, ws.pair_row, ws.sel_w, t, ws.moe)?;
+                } else {
                 ik::moe_plan(s, ws.sel_e, t, MOE_BM, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
                 ik::moe_gather(s, ws.xm, ws.pair_row, t, ws.xs)?;
                 let gemm = |x: u64, which: usize, n: usize, kk: usize| {
@@ -825,6 +873,7 @@ impl InklingModel {
                 ik::moe_act(s, ws.y, t * TOPK, cfg.gate_cap, cfg.up_cap, ws.act)?;
                 gemm(ws.act, 1, D, FF)?;
                 ik::moe_combine_rows(s, ws.y, ws.pair_row, ws.sel_w, t, ws.moe)?;
+                }
             } else {
             ik::experts(
                 s,

@@ -112,9 +112,12 @@ The DSpark drafter (3 dense layers and a recurrent "Markov" head) drafts seven t
 the accepted token and seven mask tokens attend, bidirectionally within the block, to context keys and
 values computed from four target features of every earlier position (the inputs of layer visits 5, 23
 and 41 and the final norm's output, mixed per drafter layer); then the Markov head picks the drafts in
-order, biasing the LM head's logits of each block row by a state carried from the previous pick. Each
-step verifies as many drafts as are expected to pay off (`QUENCH6K_INK_DRAFTS=N` fixes the count in
-`quench6k inkling`; `QUENCH6K_INK_DRAFT=0` does not load the drafter). Decoding stays exact.
+order, biasing the LM head's logits of each block row by a state carried from the previous pick (among
+each 256-token block's four best tokens by the LM head alone). The head also states each draft's
+probability; the draft policy calibrates those online against what verification keeps, verifies the
+number of drafts with the most expected tokens per second, and runs the drafter only while drafted steps
+beat plain ones (`QUENCH6K_INK_DRAFTS=N` fixes the count in `quench6k inkling`; `QUENCH6K_INK_DRAFT=0`
+does not load the drafter). Decoding stays exact.
 
 Its correctness gate compares teacher-forced distributions against `tools/ref/inkling_ref.py`, which
 drives the transformers implementation's decoder layers (transformers 5.24 or later) one layer at a time
@@ -438,8 +441,14 @@ the inspector's edits.
 | `QUENCH6K_HY4_DRAFTS=N` | Hy4-flash, `quench6k hy4 ... --dfly`: verify N drafts per step instead of choosing the count |
 | `QUENCH6K_HY4_W4A4=1` | Hy4-flash: prefill experts with NVFP4 activations on the FP4 tensor cores (faster; fails the gate) |
 | `QUENCH6K_HY4_DUMP=DIR`, `QUENCH6K_HY4_TIMING=1` | Hy4-flash debugging: per-layer hidden states, per-step host timings |
+| `QUENCH6K_INK_INT8=LIST` | Inkling 2: BF16 projections quantized to INT8 (a scale per 64 weights) at load, as name fragments (`all`, `none`; default the layers' and the drafter's attention and MLP projections) |
 | `QUENCH6K_INK_FP8=LIST` | Inkling 2: BF16 projections quantized to FP8 at load, as name fragments (`all`, `none`; default `model.llm.unembed`, the LM head) |
+| `QUENCH6K_INK_FP4_TC=1`, `QUENCH6K_INK_FP4_TERMS=N` | Inkling 2: prefill experts of the NVFP4 layers with NVFP4 activations of N terms (default 2; 3 for the experts' input) on the FP4 tensor cores (faster; fails the gate) |
+| `QUENCH6K_INK_MARKOV_CAND=N` | Inkling 2: the drafter's Markov head picks among each 256-token block's N best tokens (default 4; 0: the whole vocabulary) |
+| `QUENCH6K_INK_PREFETCH=0`, `QUENCH6K_INK_CLUSTER=0` | Inkling 2: small steps without the L2 prefetch of the next visit's weights / without the 8-block cluster residual mixture |
 | `QUENCH6K_INK_GRAPHS=0` | Inkling 2: run small steps and the drafter eagerly instead of as CUDA graphs |
 | `QUENCH6K_INK_DRAFT=0` | Inkling 2: do not load the DSpark drafter (the server then drafts by prompt lookup) |
 | `QUENCH6K_INK_DRAFTS=N` | Inkling 2, `quench6k inkling ... --draft`: verify N drafts per step instead of choosing the count |
 | `QUENCH6K_INK_DUMP=DIR`, `QUENCH6K_INK_DUMP_DRAFT=DIR`, `QUENCH6K_INK_TIMING=1` | Inkling 2 debugging: the stream after each layer visit, the drafter's inputs and outputs, per-step timings |
+| `QUENCH6K_INK_PROFILE_STEPS=N`, `QUENCH6K_INK_PROFILE_WIDTH=W`, `QUENCH6K_INK_CONF_LOG=FILE` | Inkling 2 profiling (`inkling bench`): N decode steps of W tokens in a profiler capture range; (`inkling generate --draft`) each judged draft's position, stated probability and outcome |
+| `QUENCH6K_PDL=0` | Launch kernels without programmatic dependent launch (checks whether a result depends on PDL ordering) |

@@ -2915,7 +2915,7 @@ fn finish_layer(
                     prof,
                     "fp4 gather",
                     s,
-                    k::fp4_gather(s, ws.yd, t, D, ws.pair_row, ws.xs)
+                    k::fp4_gather(s, ws.yd, t, D, 10, ws.pair_row, ws.xs)
                 );
                 op!(
                     prof,

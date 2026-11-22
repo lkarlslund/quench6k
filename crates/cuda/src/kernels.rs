@@ -986,10 +986,10 @@ pub fn fp4_quant_rows(s: &Stream, x: u64, rows: usize, k: usize, out: u64) -> Re
     )
 }
 
-/// Gathers quantized token rows (`t` tokens at `src`) into routed-pair order (t * 10 rows at `dst`).
-pub fn fp4_gather(s: &Stream, src: u64, t: usize, k: usize, pair_row: u64, dst: u64) -> Result<()> {
+/// Gathers quantized token rows (`t` tokens at `src`) into routed-pair order (t * topk rows at `dst`).
+pub fn fp4_gather(s: &Stream, src: u64, t: usize, k: usize, topk: usize, pair_row: u64, dst: u64) -> Result<()> {
     let (c, sc, r) = fp4_rows_layout(src, t, k);
-    let (gc, gsc, gr) = fp4_rows_layout(dst, t * 10, k);
+    let (gc, gsc, gr) = fp4_rows_layout(dst, t * topk, k);
     launch!(
         "fp4_gather",
         ffi::quench6k_fp4_gather(
@@ -999,6 +999,7 @@ pub fn fp4_gather(s: &Stream, src: u64, t: usize, k: usize, pair_row: u64, dst: 
             i(pair_row),
             n32(t),
             n32(k),
+            n32(topk),
             gc as *mut u8,
             gsc as *mut u8,
             fm(gr),
@@ -2677,6 +2678,110 @@ pub fn dflash_select(
             im(drafts),
             pm(qs),
             pm(params),
+            s.raw()
+        )
+    )
+}
+
+/// [`fp4_quant_rows`] with a second term: the residual quantized at the same row scale, its codes and
+/// block scales in `out2` (an `fp4_rows_layout` buffer whose row scales stay unused).
+/// With `out3` (non-zero): a third term, the residual of the first two.
+pub fn fp4_quant_rows2(s: &Stream, x: u64, rows: usize, k: usize, out: u64, out2: u64, out3: u64) -> Result<()> {
+    let (c, sc, r) = fp4_rows_layout(out, rows, k);
+    let (c2, sc2, _) = fp4_rows_layout(out2, rows, k);
+    let (c3, sc3, _) = if out3 != 0 { fp4_rows_layout(out3, rows, k) } else { (0, 0, 0) };
+    launch!(
+        "fp4_quant_rows2",
+        ffi::quench6k_fp4_quant_rows2(
+            p(x),
+            n32(rows),
+            n32(k),
+            c as *mut u8,
+            sc as *mut u8,
+            fm(r),
+            c2 as *mut u8,
+            sc2 as *mut u8,
+            c3 as *mut u8,
+            sc3 as *mut u8,
+            s.raw()
+        )
+    )
+}
+
+/// [`fp4_gather`] of two-term rows (`src2` / `dst2`: the second terms).
+#[allow(clippy::too_many_arguments)]
+pub fn fp4_gather2(s: &Stream, src: u64, src2: u64, t: usize, k: usize, topk: usize, pair_row: u64, dst: u64, dst2: u64) -> Result<()> {
+    let (c, sc, r) = fp4_rows_layout(src, t, k);
+    let (c2, sc2, _) = fp4_rows_layout(src2, t, k);
+    let (gc, gsc, gr) = fp4_rows_layout(dst, t * topk, k);
+    let (gc2, gsc2, _) = fp4_rows_layout(dst2, t * topk, k);
+    launch!(
+        "fp4_gather2",
+        ffi::quench6k_fp4_gather2(
+            c as *const u8,
+            sc as *const u8,
+            f(r),
+            c2 as *const u8,
+            sc2 as *const u8,
+            i(pair_row),
+            n32(t),
+            n32(k),
+            n32(topk),
+            gc as *mut u8,
+            gsc as *mut u8,
+            fm(gr),
+            gc2 as *mut u8,
+            gsc2 as *mut u8,
+            s.raw()
+        )
+    )
+}
+
+/// [`moe_fp4_gemm`] with two- or three-term activations (`a2`, `a3`: the further terms of the `rows` rows
+/// at `a`; `a3` 0 for two), F32 out.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_fp4_gemm2(
+    s: &Stream,
+    a: u64,
+    a2: u64,
+    a3: u64,
+    rows: usize,
+    w_ptr: u64,
+    s_ptr: u64,
+    ws2: u64,
+    offsets: u64,
+    tile_expert: u64,
+    tile_row: u64,
+    num_tiles: u64,
+    max_tiles: usize,
+    y: u64,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let (c, sc, r) = fp4_rows_layout(a, rows, k);
+    let (c2, sc2, _) = fp4_rows_layout(a2, rows, k);
+    let (c3, sc3, _) = if a3 != 0 { fp4_rows_layout(a3, rows, k) } else { (0, 0, 0) };
+    launch!(
+        "moe_fp4_gemm2",
+        ffi::quench6k_moe_fp4_gemm2(
+            c as *const u8,
+            sc as *const u8,
+            f(r),
+            c2 as *const u8,
+            sc2 as *const u8,
+            c3 as *const u8,
+            sc3 as *const u8,
+            w_ptr as *const u64,
+            s_ptr as *const u64,
+            f(ws2),
+            i(offsets),
+            i(tile_expert),
+            i(tile_row),
+            i(num_tiles),
+            n32(max_tiles),
+            fm(y),
+            n32(n),
+            n32(k),
             s.raw()
         )
     )
