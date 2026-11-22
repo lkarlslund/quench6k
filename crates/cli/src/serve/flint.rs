@@ -18,11 +18,12 @@ pub(super) struct Engine<'m> {
     ws: fl::Workspace,
     /// Bytes of a sequence (all the same size: --context positions).
     state_bytes: usize,
+    capacity: usize,
 }
 
 impl<'m> Engine<'m> {
     pub(super) fn new(model: &'m fl::FlintModel, s: &'m Stream) -> Result<Self> {
-        Ok(Self { model, s, ws: fl::Workspace::new(fl::MAX_STEP)?, state_bytes: 0 })
+        Ok(Self { model, s, ws: fl::Workspace::new(fl::MAX_STEP)?, state_bytes: 0, capacity: 0 })
     }
 }
 
@@ -65,10 +66,18 @@ impl<'m> SlotEngine for Engine<'m> {
             self.s.memset(b.addr(), 0, b.bytes())?;
         }
         self.state_bytes = seq_bytes(&seq);
+        self.capacity = capacity;
         Ok(seq)
     }
     fn growable(&self) -> bool {
         false
+    }
+    fn batched(&self) -> bool {
+        false
+    }
+    fn bytes_per_position(&self) -> usize {
+        // Interim: a state's whole size spread over its positions.
+        self.state_bytes / self.capacity.max(1)
     }
     fn reserve(&mut self, _st: &mut fl::FlintSeq, _positions: usize) -> Result<()> {
         Ok(())

@@ -155,6 +155,12 @@ impl SlotEngine for Mock {
     fn growable(&self) -> bool {
         self.o.growable
     }
+    fn batched(&self) -> bool {
+        true
+    }
+    fn bytes_per_position(&self) -> usize {
+        1
+    }
     fn reserve(&mut self, st: &mut MState, positions: usize) -> Result<()> {
         if !self.o.growable {
             return Ok(());
@@ -450,7 +456,11 @@ fn growable_memory_is_shared() {
     // Nothing else holds memory and it still does not fit: an error.
     let srv = server(2, 400, Opts { total: 100, growable: true, ..Default::default() });
     let (_, end) = collect(srv.send(prompt(1, 150), 5, true));
-    assert!(end.as_ref().is_err_and(|e| e.contains("out of memory")), "{end:?}");
+    assert!(end.as_ref().is_err_and(|e| e.contains("does not fit in device memory") && e.contains("about 100 positions")), "{end:?}");
+    // The prompt fits, its completion runs out of memory: an error that says so.
+    let (g, end) = collect(srv.send(prompt(3, 80), 50, true));
+    assert!(end.as_ref().is_err_and(|e| e.contains("device memory is full at")), "{end:?}");
+    assert!(!g.is_empty() && g.len() < 50 && g == expected(&prompt(3, 80), g.len(), &[]));
     // The slot works afterwards.
     let p = prompt(2, 10);
     let (g, end) = collect(srv.send(p.clone(), 5, true));
@@ -571,4 +581,23 @@ fn prefill_interleaves_with_decode() {
     let between = log[first..last].iter().filter(|l| l.starts_with("step ")).count();
     assert!(between > 5, "{between} steps during the prefill: {:?}", &log[first..=last]);
     srv.stop();
+}
+
+/// The step-cost fit follows observed steps; a sequence's shares add up to the step.
+#[test]
+fn step_cost_shares() {
+    let mut c = StepCost::new(0.010, 0.0018);
+    for i in 0..400 {
+        let r = [1.0, 2.0, 4.0, 8.0, 12.0, 32.0][i % 6];
+        c.add(r, 0.0078 + 0.002 * r);
+    }
+    let (a, b) = c.fit();
+    assert!((a - 0.0078).abs() < 0.0003 && (b - 0.002).abs() < 0.0001, "{a} {b}");
+    assert_eq!(c.share(1, 4, 4), 1.0);
+    let widths = [1, 4, 2, 1];
+    let total: f64 = widths.iter().map(|&w| c.share(4, w, 8)).sum();
+    assert!((total - 1.0).abs() < 1e-9, "{total}");
+    // Eight sequences: a plain row costs (a/8 + b), three more drafts 3b more.
+    let plain = c.share(8, 1, 8) * (a + 8.0 * b);
+    assert!((plain - (a / 8.0 + b)).abs() < 1e-9);
 }

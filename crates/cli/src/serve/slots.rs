@@ -63,6 +63,95 @@ pub(super) struct Fed {
     pub started: Instant,
 }
 
+/// A batched engine's step time against the rows it feeds, T = a + b R, fitted over recent steps (with
+/// a prior from the model's draft costs). A sequence's share of a step is the fixed part split evenly
+/// plus its own rows: what the sequence costs the batch. The draft policy sees that share as the step's
+/// time, so with many sequences running (where a row costs about as much as the fixed part is worth to
+/// each) drafts are verified only when they pay for their rows.
+/// A batched step about to run several sequences, with its fitted cost T = a + b R.
+#[derive(Clone, Copy)]
+struct Batch {
+    seqs: usize,
+    a: f64,
+    b: f64,
+}
+
+impl Batch {
+    /// Most drafts worth verifying for a sequence whose drafts are each accepted with chance `q` (given
+    /// the ones before it) and whose drafter pass costs `pass` seconds: the count k with the largest
+    /// net gain q + q^2 + .. + q^k - rate (k b + pass), where rate is what the batch's time is worth in
+    /// plain steps (seqs tokens per a + b seqs seconds). Alone this is left to the draft policy.
+    fn cap(&self, q: f64, pass: f64, most: usize) -> usize {
+        let rate = self.seqs as f64 / (self.a + self.b * self.seqs as f64);
+        let (mut best, mut best_net) = (0, 0.0);
+        let (mut gain, mut p) = (0.0, 1.0);
+        for k in 1..=most {
+            p *= q;
+            gain += p;
+            let net = gain - rate * (k as f64 * self.b + pass);
+            if net > best_net {
+                best = k;
+                best_net = net;
+            }
+        }
+        best
+    }
+}
+
+struct StepCost {
+    prior: (f64, f64),
+    /// Decayed sums of 1, R, R^2, T, R T.
+    sums: [f64; 5],
+}
+
+impl StepCost {
+    fn new(one_token: f64, per_token: f64) -> Self {
+        Self { prior: ((one_token - per_token).max(per_token), per_token), sums: [0.0; 5] }
+    }
+
+    fn add(&mut self, rows: f64, secs: f64) {
+        for v in &mut self.sums {
+            *v *= 0.98;
+        }
+        for (v, x) in self.sums.iter_mut().zip([1.0, rows, rows * rows, secs, rows * secs]) {
+            *v += x;
+        }
+    }
+
+    /// (a, b): least squares over the recent steps plus prior steps of 1 and 16 rows (weight 2 each).
+    fn fit(&self) -> (f64, f64) {
+        let (a0, b0) = self.prior;
+        let mut m = self.sums;
+        for r in [1.0, 16.0] {
+            let t = a0 + b0 * r;
+            for (v, x) in m.iter_mut().zip([1.0, r, r * r, t, r * t]) {
+                *v += 2.0 * x;
+            }
+        }
+        let det = m[0] * m[2] - m[1] * m[1];
+        let b = ((m[0] * m[4] - m[1] * m[3]) / det).max(b0 * 0.1);
+        let a = ((m[3] - b * m[1]) / m[0]).max(0.0);
+        (a, b)
+    }
+
+    /// What the next step of `seqs` sequences looks like to a sequence planning its drafts (None alone).
+    fn batch(&self, seqs: usize) -> Option<Batch> {
+        (seqs > 1).then(|| {
+            let (a, b) = self.fit();
+            Batch { seqs, a, b }
+        })
+    }
+
+    /// The share of a step of `seqs` sequences and `rows` rows that a sequence feeding `own` rows costs.
+    fn share(&self, seqs: usize, own: usize, rows: usize) -> f64 {
+        if seqs <= 1 {
+            return 1.0;
+        }
+        let (a, b) = self.fit();
+        (a / seqs as f64 + b * own as f64) / (a + b * rows as f64)
+    }
+}
+
 /// What a step's sequence keeps: its first `keep` fed tokens (the rest are dropped), and, when the
 /// request goes on with drafts, the token to draft after and the step row it was chosen from.
 pub(super) struct Verdict {
@@ -117,6 +206,11 @@ pub(super) trait SlotEngine {
     /// Whether states map memory as they grow ([`SlotEngine::reserve`], [`SlotEngine::trim`]); states
     /// that do not are dropped to free memory.
     fn growable(&self) -> bool;
+    /// Whether [`SlotEngine::step`] runs its sequences in one batched pass (their step time is shared)
+    /// rather than one after another.
+    fn batched(&self) -> bool;
+    /// Device bytes per position of a state's full-length caches.
+    fn bytes_per_position(&self) -> usize;
     /// Maps memory for positions < `positions`. Out of device memory: an error whose message contains
     /// "out of memory", nothing changed.
     fn reserve(&mut self, st: &mut Self::State, positions: usize) -> Result<()>;
@@ -210,6 +304,10 @@ struct Req {
     accepted: usize,
     steps: usize,
     done: Option<Finish>,
+    /// Chance a draft is accepted given the ones before it, and the drafter pass's seconds (this
+    /// request's share), for the cap on drafts while several sequences step together (Batch::cap).
+    q: f64,
+    pass: f64,
 }
 
 impl Req {
@@ -229,10 +327,16 @@ impl Req {
 
     /// Plans the next step's drafts at position `pos` (the pending token's): prompt-lookup drafts now,
     /// or the drafter pass to run (Some).
-    fn plan_draft(&mut self, pos: usize, context: usize, max_step: usize) -> Option<(i32, usize)> {
+    fn plan_draft(&mut self, pos: usize, context: usize, max_step: usize, batch: Option<Batch>) -> Option<(i32, usize)> {
         self.draft.clear();
         self.conf.clear();
         self.draft_secs = None;
+        // Several sequences stepping together: no more drafts than pay for their rows in the batch
+        // (every 8th step one at least, to keep the acceptance estimate current).
+        let limit = batch.map_or(max_step - 1, |b| {
+            let k = b.cap(self.q, self.pass, max_step - 1);
+            if k == 0 && self.steps % 8 == 7 { 1 } else { k }
+        });
         let cap = if self.rate < 0.15 {
             1
         } else if self.rate < 0.35 {
@@ -242,7 +346,7 @@ impl Req {
         } else {
             max_step - 1
         };
-        self.room = (self.budget - self.generated.len()).min(context.saturating_sub(pos + 1));
+        self.room = (self.budget - self.generated.len()).min(context.saturating_sub(pos + 1)).min(limit);
         match self.mode {
             Mode::Plain => None,
             Mode::Lookup => {
@@ -284,6 +388,8 @@ impl Req {
         sampler: &mut S,
         src: S::Src,
         fed: Fed,
+        share: f64,
+        batch: Option<Batch>,
         eos: &[i32],
         context: usize,
         max_step: usize,
@@ -291,7 +397,8 @@ impl Req {
     ) -> Result<Verdict> {
         let draft = std::mem::take(&mut self.draft);
         sampler.fetch(src, draft.len() + 1, &self.job.params)?;
-        let verify_secs = fed.started.elapsed().as_secs_f64();
+        // The step's time this sequence accounts for (all of it when it ran alone).
+        let verify_secs = fed.started.elapsed().as_secs_f64() * share;
         self.steps += 1;
         self.drafted += draft.len();
         let mut j = 0;
@@ -308,6 +415,12 @@ impl Req {
         self.accepted += j;
         if !draft.is_empty() {
             self.rate = 0.8 * self.rate + 0.2 * (j as f64 / draft.len() as f64);
+            for k in 0..draft.len().min(j + 1) {
+                self.q += 0.1 * ((k < j) as u8 as f64 - self.q);
+            }
+        }
+        if let Some(d) = self.draft_secs {
+            self.pass += 0.2 * (d - self.pass);
         }
         match self.mode {
             Mode::Conf => self.policy.update_conf(&self.conf, draft.len(), j, verify_secs, self.draft_secs),
@@ -317,7 +430,7 @@ impl Req {
         self.row = j;
         self.done = done;
         let next = if done.is_none() {
-            self.plan_draft(fed.at + 1 + j, context, max_step)
+            self.plan_draft(fed.at + 1 + j, context, max_step, batch)
         } else {
             None
         };
@@ -339,6 +452,7 @@ struct Sched<'a, E: SlotEngine> {
     /// Slots whose prompts are being computed, oldest first.
     prefilling: VecDeque<usize>,
     waiting_for_memory: bool,
+    cost: StepCost,
 }
 
 fn is_oom(e: &anyhow::Error) -> bool {
@@ -408,6 +522,30 @@ impl<E: SlotEngine> Sched<'_, E> {
         true
     }
 
+    /// Positions one sequence could hold with every other slot's memory given up: free device memory
+    /// (less the headroom) and what all states hold now.
+    fn positions_alone(&self) -> usize {
+        let held: usize = (0..self.cfg.slots).map(|i| self.device_bytes(i)).sum();
+        let avail = (self.e.free_bytes() + held).saturating_sub(HEADROOM);
+        let fixed = self.e.plan_bytes(0);
+        let per = self.e.bytes_per_position().max(1);
+        (avail.saturating_sub(fixed) / per).min(self.cfg.context)
+    }
+
+    /// Why memory ran out on `slot` at `positions`.
+    fn memory_note(&self, slot: usize, positions: usize) -> String {
+        let others = (0..self.cfg.slots).filter(|&i| i != slot && self.reqs[i].is_some()).count();
+        if others > 0 {
+            format!("slot {slot}: device memory for {positions} positions is held by {others} running request(s)")
+        } else {
+            format!(
+                "slot {slot}: device memory is full at {positions} positions: one sequence fits about {} positions on this device (--context {})",
+                self.positions_alone(),
+                self.cfg.context
+            )
+        }
+    }
+
     /// Runs `f` on `slot`'s state, freeing memory elsewhere while it fails for lack of it.
     fn with_memory<T>(&mut self, slot: usize, mut f: impl FnMut(&mut E, &mut E::State) -> Result<T>) -> Result<T> {
         loop {
@@ -415,7 +553,8 @@ impl<E: SlotEngine> Sched<'_, E> {
             match f(&mut self.e, st) {
                 Err(e) if is_oom(&e) => {
                     if !self.free_memory(slot) {
-                        return Err(e.context(format!("slot {slot}: device memory is held by running requests")));
+                        let pos = self.states[slot].as_ref().map_or(0, |st| self.e.pos(st));
+                        return Err(e.context(self.memory_note(slot, pos)));
                     }
                 }
                 r => return r,
@@ -539,6 +678,21 @@ impl<E: SlotEngine> Sched<'_, E> {
             let Some(slot) = free else {
                 break;
             };
+            // A prompt whose caches cannot fit on the device even alone fails now (growable states:
+            // the per-request limit is memory, not only --context).
+            if self.e.growable() && !self.busy() && job.ids.len() + 1 > self.positions_alone() {
+                let job = queue.pop_front().unwrap();
+                self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                let msg = format!(
+                    "prompt of {} tokens does not fit in device memory: one sequence fits about {} positions on this device (--context {})",
+                    job.ids.len(),
+                    self.positions_alone(),
+                    self.cfg.context
+                );
+                eprintln!("{} worker: {msg}", self.e.name());
+                let _ = job.tx.send(Msg::Error(msg));
+                continue;
+            }
             let planned = self.plan_positions(job.ids.len(), job.params.max_tokens);
             if !self.admits(slot, planned) {
                 if !self.waiting_for_memory {
@@ -609,6 +763,8 @@ impl<E: SlotEngine> Sched<'_, E> {
                 accepted: 0,
                 steps: 0,
                 done: None,
+                q: 0.6,
+                pass: d.costs.2,
             };
             self.reqs[slot] = Some(r);
             match reused {
@@ -714,7 +870,10 @@ impl<E: SlotEngine> Sched<'_, E> {
         let st = self.states[slot].as_ref().unwrap();
         r.row = self.e.last_t(st) - 1;
         let pos = self.e.pos(st);
-        if let Some((tok, row)) = r.plan_draft(pos, self.cfg.context, self.e.max_step()) {
+        let decoding = self.reqs.iter().flatten().filter(|r| r.decoding).count();
+        let batch = if self.e.batched() { self.cost.batch(decoding) } else { None };
+        let r = self.reqs[slot].as_mut().unwrap();
+        if let Some((tok, row)) = r.plan_draft(pos, self.cfg.context, self.e.max_step(), batch) {
             // The drafter writes its block past the prompt.
             let want = (pos + 2 * self.e.max_step()).min(self.cfg.context);
             self.with_memory(slot, |e, st| e.reserve(st, want))?;
@@ -759,12 +918,27 @@ impl<E: SlotEngine> Sched<'_, E> {
             .filter(|(i, _)| order.contains(i))
             .map(|(_, st)| st.as_mut().unwrap())
             .collect();
+        // A batched step's time is shared out by what each sequence costs it (see StepCost); steps run
+        // one after another time each sequence alone.
+        let rows: usize = tokens.iter().map(Vec::len).sum();
+        let batched = self.e.batched();
+        let shares: Vec<f64> = tokens
+            .iter()
+            .map(|t| if batched { self.cost.share(tokens.len(), t.len(), rows) } else { 1.0 })
+            .collect();
+        let mut step_secs = 0.0f64;
+        let batch = if batched { self.cost.batch(tokens.len()) } else { None };
         let (reqs, samplers, eos, metrics, context) = (&mut self.reqs, &mut self.samplers, &self.eos, self.metrics, self.cfg.context);
         let results = self.e.step(&mut states, &token_refs, &mut |i, src, fed| {
             let slot = order[i];
-            reqs[slot].as_mut().unwrap().verify(&mut samplers[slot], src, fed, eos, context, max_step, metrics)
+            let v = reqs[slot].as_mut().unwrap().verify(&mut samplers[slot], src, fed, shares[i], batch, eos, context, max_step, metrics);
+            step_secs = step_secs.max(fed.started.elapsed().as_secs_f64());
+            v
         });
         drop(states);
+        if batched && step_secs > 0.0 {
+            self.cost.add(rows as f64, step_secs);
+        }
         for (i, result) in results.into_iter().enumerate() {
             let slot = order[i];
             match result {
@@ -805,6 +979,7 @@ pub(super) fn schedule<E: SlotEngine>(e: E, cfg: &Config, jobs: &mpsc::Receiver<
             return Exit::Unload(Vec::new());
         }
     };
+    let drafting_costs = e.drafting().costs;
     let mut s = Sched {
         eos: e.eos().to_vec(),
         drafting: e.drafting(),
@@ -817,6 +992,7 @@ pub(super) fn schedule<E: SlotEngine>(e: E, cfg: &Config, jobs: &mpsc::Receiver<
         used: vec![Instant::now(); cfg.slots],
         prefilling: VecDeque::new(),
         waiting_for_memory: false,
+        cost: StepCost::new(drafting_costs.0, drafting_costs.1),
     };
     let mut queue: VecDeque<Job> = VecDeque::new();
     // Unload requests wait until nothing runs or is queued.
