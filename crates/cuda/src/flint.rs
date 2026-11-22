@@ -50,11 +50,15 @@ mod ffi {
             rope: c_int,
             start: *const i32,
             mask: c_int,
-            f8_rows: c_int,
             t: c_int,
             q: *mut c_void,
             kc: *mut c_void,
             vc: *mut c_void,
+            ksc: *mut f32,
+            vsc: *mut f32,
+            row_pos: *const i32,
+            row_seq: *const i32,
+            kvtab: *const u64,
             st: Stream,
         ) -> Error;
         pub fn quench6k_flint_attn_splits(t: c_int, start: c_int, window: c_int) -> c_int;
@@ -62,6 +66,8 @@ mod ffi {
             q: *const c_void,
             kc: *const c_void,
             vc: *const c_void,
+            ksc: *const f32,
+            vsc: *const f32,
             t: c_int,
             start: *const i32,
             window: c_int,
@@ -72,7 +78,38 @@ mod ffi {
             part_ml: *mut f32,
             tickets: *mut i32,
             out: *mut c_void,
-            f8_rows: c_int,
+            st: Stream,
+        ) -> Error;
+        pub fn quench6k_flint_attention_rows(
+            q: *const c_void,
+            rows: c_int,
+            row_pos: *const i32,
+            row_seq: *const i32,
+            kvtab: *const u64,
+            f8: c_int,
+            window: c_int,
+            mask: c_int,
+            splits: c_int,
+            sinks: *const f32,
+            part_o: *mut f32,
+            part_ml: *mut f32,
+            out: *mut c_void,
+            st: Stream,
+        ) -> Error;
+        pub fn quench6k_flint_gemv_rows(
+            x: *const c_void,
+            norm_w: *const f32,
+            m: c_int,
+            k: c_int,
+            codes: *const *const u8,
+            scales: *const *const u8,
+            s2: *const *const f32,
+            n: *const c_int,
+            y: *mut f32,
+            ldy: c_int,
+            accumulate: c_int,
+            xw: *mut c_void,
+            rn: *mut f32,
             st: Stream,
         ) -> Error;
         pub fn quench6k_flint_gemv_max_m() -> c_int;
@@ -271,9 +308,33 @@ pub fn rmsnorm_add(
     )
 }
 
-/// q/k/v inputs (FP32 rows with strides) -> normed (and roped) q BF16 [t, 32, 128], k/v into the cache.
+/// A cache to write (qk_prep) or read (attention): K and V, and for FP8 codes the FP32 scales
+/// [positions, HKV] of each (0 for BF16 caches).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KvCache {
+    pub k: u64,
+    pub v: u64,
+    pub ks: u64,
+    pub vs: u64,
+}
+
+/// A batched step's rows on the device: row r is at position `pos[r]` of sequence `seq[r]`, whose
+/// caches of the layer are `kvtab[4 seq ..]` = (k, v, k scales, v scales).
+#[derive(Clone, Copy, Debug)]
+pub struct Rows {
+    pub n: usize,
+    pub pos: u64,
+    pub seq: u64,
+    pub kvtab: u64,
+}
+
+fn opt<T>(a: u64) -> *mut T {
+    if a == 0 { std::ptr::null_mut() } else { pm(a) }
+}
+
+/// q/k/v inputs (FP32 rows with strides) -> normed (and roped) q BF16 [t, 32, 128], k/v into the cache
+/// at positions start.. (`start` on the device).
 #[allow(clippy::too_many_arguments)]
-/// `f8_rows`: 0 for BF16 caches, else the cache rows of an FP8 cache (codes, then per-row-head scales).
 pub fn qk_prep(
     s: &Stream,
     qi: (u64, usize),
@@ -284,11 +345,45 @@ pub fn qk_prep(
     rope: bool,
     start: u64,
     mask: i32,
-    f8_rows: usize,
     t: usize,
     q: u64,
-    kc: u64,
-    vc: u64,
+    cache: KvCache,
+) -> Result<()> {
+    qk_prep_raw(s, qi, ki, vi, q_norm, k_norm, rope, start, mask, t, q, cache, None)
+}
+
+/// qk_prep for the rows of a batched step (each into its own sequence's caches at its own position).
+#[allow(clippy::too_many_arguments)]
+pub fn qk_prep_rows(
+    s: &Stream,
+    qi: (u64, usize),
+    ki: (u64, usize),
+    vi: (u64, usize),
+    q_norm: u64,
+    k_norm: u64,
+    rope: bool,
+    mask: i32,
+    rows: Rows,
+    q: u64,
+) -> Result<()> {
+    qk_prep_raw(s, qi, ki, vi, q_norm, k_norm, rope, 0, mask, rows.n, q, KvCache::default(), Some(rows))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qk_prep_raw(
+    s: &Stream,
+    qi: (u64, usize),
+    ki: (u64, usize),
+    vi: (u64, usize),
+    q_norm: u64,
+    k_norm: u64,
+    rope: bool,
+    start: u64,
+    mask: i32,
+    t: usize,
+    q: u64,
+    cache: KvCache,
+    rows: Option<Rows>,
 ) -> Result<()> {
     check(
         unsafe {
@@ -302,13 +397,17 @@ pub fn qk_prep(
                 p(q_norm),
                 p(k_norm),
                 rope as c_int,
-                p(start),
+                opt(start),
                 mask,
-                f8_rows as c_int,
                 t as c_int,
                 pm(q),
-                pm(kc),
-                pm(vc),
+                opt(cache.k),
+                opt(cache.v),
+                opt(cache.ks),
+                opt(cache.vs),
+                rows.map_or(std::ptr::null(), |r| p(r.pos)),
+                rows.map_or(std::ptr::null(), |r| p(r.seq)),
+                rows.map_or(std::ptr::null(), |r| p(r.kvtab)),
                 s.raw(),
             )
         },
@@ -324,8 +423,7 @@ pub fn attn_splits(t: usize, start: usize, window: usize) -> usize {
 pub fn attention(
     s: &Stream,
     q: u64,
-    kc: u64,
-    vc: u64,
+    cache: KvCache,
     t: usize,
     start: u64,
     window: usize,
@@ -336,14 +434,15 @@ pub fn attention(
     part_ml: u64,
     tickets: u64,
     out: u64,
-    f8_rows: usize,
 ) -> Result<()> {
     check(
         unsafe {
             ffi::quench6k_flint_attention(
                 p(q),
-                p(kc),
-                p(vc),
+                p(cache.k),
+                p(cache.v),
+                opt(cache.ks),
+                opt(cache.vs),
                 t as c_int,
                 p(start),
                 window as c_int,
@@ -354,7 +453,6 @@ pub fn attention(
                 pm(part_ml),
                 pm(tickets),
                 pm(out),
-                f8_rows as c_int,
                 s.raw(),
             )
         },
@@ -362,8 +460,72 @@ pub fn attention(
     )
 }
 
+/// Attention of a batched step's rows: each row exactly as a one-token step of its sequence alone.
+/// `f8`: the layer's caches (in `rows.kvtab`) are FP8.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_rows(
+    s: &Stream,
+    q: u64,
+    rows: Rows,
+    f8: bool,
+    window: usize,
+    mask: i32,
+    splits: usize,
+    sinks: u64,
+    part_o: u64,
+    part_ml: u64,
+    out: u64,
+) -> Result<()> {
+    check(
+        unsafe {
+            ffi::quench6k_flint_attention_rows(
+                p(q),
+                rows.n as c_int,
+                p(rows.pos),
+                p(rows.seq),
+                p(rows.kvtab),
+                f8 as c_int,
+                window as c_int,
+                mask,
+                splits as c_int,
+                p(sinks),
+                pm(part_o),
+                pm(part_ml),
+                pm(out),
+                s.raw(),
+            )
+        },
+        "flint_attention_rows",
+    )
+}
+
 pub fn gemv_max_m() -> usize {
     unsafe { ffi::quench6k_flint_gemv_max_m() as usize }
+}
+
+type MatPtrs = (
+    [*const u8; 3],
+    [*const u8; 3],
+    [*const f32; 3],
+    [c_int; 3],
+    usize,
+);
+
+fn mat_ptrs(mats: &[Fp4]) -> MatPtrs {
+    assert!(!mats.is_empty() && mats.len() <= 3);
+    let k = mats[0].k;
+    let mut codes = [std::ptr::null::<u8>(); 3];
+    let mut scales = [std::ptr::null::<u8>(); 3];
+    let mut s2 = [std::ptr::null::<f32>(); 3];
+    let mut n = [0 as c_int; 3];
+    for (i, w) in mats.iter().enumerate() {
+        assert_eq!(w.k, k);
+        codes[i] = p(w.codes);
+        scales[i] = p(w.scales);
+        s2[i] = p(w.s2);
+        n[i] = w.n as c_int;
+    }
+    (codes, scales, s2, n, k)
 }
 
 /// y[m, c] (+)= x[m] . W_i[n] for up to three matrices with concatenated output columns. With `norm`
@@ -379,19 +541,7 @@ pub fn gemv(
     ldy: usize,
     accumulate: bool,
 ) -> Result<()> {
-    assert!(!mats.is_empty() && mats.len() <= 3);
-    let k = mats[0].k;
-    let mut codes = [std::ptr::null::<u8>(); 3];
-    let mut scales = [std::ptr::null::<u8>(); 3];
-    let mut s2 = [std::ptr::null::<f32>(); 3];
-    let mut n = [0 as c_int; 3];
-    for (i, w) in mats.iter().enumerate() {
-        assert_eq!(w.k, k);
-        codes[i] = p(w.codes);
-        scales[i] = p(w.scales);
-        s2[i] = p(w.s2);
-        n[i] = w.n as c_int;
-    }
+    let (codes, scales, s2, n, k) = mat_ptrs(mats);
     check(
         unsafe {
             ffi::quench6k_flint_gemv(
@@ -410,6 +560,45 @@ pub fn gemv(
             )
         },
         "flint_gemv",
+    )
+}
+
+/// As [`gemv`] with m = 1 for each of `m` rows (any number): every row bitwise as the single-token
+/// GEMV computes it. K = 2048 (with or without `norm`) or 4096 (without). `prenorm`: scratch for a
+/// normalized input staged once (BF16 [m, 2048] rows, then FP32 [m]; 0: staged in every CTA).
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_rows(
+    s: &Stream,
+    x: u64,
+    norm: Option<u64>,
+    m: usize,
+    mats: &[Fp4],
+    y: u64,
+    ldy: usize,
+    accumulate: bool,
+    prenorm: (u64, u64),
+) -> Result<()> {
+    let (codes, scales, s2, n, k) = mat_ptrs(mats);
+    check(
+        unsafe {
+            ffi::quench6k_flint_gemv_rows(
+                p(x),
+                norm.map_or(std::ptr::null(), p),
+                m as c_int,
+                k as c_int,
+                codes.as_ptr(),
+                scales.as_ptr(),
+                s2.as_ptr(),
+                n.as_ptr(),
+                pm(y),
+                ldy as c_int,
+                accumulate as c_int,
+                opt(prenorm.0),
+                opt(prenorm.1),
+                s.raw(),
+            )
+        },
+        "flint_gemv_rows",
     )
 }
 

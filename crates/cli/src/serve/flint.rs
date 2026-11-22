@@ -27,7 +27,7 @@ impl<'m> Engine<'m> {
 }
 
 fn seq_bytes(seq: &fl::FlintSeq) -> usize {
-    seq.k.iter().chain(&seq.v).map(|b| b.bytes()).sum()
+    seq.device_bytes()
 }
 
 impl<'m> SlotEngine for Engine<'m> {
@@ -59,11 +59,8 @@ impl<'m> SlotEngine for Engine<'m> {
         GpuSampler::new(self.s, fl::VOCAB)
     }
     fn new_state(&mut self, capacity: usize) -> Result<fl::FlintSeq> {
+        // The state zeroes cache memory as it maps it.
         let seq = fl::FlintSeq::new(self.model, capacity)?;
-        // FlintSeq::new leaves its caches uninitialized; start from zeros as the other engines' states do.
-        for b in seq.k.iter().chain(&seq.v) {
-            self.s.memset(b.addr(), 0, b.bytes())?;
-        }
         self.state_bytes = seq_bytes(&seq);
         Ok(seq)
     }

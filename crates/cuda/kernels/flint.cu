@@ -124,16 +124,30 @@ __global__ void __launch_bounds__(256) rmsnorm_kernel(float* x, const float* add
 
 // Per-head RMSNorm of q and k, RoPE (NeoX halves, theta 10000) when `rope`, K/V into the caches.
 // Grid (T, HQ + HKV), 128 threads (one per dimension). q: BF16 [T, HQ, HD]. Cache row of position p:
-// slot p & mask ([slot, HKV, HD] BF16).
+// slot p & mask ([slot, HKV, HD] BF16, or E4M3 codes with FP32 scales [slot, HKV] at ksc/vsc).
+// Row t is at position *start_p + t, or with `row_pos` (a batched step) at row_pos[t] in the caches of
+// sequence row_seq[t]: kvtab[4 * seq] = (k, v, k scales, v scales).
 __global__ void __launch_bounds__(128) qk_prep_kernel(const float* qi, int ldq, const float* ki, int ldk,
                                                       const float* vi, int ldv, const float* q_norm,
-                                                      const float* k_norm, int rope, const int* start_p, int mask, int f8_rows,
-                                                      __nv_bfloat16* q, __nv_bfloat16* kc, __nv_bfloat16* vc) {
+                                                      const float* k_norm, int rope, const int* start_p, int mask,
+                                                      __nv_bfloat16* q, __nv_bfloat16* kc, __nv_bfloat16* vc, float* ksc,
+                                                      float* vsc, const int* row_pos, const int* row_seq,
+                                                      const uint64_t* kvtab) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float red[32], xs[HD];
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
-    const int pos = *start_p + t;
+    int pos;
+    if (row_pos) {
+        pos = row_pos[t];
+        const uint64_t* e = kvtab + 4 * row_seq[t];
+        kc = reinterpret_cast<__nv_bfloat16*>(e[0]);
+        vc = reinterpret_cast<__nv_bfloat16*>(e[1]);
+        ksc = reinterpret_cast<float*>(e[2]);
+        vsc = reinterpret_cast<float*>(e[3]);
+    } else {
+        pos = *start_p + t;
+    }
     const bool is_q = h < HQ;
     float x = is_q ? qi[(size_t)t * ldq + h * HD + d] : ki[(size_t)t * ldk + (h - HQ) * HD + d];
     const float ss = block_sum(x * x, red);
@@ -153,8 +167,8 @@ __global__ void __launch_bounds__(128) qk_prep_kernel(const float* qi, int ldq, 
         const int kh = h - HQ;
         const size_t slot = (size_t)(pos & mask);
         const float v = vi[(size_t)t * ldv + kh * HD + d];
-        if (f8_rows) {
-            // FP8 E4M3 with a scale per (position, head) = amax / 448, scales after the codes.
+        if (ksc) {
+            // FP8 E4M3 with a scale per (position, head) = amax / 448.
             uint8_t* k8 = reinterpret_cast<uint8_t*>(kc);
             uint8_t* v8 = reinterpret_cast<uint8_t*>(vc);
             const float ka = block_max(fabsf(x), red), va = block_max(fabsf(v), red);
@@ -162,8 +176,8 @@ __global__ void __launch_bounds__(128) qk_prep_kernel(const float* qi, int ldq, 
             k8[(slot * HKV + kh) * HD + d] = __nv_fp8_e4m3(x / ks).__x;
             v8[(slot * HKV + kh) * HD + d] = __nv_fp8_e4m3(v / vs).__x;
             if (d == 0) {
-                reinterpret_cast<float*>(k8 + (size_t)f8_rows * HKV * HD)[slot * HKV + kh] = ks;
-                reinterpret_cast<float*>(v8 + (size_t)f8_rows * HKV * HD)[slot * HKV + kh] = vs;
+                ksc[slot * HKV + kh] = ks;
+                vsc[slot * HKV + kh] = vs;
             }
         } else {
             kc[(slot * HKV + kh) * HD + d] = f2bf(x);
@@ -208,21 +222,45 @@ constexpr int AT_MIN_TILES_DEFAULT = 1;
 
 // DEC (steps of at most 2 tokens, 16 rows): the four warps share rows 0..15 and each takes 16 keys of
 // every tile; their states combine through shared memory at the end.
-template <bool F8, bool DEC, int W = 4>
+// BATCH (with DEC): CTA x computes row x of a batched step alone, exactly as a one-token step of its
+// sequence: position row_pos[x], caches kvtab[4 * row_seq[x]] = (k, v, k scales, v scales), q row x,
+// partials at rows x * HQ ...
+template <bool F8, bool DEC, int W = 4, bool BATCH = false>
 __global__ void __launch_bounds__(W * 32) attn_kernel(const __nv_bfloat16* q, const __nv_bfloat16* kc,
-                                                   const __nv_bfloat16* vc, int T, const int* start_p, int window,
-                                                   int mask, int splits, float* part_o, float* part_ml, const float* sinks,
-                                                   int* tickets, __nv_bfloat16* out, int f8_rows, int min_tiles) {
+                                                   const __nv_bfloat16* vc, const float* ksc_in, const float* vsc_in, int T,
+                                                   const int* start_p, int window, int mask, int splits, float* part_o,
+                                                   float* part_ml, const float* sinks, int* tickets, __nv_bfloat16* out,
+                                                   int min_tiles, const int* row_pos, const int* row_seq, const uint64_t* kvtab) {
     pdl_launch_dependents();
     pdl_wait();
-    const int start = *start_p;
+    static_assert(!BATCH || DEC, "batched rows use the decode mode");
+    int start, bx;
+    const float* ksc = ksc_in;
+    const float* vsc = vsc_in;
+    if constexpr (BATCH) {
+        const int r = blockIdx.x;
+        const uint64_t* e = kvtab + 4 * row_seq[r];
+        start = row_pos[r];
+        kc = reinterpret_cast<const __nv_bfloat16*>(e[0]);
+        vc = reinterpret_cast<const __nv_bfloat16*>(e[1]);
+        ksc = reinterpret_cast<const float*>(e[2]);
+        vsc = reinterpret_cast<const float*>(e[3]);
+        q += (size_t)r * HQ * HD;
+        part_o += (size_t)r * HQ * splits * HD;
+        part_ml += (size_t)r * HQ * splits * 2;
+        T = 1;
+        bx = 0;
+    } else {
+        start = *start_p;
+        bx = blockIdx.x;
+    }
     extern __shared__ __align__(16) uint8_t at_smem[];
     constexpr int ROWS = W * 16, KEYS = W == 8 ? AT_WIDE_KEYS : AT_KEYS, NT = W * 32;
     static_assert(!DEC || W == 4, "decode mode uses 4 warps");
     using Smem = std::conditional_t<F8, AttnSmem8T<ROWS, KEYS>, AttnSmemT<ROWS, KEYS>>;
     Smem& sm = *reinterpret_cast<Smem*>(at_smem);
     const int kh = blockIdx.y, split = blockIdx.z;
-    const int tok0 = blockIdx.x * (ROWS / GROUP);
+    const int tok0 = bx * (ROWS / GROUP);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int ntok = min(ROWS / GROUP, T - tok0);
     // Key range of the whole tile, split in key-tile units.
@@ -280,8 +318,6 @@ __global__ void __launch_bounds__(W * 32) attn_kernel(const __nv_bfloat16* q, co
     // FP8: staging buffer `buf` (tile starting at key j0) -> FP16 codes (unscaled) and the rows' scales.
     auto convert = [&](int buf, int j0) {
         if constexpr (F8) {
-            const float* ksc = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(kc) + (size_t)f8_rows * HKV * HD);
-            const float* vsc = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(vc) + (size_t)f8_rows * HKV * HD);
             if (tid < KEYS) {
                 const int j = j0 + tid;
                 const bool ok = j < k_end_all;
@@ -494,7 +530,7 @@ __global__ void __launch_bounds__(W * 32) attn_kernel(const __nv_bfloat16* q, co
     __shared__ bool last;
     __threadfence();
     __syncthreads();
-    int* ticket = tickets + blockIdx.x * HKV + kh;
+    int* ticket = tickets + bx * HKV + kh;
     if (tid == 0) last = atomicAdd(ticket, 1) == se - 1;
     __syncthreads();
     if (!last) return;
@@ -530,15 +566,16 @@ __global__ void __launch_bounds__(W * 32) attn_kernel(const __nv_bfloat16* q, co
 
 // out[t, h * 128 + d] = bf16(sum_s 2^(m_s - M) o_s / (sum_s 2^(m_s - M) l_s + 2^(sink_h log2 e - M))).
 // Grid T * HQ, 128 threads.
+// With row_pos (a batched step), every token is its own tile at position row_pos[token].
 __global__ void __launch_bounds__(128) attn_merge_kernel(const float* part_o, const float* part_ml, int splits, const float* sinks,
                                                          int T, const int* start_p, int window, __nv_bfloat16* out, int min_tiles,
-                                                         int tile_tok, int keys) {
+                                                         int tile_tok, int keys, const int* row_pos) {
     pdl_launch_dependents();
     pdl_wait();
     const int row = blockIdx.x, h = row % HQ, d = threadIdx.x;
     // The attention CTA's effective split count, derived as attn_kernel does.
-    const int tok0 = (row / HQ) / tile_tok * tile_tok, ntok = min(tile_tok, T - tok0);
-    const int p_lo = *start_p + tok0, p_hi = p_lo + ntok - 1;
+    const int tok0 = row_pos ? 0 : (row / HQ) / tile_tok * tile_tok, ntok = row_pos ? 1 : min(tile_tok, T - tok0);
+    const int p_lo = (row_pos ? row_pos[row / HQ] : *start_p) + tok0, p_hi = p_lo + ntok - 1;
     const int k_begin_all = window > 0 ? max(0, p_lo - window + 1) : 0;
     const int tiles_all = (p_hi + 1 - k_begin_all + keys - 1) / keys;
     const int want = max(1, min(splits, tiles_all / min_tiles));
@@ -823,6 +860,151 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv2_kernel(const void* xi
     }
 }
 
+// Rows of a batched step, each computed exactly as fp4_gemv2_kernel computes a single token (bitwise):
+// the same lane layout, products in the same order, the same RMSNorm folding. The M input rows pass
+// through shared memory G at a time while every warp keeps its R weight rows in registers, so the weights
+// are read once for all rows. x: BF16 [M, K] rows, or with NORM the FP32 residual rows. y row m at
+// y + m * ldy.
+template <int STEPS, int R, bool NORM, int G>
+__global__ void __launch_bounds__(GV_WARPS * 32, 2) fp4_gemvb_kernel(const void* xin, const float* norm_w, Mats mats, float* y, int ldy, int M,
+                                                                  int accumulate, const float* rn_in) {
+    pdl_launch_dependents();
+    constexpr int K = STEPS * 1024;
+    extern __shared__ __align__(16) uint4 gb_x[];  // [G][K / 8], chunks swizzled per row
+    __shared__ float red[32], rns[G];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n_total = mats.end[2];
+    const int row0 = (blockIdx.x * GV_WARPS + warp) * R;
+    uint4 c[R][STEPS];
+    uint16_t sb[R][STEPS];
+    int mat[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = min(row0 + r, n_total - 1);
+        mat[r] = row < mats.end[0] ? 0 : (row < mats.end[1] ? 1 : 2);
+        const int n = row - (mat[r] == 0 ? 0 : mats.end[mat[r] - 1]);
+        const uint8_t* wc = mats.codes[mat[r]] + (size_t)n * (K / 2);
+        const uint8_t* ws = mats.scales[mat[r]] + (size_t)n * (K / 16);
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) {
+            const int k = u * 1024 + lane * 32;
+            c[r][u] = ld_stream(wc + k / 2);
+            sb[r][u] = *reinterpret_cast<const uint16_t*>(ws + k / 16);
+        }
+    }
+    pdl_wait();
+    for (int m0 = 0; m0 < M; m0 += G) {
+        const int gn = min(G, M - m0);
+        if constexpr (!NORM) {
+            // All of the group's loads in flight at once, then the swizzled stores.
+            constexpr int PER = G * (K / 8) / (GV_WARPS * 32);
+            static_assert(PER * GV_WARPS * 32 == G * (K / 8), "staging covers the group");
+            const uint4* x = static_cast<const uint4*>(xin) + (size_t)m0 * (K / 8);
+            constexpr int BATCH_LD = PER < 4 ? PER : 4;
+#pragma unroll
+            for (int i0 = 0; i0 < PER; i0 += BATCH_LD) {
+                uint4 v[BATCH_LD];
+#pragma unroll
+                for (int i = 0; i < BATCH_LD; ++i) {
+                    const int idx = threadIdx.x + (i0 + i) * GV_WARPS * 32;
+                    if (idx / (K / 8) < gn) v[i] = x[idx];
+                }
+#pragma unroll
+                for (int i = 0; i < BATCH_LD; ++i) {
+                    const int idx = threadIdx.x + (i0 + i) * GV_WARPS * 32, g = idx / (K / 8), j = idx % (K / 8);
+                    if (g < gn) gb_x[(size_t)g * (K / 8) + swz16(j)] = v[i];
+                }
+            }
+            if (threadIdx.x < gn) rns[threadIdx.x] = rn_in ? rn_in[m0 + threadIdx.x] : 1.0f;
+        }
+        for (int g = 0; g < gn && NORM; ++g) {
+            uint4* xs = gb_x + (size_t)g * (K / 8);
+            if constexpr (NORM) {
+                const float* h = static_cast<const float*>(xin) + (size_t)(m0 + g) * K;
+                float ss = 0.0f;
+                for (int j = threadIdx.x; j < K / 8; j += blockDim.x) {
+                    const float4 a = *reinterpret_cast<const float4*>(h + 8 * j), b = *reinterpret_cast<const float4*>(h + 8 * j + 4);
+                    const float4 wa = *reinterpret_cast<const float4*>(norm_w + 8 * j), wb = *reinterpret_cast<const float4*>(norm_w + 8 * j + 4);
+                    ss += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w + b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+                    __nv_bfloat162 p[4] = {__floats2bfloat162_rn(a.x * wa.x, a.y * wa.y), __floats2bfloat162_rn(a.z * wa.z, a.w * wa.w),
+                                           __floats2bfloat162_rn(b.x * wb.x, b.y * wb.y), __floats2bfloat162_rn(b.z * wb.z, b.w * wb.w)};
+                    xs[swz16(j)] = *reinterpret_cast<uint4*>(p);
+                }
+                const float rn = rsqrtf(block_sum(ss, red) / K + 1e-6f);
+                if (threadIdx.x == 0) rns[g] = rn;
+            }
+        }
+        __syncthreads();
+        if (row0 < n_total) {
+            float acc[R][G] = {};
+#pragma unroll
+            for (int u = 0; u < STEPS; ++u) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const float s0 = e4m3f(sb[r][u] & 0xff), s1 = e4m3f(sb[r][u] >> 8);
+                    const uint32_t cq[4] = {c[r][u].x, c[r][u].y, c[r][u].z, c[r][u].w};
+                    // Eight weights at a time (products of a row in the same order as fp4_gemv2_kernel).
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        float w[8];
+                        fp4x8(cq[q], q < 2 ? s0 : s1, w);
+#pragma unroll
+                        for (int g = 0; g < G; ++g) {
+                            if (g < gn) {
+                                float xv[8];
+                                load_bf16x8(reinterpret_cast<const __nv_bfloat16*>(&gb_x[(size_t)g * (K / 8) + swz16(u * 128 + lane * 4 + q)]), xv);
+#pragma unroll
+                                for (int i = 0; i < 8; ++i) acc[r][g] = fmaf(w[i], xv[i], acc[r][g]);
+                            }
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int row = row0 + r;
+                const float s2 = *mats.s2[mat[r]];
+#pragma unroll
+                for (int g = 0; g < G; ++g) {
+                    if (g < gn) {
+                        // As fp4_gemv2_kernel: (sum * s2) * rn; rn = 1 without NORM.
+                        const float v = warp_sum(acc[r][g]) * s2 * rns[g];
+                        if (lane == 0 && row < n_total) {
+                            float* dst = y + (size_t)(m0 + g) * ldy + row;
+                            *dst = accumulate ? *dst + v : v;
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// The staging of fp4_gemv2_kernel's NORM path done once per row: xw[m] = bf16(h[m] * norm_w) (K = 2048)
+// and rn[m] = rsqrt(mean(h[m]^2) + 1e-6), summed in the same order (256 threads, one 8-value chunk each).
+// fp4_gemvb_kernel then reads xw with rn as a plain BF16 input: bitwise the same rows.
+__global__ void __launch_bounds__(256) prenorm_kernel(const float* h, const float* norm_w, __nv_bfloat16* xw, float* rn) {
+    pdl_launch_dependents();
+    pdl_wait();
+    constexpr int K = 2048;
+    __shared__ float red[32];
+    const int m = blockIdx.x;
+    const float* hr = h + (size_t)m * K;
+    uint4* xo = reinterpret_cast<uint4*>(xw + (size_t)m * K);
+    float ss = 0.0f;
+    for (int j = threadIdx.x; j < K / 8; j += blockDim.x) {
+        const float4 a = *reinterpret_cast<const float4*>(hr + 8 * j), b = *reinterpret_cast<const float4*>(hr + 8 * j + 4);
+        const float4 wa = *reinterpret_cast<const float4*>(norm_w + 8 * j), wb = *reinterpret_cast<const float4*>(norm_w + 8 * j + 4);
+        ss += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w + b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+        __nv_bfloat162 p[4] = {__floats2bfloat162_rn(a.x * wa.x, a.y * wa.y), __floats2bfloat162_rn(a.z * wa.z, a.w * wa.w),
+                               __floats2bfloat162_rn(b.x * wb.x, b.y * wb.y), __floats2bfloat162_rn(b.z * wb.z, b.w * wb.w)};
+        xo[j] = *reinterpret_cast<uint4*>(p);
+    }
+    const float r = rsqrtf(block_sum(ss, red) / K + 1e-6f);
+    if (threadIdx.x == 0) rn[m] = r;
+}
+
 // ---- Routing --------------------------------------------------------------------------------------------
 // One warp per token: sigmoid scores, top 6 (ties: lower expert), weights renormalized; then the shared
 // expert's two halves (entries 256, 257) with weight 1. Slots per token: 8.
@@ -953,14 +1135,15 @@ __global__ void __launch_bounds__(GV_WARPS * 32) moe_down_kernel(const float* ac
         acc = warp_sum(acc);
         total = fmaf(sel_w[t * S + s], acc * d2[e], total);
     }
-    if (lane == 0) h[(size_t)t * D + n] += total;
+    if (lane == 0) h[(size_t)t * D + n] = h[(size_t)t * D + n] + total;
 }
 
 // ---- Router, few tokens ----------------------------------------------------------------------------
 // logits[t, e] = xn[t] . Wr[e] (BF16 [256, 2048]) with xn = RMSNorm(h[t]) computed per CTA (CTA 0 also
 // writes it for the experts); the last CTA to finish (ticket) routes every token as route_kernel and
 // resets the ticket. Grid E / GV_WARPS, a warp per expert row.
-constexpr int RT_TMAX = 8;
+// Most tokens per call (a ticket per CTA row of `per` tokens).
+constexpr int RT_TMAX = 64;
 
 SQ_DEVICE void route_token(const float* logits, int t, int lane, int* sel_e, float* sel_w) {
     float v[E / 32];
@@ -1000,7 +1183,7 @@ SQ_DEVICE void route_token(const float* logits, int t, int lane, int* sel_e, flo
 }
 
 __global__ void __launch_bounds__(128) router_kernel(const float* h, const float* norm_w, const __nv_bfloat16* W, int T, float* logits,
-                                                    __nv_bfloat16* xn, int* ticket, int* sel_e, float* sel_w) {
+                                                    __nv_bfloat16* xn, int* ticket, int* sel_e, float* sel_w, int per) {
     pdl_launch_dependents();
     __shared__ bool last;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -1010,8 +1193,11 @@ __global__ void __launch_bounds__(128) router_kernel(const float* h, const float
     for (int u = 0; u < D / 256; ++u) w[u] = ld_stream(W + (size_t)row * D + u * 256 + lane * 8);
     pdl_wait();
     // logit = rsqrt(mean(h^2) + eps) * (Wr . (h * norm_w)); the warp reads the whole row, so it also
-    // has the sum of squares. Warp 0 of CTA 0 writes the normalized row for the experts.
-    for (int t = 0; t < T; ++t) {
+    // has the sum of squares. Warp 0 of CTA 0 writes the normalized row for the experts. CTA row y takes
+    // tokens [y per, (y + 1) per) with its own ticket.
+    const int t_lo = blockIdx.y * per, t_hi = min(T, t_lo + per);
+    ticket += blockIdx.y;
+    for (int t = t_lo; t < t_hi; ++t) {
         const float* hr = h + (size_t)t * D;
         float acc = 0.0f, ss = 0.0f;
         float hv[D / 256][8];
@@ -1050,7 +1236,7 @@ __global__ void __launch_bounds__(128) router_kernel(const float* h, const float
     __syncthreads();
     if (!last) return;
     __threadfence();
-    for (int t = warp; t < T; t += 4) route_token(logits, t, lane, sel_e, sel_w);
+    for (int t = t_lo + warp; t < t_hi; t += 4) route_token(logits, t, lane, sel_e, sel_w);
     if (threadIdx.x == 0) *ticket = 0;
 }
 
@@ -1155,7 +1341,7 @@ __global__ void __launch_bounds__(GV_WARPS * 32) moe_down2_kernel(const float* a
     if (threadIdx.x < DN_ROWS) {
         float total = 0.0f;
         for (int s = 0; s < S; ++s) total += part[s][threadIdx.x];
-        h[(size_t)t * D + n0 + threadIdx.x] += total;
+        h[(size_t)t * D + n0 + threadIdx.x] = h[(size_t)t * D + n0 + threadIdx.x] + total;
     }
 }
 
@@ -1234,7 +1420,7 @@ __global__ void combine_kernel(const float* yd, const int* pair_row, const float
     for (int d = threadIdx.x; d < D; d += blockDim.x) {
         float acc = 0.0f;
         for (int s = 0; s < S; ++s) acc = fmaf(sel_w[t * S + s], yd[(size_t)pair_row[t * S + s] * D + d], acc);
-        h[(size_t)t * D + d] += acc;
+        h[(size_t)t * D + d] = h[(size_t)t * D + d] + acc;
     }
 }
 
@@ -1278,11 +1464,12 @@ cudaError_t quench6k_flint_rmsnorm(float* x, const float* add, const float* w, f
 }
 
 cudaError_t quench6k_flint_qk_prep(const float* qi, int ldq, const float* ki, int ldk, const float* vi, int ldv, const float* q_norm,
-                                   const float* k_norm, int rope, const int* start, int mask, int f8_rows, int T, void* q, void* kc, void* vc,
-                                   cudaStream_t st) {
+                                   const float* k_norm, int rope, const int* start, int mask, int T, void* q, void* kc, void* vc, float* ksc,
+                                   float* vsc, const int* row_pos, const int* row_seq, const uint64_t* kvtab, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(fl_launch(4, qk_prep_kernel, dim3(T, HQ + HKV), 128, 0, st, qi, ldq, ki, ldk, vi, ldv, q_norm, k_norm, rope, start, mask,
-                              f8_rows, static_cast<__nv_bfloat16*>(q), static_cast<__nv_bfloat16*>(kc), static_cast<__nv_bfloat16*>(vc)));
+                              static_cast<__nv_bfloat16*>(q), static_cast<__nv_bfloat16*>(kc), static_cast<__nv_bfloat16*>(vc), ksc, vsc,
+                              row_pos, row_seq, kvtab));
     SQ_RETURN_LAUNCH();
 }
 
@@ -1296,8 +1483,9 @@ int quench6k_flint_attn_splits(int T, int start, int window) {
     return splits;
 }
 
-cudaError_t quench6k_flint_attention(const void* q, const void* kc, const void* vc, int T, const int* start, int window, int mask, int splits,
-                                     const float* sinks, float* part_o, float* part_ml, int* tickets, void* out, int f8_rows, cudaStream_t st) {
+cudaError_t quench6k_flint_attention(const void* q, const void* kc, const void* vc, const float* ksc, const float* vsc, int T, const int* start,
+                                     int window, int mask, int splits, const float* sinks, float* part_o, float* part_ml, int* tickets, void* out,
+                                     cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     static bool configured = false;
     if (!configured) {
@@ -1321,21 +1509,51 @@ cudaError_t quench6k_flint_attention(const void* q, const void* kc, const void* 
     const __nv_bfloat16 *qb = static_cast<const __nv_bfloat16*>(q), *kb = static_cast<const __nv_bfloat16*>(kc), *vb = static_cast<const __nv_bfloat16*>(vc);
     int* tk = fused && !dec ? tickets : nullptr;
     __nv_bfloat16* ob = static_cast<__nv_bfloat16*>(out);
-    if (wide && f8_rows)
-        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, false, 8>, grid, 256, sizeof(AttnSmem8T<AT_WIDE_ROWS, AT_WIDE_KEYS>), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, f8_rows, min_tiles));
+    const int* np = nullptr;
+    const uint64_t* nt = nullptr;
+    if (wide && ksc)
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, false, 8>, grid, 256, sizeof(AttnSmem8T<AT_WIDE_ROWS, AT_WIDE_KEYS>), st, qb, kb, vb, ksc, vsc, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, min_tiles, np, np, nt));
     else if (wide)
-        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, false, 8>, grid, 256, sizeof(AttnSmemT<AT_WIDE_ROWS, AT_WIDE_KEYS>), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, 0, min_tiles));
-    else if (f8_rows && dec)
-        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, true>, grid, 128, sizeof(AttnSmem8), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, f8_rows, min_tiles));
-    else if (f8_rows)
-        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, false>, grid, 128, sizeof(AttnSmem8), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, f8_rows, min_tiles));
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, false, 8>, grid, 256, sizeof(AttnSmemT<AT_WIDE_ROWS, AT_WIDE_KEYS>), st, qb, kb, vb, ksc, vsc, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, min_tiles, np, np, nt));
+    else if (ksc && dec)
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, true>, grid, 128, sizeof(AttnSmem8), st, qb, kb, vb, ksc, vsc, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, min_tiles, np, np, nt));
+    else if (ksc)
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, false>, grid, 128, sizeof(AttnSmem8), st, qb, kb, vb, ksc, vsc, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, min_tiles, np, np, nt));
     else if (dec)
-        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, true>, grid, 128, sizeof(AttnSmem), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, 0, min_tiles));
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, true>, grid, 128, sizeof(AttnSmem), st, qb, kb, vb, ksc, vsc, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, min_tiles, np, np, nt));
     else
-        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, false>, grid, 128, sizeof(AttnSmem), st, qb, kb, vb, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, 0, min_tiles));
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, false>, grid, 128, sizeof(AttnSmem), st, qb, kb, vb, ksc, vsc, T, start, window, mask, splits, part_o, part_ml, sinks, tk, ob, min_tiles, np, np, nt));
     if (!fused || dec)
         SQ_CHECK_LAUNCH(fl_launch(8, attn_merge_kernel, T * HQ, 128, 0, st, (const float*)part_o, (const float*)part_ml, splits, sinks, T, start,
-                                  window, static_cast<__nv_bfloat16*>(out), min_tiles, rows / GROUP, keys));
+                                  window, static_cast<__nv_bfloat16*>(out), min_tiles, rows / GROUP, keys, np));
+    SQ_RETURN_LAUNCH();
+}
+
+// A batched step's attention: every row as a one-token decode-mode step of its own sequence (bitwise the
+// same as running that token alone). f8: the full-attention caches of the rows' sequences are FP8.
+cudaError_t quench6k_flint_attention_rows(const void* q, int rows, const int* row_pos, const int* row_seq, const uint64_t* kvtab, int f8,
+                                          int window, int mask, int splits, const float* sinks, float* part_o, float* part_ml, void* out,
+                                          cudaStream_t st) {
+    if (rows == 0) return cudaSuccess;
+    static bool configured = false;
+    if (!configured) {
+        cudaError_t err = cudaFuncSetAttribute(attn_kernel<false, true, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(AttnSmem));
+        if (err == cudaSuccess) err = cudaFuncSetAttribute(attn_kernel<true, true, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(AttnSmem8));
+        if (err != cudaSuccess) return err;
+        configured = true;
+    }
+    const int min_tiles = max(1, sq_variant("flint.attn_min_tiles", AT_MIN_TILES_DEFAULT));
+    const dim3 grid(rows, HKV, splits);
+    const __nv_bfloat16* qb = static_cast<const __nv_bfloat16*>(q);
+    const __nv_bfloat16* nb = nullptr;
+    const float* nf = nullptr;
+    __nv_bfloat16* ob = static_cast<__nv_bfloat16*>(out);
+    if (f8)
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, true, 4, true>, grid, 128, sizeof(AttnSmem8), st, qb, nb, nb, nf, nf, 1, row_pos, window, mask, splits, part_o, part_ml, sinks, (int*)nullptr, ob, min_tiles, row_pos, row_seq, kvtab));
+    else
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, true, 4, true>, grid, 128, sizeof(AttnSmem), st, qb, nb, nb, nf, nf, 1, row_pos, window, mask, splits, part_o, part_ml, sinks, (int*)nullptr, ob, min_tiles, row_pos, row_seq, kvtab));
+    SQ_CHECK_LAUNCH(fl_launch(8, attn_merge_kernel, rows * HQ, 128, 0, st, (const float*)part_o, (const float*)part_ml, splits, sinks, rows, row_pos,
+                              window, ob, min_tiles, AT_ROWS / GROUP, AT_KEYS, row_pos));
     SQ_RETURN_LAUNCH();
 }
 
@@ -1402,6 +1620,21 @@ cudaError_t gemv_m(const void* x, const float* norm_w, int K, const Mats& mats, 
               : gemv_launch<M, false, 1>(x, norm_w, K, mats, total, y, ldy, accumulate, st);
 }
 
+template <int STEPS, int R, bool NORM, int G>
+cudaError_t gemvb_launch(const void* x, const float* norm_w, const Mats& mats, int total, float* y, int ldy, int M, int accumulate,
+                         cudaStream_t st, const float* rn = nullptr) {
+    const size_t smem = (size_t)min(G, M) * STEPS * 1024 * 2;
+    static bool configured = false;
+    if (!configured) {
+        const cudaError_t err = cudaFuncSetAttribute(fp4_gemvb_kernel<STEPS, R, NORM, G>, cudaFuncAttributeMaxDynamicSharedMemorySize, G * STEPS * 1024 * 2);
+        if (err != cudaSuccess) return err;
+        configured = true;
+    }
+    const unsigned grid = (total + GV_WARPS * R - 1) / (GV_WARPS * R);
+    SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemvb_kernel<STEPS, R, NORM, G>, grid, GV_WARPS * 32, smem, st, x, norm_w, mats, y, ldy, M, accumulate, rn));
+    SQ_RETURN_LAUNCH();
+}
+
 }  // namespace
 
 extern "C" {
@@ -1433,12 +1666,46 @@ cudaError_t quench6k_flint_gemv(const void* x, const float* norm_w, int M, int K
     }
 }
 
+// Rows of a batched step (any M >= 1), each bitwise as the single-token GEMV computes it (K = 2048 with
+// or without the folded RMSNorm, K = 4096 without).
+// With `xw` (BF16 [M, 2048] scratch) and `rn` ([M] scratch), a normalized input is staged once by
+// prenorm_kernel instead of in every CTA.
+cudaError_t quench6k_flint_gemv_rows(const void* x, const float* norm_w, int M, int K, const uint8_t* const* codes, const uint8_t* const* scales,
+                                     const float* const* s2, const int* n, float* y, int ldy, int accumulate, void* xw, float* rn,
+                                     cudaStream_t st) {
+    if (M == 0) return cudaSuccess;
+    if (!(K == 2048 || (K == 4096 && !norm_w))) return cudaErrorInvalidValue;
+    Mats mats{};
+    int total = 0;
+    for (int i = 0; i < 3; ++i) {
+        mats.codes[i] = codes[i] ? codes[i] : codes[0];
+        mats.scales[i] = scales[i] ? scales[i] : scales[0];
+        mats.s2[i] = s2[i] ? s2[i] : s2[0];
+        total += codes[i] ? n[i] : 0;
+        mats.end[i] = total;
+    }
+    const int r = sq_variant("flint.gemvb_r", 0);
+    if (norm_w && xw && rn) {
+        SQ_CHECK_LAUNCH(fl_launch(16, prenorm_kernel, M, 256, 0, st, static_cast<const float*>(x), norm_w, static_cast<__nv_bfloat16*>(xw), rn));
+        return r == 1 ? gemvb_launch<2, 1, false, 8>(xw, nullptr, mats, total, y, ldy, M, accumulate, st, rn)
+                      : gemvb_launch<2, 2, false, 8>(xw, nullptr, mats, total, y, ldy, M, accumulate, st, rn);
+    }
+    if (K == 4096) return r == 2 ? gemvb_launch<4, 2, false, 4>(x, norm_w, mats, total, y, ldy, M, accumulate, st)
+                                 : gemvb_launch<4, 1, false, 4>(x, norm_w, mats, total, y, ldy, M, accumulate, st);
+    if (norm_w) return r == 1 ? gemvb_launch<2, 1, true, 8>(x, norm_w, mats, total, y, ldy, M, accumulate, st)
+                              : gemvb_launch<2, 2, true, 8>(x, norm_w, mats, total, y, ldy, M, accumulate, st);
+    return r == 1 ? gemvb_launch<2, 1, false, 8>(x, norm_w, mats, total, y, ldy, M, accumulate, st)
+                  : gemvb_launch<2, 2, false, 8>(x, norm_w, mats, total, y, ldy, M, accumulate, st);
+}
+
 cudaError_t quench6k_flint_router(const float* h, const float* norm_w, const void* w, int T, float* logits, void* xn, int* ticket, int* sel_e,
                                   float* sel_w, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     if (T > RT_TMAX) return cudaErrorInvalidValue;
-    SQ_CHECK_LAUNCH(fl_launch(32, router_kernel, E / 4, 128, 0, st, h, norm_w, static_cast<const __nv_bfloat16*>(w), T, logits,
-                              static_cast<__nv_bfloat16*>(xn), ticket, sel_e, sel_w));
+    // Tokens per CTA row (flint.router_per); every token's logits and routing are the same for any.
+    const int per = max(1, sq_variant("flint.router_per", 2));
+    SQ_CHECK_LAUNCH(fl_launch(32, router_kernel, dim3(E / 4, (T + per - 1) / per), 128, 0, st, h, norm_w, static_cast<const __nv_bfloat16*>(w), T, logits,
+                              static_cast<__nv_bfloat16*>(xn), ticket, sel_e, sel_w, per));
     SQ_RETURN_LAUNCH();
 }
 

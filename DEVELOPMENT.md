@@ -97,11 +97,19 @@ F=/path/to/flint-nvfp4-gguf
 quench6k flint generate --model $F --raw --prompt 'def fibonacci(n):' --n 48   # vs llama-completion --temp 0
 quench6k flint ppl --model $F --file text.txt --ctx 2048 --chunks 6           # vs llama-perplexity -c 2048
 quench6k [--kv fp8] flint bench --model $F --text corpus.txt --ctx 512 8192 65536 131072 260000
+quench6k [--kv fp8] flint batch-check --model $F --text corpus.txt --seqs 8 --ctx 2048 32768
 ```
 
 `ppl` scores like llama-perplexity (second half of each chunk), so the numbers compare directly; `bench`
 checks graph against eager decoding and reports how much of the corpus continuation greedy decoding
-reproduces.
+reproduces (`--dump FILE` writes every step's token and logits hash, to compare two builds bitwise;
+`--widths` times steps of 1..8 tokens). `batch-check` decodes several sequences (different prompts and
+lengths) alone, then together in batched steps, then in speculative steps of mixed widths, and requires
+every row's logits to be bitwise those of decoding alone and the speculative tokens to equal plain
+greedy decoding; then it times batched decode steps of 1, 2, 4 and 8 sequences (`--batches`).
+`--repeat N` runs it all N times from fresh states and requires the same logits and tokens every time;
+compare a run with `QUENCH6K_PDL=0` (kernels in plain stream order) to catch reads that race their
+producer.
 
 ## Model variants
 

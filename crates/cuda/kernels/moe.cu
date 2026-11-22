@@ -150,9 +150,11 @@ __global__ void __launch_bounds__(THREADS) nvfp4_gemm_kernel(const __nv_bfloat16
     pdl_wait();
     __shared__ __align__(16) __nv_bfloat16 sA[STAGES][BM * LDS];
     __shared__ __align__(16) __nv_bfloat16 sB[STAGES][BN * LDS];
-    if ((int)blockIdx.y >= *num_tiles) return;
-    const int e = tile_expert[blockIdx.y], r0 = tile_row[blockIdx.y];
-    const int r_end = min(r0 + BM, offsets[e + 1]);
+    // The tile tables are rewritten in place by the planning kernel just before (PDL): read through L2,
+    // not the non-coherent path (an SM's L1 may hold an earlier kernel's lines of them).
+    if ((int)blockIdx.y >= __ldcg(num_tiles)) return;
+    const int e = __ldcg(tile_expert + blockIdx.y), r0 = __ldcg(tile_row + blockIdx.y);
+    const int r_end = min(r0 + BM, __ldcg(offsets + e + 1));
     const uint8_t* W = reinterpret_cast<const uint8_t*>(w_ptr[e]);
     const uint8_t* Sc = reinterpret_cast<const uint8_t*>(s_ptr[e]);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;

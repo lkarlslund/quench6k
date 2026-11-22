@@ -583,6 +583,41 @@ Later the same day:
   with the split count recounted from the tiles per split (empty splits dropped; 8K keeps 64 x 2 tiles):
   FP8 decode at 64K 340 -> 357 tok/s, 8K unchanged (`flint.splits`).
 
+## 2026-11-22: Recursive Flint, several sequences per step
+
+Up to 8 sequences x up to 8 tokens per step (`FlintModel::forward_batch`), every row bitwise a
+one-token step of its sequence (`quench6k flint batch-check` checks it, and that drafted greedy
+output equals plain greedy output). How each kernel keeps a row's bits independent of the step's width:
+
+- **GEMVs** (QKV, O, LM head): a row-wise twin of the single-token NVFP4 GEMV (`fp4_gemvb_kernel`): the
+  same lane layout and product order per row, weights held in registers and read once for all rows,
+  rows staged through shared memory 8 (K = 2048) or 4 (K = 4096) at a time. Normalized inputs are
+  staged once per step by `prenorm_kernel` (bf16(h * w) and the RMS factor, summed exactly as the
+  single-token kernel's prologue). The first version took 248 registers (one CTA per SM, two waves):
+  22.8 us for QKV at 8 rows vs 6.5 us at 1 row; eight weights at a time and batched staging loads
+  brought it to 127.
+- **Attention**: each row runs as a one-token decode-mode CTA on its own sequence's caches (device
+  table of per-layer cache addresses, so a CUDA graph per row count serves any sequences). Tried
+  (removed): two consecutive rows of one sequence sharing a CTA in full-attention layers when their
+  key splits have the same tiles per split (K/V read once, the later row's extra tile all masked for
+  the earlier one). Bitwise up to 3 tiles per split (13K keys), but at 4 (20K) the later row differed
+  reproducibly; cause not found.
+- **Router and experts** were already per token; the router takes 2 tokens per CTA row (8 per row:
+  +5% step time at 8 rows).
+
+Cost: one-token decode runs the same kernels (474 vs 480 tok/s at 2K, 449 vs 449 at 8K, 600 W);
+verification steps of 2..8 tokens cost within +-5% of the old width-dependent kernels. Aggregate
+decode at 600 W, 2K / 8K prompts: 1 / 2 / 4 / 8 sequences 484 / 735 / 1042 / 1323 and 451 / 676 /
+928 / 1165 tok/s. At 8 rows (nsys, 2K, before the register fix) expert gate/up took 25% of the step,
+expert down 15%, the three GEMVs 36%, attention 14%: the experts of 8 tokens are mostly different.
+
+**PDL stale tables.** A fresh server's greedy output was not reproducible with PDL (0-1 of 8 prompts
+identical between runs, once an illegal address); `QUENCH6K_PDL=0` or `flint.pdl=511` (Flint's
+planning kernels without PDL) fixed it. The grouped NVFP4 GEMM (`moe.cu`) read the tile tables that
+Flint's planning kernels rewrite in place through `__restrict__` (non-coherent) loads; `__ldcg` fixed
+it (8/8, several fresh servers). Reading Flint's activations through L2 as well (defensive) cost 14%
+of a decode step (rows of h, x and act are reused through L1 by the CTAs of an SM) and was reverted.
+
 ## 2026-11-12: prefill after rtp-llm's Qwen4 PLE/GDN work
 
 Alibaba's rtp-llm PRs [#1673](https://github.com/alibaba/rtp-llm/pull/1673) and

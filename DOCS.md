@@ -157,6 +157,20 @@ quench6k gate --fixtures out/inkling-fixtures --candidates out/inkling-eng --ref
 `quench6k inkling generate` and `quench6k inkling bench` run greedy generation and throughput
 measurements (`--draft`: drafted decoding).
 
+### Recursive Flint
+
+Recursive Flint (`FlintForCausalLM`, 40B-A2.5B: 49 layers, 14 of full attention and 35 of 513-token
+sliding-window attention, 256 experts per layer) runs from the vendor's NVFP4 GGUF ([README](README.md#recursive-flint)).
+Each sequence's full-attention caches (28 KiB per position with BF16 KV, 14.4 KiB with FP8) are
+reserved for the sequence's capacity (at most the model's 262,144 positions) but backed by device memory
+only as positions are reached, so concurrent sequences share the memory by their actual lengths; the
+sliding layers keep rings of 8,192 positions (up to 560 MiB per sequence, and as much again for the
+copy taken at a prompt's end for prefix reuse). Up to 8 sequences with up to 8 tokens each decode in one
+step; every row is computed exactly as a one-token step of its sequence alone, so a sequence's tokens do
+not depend on which sequences share its steps or on its draft lengths (speculative greedy output equals
+plain greedy output). `quench6k flint generate`, `ppl`, `bench` and `batch-check` are described in
+[DEVELOPMENT.md](DEVELOPMENT.md#recursive-flint).
+
 Keep the PLE n-gram table's files (Swift: 92 GiB of BF16 in `embedding-model-*.safetensors`) on
 storage without filesystem compression. The table is memory-mapped and gathered on the host, 16 random
 rows per token, and most of it is never in the page cache; on a compressed file (btrfs

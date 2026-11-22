@@ -84,9 +84,9 @@ model's own `<think>` reasoning and its tool-call format. Flint has no MTP head;
 with prompt-lookup drafts instead (the tokens that followed the latest earlier occurrence of the last
 3 or 4 tokens, up to 7 as the request's acceptance rate allows, verified in one step). On a 26K-token
 coding-agent edit request (sampled, temperature 1) that takes decoding from 382 to 738 tok/s (3.8
-tokens per step); on free-form text it costs under 1%. Verification steps run
-batched kernels, so speculative greedy output is not bit-identical to plain greedy output (it differs
-by rounding); `"mtp": false` in a request turns it off. Throughput on the same machine at 600 W, with
+tokens per step); on free-form text it costs under 1%. Verification steps compute
+every token exactly as a one-token step does, so speculative greedy output is bit-identical to plain
+greedy output; `"mtp": false` in a request turns it off. Throughput on the same machine at 600 W, with
 greedy decoding of 128 tokens and FP8 KV from 64K up (BF16 KV below that):
 
 | Context | Prefill (tok/s) | | Decode (tok/s) | |
