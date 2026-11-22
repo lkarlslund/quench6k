@@ -52,6 +52,10 @@ pub enum FlintCmd {
         /// Append one JSON record per context to this file.
         #[arg(long)]
         json: Option<PathBuf>,
+        /// Write the prefill's and every decode step's next token and logits hash (FNV-1a of the
+        /// FP32 row) to this file, one line per step: comparing two builds bitwise.
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
 }
 
@@ -76,7 +80,8 @@ pub fn run(cmd: FlintCmd) -> Result<()> {
             ctx,
             generate,
             json,
-        } => bench(&model, &text, &ctx, generate, json.as_deref()),
+            dump,
+        } => bench(&model, &text, &ctx, generate, json.as_deref(), dump.as_deref()),
     }
 }
 
@@ -86,11 +91,16 @@ fn bench(
     ctxs: &[usize],
     generate: usize,
     json: Option<&Path>,
+    dump: Option<&Path>,
 ) -> Result<()> {
     let chat = Chat::load(dir, None)?;
     let ids = chat.encode(&std::fs::read_to_string(text)?)?;
     let (model, s) = load(dir)?;
     let mut ws = Workspace::new(1)?;
+    let mut dump = match dump {
+        Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
+        None => None,
+    };
     for (i, &ctx) in ctxs.iter().enumerate() {
         anyhow::ensure!(
             ctx + generate <= ids.len(),
@@ -105,13 +115,27 @@ fn bench(
         let mut next = fl::argmax(&ws, 1, &s)?[0];
         let prefill = t0.elapsed().as_secs_f64();
         let mut out = vec![next];
+        let mut hashes = Vec::new();
+        if dump.is_some() {
+            hashes.push(logits_hash(&s, ws.logits, 1)?[0]);
+        }
         let t1 = Instant::now();
         for _ in 1..generate {
             fl::decode(&model, &mut ws, &mut seq, next, &s)?;
             next = fl::argmax(&ws, 1, &s)?[0];
             out.push(next);
+            if dump.is_some() {
+                hashes.push(logits_hash(&s, ws.logits, 1)?[0]);
+            }
         }
         let decode = t1.elapsed().as_secs_f64();
+        if let Some(f) = dump.as_mut() {
+            use std::io::Write;
+            for (i, (t, h)) in out.iter().zip(&hashes).enumerate() {
+                writeln!(f, "ctx {ctx} step {i} token {t} logits {h:016x}")?;
+            }
+            f.flush()?;
+        }
         let copied = out.iter().zip(&ids[ctx..]).filter(|(a, b)| a == b).count();
         if i == 0 {
             // Eager decoding of the same prompt must give the same tokens.
@@ -149,6 +173,20 @@ fn bench(
         }
     }
     Ok(())
+}
+
+/// FNV-1a hash of each of `rows` FP32 logits rows at `logits` (bitwise comparisons between builds).
+pub fn logits_hash(s: &quench6k_cuda::Stream, logits: u64, rows: usize) -> Result<Vec<u64>> {
+    let v = s.download::<u32>(logits, rows * fl::VOCAB)?;
+    Ok(v.chunks(fl::VOCAB)
+        .map(|row| {
+            row.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| {
+                x.to_le_bytes()
+                    .iter()
+                    .fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+            })
+        })
+        .collect())
 }
 
 fn ppl(dir: &Path, file: &Path, ctx: usize, chunks: usize) -> Result<()> {
