@@ -22,6 +22,9 @@ const FULL_SPLITS: usize = 32;
 const MIN_KEYS: usize = 32;
 /// Steps of more tokens run NVFP4 experts as grouped tensor-core GEMMs (tiles of MOE_BM rows).
 const SMALL_T: usize = 16;
+/// Steps of at most this many tokens prefetch the next visit's weights: wider ones read so many experts
+/// that the prefetch only competes with them (verify steps of 3 / 5 / 6 tokens: +4.5% / +2.6% / -1.6%).
+const PREFETCH_T: usize = 5;
 const MOE_BM: usize = 64;
 pub const TOP_K: usize = 32;
 
@@ -740,7 +743,7 @@ impl InklingModel {
             }
             let msg = layer.looped && pass > 0;
             // Small steps: the next visit's dense weights into L2 while this visit runs (QUENCH6K_INK_PREFETCH=0: off).
-            if t <= SMALL_T && prefetch_on() && let Some(&(nl, np)) = cfg.visits().get(v + 1) {
+            if t <= PREFETCH_T && prefetch_on() && let Some(&(nl, np)) = cfg.visits().get(v + 1) {
                 // On a side branch: the prefetch kernel stays until its data arrives.
                 let r = self.layer_ranges(nl, self.layers[nl].looped && np > 0);
                 ws.fork.record(s)?;

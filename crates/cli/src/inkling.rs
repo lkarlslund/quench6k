@@ -349,7 +349,9 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, chunk: usize,
     let mut ws = Workspace::new(&model, chunk, if draft { 8 } else { 1 })?;
     for &ctx in ctxs {
         ensure!(ctx + generate <= ids.len(), "corpus has {} tokens, {} needed", ids.len(), ctx + generate);
-        let mut st = State::new(&model, ctx + generate + 16, &s)?;
+        // Room for the profile steps (QUENCH6K_INK_PROFILE_STEPS: each keeps one token).
+        let profile = std::env::var("QUENCH6K_INK_PROFILE_STEPS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        let mut st = State::new(&model, ctx + generate + 16 + profile, &s)?;
         s.synchronize()?;
         let t0 = Instant::now();
         prefill(&model, &mut st, &mut ws, &s, &ids[..ctx])?;
@@ -375,8 +377,9 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, chunk: usize,
             quench6k_cuda::profiler_start()?;
             // QUENCH6K_INK_PROFILE_WIDTH=w: steps of w tokens (a verification step's shape; the cache
             // rolls back after each).
-            ensure!(ctx + generate + 16 <= ids.len(), "corpus too short for the profile steps");
+            ensure!(ctx + generate + n + 16 <= ids.len(), "corpus too short for the profile steps");
             let w = std::env::var("QUENCH6K_INK_PROFILE_WIDTH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+            let t0 = std::time::Instant::now();
             for _ in 0..n {
                 if w == 1 {
                     model.forward(&mut st, &mut ws, &s, &[next], Logits::Last)?;
@@ -392,6 +395,8 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, chunk: usize,
             }
             s.synchronize()?;
             quench6k_cuda::profiler_stop()?;
+            let step = t0.elapsed().as_secs_f64() / n.max(1) as f64;
+            println!("ctx {ctx:>6}: {n} steps of {w} tokens, {:.3} ms a step, verify{w} {:.1} tok/s", step * 1e3, w as f64 / step);
         }
         let copied = out.iter().zip(&ids[ctx..]).filter(|(a, b)| a == b).count();
         let pf = ctx as f64 / prefill_s;
