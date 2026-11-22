@@ -136,32 +136,6 @@ fn batched(model: &InklingModel, ws: &mut Workspace, s: &Stream, prompts: &[&[i3
     Ok(bad)
 }
 
-/// A prompt's end restored from a snapshot after more than the rings' reach gives the bits of a fresh
-/// sequence fed the same chunks: the continuation's logits and the next drafts.
-fn snapshot_check(model: &InklingModel, ws: &mut Workspace, s: &Stream, a: &[i32], filler: &[i32], cont: &[i32]) -> Result<bool> {
-    let cap = a.len() + filler.len() + cont.len() + 64;
-    let run = |st: &mut State, ws: &mut Workspace| -> Result<(Vec<u64>, Vec<i32>)> {
-        model.forward(st, ws, s, cont, Logits::All)?;
-        let (h, picks) = row_hashes(model, ws, s, cont.len())?;
-        let d = model.draft(st, ws, s, picks[cont.len() - 1], cont.len() - 1)?;
-        Ok((h, d))
-    };
-    let mut fresh = State::new(model, cap, s)?;
-    prefill(model, &mut fresh, ws, s, a)?;
-    let want = run(&mut fresh, ws)?;
-    drop(fresh);
-    let mut st = State::new(model, cap, s)?;
-    prefill(model, &mut st, ws, s, a)?;
-    st.snapshot(s)?;
-    prefill(model, &mut st, ws, s, filler)?;
-    let mut prompt = a.to_vec();
-    prompt.extend_from_slice(cont);
-    let kept = st.rewind(&prompt, s)?;
-    ensure!(kept == a.len(), "rewind kept {kept} of {} tokens", a.len());
-    let got = run(&mut st, ws)?;
-    Ok(got == want)
-}
-
 fn gib(b: usize) -> f64 {
     b as f64 / (1u64 << 30) as f64
 }
@@ -189,8 +163,6 @@ pub fn run(dir: &Path, text: &Path, ctxs: &[usize], counts: &[usize], steps: usi
         }).collect();
         let cap = ctx + 16 * steps.max(time_steps) + 256;
         if check {
-            let ok = snapshot_check(&model, &mut ws, &s, prompts[0], &ids[..3300], &ids[ids.len() - 9..])?;
-            println!("check ctx {ctx} snapshot: restored after 3300 more positions: {}", if ok { "bit-identical to fresh" } else { "MISMATCH" });
             for drafted in [false, true] {
                 if drafted && model.drafter.is_none() {
                     continue;
@@ -292,5 +264,131 @@ pub fn run(dir: &Path, text: &Path, ctxs: &[usize], counts: &[usize], steps: usi
         }
         drop(seqs);
     }
+    Ok(())
+}
+
+/// One turn's results: the prompt's last logits row and each decoded token's logits (FNV), and the tokens.
+#[derive(PartialEq, Debug)]
+struct Turn {
+    hashes: Vec<u64>,
+    reply: Vec<i32>,
+}
+
+/// FNV of row `row` of the workspace's logits, and its greedy token.
+fn hash_row(model: &InklingModel, ws: &Workspace, s: &Stream, row: usize) -> Result<(u64, i32)> {
+    let v = model.cfg.vocab;
+    let logits: Vec<f32> = s.download(ws.out_logits + (row * v * 4) as u64, v)?;
+    let bytes: Vec<u8> = logits.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let mut best = 0;
+    for (i, &x) in logits.iter().enumerate() {
+        if x > logits[best] {
+            best = i;
+        }
+    }
+    Ok((fnv(&bytes), best as i32))
+}
+
+/// A turn on `st`: rewind to the canonical boundary, prefill the rest, then `n` greedy tokens, each step
+/// batched with `other` (one token of its own) when given. Returns the turn and the reused length.
+#[allow(clippy::too_many_arguments)]
+fn turn(model: &InklingModel, ws: &mut Workspace, s: &Stream, st: &mut State, prompt: &[i32], n: usize, other: Option<&mut Seq>) -> Result<(Turn, usize)> {
+    let keep = st.rewind(prompt, s)?;
+    model.prefill(st, ws, s, &prompt[keep..])?;
+    let (h, mut tok) = hash_row(model, ws, s, 0)?;
+    let mut t = Turn { hashes: vec![h], reply: vec![tok] };
+    let mut other = other;
+    for _ in 1..n {
+        match other.as_deref_mut() {
+            Some(o) => {
+                let mut states: Vec<&mut State> = vec![&mut o.st, st];
+                let a = [o.pending];
+                let b = [tok];
+                model.forward_batch(&mut states, ws, s, &[&a, &b])?;
+                o.pending = hash_row(model, ws, s, 0)?.1;
+                let (h, x) = hash_row(model, ws, s, 1)?;
+                t.hashes.push(h);
+                tok = x;
+            }
+            None => {
+                model.forward(st, ws, s, &[tok], Logits::Last)?;
+                let (h, x) = hash_row(model, ws, s, 0)?;
+                t.hashes.push(h);
+                tok = x;
+            }
+        }
+        t.reply.push(tok);
+    }
+    Ok((t, keep))
+}
+
+/// Canonical prefill: a multi-turn conversation's logits and tokens are the same cold (a fresh sequence
+/// each turn), warm (its previous turn cached) and cross (the sequence held another conversation with the
+/// same system prompt, decodes batched with another sequence, and branched off in between).
+pub fn canon_check(dir: &Path, text: &Path, system: usize, turns: usize, n: usize) -> Result<()> {
+    let chat = Chat::load(dir, None)?;
+    let ids = chat.encode(&std::fs::read_to_string(text)?)?;
+    let (model, s) = load(dir)?;
+    let mut ws = Workspace::new(&model, quench6k_engine::inkling::forward::CANON_CHUNK, BATCH_ROWS)?;
+    let sys = &ids[..system];
+    let user = |c: usize, k: usize| -> &[i32] {
+        let at = system + 20000 * (c + 1) + 1500 * k;
+        &ids[at..at + 600 + 97 * k + 31 * c]
+    };
+    let cap = system + turns * (2000 + n) + 8192;
+    // Cold: every turn on a fresh sequence; its replies build the later prompts.
+    let mut prompts: Vec<Vec<i32>> = Vec::new();
+    let mut cold = Vec::new();
+    let mut hist = sys.to_vec();
+    for k in 0..turns {
+        hist.extend_from_slice(user(0, k));
+        let mut st = State::new(&model, cap, &s)?;
+        let (t, _) = turn(&model, &mut ws, &s, &mut st, &hist, n, None)?;
+        prompts.push(hist.clone());
+        hist.extend_from_slice(&t.reply);
+        cold.push(t);
+    }
+    let report = |mode: &str, k: usize, t: &Turn, keep: usize, prev: usize| {
+        let same = *t == cold[k];
+        println!(
+            "canon {mode} turn {k}: prompt {} tokens, reused {keep}, recomputed {} of the cached {prev} ({} more than new tokens): {}",
+            prompts[k].len(),
+            prompts[k].len() - keep,
+            prev.saturating_sub(keep),
+            if same { "bit-identical to cold".to_string() } else { format!("DIFFERS ({} of {} rows)", t.hashes.iter().zip(&cold[k].hashes).filter(|(a, b)| a != b).count(), t.hashes.len()) }
+        );
+        same
+    };
+    let mut ok = true;
+    // Warm: one sequence through the turns.
+    let mut st = State::new(&model, cap, &s)?;
+    for k in 0..turns {
+        let prev = st.pos;
+        let (t, keep) = turn(&model, &mut ws, &s, &mut st, &prompts[k], n, None)?;
+        ok &= report("warm", k, &t, keep, prev);
+    }
+    drop(st);
+    // Cross: the sequence first serves conversation 1 (same system prompt), decoding batched with another
+    // sequence; then conversation 0, with a long generation (3104 tokens in steps of 16) before the last
+    // turn, so that its rings are beyond reach and the boundary snapshot is restored.
+    let mut st = State::new(&model, cap + 4096, &s)?;
+    let mut other = start(&model, &mut ws, &s, &ids[100000..100700], cap)?;
+    let mut h1 = sys.to_vec();
+    for k in 0..2 {
+        h1.extend_from_slice(user(1, k));
+        let (t, _) = turn(&model, &mut ws, &s, &mut st, &h1, n, Some(&mut other))?;
+        h1.extend_from_slice(&t.reply);
+    }
+    for k in 0..turns {
+        if k + 1 == turns && k > 0 {
+            for c in ids[150000..153104].chunks(16) {
+                model.forward(&mut st, &mut ws, &s, c, Logits::Last)?;
+            }
+            println!("canon cross: generated 3104 more tokens; at {}, frontier {}", st.pos, st.frontier());
+        }
+        let prev = st.pos;
+        let (t, keep) = turn(&model, &mut ws, &s, &mut st, &prompts[k], n, Some(&mut other))?;
+        ok &= report("cross", k, &t, keep, prev);
+    }
+    println!("canon: {}", if ok { "all turns bit-identical" } else { "MISMATCHES" });
     Ok(())
 }

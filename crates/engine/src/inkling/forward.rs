@@ -52,6 +52,10 @@ const REACH: usize = RING - WINDOW - 16;
 /// Rows of the sliding keys and values a snapshot keeps: the target's window (1024 positions before a
 /// resumed step) and the drafter's (its window of 1024 + block ends at the block's last row).
 const SNAP_ROWS: usize = WINDOW + 16;
+/// Canonical prefill: prompts are computed in chunks aligned to multiples of this from position 0 (the
+/// last one ends at the prompt's end), and reuse stops at such a boundary (see [`State::rewind`]), so a
+/// prompt's bits depend only on its tokens, not on what the sequence held before.
+pub const CANON_CHUNK: usize = 2048;
 
 struct Alloc {
     buffers: Vec<DeviceBuffer>,
@@ -107,6 +111,8 @@ pub struct State {
     snap_pos: Option<usize>,
     /// Positions below this are not in the rings (after a restore): no rewind below it.
     floor: usize,
+    /// See [`State::frontier`].
+    frontier: usize,
     /// Buffer addresses per layer visit, then per drafter layer (ik::TAB u64 each; see ik::T_*).
     tab: DeviceBuffer,
     /// Full-length caches (virtual reservations for `ctx` positions, mapped as positions are used).
@@ -200,6 +206,7 @@ impl State {
             snap: None,
             snap_pos: None,
             floor: 0,
+            frontier: 0,
             tab,
             grow,
             _feat: feat,
@@ -251,9 +258,7 @@ impl State {
             let keep = if self.pos <= positions + REACH && positions >= self.floor { positions } else { 0 };
             self.truncate(keep);
         }
-        if self.snap_pos.is_some_and(|e| e > positions) {
-            self.snap_pos = None;
-        }
+        self.lower_frontier(positions);
         if let Err(e) = quench6k_cuda::synchronize() {
             eprintln!("inkling: trim: {e:#}");
             return;
@@ -270,6 +275,7 @@ impl State {
         self.history.clear();
         self.snap_pos = None;
         self.floor = 0;
+        self.frontier = 0;
     }
 
     /// Drops positions from `pos` on. The rings keep the last RING positions, so `pos` must be within
@@ -279,16 +285,34 @@ impl State {
         self.history.truncate(self.pos);
     }
 
-    /// Keeps the longest cached prefix of `prompt` that can be reused (at most prompt.len() - 1 tokens, so
-    /// the last prompt token runs again for its logits) and returns its length: the common prefix with the
-    /// history if the rings still hold the positions before it, else the snapshot's position (after
-    /// restoring the rings) if the prompt extends it, else 0.
+    /// The canonical frontier: every position below it was computed by full prefill chunks aligned to
+    /// [`CANON_CHUNK`] (a multiple of it).
+    pub fn frontier(&self) -> usize {
+        self.frontier
+    }
+
+    /// Positions from `p` on are rewritten (or dropped): the frontier falls to the boundary at or below `p`,
+    /// and a snapshot above it is gone.
+    fn lower_frontier(&mut self, p: usize) {
+        if p < self.frontier {
+            self.frontier = p / CANON_CHUNK * CANON_CHUNK;
+        }
+        if self.snap_pos.is_some_and(|e| e > self.frontier) {
+            self.snap_pos = None;
+        }
+    }
+
+    /// Keeps the cached prefix of `prompt` that canonical prefill reuses and returns its length B: the
+    /// largest multiple of [`CANON_CHUNK`] at most the common prefix with the history, below the prompt's
+    /// length and at most the canonical frontier, whose rings are still live (within REACH) or are the last
+    /// boundary snapshot (restored); else 0. Everything from B on must be recomputed by
+    /// [`InklingModel::prefill`] (earlier replies included), so a prompt's results depend only on its tokens.
     pub fn rewind(&mut self, prompt: &[i32], s: &Stream) -> Result<usize> {
         let common = self.history.iter().zip(prompt).take_while(|(a, b)| a == b).count();
-        let p = common.min(prompt.len().saturating_sub(1));
-        let live = if self.pos <= p + REACH && p >= self.floor { p } else { 0 };
+        let most = common.min(prompt.len().saturating_sub(1)).min(self.frontier) / CANON_CHUNK * CANON_CHUNK;
+        let live = if self.pos <= most + REACH && most >= self.floor { most } else { 0 };
         let snap = match self.snap_pos {
-            Some(e) if e <= self.pos && e <= p => e,
+            Some(e) if e <= most && e <= self.pos => e,
             _ => 0,
         };
         let keep = if snap > live {
@@ -297,9 +321,6 @@ impl State {
         } else {
             live
         };
-        if self.snap_pos.is_some_and(|e| keep < e) {
-            self.snap_pos = None;
-        }
         self.truncate(keep);
         Ok(keep)
     }
@@ -350,9 +371,14 @@ impl State {
         Ok(())
     }
 
-    /// Copies what resuming at the current position (the end of a prompt) reads of the rings, for
-    /// [`State::rewind`].
-    pub fn snapshot(&mut self, s: &Stream) -> Result<()> {
+    /// Kept for callers of the prompt-end snapshot: canonical prefill takes boundary snapshots itself
+    /// (see [`State::rewind`]), so this does nothing.
+    pub fn snapshot(&mut self, _s: &Stream) -> Result<()> {
+        Ok(())
+    }
+
+    /// Copies what resuming at the current position (a canonical boundary) reads of the rings.
+    fn boundary_snapshot(&mut self, s: &Stream) -> Result<()> {
         if self.snap.is_none() {
             let total: usize = self.rings().iter().map(|r| r.1 * r.2).sum();
             self.snap = Some(DeviceBuffer::new(total)?);
@@ -372,12 +398,21 @@ impl State {
         Ok(())
     }
 
-    /// Bookkeeping after a step that fed `tokens` from row `row0` of the workspace.
-    fn advance(&mut self, tokens: &[i32], row0: usize) {
+    /// Bookkeeping after a step that fed `tokens` from row `row0` of the workspace: a full chunk aligned
+    /// to CANON_CHUNK at the frontier advances it (and takes the boundary snapshot), any other write below
+    /// it lowers it.
+    fn advance(&mut self, tokens: &[i32], row0: usize, s: &Stream) -> Result<()> {
+        let p0 = self.pos;
+        self.lower_frontier(p0);
         self.pos += tokens.len();
         self.last_t = tokens.len();
         self.last_row0 = row0;
         self.history.extend_from_slice(tokens);
+        if tokens.len() == CANON_CHUNK && p0 == self.frontier && p0.is_multiple_of(CANON_CHUNK) {
+            self.frontier = self.pos;
+            self.boundary_snapshot(s)?;
+        }
+        Ok(())
     }
 }
 
@@ -795,7 +830,7 @@ impl InklingModel {
         s.synchronize()?;
         ws.stage(&[(&*state, tokens)]);
         self.launch(ws, s, t, want, t <= SMALL_T)?;
-        state.advance(tokens, 0);
+        state.advance(tokens, 0, s)?;
         Ok(())
     }
 
@@ -826,8 +861,23 @@ impl InklingModel {
         self.launch(ws, s, rows, Logits::All, true)?;
         let mut row0 = 0;
         for (st, tok) in states.iter_mut().zip(tokens) {
-            st.advance(tok, row0);
+            st.advance(tok, row0, s)?;
             row0 += tok.len();
+        }
+        Ok(())
+    }
+
+    /// Canonical prefill of `tokens` at state.pos (after [`State::rewind`]): chunks end at multiples of
+    /// [`CANON_CHUNK`] (absolute positions) and at the tokens' end; the last chunk's last logits row lands
+    /// in ws.out_logits. The workspace must take chunks of CANON_CHUNK tokens.
+    pub fn prefill(&self, state: &mut State, ws: &mut Workspace, s: &Stream, tokens: &[i32]) -> Result<()> {
+        ensure!(ws.max_t >= CANON_CHUNK, "canonical prefill needs chunks of {CANON_CHUNK} tokens (workspace: {})", ws.max_t);
+        let mut at = 0;
+        while at < tokens.len() {
+            let n = (CANON_CHUNK - state.pos % CANON_CHUNK).min(tokens.len() - at);
+            let want = if at + n == tokens.len() { Logits::Last } else { Logits::None };
+            self.forward(state, ws, s, &tokens[at..at + n], want)?;
+            at += n;
         }
         Ok(())
     }
@@ -884,6 +934,8 @@ impl InklingModel {
         for &i in &live {
             let p = states[i].pos;
             states[i].reserve(p + b)?;
+            // The block's drafter keys go at p ..
+            states[i].lower_frontier(p);
         }
         let dw = ws.draft.as_mut().unwrap();
         dw.confs.resize(n, Vec::new());

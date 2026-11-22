@@ -124,9 +124,18 @@ Sequences share the GPU's memory by length: a sequence's full-attention caches (
 visits, and the drafter's one full-attention layer: 36 KiB per position in all) are reserved as virtual
 memory for its capacity (up to the model's 1,048,576 positions) and mapped in pieces as positions are
 used (`State::reserve` / `State::trim`); its rings (the sliding layers' keys and values and the
-convolution inputs, 4096 positions each, about 3.1 GiB) are allocated with it. A snapshot at the end of
-a prompt keeps only what resuming there reads (the last 1040 positions of the sliding keys and values,
-the last 4 of the convolution inputs: about 0.17 GiB). Up to 8 sequences decode together
+convolution inputs, 4096 positions each, about 3.1 GiB) are allocated with it.
+
+Prefill is canonical, so a prompt's results depend only on its tokens, not on what the sequence held
+before: prompts are computed in chunks that end at multiples of 2048 positions (`CANON_CHUNK`,
+`InklingModel::prefill`) and at the prompt's end, and `State::rewind` reuses a cached prefix only up to a
+multiple of 2048 at most the common prefix and the sequence's canonical frontier (the boundary up to
+which every position came from such whole chunks; decode steps, drafts and partial chunks never advance
+it, writes below it lower it). Everything after that boundary is recomputed, earlier replies included,
+so a turn recomputes up to 2047 cached prompt tokens plus the previous reply. The rings at a boundary are
+either still live (within 3056 positions) or the boundary snapshot each whole chunk takes (the last 1040
+positions of the sliding keys and values and the last 4 of the convolution inputs, about 0.17 GiB);
+`State::snapshot` does nothing now. Up to 8 sequences decode together
 (`InklingModel::forward_batch`, 1 to 16 tokens each, at most 64 rows; `draft_batch` drafts for them
 in one pass): every kernel of a small step finds each row's sequence, position, caches and rings in a
 small per-step descriptor, so one CUDA graph per row count serves any sequences (each sequence also keeps

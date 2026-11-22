@@ -99,6 +99,22 @@ pub enum InklingCmd {
         #[arg(long)]
         no_check: bool,
     },
+    /// Canonical prefill: a multi-turn conversation (system prompt and user turns from the corpus, greedy
+    /// replies) gives the same logits and tokens cold, warm and after serving another conversation.
+    CanonCheck {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        /// System prompt tokens (shared by the conversations).
+        #[arg(long, default_value_t = 5000)]
+        system: usize,
+        #[arg(long, default_value_t = 3)]
+        turns: usize,
+        /// Reply tokens per turn.
+        #[arg(long, default_value_t = 24)]
+        reply: usize,
+    },
 }
 
 pub fn run(cmd: InklingCmd) -> Result<()> {
@@ -144,6 +160,13 @@ pub fn run(cmd: InklingCmd) -> Result<()> {
             time_steps,
             no_check,
         } => crate::inkling_batch::run(&model, &text, &ctx, &seqs, steps, time_steps, !no_check),
+        InklingCmd::CanonCheck {
+            model,
+            text,
+            system,
+            turns,
+            reply,
+        } => crate::inkling_batch::canon_check(&model, &text, system, turns, reply),
         InklingCmd::Bench {
             model,
             text,

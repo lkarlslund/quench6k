@@ -641,8 +641,7 @@ synthetic routing with 872 tiles, 73% full, 43 to 755 rows per expert).
 each sequence alone (its own stretch of the corpus, 37 tokens shorter per sequence; plain steps, then
 drafted steps whose widths vary by sequence and step) and records every step's fed tokens, drafts, draft
 probabilities and logits rows (FNV hashes of the F32 bytes), then replays the same steps in lockstep
-batches (`forward_batch`, `draft_batch`) and compares bitwise; a snapshot check restores a prompt's end
-after 3300 more positions and compares against a fresh sequence. It then times batched steps from the
+batches (`forward_batch`, `draft_batch`) and compares bitwise. It then times batched steps from the
 prompts' ends: plain steps (one greedy token per sequence, argmax and download included), verify steps
 of 4 tokens per sequence (the corpus's next tokens as drafts, one kept) and drafter passes.
 
@@ -673,3 +672,12 @@ then a question about it), 450 W: 253,964 tokens prefilled in 55 s (4.6K tokens/
 11.9 GiB of caches; 523,508 tokens in 182 s (2.9K tokens/s), 60 tokens/s, 21.1 GiB; 1,042,346 tokens in
 626 s (1.7K tokens/s), 34 tokens/s, 38.9 GiB (58.4 GiB on the device in all). The model quoted the needle
 at 256K and 512K, and was quoting it at 1M when the run's 40 tokens ended. At 1M a decode step reads each full-attention visit's 4 GiB of keys and values.
+
+Canonical prefill (`quench6k inkling canon-check --model M --text CORPUS`): a conversation of 3 turns (a
+5000-token system prompt, user turns of 600 to 800 tokens, 24 greedy reply tokens) decoded cold (a fresh
+sequence per turn), warm (one sequence) and cross (the sequence first serves another conversation with
+the same system prompt, decodes batched with another sequence, and generates 3104 more tokens before the
+last turn, so that turn restores the boundary snapshot): every turn's prompt logits, reply logits and
+tokens are bit-identical in the three. Reuse stops at the last 2048 boundary the previous turns
+prefilled whole: warm turn 2 reused 4096 of 5623 cached tokens (1527 recomputed beyond the new ones),
+turn 3 6144 of 6344 (200).
