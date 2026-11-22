@@ -1097,6 +1097,7 @@ impl SlotSampler for GpuSampler<'_> {
 /// [`SlotEngine::step`] for engines without a batched step: each sequence's step alone, in turn. Its
 /// drafter pass runs right after its own step, while the workspace still holds that step's features.
 /// `one` runs a step of one sequence and returns where its logits are; `truncate` drops positions.
+#[cfg(test)]
 pub(super) fn step_each<E: SlotEngine>(
     e: &mut E,
     states: &mut [&mut E::State],
