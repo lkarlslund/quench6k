@@ -229,6 +229,8 @@ pub struct Workspace {
     rel: u64,
     sink: u64,
     part: u64,
+    /// F32 [SPLIT_K, t, 128]: partial sums of the narrow GEMMs (router, message gates' down).
+    splitk: u64,
     attn: u64,
     o: u64,
     rlogits: u64,
@@ -310,6 +312,7 @@ impl Workspace {
             sink: a.get(t * H * 4)?,
             // Split-key partials of small steps (larger ones run the tensor-core kernel).
             part: a.get(ik::attn_part_floats(t.min(16), FULL_SPLITS) * 4)?,
+            splitk: a.get(SPLIT_K * t * 128 * 4)?,
             attn: a.get(t * QD * 2)?,
             o: a.get(td)?,
             rlogits: a.get(t * EXPERTS * 4)?,
@@ -418,6 +421,18 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
     } else {
         k::gemm_f32(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, 1.0, false)
     }
+}
+
+/// K splits of the narrow GEMMs (outputs of at most 128 columns: one tile column, too few CTAs).
+const SPLIT_K: usize = 8;
+
+/// [`linear`] for outputs of at most 128 columns: GEMMs split along K.
+#[allow(clippy::too_many_arguments)]
+fn linear_narrow(s: &Stream, ws: &Workspace, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usize) -> Result<()> {
+    if m <= k::gemv_max_m() || l.n > 128 {
+        return linear(s, x, ldx, m, l, y, ldy);
+    }
+    k::gemm_f32_split(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, 1.0, false, ws.splitk, SPLIT_K)
 }
 
 const MARKOV_CAND_MAX: usize = 8;
@@ -627,7 +642,7 @@ impl InklingModel {
             for (j, &i) in which.iter().enumerate() {
                 let cat = ws.cat;
                 ik::rms(s, &[RmsSet { x: hs[j], w: 0, out: cat, ldo: 2 * D }, RmsSet { x: m[j], w: 0, out: cat + (D * 2) as u64, ldo: 2 * D }], t)?;
-                linear(s, cat, 2 * D, t, &g[i].down, ws.zf, RANK)?;
+                linear_narrow(s, ws, cat, 2 * D, t, &g[i].down, ws.zf, RANK)?;
                 k::f32_to_bf16(s, ws.zf, ws.z, t * RANK)?;
                 linear(s, ws.z, RANK, t, &g[i].fg, ws.fg, 2 * D)?;
                 ik::msg_apply_rows(s, hs[j], m[j], ws.fg, t, ws.gated[j])?;
@@ -814,7 +829,7 @@ impl InklingModel {
             } else {
                 ik::attn_res(s, &src, layer.mlp_query, 1, t, 0, &[(layer.post_norm, ws.xm)], D, Some(attn_conv))?;
             }
-            linear(s, ws.xm, D, t, &layer.router, ws.rlogits, EXPERTS)?;
+            linear_narrow(s, ws, ws.xm, D, t, &layer.router, ws.rlogits, EXPERTS)?;
             // Small steps route and order the pairs in one launch and fold the combine into the
             // convolution; larger ones group the pairs for the tensor-core GEMMs (NVFP4 layers).
             let small = t <= SMALL_T;
