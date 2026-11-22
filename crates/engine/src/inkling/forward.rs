@@ -410,6 +410,8 @@ pub struct Workspace {
     sel_e: u64,
     sel_w: u64,
     order: u64,
+    /// Groups of same-expert pairs for the grouped expert kernels (1 + 2 BATCH_ROWS * 8 ints).
+    groups: u64,
     act: u64,
     y: u64,
     moe: u64,
@@ -512,6 +514,7 @@ impl Workspace {
             sel_e: a.get(pairs * 4)?,
             sel_w: a.get(pairs * 4)?,
             order: a.get(pairs * 4)?,
+            groups: a.get((1 + 2 * BATCH_ROWS * TOPK) * 4)?,
             act: a.get(pairs * FF * 2)?,
             y: a.get(pairs * D * 4)?,
             moe: a.get(td)?,
@@ -744,6 +747,18 @@ fn guess_k(t: usize) -> usize {
         }
     });
     if t > PREFETCH_T { 0 } else { ks.get(t - 1).copied().unwrap_or(0) }
+}
+
+/// Small steps of at least this many rows run the grouped expert kernels (QUENCH6K_INK_EXPERT_GROUPS;
+/// 0: never). Their results are bitwise the per-pair kernels': this only moves time.
+fn expert_groups_min() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("QUENCH6K_INK_EXPERT_GROUPS").ok().and_then(|v| v.parse().ok()) {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        // 8 rows: slower (8 sequences of 1 token: 11.9 -> 13.3 ms); 16: even; 32: 39.0 -> 35.2 ms.
+        None => 16,
+    })
 }
 
 fn prefetch_on() -> bool {
@@ -1260,14 +1275,15 @@ impl InklingModel {
                 ws.guess_x.record(s)?;
                 ws.guess.wait(&ws.guess_x)?;
                 linear(&ws.guess, ws.xm, D, t, &next.router, ws.guess_logits, EXPERTS, true)?;
-                ik::route(&ws.guess, ws.guess_logits, next.bias, cfg.route_scale, t, ws.guess_e, ws.guess_w, 0)?;
+                ik::route(&ws.guess, ws.guess_logits, next.bias, cfg.route_scale, t, ws.guess_e, ws.guess_w, 0, 0)?;
                 ws.guess_done.record(&ws.guess)?;
                 guessed = true;
             }
             linear_narrow(s, ws, ws.xm, D, t, &layer.router, ws.rlogits, EXPERTS, small)?;
             // Small steps route and order the pairs in one launch and fold the combine into the
             // convolution; larger ones group the pairs for the tensor-core GEMMs (NVFP4 layers).
-            ik::route(s, ws.rlogits, layer.bias, cfg.route_scale, t, ws.sel_e, ws.sel_w, if small { ws.order } else { 0 })?;
+            let groups = if small && t >= expert_groups_min() { ws.groups } else { 0 };
+            ik::route(s, ws.rlogits, layer.bias, cfg.route_scale, t, ws.sel_e, ws.sel_w, if small { ws.order } else { 0 }, groups)?;
             if !small {
                 // QUENCH6K_INK_FP4_TC=1: NVFP4 layers on the FP4 tensor cores, activations quantized to NVFP4
                 // per row (each token's row once, gathered into pair order; the activation rows in place) as
@@ -1344,6 +1360,7 @@ impl InklingModel {
                 t,
                 ws.order,
                 small,
+                groups,
                 ws.act,
                 ws.y,
                 if small { 0 } else { ws.moe },

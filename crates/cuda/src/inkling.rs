@@ -123,6 +123,7 @@ mod ffi {
             sel_e: *mut i32,
             sel_w: *mut f32,
             order: *mut i32,
+            groups: *mut i32,
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_experts(
@@ -141,6 +142,7 @@ mod ffi {
             t: c_int,
             order: *mut i32,
             ordered: c_int,
+            groups: *const i32,
             act: *mut c_void,
             y: *mut f32,
             out: *mut f32,
@@ -641,10 +643,11 @@ pub fn attention(
     )
 }
 
-/// Routing; with `order` != 0 (t <= 16) also the pairs' order by expert for [`experts`].
+/// Routing; with `order` != 0 (t <= small_rows) also the pairs' order by expert for [`experts`], and with
+/// `groups` != 0 their groups for the grouped expert kernels (1 + 2 t * 8 ints).
 #[allow(clippy::too_many_arguments)]
-pub fn route(s: &Stream, logits: u64, bias: u64, scale: f32, t: usize, sel_e: u64, sel_w: u64, order: u64) -> Result<()> {
-    go!("ink_route", ffi::quench6k_ink_route(f(logits), f(bias), scale, n(t), im(sel_e), fm(sel_w), im(order), s.raw()))
+pub fn route(s: &Stream, logits: u64, bias: u64, scale: f32, t: usize, sel_e: u64, sel_w: u64, order: u64, groups: u64) -> Result<()> {
+    go!("ink_route", ffi::quench6k_ink_route(f(logits), f(bias), scale, n(t), im(sel_e), fm(sel_w), im(order), im(groups), s.raw()))
 }
 
 /// One expert stack: weights, block scales and (NVFP4) per-expert scales.
@@ -656,7 +659,8 @@ pub struct ExpertStack {
 }
 
 /// The routed experts of `t` tokens (x BF16 [t, 2304]) into y (per pair) and out F32 [t, 2304] (0: no
-/// combine); `ordered`: `order` already holds the pairs' order ([`route`]).
+/// combine); `ordered`: `order` already holds the pairs' order ([`route`]); `groups` (non-zero, with
+/// `ordered`): the grouped kernels over [`route`]'s groups, bitwise the same results.
 #[allow(clippy::too_many_arguments)]
 pub fn experts(
     s: &Stream,
@@ -671,6 +675,7 @@ pub fn experts(
     t: usize,
     order: u64,
     ordered: bool,
+    groups: u64,
     act: u64,
     y: u64,
     out: u64,
@@ -693,6 +698,7 @@ pub fn experts(
             n(t),
             im(order),
             ordered as c_int,
+            i(groups),
             pm(act),
             fm(y),
             fm(out),

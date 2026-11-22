@@ -634,3 +634,28 @@ synthetic routing with 872 tiles, 73% full, 43 to 755 rows per expert).
 - What is left would need a different kernel design to raise gate_up's DRAM efficiency: warp
   specialization with TMA bulk copies, fewer registers for 3 CTAs per SM. The bound is at most about
   0.2 ms of 1.0 ms per layer, or about 2% of prefill.
+
+## 2026-11-22: Inkling 2, several sequences per step
+
+`quench6k inkling batch-check --model M --text CORPUS --ctx 512 8192 32768 --seqs 1 2 4 8` first decodes
+each sequence alone (its own stretch of the corpus, 37 tokens shorter per sequence; plain steps, then
+drafted steps whose widths vary by sequence and step) and records every step's fed tokens, drafts, draft
+probabilities and logits rows (FNV hashes of the F32 bytes), then replays the same steps in lockstep
+batches (`forward_batch`, `draft_batch`) and compares bitwise; a snapshot check restores a prompt's end
+after 3300 more positions and compares against a fresh sequence. It then times batched steps from the
+prompts' ends: plain steps (one greedy token per sequence, argmax and download included), verify steps
+of 4 tokens per sequence (the corpus's next tokens as drafts, one kept) and drafter passes.
+
+600 W, max clock 3090 MHz, aggregate tokens per second of plain decode (step time):
+
+| context | 1 | 2 | 4 | 8 sequences |
+|---|---|---|---|---|
+| 512 | 238 (4.21 ms) | 363 (5.51) | 533 (7.51) | 671 (11.92) |
+| 8192 | 229 (4.37) | 337 (5.94) | 468 (8.55) | 558 (14.34) |
+| 32768 | 197 (5.09) | 276 (7.23) | 368 (10.88) | 428 (18.69) |
+
+Verify steps of 4 tokens per sequence: 557 / 667 / 787 / 825 rows/s at 512 (7.2 / 12.0 / 20.3 / 38.8 ms),
+428 / 507 / 545 / 563 at 32K; drafter passes 0.85 / 1.17 / 2.08 / 3.98 ms at 512. A plain step's extra
+sequence costs about 1.1 ms at 512: its 8 experts per layer visit (48 visits x 8 x 4 MB of NVFP4 weights,
+about 1.5 GB) are new DRAM traffic. Verify steps grow with their pairs (the per-pair expert kernels
+re-read and re-decode an expert's rows for every pair routed to it), not with the experts read.

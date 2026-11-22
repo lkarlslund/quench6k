@@ -497,6 +497,7 @@ the inspector's edits.
 | `QUENCH6K_INK_PREFETCH=0`, `QUENCH6K_INK_CLUSTER=0` | Inkling 2: small steps without the L2 prefetch of the next visit's weights / without the 8-block cluster residual mixture |
 | `QUENCH6K_INK_GUESS=0`, `QUENCH6K_INK_GUESS_K=k1,k2,..` | Inkling 2: steps of up to 4 tokens without the guessed experts (the next visit's router on this visit's MLP input; the best guesses' gate/up weights requested into L2 after the next visit's output projection) / the guesses per row for steps of 1, 2, .. tokens (default 3,2,2,1) |
 | `QUENCH6K_INK_GRAPHS=0` | Inkling 2: run small steps and the drafter eagerly instead of as CUDA graphs |
+| `QUENCH6K_INK_EXPERT_GROUPS=N` | Inkling 2: small steps of N or more rows (default 16; 0: never) run the routed experts in groups of up to 4 pairs of the same expert (each expert's rows read and decoded once per group; the same bits as per pair) |
 | `QUENCH6K_INK_DRAFT=0` | Inkling 2: do not load the DSpark drafter (the server then drafts by prompt lookup) |
 | `QUENCH6K_INK_DRAFTS=N` | Inkling 2, `quench6k inkling ... --draft`: verify N drafts per step instead of choosing the count |
 | `QUENCH6K_INK_DUMP=DIR`, `QUENCH6K_INK_DUMP_DRAFT=DIR`, `QUENCH6K_INK_TIMING=1` | Inkling 2 debugging: the stream after each layer visit, the drafter's inputs and outputs, per-step timings |

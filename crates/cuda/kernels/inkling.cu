@@ -1136,12 +1136,15 @@ __global__ void __launch_bounds__(E) route_kernel(const float* __restrict__ logi
 // Routing of up to SMALL_ROWS tokens and the pairs' order by expert (ties by pair), one block of 1024
 // threads (8 tokens at a time, 128 threads a token).
 constexpr int SMALL_ROWS = 64;
+// With `groups`: the ordered pairs also in groups of at most EX_G with the same expert (see EX_G).
+constexpr int EX_G = 4;
 __global__ void __launch_bounds__(1024) route_order_kernel(const float* __restrict__ logits, const float* __restrict__ bias, float scale, int T,
-                                                           int* sel_e, float* sel_w, int* order) {
+                                                           int* sel_e, float* sel_w, int* order, int* groups) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float key[8][E], picked[8][TOPK];
     __shared__ int se[SMALL_ROWS * TOPK];
+    __shared__ int count[E], gbase[E + 1];
     const int g = threadIdx.x / E, e = threadIdx.x % E;
     for (int t0 = 0; t0 < T; t0 += 8) {
         const int t = t0 + g;
@@ -1170,11 +1173,37 @@ __global__ void __launch_bounds__(1024) route_order_kernel(const float* __restri
         __syncthreads();
     }
     const int pairs = T * TOPK;
+    if (groups) {
+        if (threadIdx.x < E) count[threadIdx.x] = 0;
+        __syncthreads();
+        for (int p = threadIdx.x; p < pairs; p += blockDim.x) atomicAdd(&count[se[p]], 1);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int n = 0;
+            for (int x = 0; x < E; ++x) {
+                gbase[x] = n;
+                n += (count[x] + EX_G - 1) / EX_G;
+            }
+            gbase[E] = n;
+            groups[0] = n;
+        }
+        __syncthreads();
+    }
     for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
         const int ep = se[p];
-        int rank = 0;
-        for (int q = 0; q < pairs; ++q) rank += se[q] < ep || (se[q] == ep && q < p);
+        int below = 0, before = 0;
+        for (int q = 0; q < pairs; ++q) {
+            below += se[q] < ep;
+            before += se[q] == ep && q < p;
+        }
+        const int rank = below + before;
         order[rank] = p;
+        // groups: [count][first ranks (pairs)][sizes (pairs)].
+        if (groups && before % EX_G == 0) {
+            const int gid = gbase[ep] + before / EX_G;
+            groups[1 + gid] = rank;
+            groups[1 + pairs + gid] = min(EX_G, count[ep] - before);
+        }
     }
 }
 
@@ -1381,6 +1410,158 @@ __global__ void __launch_bounds__(256) experts_down_kernel(const bf16* __restric
         float v[EX_R];
         rows_dot<FP4, EX_R>(wt, e, D, n0, FF, act + (size_t)pair * FF, v);
         finish(pair, n0, e, v);
+    }
+}
+
+// rows_dot for up to G inputs (np of them, rows of the same expert): each chunk's weights load and decode
+// once, then every input's sums run exactly as rows_dot's (the same chunks, FMAs and order), so each
+// input's results are bitwise rows_dot's.
+template <bool FP4, int R, int G, int U = EX_U>
+SQ_DEVICE void rows_dot_g(const ExpertW& wt, int e, int rows_per_expert, int n0, int K, const bf16* const (&x)[G], int np, float (&out)[G][R]) {
+    constexpr int CV = FP4 ? 32 : 16;
+    const int lane = threadIdx.x & 31, cpr = K / CV, total = R * cpr;
+#pragma unroll
+    for (int j = 0; j < G; ++j)
+#pragma unroll
+        for (int r = 0; r < R; ++r) out[j][r] = 0.0f;
+    for (int c0 = lane; c0 < total; c0 += 32 * U) {
+        uint4 wv[U];
+        uint16_t sv[U];
+        rows_load<FP4, R, U>(wt, e, rows_per_expert, n0, K, c0, wv, sv);
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int c = c0 + 32 * u;
+            if (c >= total) break;
+            const int r = c / cpr, cc = c % cpr;
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(&wv[u]);
+            float2 f[CV / 2];
+#pragma unroll
+            for (int i = 0; i < CV / 2; ++i) {
+                const __half2_raw hr = FP4 ? __nv_cvt_fp4x2_to_halfraw2(b[i], __NV_E2M1)
+                                           : __nv_cvt_fp8x2_to_halfraw2(*reinterpret_cast<const __nv_fp8x2_storage_t*>(b + 2 * i), __NV_E4M3);
+                f[i] = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+            }
+#pragma unroll
+            for (int j = 0; j < G; ++j) {
+                if (j >= np) break;
+                float xs[CV];
+                const uint4* src = reinterpret_cast<const uint4*>(x[j] + cc * CV);
+#pragma unroll
+                for (int h = 0; h < CV / 8; ++h) {
+                    const uint4 v = src[h];
+                    const bf16* pv = reinterpret_cast<const bf16*>(&v);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) xs[h * 8 + i] = bf2f(pv[i]);
+                }
+                float acc;
+                if constexpr (FP4) {
+                    const uint16_t sc2 = sv[u];
+                    float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        if (i < 8) {
+                            a0 = fmaf(f[i].x, xs[2 * i], a0);
+                            a0 = fmaf(f[i].y, xs[2 * i + 1], a0);
+                        } else {
+                            a1 = fmaf(f[i].x, xs[2 * i], a1);
+                            a1 = fmaf(f[i].y, xs[2 * i + 1], a1);
+                        }
+                    }
+                    acc = a0 * e4m3_value(sc2 & 0xff) + a1 * e4m3_value(sc2 >> 8);
+                } else {
+                    acc = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        acc = fmaf(f[i].x, xs[2 * i], acc);
+                        acc = fmaf(f[i].y, xs[2 * i + 1], acc);
+                    }
+                    acc *= ue8m0((uint8_t)sv[u]);
+                }
+#pragma unroll
+                for (int q = 0; q < R; ++q)
+                    if (q == r) out[j][q] += acc;
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < G; ++j)
+#pragma unroll
+        for (int r = 0; r < R; ++r) out[j][r] = warp_sum(out[j][r]);
+}
+
+// The gate/up and down kernels over groups of pairs of the same expert (route_order_kernel's groups): one
+// warp item per (group, 8 rows), the results per pair bitwise those of the per-pair kernels.
+template <bool FP4>
+__global__ void __launch_bounds__(256) experts_gate_up_g_kernel(const bf16* __restrict__ x, const int* __restrict__ sel_e, const int* __restrict__ order,
+                                                                const int* groups, ExpertW wt, int pairs, float gcap, float ucap, bf16* act) {
+    pdl_wait();
+    pdl_launch_dependents();
+    const int lane = threadIdx.x & 31;
+    const int ng = __ldcg(groups), warps = gridDim.x * 8, items = ng * (2 * FF / EX_R);
+    for (int item = blockIdx.x * 8 + (threadIdx.x >> 5); item < items; item += warps) {
+        const int g = item % ng, n0 = item / ng * EX_R;
+        const int first = __ldcg(groups + 1 + g), np = __ldcg(groups + 1 + pairs + g);
+        int pr[EX_G];
+        const bf16* xp[EX_G];
+#pragma unroll
+        for (int j = 0; j < EX_G; ++j) {
+            pr[j] = j < np ? __ldcg(order + first + j) : 0;
+            xp[j] = x + (size_t)(pr[j] / TOPK) * D;
+        }
+        const int e = __ldcg(sel_e + pr[0]);
+        float v[EX_G][EX_R];
+        rows_dot_g<FP4, EX_R, EX_G>(wt, e, 2 * FF, n0, D, xp, np, v);
+        const float s2 = FP4 ? wt.s2[e] : 1.0f;
+#pragma unroll
+        for (int j = 0; j < EX_G; ++j) {
+            if (j >= np) break;
+            if (lane < EX_R / 2) {
+                float gv = 0.0f, uv = 0.0f;
+#pragma unroll
+                for (int i = 0; i < EX_R / 2; ++i)
+                    if (i == lane) {
+                        gv = v[j][2 * i];
+                        uv = v[j][2 * i + 1];
+                    }
+                const float gg = gv * s2, u = uv * s2;
+                act[(size_t)pr[j] * FF + n0 / 2 + lane] = f2bf(softcap(gg, gcap) * sigmoidf(gg) * softcap(u, ucap));
+            }
+        }
+    }
+}
+
+template <bool FP4>
+__global__ void __launch_bounds__(256) experts_down_g_kernel(const bf16* __restrict__ act, const int* __restrict__ sel_e, const int* __restrict__ order,
+                                                             const int* groups, ExpertW wt, int pairs, float* y) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int lane = threadIdx.x & 31;
+    const int ng = __ldcg(groups), warps = gridDim.x * 8, items = ng * (D / EX_R);
+    for (int item = blockIdx.x * 8 + (threadIdx.x >> 5); item < items; item += warps) {
+        const int g = item % ng, n0 = item / ng * EX_R;
+        const int first = __ldcg(groups + 1 + g), np = __ldcg(groups + 1 + pairs + g);
+        int pr[EX_G];
+        const bf16* ap[EX_G];
+#pragma unroll
+        for (int j = 0; j < EX_G; ++j) {
+            pr[j] = j < np ? __ldcg(order + first + j) : 0;
+            ap[j] = act + (size_t)pr[j] * FF;
+        }
+        const int e = __ldcg(sel_e + pr[0]);
+        float v[EX_G][EX_R];
+        rows_dot_g<FP4, EX_R, EX_G>(wt, e, D, n0, FF, ap, np, v);
+        const float s2 = FP4 ? wt.s2[e] : 1.0f;
+#pragma unroll
+        for (int j = 0; j < EX_G; ++j) {
+            if (j >= np) break;
+            if (lane < EX_R) {
+                float vv = 0.0f;
+#pragma unroll
+                for (int i = 0; i < EX_R; ++i)
+                    if (i == lane) vv = v[j][i];
+                y[(size_t)pr[j] * D + n0 + lane] = vv * s2;
+            }
+        }
     }
 }
 
@@ -2490,11 +2671,13 @@ cudaError_t quench6k_ink_attention(const void* q, const float* rel, const float*
 }
 
 // order (non-null, T <= 16): also the pairs' order by expert, in the same launch.
-cudaError_t quench6k_ink_route(const float* logits, const float* bias, float scale, int T, int* sel_e, float* sel_w, int* order, cudaStream_t st) {
+// groups (with order): the ordered pairs' groups of the grouped expert kernels (1 + 2 T * 8 ints).
+cudaError_t quench6k_ink_route(const float* logits, const float* bias, float scale, int T, int* sel_e, float* sel_w, int* order, int* groups,
+                               cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     if (order) {
         if (T > SMALL_ROWS) return cudaErrorInvalidValue;
-        SQ_CHECK_LAUNCH(sq_launch(route_order_kernel, 1, 1024, 0, st, logits, bias, scale, T, sel_e, sel_w, order));
+        SQ_CHECK_LAUNCH(sq_launch(route_order_kernel, 1, 1024, 0, st, logits, bias, scale, T, sel_e, sel_w, order, groups));
         SQ_RETURN_LAUNCH();
     }
     SQ_CHECK_LAUNCH(sq_launch(route_kernel, T, E, 0, st, logits, bias, scale, sel_e, sel_w));
@@ -2503,14 +2686,31 @@ cudaError_t quench6k_ink_route(const float* logits, const float* bias, float sca
 
 // The routed experts of T tokens: order (pairs in expert order; computed here unless `ordered`), act BF16
 // [T * 8, 1152], y F32 [T * 8, D], out F32 [T, D] (null: no combine). fp4: NVFP4 weights with s2, else MXFP8.
+// groups (non-null, from route with `order`): the grouped kernels (the same bits, fewer weight reads when
+// several pairs share an expert).
 cudaError_t quench6k_ink_experts(const void* x, const int* sel_e, const float* sel_w, int fp4, const uint8_t* gu_w, const uint8_t* gu_sc,
                                  const float* gu_s2, const uint8_t* d_w, const uint8_t* d_sc, const float* d_s2, float gcap, float ucap,
-                                 int T, int* order, int ordered, void* act, float* y, float* out, cudaStream_t st) {
+                                 int T, int* order, int ordered, const int* groups, void* act, float* y, float* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     const int pairs = T * TOPK;
     if (!ordered) SQ_CHECK_LAUNCH(sq_launch(moe_order_kernel, 1, 1024, 0, st, sel_e, pairs, order));
     const ExpertW gu{gu_w, gu_sc, gu_s2}, dn{d_w, d_sc, d_s2};
     const int sms = sm_count();
+    if (groups && ordered) {
+        const auto xb = static_cast<const bf16*>(x);
+        const auto ab = static_cast<bf16*>(act);
+        const unsigned gb = (unsigned)std::min<size_t>((size_t)pairs * (2 * FF / EX_R) / 8 + 1, (size_t)sms * 8);
+        const unsigned db = (unsigned)std::min<size_t>((size_t)pairs * (D / EX_R) / 8 + 1, (size_t)sms * 8);
+        if (fp4) {
+            SQ_CHECK_LAUNCH(sq_launch(experts_gate_up_g_kernel<true>, gb, 256, 0, st, xb, sel_e, (const int*)order, groups, gu, pairs, gcap, ucap, ab));
+            SQ_CHECK_LAUNCH(sq_launch(experts_down_g_kernel<true>, db, 256, 0, st, (const bf16*)ab, sel_e, (const int*)order, groups, dn, pairs, y));
+        } else {
+            SQ_CHECK_LAUNCH(sq_launch(experts_gate_up_g_kernel<false>, gb, 256, 0, st, xb, sel_e, (const int*)order, groups, gu, pairs, gcap, ucap, ab));
+            SQ_CHECK_LAUNCH(sq_launch(experts_down_g_kernel<false>, db, 256, 0, st, (const bf16*)ab, sel_e, (const int*)order, groups, dn, pairs, y));
+        }
+        if (out) SQ_CHECK_LAUNCH(sq_launch(moe_combine_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, (const float*)y, sel_w, T, out));
+        SQ_RETURN_LAUNCH();
+    }
     const unsigned gb = (unsigned)std::min<size_t>((size_t)pairs * (2 * FF / EX_R) / 8 + 1, (size_t)sms * 8);
     const unsigned db = (unsigned)std::min<size_t>((size_t)pairs * (D / EX_R) / 8 + 1, (size_t)sms * 8);
     if (fp4) {
