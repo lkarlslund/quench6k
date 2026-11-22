@@ -1232,14 +1232,7 @@ __global__ void __launch_bounds__(256) experts_down_kernel(const bf16* __restric
         rows_load<FP4, EX_R>(wt, e, D, first / pairs * EX_R, FF, lane, pw, ps);
     }
     pdl_wait();
-    for (int item = first; item < items; item += warps) {
-        const int pair = order[item % pairs], n0 = item / pairs * EX_R;
-        const int e = sel_e[pair];
-        float v[EX_R];
-        if (item == first)
-            rows_dot<FP4, EX_R>(wt, e, D, n0, FF, act + (size_t)pair * FF, v, pw, ps);
-        else
-            rows_dot<FP4, EX_R>(wt, e, D, n0, FF, act + (size_t)pair * FF, v);
+    auto finish = [&](int pair, int n0, int e, const float (&v)[EX_R]) {
         const float s2 = FP4 ? wt.s2[e] : 1.0f;
         if (lane < EX_R) {
             float vv = 0.0f;
@@ -1248,6 +1241,21 @@ __global__ void __launch_bounds__(256) experts_down_kernel(const bf16* __restric
                 if (i == lane) vv = v[i];
             y[(size_t)pair * D + n0 + lane] = vv * s2;
         }
+    };
+    // The first item (its weights preloaded) apart from the loop, so that the preloaded registers are
+    // free for the others.
+    if (first < items) {
+        const int pair = order[first % pairs], n0 = first / pairs * EX_R, e = sel_e[pair];
+        float v[EX_R];
+        rows_dot<FP4, EX_R>(wt, e, D, n0, FF, act + (size_t)pair * FF, v, pw, ps);
+        finish(pair, n0, e, v);
+    }
+    for (int item = first + warps; item < items; item += warps) {
+        const int pair = order[item % pairs], n0 = item / pairs * EX_R;
+        const int e = sel_e[pair];
+        float v[EX_R];
+        rows_dot<FP4, EX_R>(wt, e, D, n0, FF, act + (size_t)pair * FF, v);
+        finish(pair, n0, e, v);
     }
 }
 
