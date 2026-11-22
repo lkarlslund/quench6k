@@ -17,6 +17,17 @@ namespace {
 
 constexpr int WARPS = 8, THREADS = WARPS * 32;
 
+// Row segments of one weight matrix with their own inputs and outputs (n > 1; boundaries multiples of
+// the rows per warp; no K split): rows [0, end[0]) read x[0] and write y[0] (row n at column n), rows
+// [end[0], end[1]) x[1] / y[1] (column n - end[0]), the rest x[2] / y[2]. n = 0: X and Y as given.
+struct GSeg {
+    const void* x[3];
+    float* y[3];
+    int ldy[3];
+    int end[2];
+    int n;
+};
+
 // grid (ceil(N / (NW R)), splits). Each split covers k_per_split columns (a multiple of 512). A warp owns
 // R rows; lane l handles the 16-weight chunks at columns k_begin + 16 l + 512 c. The first PRE chunks
 // of every row (all of them for K <= 2560 per split) are loaded raw before the PDL wait, so the weight
@@ -26,12 +37,20 @@ template <WFmt F, int M, typename XT, int R, int PRE = 5, int NW = WARPS>
 __global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X, int ldx,
                                                        const uint8_t* __restrict__ W, const float* __restrict__ row_scale,
                                                        float* Y, int ldy, float* partial, int ldp, int N,
-                                                       int K, int k_per_split, float alpha, int accumulate) {
+                                                       int K, int k_per_split, float alpha, int accumulate, GSeg seg) {
     pdl_launch_dependents();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int k_begin = blockIdx.y * k_per_split, k_end = min(K, k_begin + k_per_split);
     const size_t row_bytes = (size_t)K * elem_bytes<F>();
     const int n0 = (blockIdx.x * NW + warp) * R;
+    int nb = 0;
+    if (seg.n > 1) {
+        const int sg = n0 < seg.end[0] ? 0 : (seg.n > 2 && n0 >= seg.end[1] ? 2 : 1);
+        nb = sg ? seg.end[sg - 1] : 0;
+        X = static_cast<const XT*>(seg.x[sg]);
+        Y = seg.y[sg];
+        ldy = seg.ldy[sg];
+    }
     const uint8_t* rows[R];
     bool row_live[R];
 #pragma unroll
@@ -111,7 +130,7 @@ __global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X,
         const int n = n0 + r;
         const float scale = alpha * (F == WFmt::FP8 || F == WFmt::INT8 ? row_scale[n] : 1.0f);
         if (gridDim.y == 1) {
-            float* y = &Y[(size_t)m * ldy + n];
+            float* y = &Y[(size_t)m * ldy + n - nb];
             *y = accumulate ? *y + v * scale : v * scale;
         } else {
             partial[((size_t)blockIdx.y * M + m) * ldp + n] = v * scale;
@@ -156,10 +175,10 @@ __global__ void reduce_kernel(const float* __restrict__ partial, int ldp, int sp
 
 template <WFmt F, int M, int R, int PRE, int NW>
 cudaError_t launch_one(const __nv_bfloat16* X, int ldx, const uint8_t* W, const float* scale, float* Y, int ldy, float* partial,
-                       int N, int K, int splits, int k_per_split, float alpha, int accumulate, cudaStream_t st) {
+                       int N, int K, int splits, int k_per_split, float alpha, int accumulate, cudaStream_t st, GSeg seg) {
     const dim3 grid((N + NW * R - 1) / (NW * R), splits);
     SQ_CHECK_LAUNCH(sq_launch(gemv_kernel<F, M, __nv_bfloat16, R, PRE, NW>, grid, NW * 32, 0, st, X, ldx, W, scale, Y, ldy, partial, N,
-                              N, K, k_per_split, alpha, accumulate));
+                              N, K, k_per_split, alpha, accumulate, seg));
     return cudaSuccess;
 }
 
@@ -167,8 +186,8 @@ cudaError_t launch_one(const __nv_bfloat16* X, int ldx, const uint8_t* W, const 
 // gemv.warps in {4, 8, 16}, gemv.rows in {1, 2, 4} (0: the default choice below).
 template <WFmt F, int M, int R>
 cudaError_t launch_r(int pre, int nw, const __nv_bfloat16* X, int ldx, const uint8_t* W, const float* scale, float* Y, int ldy,
-                     float* partial, int N, int K, int splits, int k_per_split, float alpha, int accumulate, cudaStream_t st) {
-#define SQ_ARGS X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st
+                     float* partial, int N, int K, int splits, int k_per_split, float alpha, int accumulate, cudaStream_t st, GSeg seg) {
+#define SQ_ARGS X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st, seg
     if constexpr (M == 1 || M == 4) {
         switch (pre * 100 + nw) {
             case 304: return launch_one<F, M, R, 3, 4>(SQ_ARGS);
@@ -191,7 +210,7 @@ cudaError_t launch_r(int pre, int nw, const __nv_bfloat16* X, int ldx, const uin
 
 template <WFmt F, int M>
 cudaError_t launch_m(const __nv_bfloat16* X, int ldx, const uint8_t* W, const float* scale, float* Y, int ldy,
-                     float* partial, int N, int K, int splits, float alpha, int accumulate, cudaStream_t st) {
+                     float* partial, int N, int K, int splits, float alpha, int accumulate, cudaStream_t st, GSeg seg = {}) {
     const int k_per_split = ((K + splits - 1) / splits + 511) / 512 * 512;
     splits = (K + k_per_split - 1) / k_per_split;
     const int variant = M == 1 || M == 4;
@@ -204,9 +223,9 @@ cudaError_t launch_m(const __nv_bfloat16* X, int ldx, const uint8_t* W, const fl
     // steps (MTP verify rounds) always take two (kbench: 1.1% faster per verify step).
     if (rows == 0) rows = M == 4 || (N + 2 * nw - 1) / (2 * nw) * splits >= 188 ? 2 : 1;
     cudaError_t e;
-    if (rows == 1) e = launch_r<F, M, 1>(pre, nw, X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st);
-    else if (rows == 2) e = launch_r<F, M, 2>(pre, nw, X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st);
-    else if (rows == 4 && variant) e = launch_r<F, M, 4>(pre, nw, X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st);
+    if (rows == 1) e = launch_r<F, M, 1>(pre, nw, X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st, seg);
+    else if (rows == 2) e = launch_r<F, M, 2>(pre, nw, X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st, seg);
+    else if (rows == 4 && variant) e = launch_r<F, M, 4>(pre, nw, X, ldx, W, scale, Y, ldy, partial, N, K, splits, k_per_split, alpha, accumulate, st, seg);
     else e = cudaErrorInvalidValue;
     if (e != cudaSuccess) return e;
     if (splits > 1)
@@ -217,11 +236,11 @@ cudaError_t launch_m(const __nv_bfloat16* X, int ldx, const uint8_t* W, const fl
 // M in 1..16.
 template <WFmt F>
 cudaError_t launch_rows(int M, const __nv_bfloat16* X, int ldx, const uint8_t* W, const float* scale, float* Y, int ldy,
-                        float* partial, int N, int K, int splits, float alpha, int accumulate, cudaStream_t st) {
+                        float* partial, int N, int K, int splits, float alpha, int accumulate, cudaStream_t st, GSeg seg = {}) {
     switch (M) {
 #define SQ_CASE(m) \
     case m:        \
-        return launch_m<F, m>(X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
+        return launch_m<F, m>(X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st, seg);
         SQ_CASE(1) SQ_CASE(2) SQ_CASE(3) SQ_CASE(4) SQ_CASE(5) SQ_CASE(6) SQ_CASE(7) SQ_CASE(8)
         SQ_CASE(9) SQ_CASE(10) SQ_CASE(11) SQ_CASE(12) SQ_CASE(13) SQ_CASE(14) SQ_CASE(15) SQ_CASE(16)
 #undef SQ_CASE
@@ -232,16 +251,30 @@ cudaError_t launch_rows(int M, const __nv_bfloat16* X, int ldx, const uint8_t* W
 
 template <WFmt F>
 cudaError_t launch(int M, const void* Xv, int ldx, const void* Wv, const float* scale, float* Y, int ldy, float* partial,
-                   int N, int K, int splits, float alpha, int accumulate, cudaStream_t st) {
+                   int N, int K, int splits, float alpha, int accumulate, cudaStream_t st, GSeg seg = {}) {
     if (K % 16 != 0 || ldx % 8 != 0) return cudaErrorInvalidValue;
     const auto* X = static_cast<const __nv_bfloat16*>(Xv);
     const auto* W = static_cast<const uint8_t*>(Wv);
-    return launch_rows<F>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st);
+    return launch_rows<F>(M, X, ldx, W, scale, Y, ldy, partial, N, K, splits, alpha, accumulate, st, seg);
 }
 
 }  // namespace
 
 extern "C" int quench6k_gemv_max_m() { return 16; }
+
+// One weight matrix [N, K] in up to three row segments with their own inputs (x[i], shared ldx) and
+// outputs (y[i], ldy[i]): rows [0, end0) -> x0 / y0, [end0, end1) -> x1 / y1, [end1, N) -> x2 / y2
+// (segments = 2: no third). Boundaries must be multiples of 4 rows. No K split; fmt 0 or 3.
+extern "C" cudaError_t quench6k_gemv_seg(int fmt, int M, const void* x0, const void* x1, const void* x2, int ldx, const void* W,
+                                       const float* scale, float* y0, float* y1, float* y2, int ldy0, int ldy1, int ldy2, int end0,
+                                       int end1, int segments, int N, int K, cudaStream_t st) {
+    if (M == 0) return cudaSuccess;
+    if (segments < 2 || segments > 3 || end0 % 4 != 0 || end1 % 4 != 0) return cudaErrorInvalidValue;
+    const GSeg seg{{x0, x1, x2}, {y0, y1, y2}, {ldy0, ldy1, ldy2}, {end0, end1}, segments};
+    if (fmt == 0) return launch<WFmt::BF16>(M, x0, ldx, W, scale, y0, ldy0, nullptr, N, K, 1, 1.0f, 0, st, seg);
+    if (fmt == 3 && K % GROUP == 0) return launch<WFmt::INT8G>(M, x0, ldx, W, scale, y0, ldy0, nullptr, N, K, 1, 1.0f, 0, st, seg);
+    return cudaErrorInvalidValue;
+}
 
 // fmt: 0 BF16, 3 INT8 with one scale per 64 weights, 4 MXFP8, 5 FP8 with a scale per 128 x 128 block. With splits > 1 the K range is split across CTAs;
 // `partial` holds splits * M * N floats, reduced in split order.

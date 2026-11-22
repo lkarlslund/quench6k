@@ -304,7 +304,8 @@ impl Workspace {
             gated: [a.get(td)?, a.get(td)?, a.get(td)?],
             x: [a.get(t * D * 2)?, a.get(t * D * 2)?, a.get(t * D * 2)?],
             xm: a.get(t * D * 2)?,
-            lin_q: a.get(t * QG * 4)?,
+            // Also the three projections' outputs together [t, QG + 2 * ldk] (prefill, one input).
+            lin_q: a.get(t * (QG + 2 * (KVD + 32)) * 4)?,
             lin_k: a.get(t * (KVD + 32) * 4)?,
             lin_v: a.get(t * (KVD + 32) * 4)?,
             q: a.get(t * QD * 2)?,
@@ -748,10 +749,28 @@ impl InklingModel {
             }
             // Attention.
             let a = &layer.attn;
-            let ldk = a.kg.n;
-            linear(s, xq, D, t, &a.qg, ws.lin_q, QG)?;
-            linear(s, xk, D, t, &a.kg, ws.lin_k, ldk)?;
-            linear(s, xv, D, t, &a.vg, ws.lin_v, ldk)?;
+            let mut ldk = a.kg.n;
+            let (mut ldq, mut lin_k, mut lin_v) = (QG, ws.lin_k, ws.lin_v);
+            match &a.qkv {
+                // Small steps: one GEMV launch over the three projections, each with its input.
+                Some(m) if t <= k::gemv_max_m() => {
+                    let segs = [(QG, xq, ws.lin_q, QG), (ldk, xk, ws.lin_k, ldk), (ldk, xv, ws.lin_v, ldk)];
+                    k::gemv_seg(s, t, m.fmt, m.w, m.scale, D, &segs, D)?;
+                }
+                // One input (sliding layers outside the message gates): one GEMM, outputs side by side.
+                Some(m) if xq == xk && xk == xv => {
+                    linear(s, xq, D, t, m, ws.lin_q, m.n)?;
+                    ldq = m.n;
+                    lin_k = ws.lin_q + (QG * 4) as u64;
+                    lin_v = lin_k + (ldk * 4) as u64;
+                    ldk = m.n;
+                }
+                _ => {
+                    linear(s, xq, D, t, &a.qg, ws.lin_q, QG)?;
+                    linear(s, xk, D, t, &a.kg, ws.lin_k, ldk)?;
+                    linear(s, xv, D, t, &a.vg, ws.lin_v, ldk)?;
+                }
+            }
             let side = |ring: u64, conv: u64, cache: u64| {
                 if layer.sliding {
                     KvSide { ring, conv, static_w: 0, cache }
@@ -762,7 +781,7 @@ impl InklingModel {
             ik::qkv_prep(
                 s,
                 ws.lin_q,
-                QG,
+                ldq,
                 a.qscale,
                 a.rscale,
                 cfg.qk_clip,
@@ -771,8 +790,8 @@ impl InklingModel {
                 ws.q,
                 ws.rel,
                 ws.sink,
-                ws.lin_k,
-                ws.lin_v,
+                lin_k,
+                lin_v,
                 ldk,
                 side(c.k_ring, a.kconv, c.k),
                 side(c.v_ring, a.vconv, c.v),
@@ -798,7 +817,7 @@ impl InklingModel {
                 splits,
                 MIN_KEYS,
                 ws.lin_q,
-                QG,
+                ldq,
                 GATE_OFF,
                 ws.part,
                 ws.attn,

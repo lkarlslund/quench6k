@@ -172,6 +172,8 @@ pub struct Linear {
 }
 
 pub struct Attn {
+    /// qg | kg | vg in one matrix (BF16 or INT8 group weights; the three below are views of it).
+    pub qkv: Option<Linear>,
     /// [q (3072) | output gate (3072) | relative states (384) | sinks (24)] x 2304.
     pub qg: Linear,
     /// Keys [1024] (+ the full layers' per-token convolution taps [32]) x 2304; values likewise.
@@ -277,6 +279,21 @@ pub struct InklingModel {
 }
 
 impl Linear {
+    /// Rows r0 .. r0 + n as a matrix of their own (BF16 or INT8 group weights).
+    pub fn rows(&self, r0: usize, n: usize) -> Linear {
+        let (wb, sb) = match self.fmt {
+            WeightFormat::Bf16 => (self.k * 2, 0),
+            WeightFormat::Int8Group => (self.k, self.k / quench6k_cuda::kernels::int8_group() * 4),
+            f => panic!("row view of {f:?} weights"),
+        };
+        Linear {
+            w: self.w + (r0 * wb) as u64,
+            scale: if sb > 0 { self.scale + (r0 * sb) as u64 } else { self.scale },
+            n,
+            ..*self
+        }
+    }
+
     /// (address, bytes) of the weights and of their scales.
     pub fn ranges(&self) -> Vec<(u64, usize)> {
         let w = match self.fmt {
@@ -351,24 +368,34 @@ impl InklingModel {
                     l.raw(&n("v_input_norm.weight"), DType::BF16, Some(&[D]))?,
                 ]
             };
-            let qg = l.concat(&[a("wq_du.weight"), a("gate_attn.weight"), a("wr_du.weight"), a("attn_sink_proj.weight")], D)?;
-            ensure!(qg.n == QG, "layer {i}: query-side projections have {} rows", qg.n);
-            let (kg, vg, kconv, vconv) = if sliding {
+            let qn = [a("wq_du.weight"), a("gate_attn.weight"), a("wr_du.weight"), a("attn_sink_proj.weight")];
+            let (kn, vn, kconv, vconv) = if sliding {
                 (
-                    l.concat(&[a("wk_dv.weight")], D)?,
-                    l.concat(&[a("wv_dv.weight")], D)?,
+                    vec![a("wk_dv.weight")],
+                    vec![a("wv_dv.weight")],
                     l.raw(&a("k_sconv.weight"), DType::BF16, Some(&[KVD, 1, CONVK]))?,
                     l.raw(&a("v_sconv.weight"), DType::BF16, Some(&[KVD, 1, CONVK]))?,
                 )
             } else {
                 (
-                    l.concat(&[a("wk_dv.weight"), a("k_sconv.weight_proj")], D)?,
-                    l.concat(&[a("wv_dv.weight"), a("v_sconv.weight_proj")], D)?,
+                    vec![a("wk_dv.weight"), a("k_sconv.weight_proj")],
+                    vec![a("wv_dv.weight"), a("v_sconv.weight_proj")],
                     l.raw(&a("k_sconv.static_w"), DType::BF16, Some(&[CONVK, KVD]))?,
                     l.raw(&a("v_sconv.static_w"), DType::BF16, Some(&[CONVK, KVD]))?,
                 )
             };
+            // One matrix for the three projections when its format allows row views (BF16, INT8 groups).
+            let all: Vec<String> = qn.iter().chain(&kn).chain(&vn).cloned().collect();
+            let (qkv, qg, kg, vg) = if l.row_viewable(&all[0], D) {
+                let m = l.concat(&all, D)?;
+                let ldk = (m.n - QG) / 2;
+                (Some(m), m.rows(0, QG), m.rows(QG, ldk), m.rows(QG + ldk, ldk))
+            } else {
+                (None, l.concat(&qn, D)?, l.concat(&kn, D)?, l.concat(&vn, D)?)
+            };
+            ensure!(qg.n == QG, "layer {i}: query-side projections have {} rows", qg.n);
             let attn = Attn {
+                qkv,
                 qg,
                 kg,
                 vg,
@@ -576,6 +603,13 @@ impl Loader<'_> {
 
     /// BF16 matrices of `k` columns stacked row-wise into one projection; quantized at load to block-128
     /// FP8 when the first name matches QUENCH6K_INK_FP8 (see [`fp8_at_load`]).
+    /// Whether `concat` keeps the weights of `name` (input width k) as BF16 or INT8 groups (formats
+    /// whose rows can be viewed separately).
+    fn row_viewable(&self, name: &str, k: usize) -> bool {
+        let int8 = k.is_multiple_of(quench6k_cuda::kernels::int8_group()) && quantized_at_load("QUENCH6K_INK_INT8", INT8_DEFAULT, name);
+        int8 || !(k.is_multiple_of(128) && fp8_at_load(name))
+    }
+
     fn concat(&mut self, names: &[String], k: usize) -> Result<Linear> {
         let mut rows = 0;
         for name in names {

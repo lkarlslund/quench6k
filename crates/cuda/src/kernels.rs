@@ -363,6 +363,43 @@ pub fn gemv(
     check(err, "gemv")
 }
 
+/// [`gemv`] of one weight matrix [n, k] (BF16 or INT8 group) in row segments with their own inputs
+/// and outputs: `segs` = (rows, x, y, ldy) in row order (2 or 3; rows multiples of 4), shared `ldx`.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_seg(s: &Stream, m: usize, fmt: WeightFormat, w: u64, scale: u64, ldx: usize, segs: &[(usize, u64, u64, usize)], k: usize) -> Result<()> {
+    if segs.len() < 2 || segs.len() > 3 {
+        return Err(anyhow::anyhow!("gemv_seg: {} segments", segs.len()));
+    }
+    let g = |i: usize| segs.get(i).copied().unwrap_or((0, 0, 0, 0));
+    let (end0, end1) = (g(0).0, g(0).0 + g(1).0);
+    let n: usize = segs.iter().map(|x| x.0).sum();
+    let err = unsafe {
+        ffi::quench6k_gemv_seg(
+            fmt as i32,
+            m as i32,
+            p(g(0).1),
+            p(g(1).1),
+            p(g(2).1),
+            ldx as i32,
+            p(w),
+            opt_f(scale),
+            g(0).2 as *mut f32,
+            g(1).2 as *mut f32,
+            g(2).2 as *mut f32,
+            g(0).3 as i32,
+            g(1).3 as i32,
+            g(2).3 as i32,
+            end0 as i32,
+            end1 as i32,
+            segs.len() as i32,
+            n as i32,
+            k as i32,
+            s.raw(),
+        )
+    };
+    check(err, "gemv_seg")
+}
+
 /// W[n, k] *= 1 + g[k] in place (BF16).
 pub fn fold_norm(s: &Stream, w: u64, g: u64, n: usize, k: usize) -> Result<()> {
     check(
