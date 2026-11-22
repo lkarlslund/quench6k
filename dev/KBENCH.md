@@ -648,3 +648,41 @@ synthetic routing with 872 tiles, 73% full, 43 to 755 rows per expert).
 - What is left would need a different kernel design to raise gate_up's DRAM efficiency: warp
   specialization with TMA bulk copies, fewer registers for 3 CTAs per SM. The bound is at most about
   0.2 ms of 1.0 ms per layer, or about 2% of prefill.
+
+## 2026-11-22: Hy4-flash batched steps
+
+`quench6k hy4 batch-check` steps several sequences alone and batched and compares them bitwise
+(teacher-forced logits rows and cache checksums; greedy decoding with drafts: tokens, drafts, logits;
+plain greedy against drafted), and with `--bench-ctx` times batched decode steps. `quench6k hy4
+width-check` compares a fixture's positions run in one-token steps with wider steps. Extra batch-check
+cases: `QUENCH6K_HY4_INTERLEAVE=1` (one sequence's short step after another's one-token steps),
+`QUENCH6K_HY4_STAGGER=1` (short raw prompts started between running sequences' steps, as a server runs
+them), `QUENCH6K_HY4_PICK=topk` (greedy picks by the top-k kernel, as the server's sampler, instead of
+argmax). `QUENCH6K_TOPK_ATOMIC_TIES=1` restores top-k's old timing-dependent choice among tied values,
+to tell tie effects from other differences.
+
+- Width invariance before this work: steps of 1 to 6 tokens gave the one-token bits, 7 and more did not
+  (the attention split each row's keys by the step's width). With a fixed split (16 for sliding, 32 for
+  indexed layers, what one-token steps used) 1 to 8 tokens give the same bits; 9 to 16 still differ (the
+  routed experts switch to the grouped tensor-core GEMM there, single-sequence steps only).
+- The indexer's top-k picked tied groups by thread timing (many groups score exactly 0): drafted greedy
+  differed from plain greedy on long prompts. Ties now go to the lowest group indices (topk.cu).
+- Aggregate decode throughput, 600 W, prompts from the long-context fixture (tokens per second over all
+  sequences; drafted: 3 drafts per sequence per step):
+
+| ctx | sequences | plain ms/step | plain tok/s | drafted ms/step | drafted tok/s |
+|---|---|---|---|---|---|
+| 512 | 1 | 9.8 | 102 | 18.6 | 103 |
+| 512 | 2 | 11.7 | 171 | 25.3 | 198 |
+| 512 | 4 | 15.9 | 251 | 41.2 | 306 |
+| 512 | 8 | 23.7 | 338 | 72.8 | 333 |
+| 8192 | 1 | 10.6 | 94 | 19.3 | 102 |
+| 8192 | 2 | 12.6 | 158 | 27.0 | 153 |
+| 8192 | 4 | 16.8 | 238 | 43.3 | 229 |
+| 8192 | 8 | 24.3 | 329 | 76.2 | 246 |
+
+  Plain steps scale well (8 sequences in 2.4x the time of one); verified drafts stop paying at about 4
+  sequences: a batched step's cost grows with its rows (every row is a GEMV row and 16 expert pairs), so
+  with many sequences fewer drafts per sequence should be verified.
+- Dropped: routed experts per run of pairs of one expert (each work item loading its expert's weight rows
+  once for up to 8 pairs, the same arithmetic): 4 x 4-row steps 171 ms instead of 41 ms.

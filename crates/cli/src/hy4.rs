@@ -1,5 +1,7 @@
 //! Commands for Hy4-flash checkpoints (`hy_v4_flash`).
 
+mod batch;
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -72,6 +74,49 @@ pub enum Hy4Cmd {
         #[arg(long)]
         dfly: bool,
     },
+    /// Width invariance: a fixture's tokens teacher-forced in steps of each width after a common prefill;
+    /// every position's logits row compared bitwise with the one-token steps' row.
+    WidthCheck {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        fixture: PathBuf,
+        /// Positions prefilled before the steps.
+        #[arg(long, default_value_t = 2040)]
+        prefill: usize,
+        /// Positions run in steps after the prefill.
+        #[arg(long, default_value_t = 240)]
+        steps: usize,
+        #[arg(long, num_args = 1.., default_values_t = [1usize, 2, 3, 4, 5, 6, 7, 8, 12, 16])]
+        widths: Vec<usize>,
+    },
+    /// Several sequences (fixtures at different prompt lengths) stepped alone and batched: teacher-forced
+    /// logits rows and caches, and greedy decoding with drafts (tokens, drafts, logits) compared bitwise;
+    /// then (with --bench-ctx) the aggregate decode throughput of 1, 2, 4 and 8 batched sequences.
+    BatchCheck {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, num_args = 1..)]
+        fixture: Vec<PathBuf>,
+        #[arg(long, default_value_t = 8)]
+        seqs: usize,
+        /// Teacher-forced positions per sequence (0: skip).
+        #[arg(long, default_value_t = 40)]
+        steps: usize,
+        /// Greedy tokens per sequence (0: skip).
+        #[arg(long, default_value_t = 48)]
+        decode: usize,
+        /// Text for the throughput prompts (default: the longest fixture's tokens).
+        #[arg(long)]
+        text: Option<PathBuf>,
+        #[arg(long, num_args = 0..)]
+        bench_ctx: Vec<usize>,
+        #[arg(long, default_value_t = 32)]
+        bench_steps: usize,
+        /// Drafts per sequence of the drafted throughput runs.
+        #[arg(long, num_args = 0.., default_values_t = [3usize])]
+        bench_drafts: Vec<usize>,
+    },
 }
 
 pub fn run(cmd: Hy4Cmd) -> Result<()> {
@@ -110,7 +155,97 @@ pub fn run(cmd: Hy4Cmd) -> Result<()> {
             json,
             dfly,
         } => bench(&model, &text, &ctx, generate, chunk, json.as_deref(), dfly),
+        Hy4Cmd::WidthCheck {
+            model,
+            fixture,
+            prefill,
+            steps,
+            widths,
+        } => width_check(&model, &fixture, prefill, steps, &widths),
+        Hy4Cmd::BatchCheck {
+            model,
+            fixture,
+            seqs,
+            steps,
+            decode,
+            text,
+            bench_ctx,
+            bench_steps,
+            bench_drafts,
+        } => batch::run(&model, &fixture, seqs, steps, decode, text.as_deref(), &bench_ctx, bench_steps, &bench_drafts),
     }
+}
+
+fn fixture_tokens(fixture: &Path) -> Result<Vec<i32>> {
+    let seq: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixture.join("sequence.json")).with_context(|| format!("{}/sequence.json", fixture.display()))?,
+    )?;
+    Ok(seq["tokens"]
+        .as_array()
+        .context("sequence.json: tokens")?
+        .iter()
+        .map(|v| v.as_i64().unwrap_or(0) as i32)
+        .collect())
+}
+
+/// Hashes of `rows` logits rows at `addr` (F32 [rows, vocab]).
+fn row_hashes(s: &quench6k_cuda::Stream, addr: u64, rows: usize, vocab: usize) -> Result<Vec<u64>> {
+    use std::hash::{Hash, Hasher};
+    let v: Vec<u32> = s.download(addr, rows * vocab)?;
+    Ok(v.chunks_exact(vocab)
+        .map(|r| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            r.hash(&mut h);
+            h.finish()
+        })
+        .collect())
+}
+
+fn width_check(dir: &Path, fixture: &Path, prefill_n: usize, steps: usize, widths: &[usize]) -> Result<()> {
+    let tokens = fixture_tokens(fixture)?;
+    ensure!(prefill_n + steps <= tokens.len(), "fixture has {} tokens", tokens.len());
+    let (model, s) = load(dir)?;
+    let (free, total) = quench6k_cuda::mem_info()?;
+    eprintln!(
+        "device memory after load: {:.2} GiB free of {:.2} GiB; weights {:.2} GiB; mapping granularity {} KiB",
+        free as f64 / (1u64 << 30) as f64,
+        total as f64 / (1u64 << 30) as f64,
+        model.device_bytes as f64 / (1u64 << 30) as f64,
+        quench6k_cuda::vm_granularity()? >> 10
+    );
+    let vocab = model.cfg.vocab;
+    let ctx = prefill_n + steps + 64;
+    let mut ws = Workspace::new(&model, 2048, ctx, 16)?;
+    let mut base: Option<Vec<u64>> = None;
+    for &w in widths {
+        let mut st = State::new(&model, ctx, &s)?;
+        prefill(&model, &mut st, &mut ws, &s, &tokens[..prefill_n])?;
+        let mut hashes = Vec::with_capacity(steps);
+        let mut at = prefill_n;
+        let t0 = Instant::now();
+        while at < prefill_n + steps {
+            let n = w.min(prefill_n + steps - at);
+            model.forward(&mut st, &mut ws, &s, &tokens[at..at + n], Logits::All)?;
+            hashes.extend(row_hashes(&s, ws.out_logits, n, vocab)?);
+            at += n;
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        match &base {
+            None => {
+                println!("width {w:>2}: reference ({steps} positions, {:.1} ms per step)", secs * 1e3 / steps.div_ceil(w) as f64);
+                base = Some(hashes);
+            }
+            Some(b) => {
+                let diff: Vec<usize> = (0..steps).filter(|&i| b[i] != hashes[i]).collect();
+                println!(
+                    "width {w:>2}: {} of {steps} positions differ{}",
+                    diff.len(),
+                    diff.first().map_or(String::new(), |f| format!(" (first at position {})", prefill_n + f))
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn load(dir: &Path) -> Result<(Hy4Model, quench6k_cuda::Stream)> {

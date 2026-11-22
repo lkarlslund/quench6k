@@ -38,8 +38,11 @@ __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__
     }
     const int slice = MODE == 1 ? blockIdx.x % slices : 0;
     const float* row = MODE == 0 ? x + blockIdx.x * ld : MODE == 1 ? x + (blockIdx.x / slices) * ld + (size_t)slice * n : x + (size_t)blockIdx.x * n;
+    // The second stage reads candidates the first stage wrote just before (programmatic dependent launch):
+    // through L2, so no stale L1 line of an earlier call's candidates is read.
+    auto at = [&](int i) { return MODE == 2 ? __ldcg(row + i) : row[i]; };
     // Row-global index of element i.
-    auto gidx = [&](int i) { return MODE == 0 ? i : MODE == 1 ? slice * n + i : cand_idx[(size_t)blockIdx.x * n + i]; };
+    auto gidx = [&](int i) { return MODE == 0 ? i : MODE == 1 ? slice * n + i : __ldcg(cand_idx + (size_t)blockIdx.x * n + i); };
     __shared__ unsigned hist[256];
     __shared__ unsigned s_prefix, s_mask, s_remaining, s_gt, s_eq, s_digit, s_above, s_wsum[8];
     __shared__ int pick_idx[MAXK];
@@ -56,7 +59,7 @@ __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__
         __syncthreads();
         const unsigned prefix = s_prefix, mask = s_mask;
         for (int i = tid; i < n; i += THREADS) {
-            const unsigned u = order_key(row[i]);
+            const unsigned u = order_key(at(i));
             if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 255], 1u);
         }
         __syncthreads();
@@ -94,19 +97,46 @@ __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__
     }
     const unsigned threshold = s_prefix, take_equal = s_remaining;
     const unsigned greater = k - take_equal;
+    // Values equal to the k-th: the last pass's bin of the threshold counts them.
+    // (sort_by_index & 2: the old timing-dependent choice, QUENCH6K_TOPK_ATOMIC_TIES=1, for comparisons.)
+    const unsigned equal = (sort_by_index & 2) ? 0 : hist[threshold & 255];
     for (int i = tid; i < n; i += THREADS) {
-        const float v = row[i];
+        const float v = at(i);
         const unsigned u = order_key(v);
         if (u > threshold) {
             const unsigned slot = atomicAdd(&s_gt, 1u);
             pick_idx[slot] = gidx(i);
             pick_val[slot] = v;
-        } else if (u == threshold) {
+        } else if (u == threshold && equal <= take_equal) {
             const unsigned slot = atomicAdd(&s_eq, 1u);
             if (slot < take_equal) {
                 pick_idx[greater + slot] = gidx(i);
                 pick_val[greater + slot] = v;
             }
+        }
+    }
+    if (equal > take_equal) {
+        // More values equal the k-th than are taken: the first ones in row order (MODE 2: the candidates'
+        // order, which is row order among equal values), so the picks do not depend on thread timing.
+        __shared__ unsigned s_wcnt[THREADS / 32];
+        const int lane = tid & 31, warp = tid >> 5;
+        for (int base = 0;; base += THREADS) {
+            const int i = base + tid;
+            const bool eq = i < n && order_key(at(i)) == threshold;
+            const unsigned ballot = __ballot_sync(0xffffffffu, eq);
+            if (lane == 0) s_wcnt[warp] = __popc(ballot);
+            __syncthreads();
+            unsigned before = s_eq + __popc(ballot & ((1u << lane) - 1));
+            for (int w = 0; w < warp; ++w) before += s_wcnt[w];
+            if (eq && before < take_equal) {
+                pick_idx[greater + before] = gidx(i);
+                pick_val[greater + before] = at(i);
+            }
+            __syncthreads();
+            if (tid == 0)
+                for (int w = 0; w < THREADS / 32; ++w) s_eq += s_wcnt[w];
+            __syncthreads();
+            if (s_eq >= take_equal || base + THREADS >= n) break;
         }
     }
     __syncthreads();
@@ -127,7 +157,7 @@ __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__
                     const bool up = (i & len) == 0;
                     const int ai = pick_idx[i], aj = pick_idx[j];
                     const float vi = pick_val[i], vj = pick_val[j];
-                    const bool i_first = sort_by_index ? ai < aj : (vi > vj || (vi == vj && ai < aj));
+                    const bool i_first = (sort_by_index & 1) ? ai < aj : (vi > vj || (vi == vj && ai < aj));
                     if (i_first != up) {
                         pick_idx[i] = aj;
                         pick_idx[j] = ai;
@@ -158,6 +188,8 @@ extern "C" cudaError_t quench6k_topk(const float* x, int rows, int n, size_t ld,
                                    float* out_val, cudaStream_t st) {
     if (k > MAXK || k > n || k <= 0) return cudaErrorInvalidValue;
     if (rows == 0) return cudaSuccess;
+    static const int atomic_ties = getenv("QUENCH6K_TOPK_ATOMIC_TIES") && getenv("QUENCH6K_TOPK_ATOMIC_TIES")[0] == '1' ? 2 : 0;
+    sort_by_index = (sort_by_index & 1) | atomic_ties;
     // Long rows (vocabulary logits): slices in parallel, then a merge of their candidates (one block
     // per row would stream the whole row through one SM five times).
     if (n >= 65536 && n % TK_SLICES == 0 && n / TK_SLICES >= k && (size_t)rows * TK_SLICES * k <= TK_CAND &&
@@ -166,7 +198,7 @@ extern "C" cudaError_t quench6k_topk(const float* x, int rows, int n, size_t ld,
         float* cv;
         SQ_CHECK_LAUNCH(cudaGetSymbolAddress((void**)&ci, tk_cand_idx));
         SQ_CHECK_LAUNCH(cudaGetSymbolAddress((void**)&cv, tk_cand_val));
-        SQ_CHECK_LAUNCH(sq_launch(topk_kernel<1>, rows * TK_SLICES, THREADS, 0, st, x, n / TK_SLICES, ld, k, 0, ci, cv, nullptr, 0,
+        SQ_CHECK_LAUNCH(sq_launch(topk_kernel<1>, rows * TK_SLICES, THREADS, 0, st, x, n / TK_SLICES, ld, k, atomic_ties, ci, cv, nullptr, 0,
                                   TK_SLICES, nullptr));
         SQ_CHECK_LAUNCH(sq_launch(topk_kernel<2>, rows, THREADS, 0, st, (const float*)cv, TK_SLICES * k, ld, k, sort_by_index, out_idx,
                                   out_val, nullptr, 0, TK_SLICES, (const int*)ci));
@@ -261,6 +293,8 @@ __global__ void argmax_partial_kernel(const float* __restrict__ x, int n, size_t
     }
 }
 
+// Reads the partial results through L2 (__ldcg): the partial kernel wrote them just before, under
+// programmatic dependent launch.
 __global__ void argmax_final_kernel(const float* __restrict__ pv, const int* __restrict__ pi, int slices, int* out) {
     pdl_launch_dependents();
     pdl_wait();
@@ -268,8 +302,8 @@ __global__ void argmax_final_kernel(const float* __restrict__ pv, const int* __r
     float best = -INFINITY;
     int bi = 0x7fffffff;
     for (int i = lane; i < slices; i += 32) {
-        const float v = pv[r * slices + i];
-        const int idx = pi[r * slices + i];
+        const float v = __ldcg(pv + r * slices + i);
+        const int idx = __ldcg(pi + r * slices + i);
         if (v > best || (v == best && idx < bi)) {
             best = v;
             bi = idx;
