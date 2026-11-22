@@ -1,4 +1,5 @@
 mod bench;
+mod canon;
 mod chat;
 mod flint;
 mod hy4;

@@ -117,6 +117,27 @@ pub enum Hy4Cmd {
         #[arg(long, num_args = 0.., default_values_t = [3usize])]
         bench_drafts: Vec<usize>,
     },
+    /// Canonical prefill: multi-turn conversations sharing a system prompt computed cold (a fresh state
+    /// per turn), warm (reusing the conversation's previous turn) and cross (reusing prefixes cached by
+    /// other conversations, interleaved and batched with another sequence); every turn's logits rows and
+    /// greedy tokens must be bit-identical. Prints reuse points and extra prefill per turn.
+    CanonCheck {
+        #[arg(long)]
+        model: PathBuf,
+        /// Text files (concatenated) for the prompts.
+        #[arg(long, num_args = 1..)]
+        text: Vec<PathBuf>,
+        /// Shared system prompt tokens.
+        #[arg(long, default_value_t = 3109)]
+        system: usize,
+        #[arg(long, default_value_t = 3)]
+        convs: usize,
+        #[arg(long, default_value_t = 3)]
+        turns: usize,
+        /// Reply tokens per turn.
+        #[arg(long, default_value_t = 12)]
+        reply: usize,
+    },
 }
 
 pub fn run(cmd: Hy4Cmd) -> Result<()> {
@@ -173,6 +194,14 @@ pub fn run(cmd: Hy4Cmd) -> Result<()> {
             bench_steps,
             bench_drafts,
         } => batch::run(&model, &fixture, seqs, steps, decode, text.as_deref(), &bench_ctx, bench_steps, &bench_drafts),
+        Hy4Cmd::CanonCheck {
+            model,
+            text,
+            system,
+            convs,
+            turns,
+            reply,
+        } => canon_check(&model, &text, system, convs, turns, reply),
     }
 }
 
@@ -528,4 +557,78 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, chunk: usize,
         }
     }
     Ok(())
+}
+
+/// [`crate::canon`]'s view of the Hy4 engine.
+struct Canon<'m> {
+    model: &'m Hy4Model,
+    s: &'m quench6k_cuda::Stream,
+    ws: Workspace,
+}
+
+impl Canon<'_> {
+    fn rows(&self, rows: usize) -> Result<Vec<crate::canon::Row>> {
+        let vocab = self.model.cfg.vocab;
+        let h = row_hashes(self.s, self.ws.out_logits, rows, vocab)?;
+        k::argmax(self.s, self.ws.out_logits, rows, vocab, vocab, self.ws.argmax_scratch, self.ws.argmax)?;
+        let t = self.s.download::<i32>(self.ws.argmax, rows)?;
+        Ok(h.into_iter().zip(t).collect())
+    }
+}
+
+impl crate::canon::Engine for Canon<'_> {
+    type St = State;
+    fn name(&self) -> &'static str {
+        "hy4"
+    }
+    fn chunk(&self) -> usize {
+        quench6k_engine::hy4::forward::CANON_CHUNK
+    }
+    fn ring(&self) -> usize {
+        quench6k_engine::hy4::forward::RING
+    }
+    fn new_state(&mut self, capacity: usize) -> Result<State> {
+        State::new(self.model, capacity, self.s)
+    }
+    fn history<'a>(&self, st: &'a State) -> &'a [i32] {
+        &st.history
+    }
+    fn frontier(&self, st: &State) -> usize {
+        st.frontier()
+    }
+    fn snapshots(&self, st: &State) -> Vec<usize> {
+        st.snapshot_boundaries()
+    }
+    fn rewind(&mut self, st: &mut State, prompt: &[i32]) -> Result<usize> {
+        st.rewind(prompt, self.s)
+    }
+    fn prefill(&mut self, st: &mut State, tokens: &[i32]) -> Result<crate::canon::Row> {
+        self.model.prefill(st, &mut self.ws, self.s, tokens)?;
+        Ok(self.rows(1)?[0])
+    }
+    fn feed(&mut self, st: &mut State, tokens: &[i32]) -> Result<()> {
+        self.model.forward(st, &mut self.ws, self.s, tokens, Logits::None)
+    }
+    fn step(&mut self, states: &mut [&mut State], tokens: &[&[i32]]) -> Result<Vec<crate::canon::Row>> {
+        self.model.forward_batch(states, &mut self.ws, self.s, tokens)?;
+        self.rows(tokens.iter().map(|t| t.len()).sum())
+    }
+    fn truncate(&mut self, st: &mut State, pos: usize) {
+        st.truncate(pos);
+    }    fn sync(&self) -> Result<()> {
+        self.s.synchronize()
+    }
+}
+
+fn canon_check(dir: &Path, text: &[PathBuf], system: usize, convs: usize, turns: usize, reply: usize) -> Result<()> {
+    let chat = Chat::load(dir, None)?;
+    let mut all = String::new();
+    for t in text {
+        all.push_str(&std::fs::read_to_string(t).with_context(|| t.display().to_string())?);
+    }
+    let ids = chat.encode(&all)?;
+    let (model, s) = load(dir)?;
+    let ws = Workspace::new(&model, quench6k_engine::hy4::forward::CANON_CHUNK, 0, 16)?;
+    let mut e = Canon { model: &model, s: &s, ws };
+    crate::canon::check(&mut e, &ids, system, convs, turns, reply)
 }

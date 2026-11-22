@@ -98,9 +98,25 @@ to the workspace and serve any sequences.
 A sequence's indexed layers keep 17,664 bytes per position (cache row, token key and pooled key of 12
 layers), in address ranges reserved for its capacity (up to the model's 1,048,576 positions) and backed
 by memory in 2 MiB pieces as the sequence grows (`State::reserve`, released by `State::trim`); the
-sliding layers' rings and the prompt-end snapshot take a fixed 106 MB. Sequences share what the weights
-(87 GiB) and the workspace (1.85 GiB with 2048-token prefill chunks) leave: about 4.4 GiB on a 96 GB GPU,
-some 260K positions for one sequence or 27K each for eight.
+sliding layers' rings (2560 positions) and four boundary snapshots take a fixed 159 MB. Sequences share
+what the weights (87 GiB) and the workspace (1.85 GiB with 2048-token prefill chunks) leave: about 4.4 GiB
+on a 96 GB GPU, some 260K positions for one sequence or 27K each for eight.
+
+Prefill is canonical, so a prompt's results depend only on its tokens, not on what the sequence held
+before: prompts are computed in chunks that end at multiples of 2048 positions (`CANON_CHUNK`,
+`Hy4Model::prefill`) and at the prompt's end, and `State::rewind` reuses a cached prefix only up to a
+multiple of 2048 at most the common prefix and the sequence's canonical frontier (the boundary up to
+which every position came from such whole chunks; decode and verification steps, drafts and partial or
+unaligned chunks never advance it, writes below it lower it). Everything after that boundary is
+recomputed, earlier replies included, so a turn recomputes up to 2047 cached prompt tokens plus the
+previous reply. The rings at the boundary are either still live (the rings still hold the 512 positions
+before it) or come from a boundary snapshot: each whole chunk copies the 512 ring positions before its
+end (17.7 MB), and a sequence keeps the latest and the three lowest such snapshots (the lowest serve
+another conversation with the same system prompt); `State::snapshot` does nothing now. `quench6k hy4
+canon-check` runs conversations cold (a fresh sequence per turn), warm and across sequences (another
+conversation's cache, interleaved and batched with a third sequence) and requires bit-identical logits
+and tokens. Prefill chunks of 1024 instead of 2048 tokens would halve the recomputation but prefill 18%
+slower (3.2K instead of 3.9K tokens/s at 4K).
 
 ### Inkling 2
 
@@ -164,8 +180,13 @@ sliding-window attention, 256 experts per layer) runs from the vendor's NVFP4 GG
 Each sequence's full-attention caches (28 KiB per position with BF16 KV, 14.4 KiB with FP8) are
 reserved for the sequence's capacity (at most the model's 262,144 positions) but backed by device memory
 only as positions are reached, so concurrent sequences share the memory by their actual lengths; the
-sliding layers keep rings of 8,192 positions (up to 560 MiB per sequence, and as much again for the
-copy taken at a prompt's end for prefix reuse). Up to 8 sequences with up to 8 tokens each decode in one
+sliding layers keep rings of 8,192 positions (up to 560 MiB per sequence). Prefill is canonical, as for
+Hy4-flash above, with chunks of 4096 positions (`CANON_CHUNK`, `FlintModel::prefill`): `FlintState::rewind`
+reuses a cached prefix only up to a multiple of 4096 at most the common prefix and the canonical frontier,
+so a turn recomputes up to 4095 cached prompt tokens plus the previous reply, and its results depend only on
+its tokens (`quench6k flint canon-check`; chunks of 2048 would halve the recomputation but prefill 12%
+slower, 17.3K instead of 19.7K tokens/s at 8K). Each whole chunk snapshots the 513 ring positions before
+its end (35 MiB); a sequence keeps the latest and the seven lowest. Up to 8 sequences with up to 8 tokens each decode in one
 step; every row is computed exactly as a one-token step of its sequence alone, so a sequence's tokens do
 not depend on which sequences share its steps or on its draft lengths (speculative greedy output equals
 plain greedy output). `quench6k flint generate`, `ppl`, `bench` and `batch-check` are described in

@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use quench6k_cuda::hy4::{self as hk, AttnMode, SeqRows};
 use quench6k_cuda::kernels as k;
 use quench6k_cuda::{DeviceBuffer, PinnedBuffer, Stream, VmBuffer};
@@ -22,7 +22,7 @@ use quench6k_cuda::{DeviceBuffer, PinnedBuffer, Stream, VmBuffer};
 use super::*;
 
 /// Rows of a sliding layer's ring: a prefill chunk (at most 2048 tokens) plus the window before it.
-const RING: usize = 2560;
+pub const RING: usize = 2560;
 const MAX_SPLITS: usize = 32;
 /// Small steps split each row's keys over a fixed number of blocks (sliding layers: 512 keys, indexed
 /// layers: up to 2048 selected keys), merged in split order: a row's result does not depend on the step.
@@ -50,6 +50,13 @@ const RESERVE_STEP: usize = 1024;
 const MAX_GRAPHS: usize = 512;
 /// Per-sequence address tables: indexed rows, token keys, pooled keys, rings, drafter buffers.
 const TABS: usize = 5;
+/// Canonical prefill: every prompt position is computed in chunks of CANON_CHUNK tokens aligned to
+/// multiples of CANON_CHUNK from position 0 (the last chunk ends at the prompt's end), so a prompt's chunk
+/// geometry depends only on its length, and a cached prefix is reused only up to such a boundary (see
+/// [`State::rewind`]): a sequence's bits then depend only on its tokens, not on what was cached before.
+pub const CANON_CHUNK: usize = 2048;
+/// Boundary snapshots a state keeps: the latest boundary and the lowest SNAPS - 1 others.
+const SNAPS: usize = 4;
 
 /// Prefill chunks run the routed experts W4A4 (NVFP4 activations, FP4 tensor cores) when
 /// QUENCH6K_HY4_W4A4 is set to 1.
@@ -133,9 +140,16 @@ pub struct State {
     rings: DeviceBuffer,
     /// The drafter's key lists and hidden states (KeepLayout).
     keep: DeviceBuffer,
-    /// The rings' last WINDOW positions before snap_pos (the end of the last prompt) [n_sliding, WINDOW, 576].
+    /// Boundary snapshots: SNAPS slots of the rings' last WINDOW positions before a boundary (a multiple
+    /// of CANON_CHUNK) at the frontier [SNAPS, n_sliding, WINDOW, 576]; `snap_at[i]`: slot i's boundary.
     snap: DeviceBuffer,
-    snap_pos: Option<usize>,
+    snap_at: [Option<usize>; SNAPS],
+    /// The canonical frontier: a multiple of CANON_CHUNK below which every position was computed by an
+    /// aligned prefill chunk of CANON_CHUNK tokens (never by a smaller or unaligned step) and has not been
+    /// rewritten since. Every snapshot's boundary is at most the frontier.
+    canon: usize,
+    /// The rings hold the last-written rows of positions [ring_lo, pos).
+    ring_lo: usize,
     n_indexed: usize,
     n_sliding: usize,
 }
@@ -159,7 +173,7 @@ impl State {
         s.memset(rings.addr(), 0, rings.bytes())?;
         let keep = DeviceBuffer::new(KeepLayout::of(model).bytes)?;
         s.memset(keep.addr(), 0, keep.bytes())?;
-        let snap = DeviceBuffer::new((ns * WINDOW * KROW * 2).max(16))?;
+        let snap = DeviceBuffer::new((SNAPS * ns * WINDOW * KROW * 2).max(16))?;
         let device_bytes = rings.bytes() + keep.bytes() + snap.bytes();
         Ok(Self {
             pos: 0,
@@ -174,7 +188,9 @@ impl State {
             rings,
             keep,
             snap,
-            snap_pos: None,
+            snap_at: [None; SNAPS],
+            canon: 0,
+            ring_lo: 0,
             n_indexed: ni,
             n_sliding: ns,
         })
@@ -244,9 +260,7 @@ impl State {
             self.last_t = 0;
             self.hidden = false;
         }
-        if self.snap_pos.is_some_and(|e| e > positions) {
-            self.snap_pos = None;
-        }
+        self.lower(self.pos);
         let ni = self.n_indexed;
         let keep = (positions * ni * KROW * 2, positions * ni * ID * 2, positions.div_ceil(GROUP) * ni * ID * 2);
         if (self.rows.mapped() > keep.0 || self.tk.mapped() > keep.1 || self.pooled.mapped() > keep.2)
@@ -263,42 +277,90 @@ impl State {
     pub fn reset(&mut self) {
         self.pos = 0;
         self.history.clear();
-        self.snap_pos = None;
+        self.canon = 0;
+        self.snap_at = [None; SNAPS];
+        self.ring_lo = 0;
         self.last_t = 0;
         self.hidden = false;
     }
 
     /// Drops positions from `pos` on. The sliding layers keep the last RING rows, so `pos` must be within
-    /// REACH positions of the current one (see [`State::rewind`]).
+    /// RING - WINDOW positions of the current one for steps to continue from it (see [`State::rewind`]).
     pub fn truncate(&mut self, pos: usize) {
         self.pos = self.pos.min(pos);
         self.history.truncate(self.pos);
+        self.lower(self.pos);
     }
 
-    /// Keeps the longest cached prefix of `prompt` that can be reused (at most prompt.len() - 1 tokens,
-    /// so the last prompt token is run again for its logits) and returns its length: the common prefix
-    /// with the history if the sliding rings still hold its last WINDOW positions, else the snapshot's
-    /// position (after restoring the rings) if it is within reach, else 0.
-    pub fn rewind(&mut self, prompt: &[i32], s: &Stream) -> Result<usize> {
-        const REACH: usize = RING - WINDOW;
-        let common = self.history.iter().zip(prompt).take_while(|(a, b)| a == b).count();
-        let p = common.min(prompt.len().saturating_sub(1));
-        let live = if self.pos <= p + REACH { p } else { 0 };
-        let snap = match self.snap_pos {
-            Some(e) if e <= self.pos && e <= common + REACH => p.min(e),
-            _ => 0,
-        };
-        let keep = if snap > live {
-            self.restore(s)?;
-            snap
-        } else {
-            live
-        };
-        if self.snap_pos.is_some_and(|e| keep < e) {
-            self.snap_pos = None;
+    /// The canonical frontier (see [`State::rewind`]).
+    pub fn frontier(&self) -> usize {
+        self.canon
+    }
+
+    /// Boundaries of the kept ring snapshots, ascending.
+    pub fn snapshot_boundaries(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.snap_at.iter().flatten().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Positions from `pos` on are (about to be) rewritten: lowers the frontier to the boundary at or below
+    /// `pos` and forgets the snapshots above it.
+    fn lower(&mut self, pos: usize) {
+        self.canon = self.canon.min(pos / CANON_CHUNK * CANON_CHUNK);
+        let canon = self.canon;
+        for b in &mut self.snap_at {
+            if b.is_some_and(|b| b > canon) {
+                *b = None;
+            }
         }
-        self.truncate(keep);
-        Ok(keep)
+    }
+
+    /// A step wrote positions [start, end) (its tokens; the rings' rows of those positions): advances the
+    /// frontier when it was an aligned chunk of CANON_CHUNK tokens right at it, and then snapshots the
+    /// rings at the new boundary.
+    fn wrote(&mut self, start: usize, end: usize, s: &Stream) -> Result<()> {
+        self.ring_lo = self.ring_lo.min(start).max(end.saturating_sub(RING));
+        if start == self.canon && start.is_multiple_of(CANON_CHUNK) && end - start == CANON_CHUNK {
+            self.canon = end;
+            // A free slot, else the highest boundary (the previous latest; the lowest ones stay).
+            let slot = match self.snap_at.iter().position(|b| b.is_none()) {
+                Some(i) => i,
+                None => (0..SNAPS).max_by_key(|&i| self.snap_at[i]).unwrap(),
+            };
+            self.snap_at[slot] = None;
+            self.copy_window(end, slot, true, s)?;
+            self.snap_at[slot] = Some(end);
+        }
+        Ok(())
+    }
+
+    /// Keeps the longest cached prefix of `prompt` that canonical prefill allows and returns its length B
+    /// (0: start over): a multiple of CANON_CHUNK at most the common prefix with the history, below the
+    /// prompt's length (its last token is run again for its logits) and at most the canonical frontier,
+    /// for which the sliding rings' WINDOW positions before B are still in the rings or in a boundary
+    /// snapshot (restored then). The caller computes the prompt from B on in chunks of CANON_CHUNK tokens
+    /// (the last one ends at the prompt's end), so every position's bits are those of a cold prefill.
+    pub fn rewind(&mut self, prompt: &[i32], s: &Stream) -> Result<usize> {
+        self.lower(self.pos);
+        let common = self.history.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        let limit = common.min(prompt.len().saturating_sub(1)).min(self.canon) / CANON_CHUNK * CANON_CHUNK;
+        let mut b = limit;
+        while b > 0 {
+            if b <= self.pos && self.ring_lo <= b - b.min(WINDOW) {
+                break;
+            }
+            if let Some(i) = self.snap_at.iter().position(|&x| x == Some(b)) {
+                self.copy_window(b, i, false, s)?;
+                self.ring_lo = b - b.min(WINDOW);
+                break;
+            }
+            b -= CANON_CHUNK;
+        }
+        self.truncate(b);
+        self.last_t = 0;
+        self.hidden = false;
+        Ok(b)
     }
 
     /// The ring slots of the last `n` positions before `e`: (first slot, count) runs in position order.
@@ -310,39 +372,25 @@ impl State {
         if first + n <= RING { vec![(first, n)] } else { vec![(first, RING - first), (0, n - (RING - first))] }
     }
 
-    /// Copies the sliding rings' last WINDOW positions (the end of a prompt), for [`State::rewind`].
-    pub fn snapshot(&mut self, s: &Stream) -> Result<()> {
-        let e = self.pos;
-        let n = e.min(WINDOW);
-        let row = KROW * 2;
-        for l in 0..self.n_sliding {
-            let ring = self.rings.addr() + (l * RING * row) as u64;
-            let mut at = self.snap.addr() + (l * WINDOW * row) as u64;
-            for (first, count) in Self::ring_runs(e, n) {
-                s.copy_d2d(at, ring + (first * row) as u64, count * row)?;
-                at += (count * row) as u64;
-            }
-        }
-        self.snap_pos = Some(e);
+    /// Prefix reuse needs no prompt-end snapshot any more (boundary snapshots are taken as canonical chunks
+    /// reach them); kept for the scheduler's API.
+    pub fn snapshot(&mut self, _s: &Stream) -> Result<()> {
         Ok(())
     }
 
-    fn restore(&mut self, s: &Stream) -> Result<()> {
-        let e = self.snap_pos.context("no snapshot")?;
+    /// Copies the rings' last WINDOW positions before `e` into snapshot slot `slot` (`save`), or back.
+    fn copy_window(&self, e: usize, slot: usize, save: bool, s: &Stream) -> Result<()> {
         let n = e.min(WINDOW);
         let row = KROW * 2;
         for l in 0..self.n_sliding {
             let ring = self.rings.addr() + (l * RING * row) as u64;
-            let mut at = self.snap.addr() + (l * WINDOW * row) as u64;
+            let mut at = self.snap.addr() + ((slot * self.n_sliding + l) * WINDOW * row) as u64;
             for (first, count) in Self::ring_runs(e, n) {
-                s.copy_d2d(ring + (first * row) as u64, at, count * row)?;
+                let r = ring + (first * row) as u64;
+                if save { s.copy_d2d(at, r, count * row)? } else { s.copy_d2d(r, at, count * row)? }
                 at += (count * row) as u64;
             }
         }
-        self.pos = e;
-        self.history.truncate(e);
-        self.last_t = 0;
-        self.hidden = false;
         Ok(())
     }
 
@@ -842,6 +890,21 @@ impl Hy4Model {
         self.step(&mut [state], ws, s, &[tokens], want)
     }
 
+    /// Canonical prefill of `tokens` at state.pos (after [`State::rewind`]): chunks end at multiples of
+    /// [`CANON_CHUNK`] (absolute positions) and at the tokens' end; the last chunk's last logits row lands
+    /// in ws.out_logits. The workspace must take chunks of CANON_CHUNK tokens.
+    pub fn prefill(&self, state: &mut State, ws: &mut Workspace, s: &Stream, tokens: &[i32]) -> Result<()> {
+        ensure!(ws.max_t >= CANON_CHUNK, "canonical prefill needs chunks of {CANON_CHUNK} tokens (workspace: {})", ws.max_t);
+        let mut at = 0;
+        while at < tokens.len() {
+            let n = (CANON_CHUNK - state.pos % CANON_CHUNK).min(tokens.len() - at);
+            let want = if at + n == tokens.len() { Logits::Last } else { Logits::None };
+            self.forward(state, ws, s, &tokens[at..at + n], want)?;
+            at += n;
+        }
+        Ok(())
+    }
+
     /// One step for 1..=MAX_SEQS sequences, 1..=MAX_STEP tokens each; logits for every fed token land in
     /// ws.out_logits sequence by sequence, row by row. Each sequence's results (caches, hidden states,
     /// logits) are bit-identical to `forward(state_i, tokens_i, Logits::All)` run alone.
@@ -872,6 +935,8 @@ impl Hy4Model {
         for (st, t) in states.iter_mut().zip(tokens) {
             ensure!(st.pos + t.len() <= st.capacity, "context full ({} + {} > {})", st.pos, t.len(), st.capacity);
             st.reserve(st.pos + t.len())?;
+            let pos = st.pos;
+            st.lower(pos);
         }
         // The pinned buffer may still feed the previous step's uploads.
         let timing = std::env::var_os("QUENCH6K_HY4_TIMING").is_some();
@@ -916,6 +981,7 @@ impl Hy4Model {
             self.enqueue(ws, s, &plan)?;
         }
         for (st, t) in states.iter_mut().zip(tokens) {
+            st.wrote(st.pos, st.pos + t.len(), s)?;
             st.pos += t.len();
             st.last_t = t.len();
             st.hidden = want != Logits::None;
@@ -968,6 +1034,9 @@ impl Hy4Model {
             );
             ensure!((pending[i] as usize) < self.cfg.vocab, "token {} out of range", pending[i]);
             st.reserve(st.pos + w)?;
+            // The block's cache rows go to positions pos .. pos + w.
+            let pos = st.pos;
+            st.lower(pos);
             live.push(i);
         }
         if live.is_empty() {

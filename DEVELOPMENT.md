@@ -98,6 +98,7 @@ quench6k flint generate --model $F --raw --prompt 'def fibonacci(n):' --n 48   #
 quench6k flint ppl --model $F --file text.txt --ctx 2048 --chunks 6           # vs llama-perplexity -c 2048
 quench6k [--kv fp8] flint bench --model $F --text corpus.txt --ctx 512 8192 65536 131072 260000
 quench6k [--kv fp8] flint batch-check --model $F --text corpus.txt --seqs 8 --ctx 2048 32768
+quench6k flint canon-check --model $F --text DOCS.md dev/KBENCH.md
 ```
 
 `ppl` scores like llama-perplexity (second half of each chunk), so the numbers compare directly; `bench`
@@ -109,7 +110,13 @@ every row's logits to be bitwise those of decoding alone and the speculative tok
 greedy decoding; then it times batched decode steps of 1, 2, 4 and 8 sequences (`--batches`).
 `--repeat N` runs it all N times from fresh states and requires the same logits and tokens every time;
 compare a run with `QUENCH6K_PDL=0` (kernels in plain stream order) to catch reads that race their
-producer.
+producer. `canon-check` (also `quench6k hy4 canon-check`) runs multi-turn conversations sharing a system
+prompt cold (a fresh sequence per turn), warm (one sequence, verification steps with a rejected draft, a
+long unaligned generation before the last turn so that a boundary snapshot is restored) and across two
+sequences (prefixes cached by other conversations, prefill chunks interleaved with a third sequence's
+steps, decode batched with it) and requires every turn's logits and tokens to be bit-identical; it prints
+the reuse points, the extra prefill per turn, whether a row's bits depend on its chunk's length, and the
+prefill rate with chunks of `CANON_CHUNK` and half that.
 
 ## Model variants
 

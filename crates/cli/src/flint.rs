@@ -88,6 +88,27 @@ pub enum FlintCmd {
         #[arg(long, default_value_t = 1)]
         repeat: usize,
     },
+    /// Canonical prefill: multi-turn conversations sharing a system prompt computed cold (a fresh
+    /// sequence per turn), warm (reusing the conversation's previous turn) and cross (reusing prefixes
+    /// cached by other conversations, interleaved and batched with another sequence); every turn's
+    /// logits rows and greedy tokens must be bit-identical. Prints reuse points and extra prefill.
+    CanonCheck {
+        #[arg(long)]
+        model: PathBuf,
+        /// Text files (concatenated) for the prompts.
+        #[arg(long, num_args = 1..)]
+        text: Vec<PathBuf>,
+        /// Shared system prompt tokens.
+        #[arg(long, default_value_t = 6181)]
+        system: usize,
+        #[arg(long, default_value_t = 3)]
+        convs: usize,
+        #[arg(long, default_value_t = 3)]
+        turns: usize,
+        /// Reply tokens per turn.
+        #[arg(long, default_value_t = 12)]
+        reply: usize,
+    },
 }
 
 pub fn run(cmd: FlintCmd) -> Result<()> {
@@ -132,6 +153,14 @@ pub fn run(cmd: FlintCmd) -> Result<()> {
             batches,
             repeat,
         } => batch_check(&model, &text, seqs, &ctx, steps, time_steps, &batches, repeat),
+        FlintCmd::CanonCheck {
+            model,
+            text,
+            system,
+            convs,
+            turns,
+            reply,
+        } => canon_check(&model, &text, system, convs, turns, reply),
     }
 }
 
@@ -803,4 +832,75 @@ pub fn lookup_draft(hist: &[i32], k: usize) -> Vec<i32> {
         }
     }
     Vec::new()
+}
+
+/// [`crate::canon`]'s view of the Flint engine.
+struct Canon<'m> {
+    model: &'m FlintModel,
+    s: &'m quench6k_cuda::Stream,
+    ws: Workspace,
+}
+
+impl Canon<'_> {
+    fn rows(&self, rows: usize) -> Result<Vec<crate::canon::Row>> {
+        let h = logits_hash(self.s, self.ws.logits, rows)?;
+        let t = fl::argmax(&self.ws, rows, self.s)?;
+        Ok(h.into_iter().zip(t).collect())
+    }
+}
+
+impl crate::canon::Engine for Canon<'_> {
+    type St = FlintState;
+    fn name(&self) -> &'static str {
+        "flint"
+    }
+    fn chunk(&self) -> usize {
+        fl::CANON_CHUNK
+    }
+    fn ring(&self) -> usize {
+        fl::SWA_RING
+    }
+    fn new_state(&mut self, capacity: usize) -> Result<FlintState> {
+        FlintState::new(self.model, capacity, self.s)
+    }
+    fn history<'a>(&self, st: &'a FlintState) -> &'a [i32] {
+        &st.tokens
+    }
+    fn frontier(&self, st: &FlintState) -> usize {
+        st.frontier()
+    }
+    fn snapshots(&self, st: &FlintState) -> Vec<usize> {
+        st.snapshot_boundaries()
+    }
+    fn rewind(&mut self, st: &mut FlintState, prompt: &[i32]) -> Result<usize> {
+        st.rewind(prompt, self.s)
+    }
+    fn prefill(&mut self, st: &mut FlintState, tokens: &[i32]) -> Result<crate::canon::Row> {
+        self.model.prefill(st, &self.ws, self.s, tokens)?;
+        Ok(self.rows(1)?[0])
+    }
+    fn feed(&mut self, st: &mut FlintState, tokens: &[i32]) -> Result<()> {
+        fl::forward(self.model, &self.ws, st, tokens, false, self.s)
+    }
+    fn step(&mut self, states: &mut [&mut FlintState], tokens: &[&[i32]]) -> Result<Vec<crate::canon::Row>> {
+        self.model.forward_batch(states, &mut self.ws, self.s, tokens)?;
+        self.rows(tokens.iter().map(|t| t.len()).sum())
+    }
+    fn truncate(&mut self, st: &mut FlintState, pos: usize) {
+        st.truncate(pos);
+    }    fn sync(&self) -> Result<()> {
+        self.s.synchronize()
+    }
+}
+
+fn canon_check(dir: &Path, text: &[PathBuf], system: usize, convs: usize, turns: usize, reply: usize) -> Result<()> {
+    let chat = Chat::load(dir, None)?;
+    let mut all = String::new();
+    for t in text {
+        all.push_str(&std::fs::read_to_string(t)?);
+    }
+    let ids = chat.encode(&all)?;
+    let (model, s) = load(dir)?;
+    let mut e = Canon { model: &model, s: &s, ws: Workspace::new(fl::MAX_ROWS)? };
+    crate::canon::check(&mut e, &ids, system, convs, turns, reply)
 }
