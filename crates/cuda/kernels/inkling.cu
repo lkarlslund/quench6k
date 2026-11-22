@@ -2213,15 +2213,17 @@ __global__ void prefetch_kernel(Ranges r, int n) {
     pdl_wait();
 }
 
-// L2 prefetch of the gate/up weights (codes and block scales, each expert's contiguous) of the experts
-// sel[0 .. k) of one layer (best first), in pieces of 64 KB over the grid (the guessed experts of the
-// next visit).
-__global__ void prefetch_experts_kernel(const int* __restrict__ sel, int k, const char* w, size_t wbytes, const char* sc, size_t scbytes) {
+// L2 prefetch of the gate/up weights (codes and block scales, each expert's contiguous) of the k best
+// experts of each of `rows` routing rows (sel [rows, 8], best first) of one layer, in pieces of 64 KB
+// over the grid (the guessed experts of the next visit).
+__global__ void prefetch_experts_kernel(const int* __restrict__ sel, int rows, int k, const char* w, size_t wbytes, const char* sc,
+                                        size_t scbytes) {
     pdl_launch_dependents();
     pdl_wait();
     const unsigned wp = (unsigned)((wbytes + 65535) / 65536), per = wp + (unsigned)((scbytes + 65535) / 65536);
-    for (unsigned i = threadIdx.x + blockIdx.x * blockDim.x; i < k * per; i += blockDim.x * gridDim.x) {
-        const int e = sel[i / per];
+    for (unsigned i = threadIdx.x + blockIdx.x * blockDim.x; i < rows * k * per; i += blockDim.x * gridDim.x) {
+        const unsigned x = i / per;
+        const int e = sel[x / k * TOPK + x % k];
         const unsigned j = i % per;
         const bool codes = j < wp;
         const size_t bytes = codes ? wbytes : scbytes, off = (size_t)(codes ? j : j - wp) * 65536;
@@ -2555,13 +2557,11 @@ cudaError_t quench6k_ink_prefetch(const void* const* p, const size_t* bytes, int
     SQ_RETURN_LAUNCH();
 }
 
-cudaError_t quench6k_ink_prefetch_experts(const int* sel, int k, const void* w, size_t wbytes, const void* sc, size_t scbytes, cudaStream_t st) {
-    // The k best (ink.guess_k): more crowd out the next visit's prefetched weights.
-    static const int kmax = sq_variant("ink.guess_k", 3);
-    k = std::min(k, kmax);
-    if (k == 0) return cudaSuccess;
+cudaError_t quench6k_ink_prefetch_experts(const int* sel, int rows, int k, const void* w, size_t wbytes, const void* sc, size_t scbytes,
+                                          cudaStream_t st) {
+    if (rows == 0 || k == 0) return cudaSuccess;
     static const int blocks = sq_variant("ink.pf_blocks", 64), threads = sq_variant("ink.pf_threads", 32);
-    SQ_CHECK_LAUNCH(sq_launch(prefetch_experts_kernel, blocks, threads, 0, st, sel, k, static_cast<const char*>(w), wbytes,
+    SQ_CHECK_LAUNCH(sq_launch(prefetch_experts_kernel, blocks, threads, 0, st, sel, rows, k, static_cast<const char*>(w), wbytes,
                               static_cast<const char*>(sc), scbytes));
     SQ_RETURN_LAUNCH();
 }

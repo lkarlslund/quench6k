@@ -363,9 +363,9 @@ impl Workspace {
             guess_done: quench6k_cuda::Event::new()?,
             guess_moe: quench6k_cuda::Event::new()?,
             guess_join: quench6k_cuda::Event::new()?,
-            guess_logits: a.get(EXPERTS * 4)?,
-            guess_e: a.get(TOPK * 4)?,
-            guess_w: a.get(TOPK * 4)?,
+            guess_logits: a.get(PREFETCH_T * EXPERTS * 4)?,
+            guess_e: a.get(PREFETCH_T * TOPK * 4)?,
+            guess_w: a.get(PREFETCH_T * TOPK * 4)?,
             device_bytes: 0,
             _alloc: Alloc::new(),
         };
@@ -487,9 +487,21 @@ fn fp4_terms() -> usize {
     *V.get_or_init(|| std::env::var("QUENCH6K_INK_FP4_TERMS").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
 }
 
-fn guess_on() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("QUENCH6K_INK_GUESS").map_or(true, |v| v != "0"))
+/// Guessed experts prefetched per routing row of a step of t tokens (0: no guess; QUENCH6K_INK_GUESS=0: off;
+/// QUENCH6K_INK_GUESS_K=k1,k2,..: per width, for tuning).
+fn guess_k(t: usize) -> usize {
+    static V: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    let ks = V.get_or_init(|| {
+        if std::env::var("QUENCH6K_INK_GUESS").is_ok_and(|v| v == "0") {
+            return Vec::new();
+        }
+        match std::env::var("QUENCH6K_INK_GUESS_K") {
+            Ok(v) => v.split(',').filter_map(|x| x.parse().ok()).collect(),
+            // Steps of 1 / 2 / 3 / 4 tokens (verify steps of 2 / 3 / 4: +3.4% / +3.4% / +1%).
+            Err(_) => vec![3, 2, 2, 1],
+        }
+    });
+    if t > PREFETCH_T { 0 } else { ks.get(t - 1).copied().unwrap_or(0) }
 }
 
 fn prefetch_on() -> bool {
@@ -877,7 +889,7 @@ impl InklingModel {
                 ws.guess_moe.record(s)?;
                 ws.guess.wait(&ws.guess_moe)?;
                 let (wb, sb) = if g.fp4 { (2 * FF * D / 2, 2 * FF * D / 16) } else { (2 * FF * D, 2 * FF * D / 32) };
-                ik::prefetch_experts(&ws.guess, ws.guess_e, TOPK, g.gate_up.w, wb, g.gate_up.sc, sb)?;
+                ik::prefetch_experts(&ws.guess, ws.guess_e, t, guess_k(t), g.gate_up.w, wb, g.gate_up.sc, sb)?;
             }
             let boundary = li.is_multiple_of(BLOCK);
             if boundary {
@@ -905,12 +917,12 @@ impl InklingModel {
                 ik::attn_res(s, &src, layer.mlp_query, 1, t, 0, &[(layer.post_norm, ws.xm)], D, Some(attn_conv))?;
             }
             // One-token steps: guess the next visit's experts beside this visit's routing (QUENCH6K_INK_GUESS=0: off).
-            let next = cfg.visits().get(v + 1).map(|&(nl, _)| &self.layers[nl]).filter(|_| t == 1 && guess_on());
+            let next = cfg.visits().get(v + 1).map(|&(nl, _)| &self.layers[nl]).filter(|_| guess_k(t) > 0);
             if let Some(next) = next {
                 ws.guess_x.record(s)?;
                 ws.guess.wait(&ws.guess_x)?;
-                linear(&ws.guess, ws.xm, D, 1, &next.router, ws.guess_logits, EXPERTS)?;
-                ik::route(&ws.guess, ws.guess_logits, next.bias, cfg.route_scale, 1, ws.guess_e, ws.guess_w, 0)?;
+                linear(&ws.guess, ws.xm, D, t, &next.router, ws.guess_logits, EXPERTS)?;
+                ik::route(&ws.guess, ws.guess_logits, next.bias, cfg.route_scale, t, ws.guess_e, ws.guess_w, 0)?;
                 ws.guess_done.record(&ws.guess)?;
                 guessed = true;
             }

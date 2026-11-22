@@ -179,7 +179,16 @@ mod ffi {
         ) -> Error;
         pub fn quench6k_ink_msg_apply_rows(hs: *const f32, m: *const f32, fg: *const f32, t: c_int, out: *mut f32, st: Stream) -> Error;
         pub fn quench6k_ink_prefetch(p: *const *const c_void, bytes: *const usize, n: c_int, st: Stream) -> Error;
-        pub fn quench6k_ink_prefetch_experts(sel: *const i32, k: c_int, w: *const c_void, wbytes: usize, sc: *const c_void, scbytes: usize, st: Stream) -> Error;
+        pub fn quench6k_ink_prefetch_experts(
+            sel: *const i32,
+            rows: c_int,
+            k: c_int,
+            w: *const c_void,
+            wbytes: usize,
+            sc: *const c_void,
+            scbytes: usize,
+            st: Stream,
+        ) -> Error;
         pub fn quench6k_ink_markov_cand_blocks(v: c_int) -> usize;
         pub fn quench6k_ink_markov_cand(base: *const f32, fold_b: *const f32, v: c_int, n: c_int, c: c_int, cand: *mut i32, st: Stream) -> Error;
         pub fn quench6k_ink_nv4_gemm(
@@ -846,10 +855,11 @@ pub fn prefetch(s: &Stream, ranges: &[(u64, usize)]) -> Result<()> {
     go!("ink_prefetch", ffi::quench6k_ink_prefetch(ptrs.as_ptr(), bytes.as_ptr(), n(ranges.len()), s.raw()))
 }
 
-/// L2 prefetch of the experts `sel[0..k)` (device ids) of one stack: `wbytes` of codes and `scbytes` of
-/// block scales per expert.
-pub fn prefetch_experts(s: &Stream, sel: u64, k: usize, w: u64, wbytes: usize, sc: u64, scbytes: usize) -> Result<()> {
-    go!("ink_prefetch_experts", ffi::quench6k_ink_prefetch_experts(i(sel), n(k), p(w), wbytes, p(sc), scbytes, s.raw()))
+/// L2 prefetch of the `k` best experts of each of `rows` routing rows (`sel` [rows, 8], device ids, best
+/// first) of one stack: `wbytes` of codes and `scbytes` of block scales per expert.
+#[allow(clippy::too_many_arguments)]
+pub fn prefetch_experts(s: &Stream, sel: u64, rows: usize, k: usize, w: u64, wbytes: usize, sc: u64, scbytes: usize) -> Result<()> {
+    go!("ink_prefetch_experts", ffi::quench6k_ink_prefetch_experts(i(sel), n(rows), n(k), p(w), wbytes, p(sc), scbytes, s.raw()))
 }
 
 /// Blocks of the Markov candidates' vocabulary split (candidates per base row = blocks * c).
