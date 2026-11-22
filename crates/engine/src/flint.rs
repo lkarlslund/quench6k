@@ -8,9 +8,9 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use quench6k_cuda::flint::{self as fk, Fp4, Table};
+use quench6k_cuda::flint::{self as fk, Fp4, KvCache, Rows, Table};
 use quench6k_cuda::kernels::{self as k, WeightFormat};
-use quench6k_cuda::{DeviceBuffer, PinnedBuffer, Stream};
+use quench6k_cuda::{DeviceBuffer, Event, Graph, PinnedBuffer, Stream, VmBuffer};
 
 use crate::gguf::{GgmlType, Gguf};
 
@@ -27,8 +27,12 @@ pub const WINDOW: usize = 513;
 /// Sliding layers keep the last SWA_RING positions (power of two; at least WINDOW + the largest chunk).
 pub const SWA_RING: usize = 8192;
 pub const MAX_CHUNK: usize = 4096;
-/// Most tokens of one graph step (a speculative verification).
+/// Most tokens of one sequence in a graph step (a speculative verification).
 pub const MAX_STEP: usize = SMALL;
+/// Most sequences of one batched step ([`FlintModel::forward_batch`]).
+pub const MAX_SEQS: usize = 8;
+/// Most rows (tokens of all sequences) of one batched step.
+pub const MAX_ROWS: usize = MAX_SEQS * MAX_STEP;
 const EPS: f32 = 1e-6;
 /// Buffer bound on attention splits; steps of few tokens use `decode_splits()` (<= this).
 const MAX_SPLITS: usize = 128;
@@ -76,6 +80,8 @@ pub struct FlintModel {
     pub lm_head: Fp4,
     pub lm_t: Table,
     pub stop_tokens: Vec<i32>,
+    /// The longest sequence the model was trained for (GGUF flint.context_length).
+    pub max_context: usize,
     _buffers: Vec<DeviceBuffer>,
 }
 
@@ -253,6 +259,11 @@ impl FlintModel {
         let sliding = pattern("flint.attention.sliding_window_pattern")?;
         let rope = pattern("flint.attention.rope_pattern")?;
         let dense_lead = g.meta_i64("flint.leading_dense_block_count")? as usize;
+        let max_context = g.meta_i64("flint.context_length")? as usize;
+        ensure!(
+            max_context > 0 && max_context < (1 << 30),
+            "unexpected context length {max_context}"
+        );
         let mut stop_tokens = Vec::new();
         if let Some(crate::gguf::Value::Array(a)) = g.meta.get("tokenizer.ggml.eog_token_ids") {
             stop_tokens.extend(a.iter().filter_map(|v| v.as_i64()).map(|v| v as i32));
@@ -428,53 +439,268 @@ impl FlintModel {
             lm_head,
             lm_t,
             stop_tokens,
+            max_context,
             _buffers: buffers,
         })
     }
 }
 
-/// A sequence's KV caches: full layers [capacity, 4, 128] BF16, sliding layers a ring of SWA_RING rows.
-pub struct FlintSeq {
+/// Bytes per position of a sliding layer's ring (K or V, BF16 [HKV, HD]).
+const RING_ROW: usize = HKV * HD * 2;
+/// Bytes per position of an FP8 cache's scales (K or V, FP32 [HKV]).
+const SCALE_ROW: usize = HKV * 4;
+/// Reach of a kept prefix p: the rings still hold [p - WINDOW, p) while nothing at or past p + REACH
+/// has been written.
+const REACH: usize = SWA_RING - WINDOW;
+
+fn full_row(fp8: bool) -> usize {
+    if fp8 { HKV * HD } else { HKV * HD * 2 }
+}
+
+/// One layer's caches of a sequence. Full layers: K and V (and FP8 scales) for `capacity` positions,
+/// reserved as virtual memory and mapped as positions are reached. Sliding layers: a ring of SWA_RING
+/// BF16 rows (position p at row p % SWA_RING), mapped up to the rows reached.
+struct LayerCache {
+    sliding: bool,
+    k: VmBuffer,
+    v: VmBuffer,
+    ks: Option<VmBuffer>,
+    vs: Option<VmBuffer>,
+}
+
+impl LayerCache {
+    fn kv(&self) -> KvCache {
+        KvCache {
+            k: self.k.addr(),
+            v: self.v.addr(),
+            ks: self.ks.as_ref().map_or(0, |b| b.addr()),
+            vs: self.vs.as_ref().map_or(0, |b| b.addr()),
+        }
+    }
+
+    /// Each buffer with its bytes per position.
+    fn parts(&mut self, fp8: bool) -> impl Iterator<Item = (&mut VmBuffer, usize)> {
+        let row = if self.sliding { RING_ROW } else { full_row(fp8) };
+        [(&mut self.k, row), (&mut self.v, row)]
+            .into_iter()
+            .chain(self.ks.iter_mut().map(|b| (b, SCALE_ROW)))
+            .chain(self.vs.iter_mut().map(|b| (b, SCALE_ROW)))
+    }
+}
+
+/// The sliding layers' rings at the end of a prompt (`pos` tokens): `rows` rows of each, K then V per
+/// sliding layer.
+struct Snap {
+    pos: usize,
+    high: usize,
+    rows: usize,
+    buf: DeviceBuffer,
+}
+
+/// One sequence's state: its tokens and KV caches. Full-attention caches grow with the sequence (device
+/// memory is mapped as positions are reached, see [`FlintState::reserve`], and released by
+/// [`FlintState::trim`]), so sequences share the device memory by their actual lengths.
+pub struct FlintState {
+    /// Most positions this sequence may reach.
     pub capacity: usize,
     /// Full-attention caches are FP8 (E4M3 with a scale per position and head) instead of BF16.
     pub fp8: bool,
+    /// The tokens whose K/V the caches hold, in order.
     pub tokens: Vec<i32>,
-    pub k: Vec<DeviceBuffer>,
-    pub v: Vec<DeviceBuffer>,
-    /// Captured steps of this sequence (its caches are baked in), by token count 1..=SMALL.
-    graphs: Vec<Option<quench6k_cuda::Graph>>,
-    /// The sliding layers' rings as they were after the first `pos` tokens (taken at a prompt's end),
-    /// so that a follow-up prompt diverging anywhere after it needs no full prefill.
-    snap: Option<(usize, DeviceBuffer)>,
-    sliding: Vec<bool>,
+    layers: Vec<LayerCache>,
+    /// Positions backed by device memory in every cache.
+    mapped: usize,
+    /// One past the highest position ever written into the rings since they were last empty: rows of
+    /// positions below `high - SWA_RING` may have been overwritten.
+    high: usize,
+    /// The rings as they were after the first `pos` tokens (taken at a prompt's end), so that a
+    /// follow-up prompt diverging anywhere after it needs no full prefill.
+    snap: Option<Snap>,
 }
 
-impl FlintSeq {
-    pub fn new(model: &FlintModel, capacity: usize) -> Result<Self> {
+impl FlintState {
+    /// `capacity`: most positions this sequence may reach (at most the model's maximum). Reserves
+    /// addresses only; device memory is mapped as positions are reached.
+    pub fn new(model: &FlintModel, capacity: usize, _s: &Stream) -> Result<Self> {
+        Self::create(model, capacity)
+    }
+
+    fn create(model: &FlintModel, capacity: usize) -> Result<Self> {
+        ensure!(
+            capacity > 0 && capacity <= model.max_context,
+            "sequence capacity {capacity}: the model supports 1..={}",
+            model.max_context
+        );
         let fp8 = crate::forward::KV_FP8.load(std::sync::atomic::Ordering::Relaxed);
-        let mut k = Vec::with_capacity(LAYERS);
-        let mut v = Vec::with_capacity(LAYERS);
+        let mut layers = Vec::with_capacity(LAYERS);
         for layer in &model.layers {
-            let bytes = if layer.sliding {
-                SWA_RING * HKV * HD * 2
-            } else if fp8 {
-                capacity * HKV * (HD + 4)
+            let (rows, row) = if layer.sliding {
+                (SWA_RING, RING_ROW)
             } else {
-                capacity * HKV * HD * 2
+                (capacity, full_row(fp8))
             };
-            k.push(DeviceBuffer::new(bytes)?);
-            v.push(DeviceBuffer::new(bytes)?);
+            let scales = || -> Result<Option<VmBuffer>> {
+                Ok(if fp8 && !layer.sliding {
+                    Some(VmBuffer::reserve(capacity * SCALE_ROW)?)
+                } else {
+                    None
+                })
+            };
+            layers.push(LayerCache {
+                sliding: layer.sliding,
+                k: VmBuffer::reserve(rows * row)?,
+                v: VmBuffer::reserve(rows * row)?,
+                ks: scales()?,
+                vs: scales()?,
+            });
         }
         Ok(Self {
             capacity,
             fp8,
             tokens: Vec::new(),
-            k,
-            v,
-            graphs: (0..=SMALL).map(|_| None).collect(),
+            layers,
+            mapped: 0,
+            high: 0,
             snap: None,
-            sliding: model.layers.iter().map(|l| l.sliding).collect(),
         })
+    }
+
+    /// Positions of cached tokens.
+    pub fn pos(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Device bytes of the growable (full-attention) caches per position, for the current KV format.
+    pub fn bytes_per_position(model: &FlintModel) -> usize {
+        let fp8 = crate::forward::KV_FP8.load(std::sync::atomic::Ordering::Relaxed);
+        let full = model.layers.iter().filter(|l| !l.sliding).count();
+        full * 2 * (full_row(fp8) + if fp8 { SCALE_ROW } else { 0 })
+    }
+
+    /// Device bytes the sliding rings take once a sequence reaches SWA_RING positions (below that,
+    /// RING_ROW per position and layer); a prompt-end snapshot of them takes as much again.
+    pub fn ring_bytes(model: &FlintModel) -> usize {
+        model.layers.iter().filter(|l| l.sliding).count() * 2 * SWA_RING * RING_ROW
+    }
+
+    /// Device memory this sequence holds: mapped caches and its ring snapshot.
+    pub fn device_bytes(&self) -> usize {
+        let caches: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                l.k.mapped()
+                    + l.v.mapped()
+                    + l.ks.as_ref().map_or(0, |b| b.mapped())
+                    + l.vs.as_ref().map_or(0, |b| b.mapped())
+            })
+            .sum();
+        caches + self.snap.as_ref().map_or(0, |s| s.buf.bytes())
+    }
+
+    /// Positions [0, n) are backed in every cache (from what is mapped).
+    fn mapped_positions(&mut self) -> usize {
+        let fp8 = self.fp8;
+        let mut n = self.capacity;
+        for l in &mut self.layers {
+            let sliding = l.sliding;
+            for (b, row) in l.parts(fp8) {
+                let rows = b.mapped() / row;
+                if !(sliding && rows >= SWA_RING) {
+                    n = n.min(rows);
+                }
+            }
+        }
+        n
+    }
+
+    /// Maps device memory for positions < `positions` (at most the capacity). Out of device memory:
+    /// an error whose message contains "out of memory", and nothing changed.
+    pub fn reserve(&mut self, positions: usize) -> Result<()> {
+        ensure!(
+            positions <= self.capacity,
+            "{positions} positions exceed the sequence capacity {}",
+            self.capacity
+        );
+        if positions <= self.mapped {
+            return Ok(());
+        }
+        let fp8 = self.fp8;
+        let before: Vec<Vec<usize>> = self
+            .layers
+            .iter_mut()
+            .map(|l| l.parts(fp8).map(|(b, _)| b.mapped()).collect())
+            .collect();
+        let mut result = Ok(());
+        'map: for l in &mut self.layers {
+            let rows = if l.sliding {
+                positions.min(SWA_RING)
+            } else {
+                positions
+            };
+            for (b, row) in l.parts(fp8) {
+                if let Err(e) = b.map_to(rows * row) {
+                    result = Err(e);
+                    break 'map;
+                }
+            }
+        }
+        if let Err(e) = result {
+            for (l, before) in self.layers.iter_mut().zip(&before) {
+                for ((b, _), &m) in l.parts(fp8).zip(before) {
+                    b.unmap_to(m)?;
+                }
+            }
+            return Err(e);
+        }
+        self.mapped = self.mapped_positions();
+        Ok(())
+    }
+
+    /// Forgets the cached tokens from `positions` on and releases the full-attention cache memory
+    /// past them (the rings too while they have not wrapped). The device must be done with this
+    /// sequence's earlier steps (synchronize the stream first).
+    pub fn trim(&mut self, positions: usize) {
+        self.truncate(positions);
+        let fp8 = self.fp8;
+        // Rings that never wrapped hold nothing past `high`; once wrapped they stay (positions below
+        // the kept ones may sit in any row).
+        let rings = positions == 0 || self.high <= SWA_RING;
+        if rings {
+            self.high = self.high.min(positions);
+        }
+        for l in &mut self.layers {
+            let sliding = l.sliding;
+            if sliding && !rings {
+                continue;
+            }
+            let rows = if sliding {
+                positions.min(SWA_RING)
+            } else {
+                positions
+            };
+            for (b, row) in l.parts(fp8) {
+                // Unmapping only fails on a broken context; the memory stays mapped then.
+                let _ = b.unmap_to(rows * row);
+            }
+        }
+        self.mapped = self.mapped_positions();
+        if positions == 0 {
+            self.snap = None;
+        }
+    }
+
+    /// Forgets the cached tokens from `positions` on (their memory stays mapped).
+    pub fn truncate(&mut self, positions: usize) {
+        self.tokens.truncate(positions);
+        if self.snap.as_ref().is_some_and(|s| s.pos > positions) {
+            self.snap = None;
+        }
+    }
+
+    /// Forgets everything and releases all cache memory.
+    pub fn reset(&mut self) {
+        self.trim(0);
     }
 
     /// Keeps the longest prefix of `prompt` whose state is available and drops the rest of the cached
@@ -482,7 +708,6 @@ impl FlintSeq {
     /// still hold the WINDOW positions before it (rewriting a chunk of <= MAX_CHUNK positions never
     /// overwrites a key its queries need); otherwise the ring snapshot is restored when it covers it.
     pub fn rewind(&mut self, prompt: &[i32], s: &Stream) -> Result<usize> {
-        const REACH: usize = SWA_RING - WINDOW;
         let common = self
             .tokens
             .iter()
@@ -490,9 +715,9 @@ impl FlintSeq {
             .take_while(|(a, b)| a == b)
             .count();
         let p = common.min(prompt.len().saturating_sub(1));
-        let live = if self.tokens.len() <= p + REACH { p } else { 0 };
+        let live = if self.high <= p + REACH { p } else { 0 };
         let snap = match &self.snap {
-            Some((e, _)) if *e <= self.tokens.len() && p + REACH >= *e => p.min(*e),
+            Some(sn) if sn.pos <= self.tokens.len() && p + REACH >= sn.high => p.min(sn.pos),
             _ => 0,
         };
         let keep = if snap > live {
@@ -501,47 +726,90 @@ impl FlintSeq {
         } else {
             live
         };
-        if self.snap.as_ref().is_some_and(|(e, _)| keep < *e) {
-            self.snap = None;
-        }
-        self.tokens.truncate(keep);
+        self.truncate(keep);
         Ok(keep)
     }
 
     /// Remembers the rings at the current position (after a prompt).
-    pub fn snapshot(&mut self, model: &FlintModel, s: &Stream) -> Result<()> {
-        let ring = SWA_RING * HKV * HD * 2;
-        let n = model.layers.iter().filter(|l| l.sliding).count();
+    pub fn snapshot(&mut self, _model: &FlintModel, s: &Stream) -> Result<()> {
+        let rows = self.high.min(SWA_RING);
+        let n = self.layers.iter().filter(|l| l.sliding).count();
+        let need = 2 * n * rows * RING_ROW;
         let buf = match self.snap.take() {
-            Some((_, b)) => b,
-            None => DeviceBuffer::new(2 * n * ring)?,
-        };
-        let mut at = 0;
-        for (i, layer) in model.layers.iter().enumerate() {
-            if layer.sliding {
-                s.copy_d2d(buf.addr() + at as u64, self.k[i].addr(), ring)?;
-                s.copy_d2d(buf.addr() + (at + ring) as u64, self.v[i].addr(), ring)?;
-                at += 2 * ring;
+            Some(sn) if sn.buf.bytes() >= need => sn.buf,
+            _ => {
+                // Room for 1024 more rows, so that growing prompts reallocate rarely.
+                let rows = (rows + 1024).min(SWA_RING).max(1);
+                DeviceBuffer::new(2 * n * rows * RING_ROW)?
             }
+        };
+        let bytes = rows * RING_ROW;
+        let mut at = 0u64;
+        for l in self.layers.iter().filter(|l| l.sliding) {
+            s.copy_d2d(buf.addr() + at, l.k.addr(), bytes)?;
+            s.copy_d2d(buf.addr() + at + bytes as u64, l.v.addr(), bytes)?;
+            at += 2 * bytes as u64;
         }
-        self.snap = Some((self.tokens.len(), buf));
+        self.snap = Some(Snap {
+            pos: self.tokens.len(),
+            high: self.high,
+            rows,
+            buf,
+        });
         Ok(())
     }
 
     fn restore(&mut self, s: &Stream) -> Result<()> {
-        let Some((_, buf)) = &self.snap else {
+        let Some(sn) = &self.snap else {
             return Ok(());
         };
-        let ring = SWA_RING * HKV * HD * 2;
-        let mut at = 0;
-        for i in 0..self.k.len() {
-            if self.sliding[i] {
-                s.copy_d2d(self.k[i].addr(), buf.addr() + at as u64, ring)?;
-                s.copy_d2d(self.v[i].addr(), buf.addr() + (at + ring) as u64, ring)?;
-                at += 2 * ring;
-            }
+        let (rows, high) = (sn.rows, sn.high);
+        let bytes = rows * RING_ROW;
+        for l in self.layers.iter_mut().filter(|l| l.sliding) {
+            l.k.map_to(bytes)?;
+            l.v.map_to(bytes)?;
         }
+        let sn = self.snap.as_ref().unwrap();
+        let mut at = 0u64;
+        for l in self.layers.iter().filter(|l| l.sliding) {
+            s.copy_d2d(l.k.addr(), sn.buf.addr() + at, bytes)?;
+            s.copy_d2d(l.v.addr(), sn.buf.addr() + at + bytes as u64, bytes)?;
+            at += 2 * bytes as u64;
+        }
+        self.high = high;
         Ok(())
+    }
+
+    /// The caches of layer `li`.
+    fn kv(&self, li: usize) -> KvCache {
+        self.layers[li].kv()
+    }
+
+    /// Records that positions [start, end) were written.
+    fn wrote(&mut self, end: usize) {
+        self.high = self.high.max(end);
+    }
+}
+
+/// The single-sequence server loop's handle on a [`FlintState`] (its constructor without a stream).
+pub struct FlintSeq(pub FlintState);
+
+impl FlintSeq {
+    pub fn new(model: &FlintModel, capacity: usize) -> Result<Self> {
+        Ok(Self(FlintState::create(model, capacity)?))
+    }
+}
+
+impl std::ops::Deref for FlintSeq {
+    type Target = FlintState;
+    fn deref(&self) -> &FlintState {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for FlintSeq {
+    fn deref_mut(&mut self) -> &mut FlintState {
+        &mut self.0
     }
 }
 
@@ -588,17 +856,31 @@ pub struct Workspace {
     logit_rows: usize,
     argmax_scratch: u64,
     pub argmax_out: u64,
+    /// Router tickets, one per group of 8 tokens.
     ticket: u64,
     /// Attention merge tickets, one per (64-row tile, KV head).
     attn_tickets: u64,
-    /// Host staging of a decode step's token and position.
+    /// A batched step's rows: tokens, positions and sequence slots ([MAX_ROWS] i32 each).
+    rows: u64,
+    /// Per layer and sequence slot: (k, v, k scales, v scales) of the step's sequences.
+    kvtab: u64,
+    /// Host staging of `rows` and `kvtab`; `io_done` marks when their last upload has completed.
     io: PinnedBuffer,
+    kv_io: PinnedBuffer,
+    io_done: Event,
+    /// The table last uploaded to `kvtab`.
+    kv_host: Vec<u64>,
+    /// Batched-step graphs by (rows, FP8 caches).
+    graphs: std::collections::HashMap<(usize, bool), Graph>,
 }
+
+const KVTAB: usize = LAYERS * MAX_SEQS * 4;
 
 const SMALL: usize = 8;
 
 impl Workspace {
-    /// `logit_rows`: rows of logits a step can return (1 for generation).
+    /// `logit_rows`: rows of logits a step can return (1 for generation of one sequence, MAX_ROWS
+    /// for any batched step).
     pub fn new(logit_rows: usize) -> Result<Self> {
         let t = MAX_CHUNK;
         let pairs = t * 12;
@@ -616,21 +898,20 @@ impl Workspace {
             start: a(16)?,
             h: a(t * D * 4)?,
             xn: a(t * D * 2)?,
-            qkv: a(SMALL * QKV * 4)?,
+            qkv: a(MAX_ROWS * QKV * 4)?,
             qf: a(t * HQ * HD * 4)?,
             kf: a(t * HKV * HD * 4)?,
             vf: a(t * HKV * HD * 4)?,
             qb: a(t * HQ * HD * 2)?,
             attn: a(t * HQ * HD * 2)?,
             of: a(t * D * 4)?,
-            part_o: a(
-                t * HQ * MAX_SPLITS.min(8).max(1) * HD * 4 + SMALL * HQ * MAX_SPLITS * HD * 4
-            )?,
-            part_ml: a(t * HQ * MAX_SPLITS * 2 * 4)?,
+            // Chunks of more than SMALL tokens use at most 8 splits; smaller steps MAX_SPLITS.
+            part_o: a((t * HQ * 8).max(MAX_ROWS * HQ * MAX_SPLITS) * HD * 4)?,
+            part_ml: a((t * HQ * 8).max(MAX_ROWS * HQ * MAX_SPLITS) * 2 * 4)?,
             rlogits: a(t * EXPERTS * 4)?,
             sel_e: a(pairs * 4)?,
             sel_w: a(pairs * 4)?,
-            act: a(SMALL * 12 * EW * 4)?,
+            act: a(MAX_ROWS * 12 * EW * 4)?,
             counts: a(512 * 4)?,
             cursor: a(512 * 4)?,
             offsets: a(513 * 4)?,
@@ -653,8 +934,9 @@ impl Workspace {
             logit_rows,
             argmax_scratch: a(k::argmax_scratch(logit_rows, VOCAB))?,
             argmax_out: a(logit_rows * 4)?,
+            rows: a(3 * MAX_ROWS * 4)?,
             ticket: {
-                let b = DeviceBuffer::zeroed(16)?;
+                let b = DeviceBuffer::zeroed(MAX_ROWS.div_ceil(8) * 4)?;
                 let addr = b.addr();
                 bufs.push(b);
                 addr
@@ -665,7 +947,17 @@ impl Workspace {
                 bufs.push(b);
                 addr
             },
-            io: PinnedBuffer::new(64)?,
+            kvtab: {
+                let b = DeviceBuffer::zeroed(KVTAB * 8)?;
+                let addr = b.addr();
+                bufs.push(b);
+                addr
+            },
+            io: PinnedBuffer::new(3 * MAX_ROWS * 4)?,
+            kv_io: PinnedBuffer::new(KVTAB * 8)?,
+            io_done: Event::new()?,
+            kv_host: vec![0; KVTAB],
+            graphs: std::collections::HashMap::new(),
             _bufs: Vec::new(),
         };
         Ok(Self { _bufs: bufs, ..ws })
@@ -701,7 +993,7 @@ fn checkpoint(s: &Stream, what: &str) -> Result<()> {
 pub fn forward(
     model: &FlintModel,
     ws: &Workspace,
-    seq: &mut FlintSeq,
+    seq: &mut FlintState,
     tokens: &[i32],
     all_logits: bool,
     s: &Stream,
@@ -714,60 +1006,237 @@ pub fn forward(
         "sequence capacity {} exceeded",
         seq.capacity
     );
+    seq.reserve(start + t)?;
     s.upload_to(ws.tok, tokens)?;
     s.upload_to(ws.start, &[start as i32])?;
     body(model, ws, seq, t, Some(start), all_logits, s)?;
     seq.tokens.extend_from_slice(tokens);
+    seq.wrote(start + t);
     Ok(())
 }
 
-/// One decode token through the sequence's CUDA graph (captured on first use); logits in `ws.logits`.
+/// One decode token (a batched step of one sequence); logits in `ws.logits`.
 pub fn decode(
     model: &FlintModel,
     ws: &mut Workspace,
-    seq: &mut FlintSeq,
+    seq: &mut FlintState,
     token: i32,
     s: &Stream,
 ) -> Result<()> {
     step(model, ws, seq, &[token], s)
 }
 
-/// 1..=SMALL tokens (a speculative verification) through the sequence's CUDA graph for that count;
-/// logits of every token in `ws.logits` (the workspace must hold that many rows).
+/// 1..=MAX_STEP tokens of one sequence (a speculative verification) as a batched step; logits of
+/// every token in `ws.logits` (the workspace must hold that many rows). Every row's logits are
+/// bitwise those of feeding its token alone.
 pub fn step(
     model: &FlintModel,
     ws: &mut Workspace,
-    seq: &mut FlintSeq,
+    seq: &mut FlintState,
     tokens: &[i32],
     s: &Stream,
 ) -> Result<()> {
-    let t = tokens.len();
-    ensure!(
-        (1..=SMALL).contains(&t) && t <= ws.logit_rows,
-        "step of {t} tokens"
+    model.forward_batch(&mut [seq], ws, s, &[tokens])
+}
+
+impl FlintModel {
+    /// One step for 1..=MAX_SEQS sequences with 1..=MAX_STEP tokens each, appended to each sequence;
+    /// logits of every fed token in `ws.logits`, sequence by sequence, row by row. Every row is
+    /// computed as a one-token step of its sequence alone, so each sequence's results are bitwise
+    /// the same as running it alone (with any widths and companions). Maps the memory the step needs
+    /// first (an "out of memory" error before any work). Runs as a CUDA graph per (rows, KV format)
+    /// that reads the rows' positions and caches from device tables. The caller reads the results
+    /// (synchronizes) before the next step.
+    pub fn forward_batch(
+        &self,
+        states: &mut [&mut FlintState],
+        ws: &mut Workspace,
+        s: &Stream,
+        tokens: &[&[i32]],
+    ) -> Result<()> {
+        let n = states.len();
+        ensure!(
+            (1..=MAX_SEQS).contains(&n) && tokens.len() == n,
+            "batched step of {n} sequences and {} token lists",
+            tokens.len()
+        );
+        ensure!(
+            tokens.iter().all(|t| (1..=MAX_STEP).contains(&t.len())),
+            "batched step with a sequence of no or more than {MAX_STEP} tokens"
+        );
+        let rows: usize = tokens.iter().map(|t| t.len()).sum();
+        ensure!(
+            rows <= ws.logit_rows,
+            "{rows} rows in a step, the workspace holds {}",
+            ws.logit_rows
+        );
+        let fp8 = states[0].fp8;
+        ensure!(
+            states.iter().all(|st| st.fp8 == fp8),
+            "a batched step mixes KV formats"
+        );
+        for (st, t) in states.iter_mut().zip(tokens) {
+            ensure!(
+                st.tokens.len() + t.len() <= st.capacity,
+                "sequence capacity {} exceeded",
+                st.capacity
+            );
+            st.reserve(st.tokens.len() + t.len())?;
+        }
+        // Rows and cache tables into pinned staging (after the previous upload has been consumed).
+        ws.io_done.synchronize()?;
+        let mut kv = vec![0u64; KVTAB];
+        for (b, st) in states.iter().enumerate() {
+            for li in 0..LAYERS {
+                let c = st.kv(li);
+                kv[(li * MAX_SEQS + b) * 4..][..4].copy_from_slice(&[c.k, c.v, c.ks, c.vs]);
+            }
+        }
+        {
+            let io = ws.io.as_mut_slice();
+            let mut r = 0;
+            for (b, (st, t)) in states.iter().zip(tokens).enumerate() {
+                for (i, &tok) in t.iter().enumerate() {
+                    let pos = (st.tokens.len() + i) as i32;
+                    for (field, v) in [tok, pos, b as i32].into_iter().enumerate() {
+                        let at = (field * MAX_ROWS + r) * 4;
+                        io[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    r += 1;
+                }
+            }
+        }
+        unsafe { s.copy_h2d(ws.rows, ws.io.as_ptr(), 3 * MAX_ROWS * 4)? };
+        if kv != ws.kv_host {
+            for (dst, v) in ws.kv_io.as_mut_slice().chunks_exact_mut(8).zip(&kv) {
+                dst.copy_from_slice(&v.to_le_bytes());
+            }
+            unsafe { s.copy_h2d(ws.kvtab, ws.kv_io.as_ptr(), KVTAB * 8)? };
+            ws.kv_host = kv;
+        }
+        ws.io_done.record(s)?;
+        if !ws.graphs.contains_key(&(rows, fp8)) {
+            let g = Graph::capture(s, |s| body_rows(self, ws, rows, fp8, s))?;
+            ws.graphs.insert((rows, fp8), g);
+        }
+        ws.graphs[&(rows, fp8)].launch(s)?;
+        for (st, t) in states.iter_mut().zip(tokens) {
+            st.tokens.extend_from_slice(t);
+            let end = st.tokens.len();
+            st.wrote(end);
+        }
+        Ok(())
+    }
+}
+
+/// The kernels of a batched step of `rows` rows whose tokens, positions, sequences and cache tables
+/// are on the device (`ws.rows`, `ws.kvtab`). Every kernel computes each row as a one-token step does.
+fn body_rows(model: &FlintModel, ws: &Workspace, rows: usize, fp8: bool, s: &Stream) -> Result<()> {
+    let (tok, pos, seq) = (
+        ws.rows,
+        ws.rows + (MAX_ROWS * 4) as u64,
+        ws.rows + (2 * MAX_ROWS * 4) as u64,
     );
-    let start = seq.tokens.len();
-    ensure!(
-        start + t <= seq.capacity,
-        "sequence capacity {} exceeded",
-        seq.capacity
-    );
-    let io = ws.io.as_mut_slice();
-    for (i, tok) in tokens.iter().enumerate() {
-        io[4 * i..4 * i + 4].copy_from_slice(&tok.to_le_bytes());
+    fk::embed(s, tok, rows, model.embed, ws.h)?;
+    let fuse = quench6k_cuda::variants::get("flint.fuse_norm", 1) != 0;
+    // The single-token GEMV for one row, else its row-wise twin (bitwise the same per row).
+    let gemv = |x: u64, norm: Option<u64>, mats: &[Fp4], y: u64, ldy: usize, acc: bool| {
+        if rows == 1 {
+            fk::gemv(s, x, norm, 1, mats, y, ldy, acc)
+        } else {
+            fk::gemv_rows(s, x, norm, rows, mats, y, ldy, acc)
+        }
+    };
+    // A GEMV over normalized rows: RMSNorm folded into it (flint.fuse_norm) or a separate kernel.
+    let gemv_norm = |h: u64, w: u64, mats: &[Fp4], y: u64, ldy: usize| -> Result<()> {
+        if fuse {
+            gemv(h, Some(w), mats, y, ldy, false)
+        } else {
+            fk::rmsnorm(s, h, w, EPS, ws.xn, rows)?;
+            gemv(ws.xn, None, mats, y, ldy, false)
+        }
+    };
+    for (li, layer) in model.layers.iter().enumerate() {
+        gemv_norm(
+            ws.h,
+            layer.attn_norm,
+            &[layer.q, layer.k, layer.v],
+            ws.qkv,
+            QKV,
+        )?;
+        let r = Rows {
+            n: rows,
+            pos,
+            seq,
+            kvtab: ws.kvtab + (li * MAX_SEQS * 4 * 8) as u64,
+        };
+        let (mask, window) = if layer.sliding {
+            ((SWA_RING - 1) as i32, WINDOW)
+        } else {
+            (i32::MAX, 0)
+        };
+        fk::qk_prep_rows(
+            s,
+            (ws.qkv, QKV),
+            (ws.qkv + (HQ * HD * 4) as u64, QKV),
+            (ws.qkv + ((HQ + HKV) * HD * 4) as u64, QKV),
+            layer.q_norm,
+            layer.k_norm,
+            layer.rope,
+            mask,
+            r,
+            ws.qb,
+        )?;
+        checkpoint(s, "qk_prep")?;
+        fk::attention_rows(
+            s,
+            ws.qb,
+            r,
+            fp8 && !layer.sliding,
+            window,
+            mask,
+            decode_splits(),
+            layer.sinks,
+            ws.part_o,
+            ws.part_ml,
+            ws.attn,
+        )?;
+        checkpoint(s, "attention")?;
+        gemv(ws.attn, None, &[layer.o], ws.h, D, true)?;
+        match layer.router {
+            Some(router) => fk::router(
+                s,
+                ws.h,
+                layer.ffn_norm,
+                router,
+                rows,
+                ws.rlogits,
+                ws.xn,
+                ws.ticket,
+                ws.sel_e,
+                ws.sel_w,
+            )?,
+            None => {
+                fk::rmsnorm_add(s, ws.h, 0, layer.ffn_norm, EPS, ws.xn, rows)?;
+                fk::dense_slots(s, rows, layer.slots, ws.sel_e, ws.sel_w)?
+            }
+        }
+        fk::moe_small(
+            s,
+            ws.xn,
+            rows,
+            layer.slots,
+            ws.sel_e,
+            ws.sel_w,
+            layer.gate,
+            layer.up,
+            layer.down,
+            ws.act,
+            ws.h,
+        )?;
+        checkpoint(s, "moe_small")?;
     }
-    io[48..52].copy_from_slice(&(start as i32).to_le_bytes());
-    unsafe {
-        s.copy_h2d(ws.tok, ws.io.as_ptr(), 4 * t)?;
-        s.copy_h2d(ws.start, ws.io.as_ptr().add(48), 4)?;
-    }
-    if seq.graphs[t].is_none() {
-        let g = quench6k_cuda::Graph::capture(s, |s| body(model, ws, seq, t, None, true, s))?;
-        seq.graphs[t] = Some(g);
-    }
-    seq.graphs[t].as_ref().unwrap().launch(s)?;
-    seq.tokens.extend_from_slice(tokens);
-    Ok(())
+    gemv_norm(ws.h, model.out_norm, &[model.lm_head], ws.logits, VOCAB)
 }
 
 /// The step's kernels for `t` tokens whose ids and start position are already on the device. `start`:
@@ -775,7 +1244,7 @@ pub fn step(
 fn body(
     model: &FlintModel,
     ws: &Workspace,
-    seq: &FlintSeq,
+    seq: &FlintState,
     t: usize,
     start: Option<usize>,
     all_logits: bool,
@@ -857,11 +1326,7 @@ fn body(
         } else {
             (i32::MAX, 0)
         };
-        let f8_rows = if seq.fp8 && !layer.sliding {
-            seq.capacity
-        } else {
-            0
-        };
+        let cache = seq.kv(li);
         checkpoint(s, "qkv")?;
         fk::qk_prep(
             s,
@@ -873,11 +1338,9 @@ fn body(
             layer.rope,
             ws.start,
             mask,
-            f8_rows,
             t,
             ws.qb,
-            seq.k[li].addr(),
-            seq.v[li].addr(),
+            cache,
         )?;
         checkpoint(s, "qk_prep")?;
         // Steps of few tokens always split the keys MAX_SPLITS ways, so that eager and graph steps
@@ -889,8 +1352,7 @@ fn body(
         fk::attention(
             s,
             ws.qb,
-            seq.k[li].addr(),
-            seq.v[li].addr(),
+            cache,
             t,
             ws.start,
             window,
@@ -901,7 +1363,6 @@ fn body(
             ws.part_ml,
             ws.attn_tickets,
             ws.attn,
-            f8_rows,
         )?;
         checkpoint(s, "attention")?;
         if small {
@@ -1134,7 +1595,7 @@ pub fn argmax(ws: &Workspace, rows: usize, s: &Stream) -> Result<Vec<i32>> {
 pub fn prefill(
     model: &FlintModel,
     ws: &Workspace,
-    seq: &mut FlintSeq,
+    seq: &mut FlintState,
     prompt: &[i32],
     s: &Stream,
 ) -> Result<usize> {

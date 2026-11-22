@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Subcommand;
-use quench6k_engine::flint::{self as fl, FlintModel, FlintSeq, Workspace};
+use quench6k_engine::flint::{self as fl, FlintModel, FlintState, Workspace};
 
 use crate::chat::Chat;
 
@@ -56,6 +56,30 @@ pub enum FlintCmd {
         /// FP32 row) to this file, one line per step: comparing two builds bitwise.
         #[arg(long)]
         dump: Option<PathBuf>,
+        /// Also time steps of 1..=8 tokens of the sequence (speculative verifications) at each context.
+        #[arg(long)]
+        widths: bool,
+    },
+    /// Batched decoding check and throughput: `seqs` sequences (different prompts and lengths from the
+    /// text) decode `steps` greedy tokens alone (one token per step), then all together in batched
+    /// steps, then with speculative steps of mixed widths (prompt-lookup and continuation drafts, some
+    /// corrupted); every row's logits must be bitwise those of decoding alone, and the speculative
+    /// tokens those of plain greedy decoding. Then times batched decode steps of 1, 2, 4, .. sequences.
+    BatchCheck {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        seqs: usize,
+        /// Prompt length of the first sequence (the others are shorter by 97 tokens each), per run.
+        #[arg(long, num_args = 1.., default_values_t = [2048usize])]
+        ctx: Vec<usize>,
+        #[arg(long, default_value_t = 48)]
+        steps: usize,
+        /// Timed batched decode steps per batch size (0: no timing).
+        #[arg(long, default_value_t = 64)]
+        time_steps: usize,
     },
 }
 
@@ -81,7 +105,24 @@ pub fn run(cmd: FlintCmd) -> Result<()> {
             generate,
             json,
             dump,
-        } => bench(&model, &text, &ctx, generate, json.as_deref(), dump.as_deref()),
+            widths,
+        } => bench(
+            &model,
+            &text,
+            &ctx,
+            generate,
+            json.as_deref(),
+            dump.as_deref(),
+            widths,
+        ),
+        FlintCmd::BatchCheck {
+            model,
+            text,
+            seqs,
+            ctx,
+            steps,
+            time_steps,
+        } => batch_check(&model, &text, seqs, &ctx, steps, time_steps),
     }
 }
 
@@ -92,11 +133,12 @@ fn bench(
     generate: usize,
     json: Option<&Path>,
     dump: Option<&Path>,
+    widths: bool,
 ) -> Result<()> {
     let chat = Chat::load(dir, None)?;
     let ids = chat.encode(&std::fs::read_to_string(text)?)?;
     let (model, s) = load(dir)?;
-    let mut ws = Workspace::new(1)?;
+    let mut ws = Workspace::new(if widths { fl::MAX_STEP } else { 1 })?;
     let mut dump = match dump {
         Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
         None => None,
@@ -108,7 +150,7 @@ fn bench(
             ids.len(),
             ctx + generate
         );
-        let mut seq = FlintSeq::new(&model, ctx + generate + 8)?;
+        let mut seq = FlintState::new(&model, ctx + generate + 8, &s)?;
         s.synchronize()?;
         let t0 = Instant::now();
         fl::prefill(&model, &ws, &mut seq, &ids[..ctx], &s)?;
@@ -139,7 +181,7 @@ fn bench(
         let copied = out.iter().zip(&ids[ctx..]).filter(|(a, b)| a == b).count();
         if i == 0 {
             // Eager decoding of the same prompt must give the same tokens.
-            let mut eager = FlintSeq::new(&model, ctx + generate + 8)?;
+            let mut eager = FlintState::new(&model, ctx + generate + 8, &s)?;
             fl::prefill(&model, &ws, &mut eager, &ids[..ctx], &s)?;
             let mut e = vec![fl::argmax(&ws, 1, &s)?[0]];
             while e.len() < out.len().min(64) {
@@ -152,6 +194,23 @@ fn bench(
                 &out[..e.len()]
             );
             println!("graph decoding matches eager decoding ({} tokens)", e.len());
+        }
+        if widths {
+            // Steps of w tokens (the greedy continuation), each undone again.
+            let mut line = String::new();
+            for w in 1..=fl::MAX_STEP.min(out.len()) {
+                let reps = 16;
+                let t2 = Instant::now();
+                for _ in 0..reps {
+                    let before = seq.tokens.len();
+                    fl::step(&model, &mut ws, &mut seq, &out[..w], &s)?;
+                    fl::argmax(&ws, w, &s)?;
+                    seq.tokens.truncate(before);
+                }
+                let ms = t2.elapsed().as_secs_f64() * 1e3 / reps as f64;
+                line.push_str(&format!(" {w}:{ms:.2}"));
+            }
+            println!("ctx {ctx:>6}: ms per step by tokens{line}");
         }
         let pf = ctx as f64 / prefill;
         let tg = (generate - 1) as f64 / decode;
@@ -172,6 +231,201 @@ fn bench(
             )?;
         }
     }
+    Ok(())
+}
+
+fn batch_check(
+    dir: &Path,
+    text: &Path,
+    seqs: usize,
+    ctxs: &[usize],
+    steps: usize,
+    time_steps: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        (1..=fl::MAX_SEQS).contains(&seqs),
+        "1..={} sequences",
+        fl::MAX_SEQS
+    );
+    let chat = Chat::load(dir, None)?;
+    let ids = chat.encode(&std::fs::read_to_string(text)?)?;
+    let (model, s) = load(dir)?;
+    let mut ws = Workspace::new(fl::MAX_ROWS)?;
+    let mut failures = 0usize;
+    for &ctx in ctxs {
+        let lens: Vec<usize> = (0..seqs).map(|i| (ctx - 97 * i).max(ctx / 2).max(1)).collect();
+        anyhow::ensure!(ids.len() > ctx + 1, "the text has {} tokens", ids.len());
+        let prompts: Vec<&[i32]> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                let off = (i * 104_729) % (ids.len() - len);
+                &ids[off..off + len]
+            })
+            .collect();
+        let mut states = Vec::new();
+        let mut first = Vec::new();
+        let t0 = Instant::now();
+        for p in &prompts {
+            let mut st = FlintState::new(&model, p.len() + steps + 2 * fl::MAX_STEP, &s)?;
+            fl::prefill(&model, &ws, &mut st, p, &s)?;
+            first.push(fl::argmax(&ws, 1, &s)?[0]);
+            states.push(st);
+        }
+        println!(
+            "ctx {ctx}: {seqs} sequences of {}..{} prompt tokens prefilled in {:.1}s",
+            lens.iter().min().unwrap(),
+            lens.iter().max().unwrap(),
+            t0.elapsed().as_secs_f64()
+        );
+        // A: each sequence alone, one token per step. alone[i][j]: logits hash after feeding token j
+        // (toks[i][j]); toks[i][j + 1] is its greedy successor.
+        let mut alone: Vec<Vec<u64>> = Vec::new();
+        let mut toks: Vec<Vec<i32>> = Vec::new();
+        for (st, &f) in states.iter_mut().zip(&first) {
+            let (mut h, mut t) = (Vec::new(), vec![f]);
+            for j in 0..steps {
+                fl::step(&model, &mut ws, st, &[t[j]], &s)?;
+                h.push(logits_hash(&s, ws.logits, 1)?[0]);
+                t.push(fl::argmax(&ws, 1, &s)?[0]);
+            }
+            alone.push(h);
+            toks.push(t);
+        }
+        // B: all sequences together, one token each per step.
+        for (st, p) in states.iter_mut().zip(&prompts) {
+            st.trim(p.len());
+        }
+        let (mut equal, mut total) = (0usize, 0usize);
+        for j in 0..steps {
+            let feed: Vec<[i32; 1]> = toks.iter().map(|t| [t[j]]).collect();
+            let feed: Vec<&[i32]> = feed.iter().map(|f| &f[..]).collect();
+            let mut refs: Vec<&mut FlintState> = states.iter_mut().collect();
+            model.forward_batch(&mut refs, &mut ws, &s, &feed)?;
+            let h = logits_hash(&s, ws.logits, seqs)?;
+            for i in 0..seqs {
+                total += 1;
+                equal += (h[i] == alone[i][j]) as usize;
+            }
+        }
+        failures += total - equal;
+        println!("  batched plain decode: {equal}/{total} rows bitwise equal to decoding alone");
+        // C: speculative steps of mixed widths; sequences leave the batch as they finish.
+        for (st, p) in states.iter_mut().zip(&prompts) {
+            st.trim(p.len());
+        }
+        let mut at = vec![0usize; seqs];
+        let mut out: Vec<Vec<i32>> = first.iter().map(|&f| vec![f]).collect();
+        let (mut equal, mut total, mut rounds, mut fed_rows) = (0usize, 0usize, 0usize, 0usize);
+        let mut widths = [0usize; fl::MAX_STEP + 1];
+        while at.iter().any(|&a| a < steps) {
+            let live: Vec<usize> = (0..seqs).filter(|&i| at[i] < steps).collect();
+            let mut feeds = Vec::new();
+            for &i in &live {
+                let w = (1 + (rounds * 3 + i * 5) % fl::MAX_STEP).min(steps - at[i]);
+                let pending = *out[i].last().unwrap();
+                let mut f = vec![pending];
+                if rounds % 2 == 1 {
+                    let mut hist = prompts[i].to_vec();
+                    hist.extend_from_slice(&out[i]);
+                    f.extend(crate::flint::lookup_draft(&hist, w - 1));
+                } else {
+                    f.extend_from_slice(&toks[i][at[i] + 1..at[i] + w]);
+                    if (rounds + i) % 3 == 0 && w > 1 {
+                        let k = 1 + (rounds + i) % (w - 1);
+                        f[k] = f[k].wrapping_add(1) % fl::VOCAB as i32;
+                    }
+                }
+                widths[f.len()] += 1;
+                feeds.push(f);
+            }
+            let before: Vec<usize> = live.iter().map(|&i| states[i].pos()).collect();
+            {
+                let feed: Vec<&[i32]> = feeds.iter().map(|f| &f[..]).collect();
+                let mut refs: Vec<&mut FlintState> = states
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(i, _)| live.contains(i))
+                    .map(|(_, st)| st)
+                    .collect();
+                model.forward_batch(&mut refs, &mut ws, &s, &feed)?;
+            }
+            let rows: usize = feeds.iter().map(|f| f.len()).sum();
+            fed_rows += rows;
+            let h = logits_hash(&s, ws.logits, rows)?;
+            let next = fl::argmax(&ws, rows, &s)?;
+            let mut r = 0;
+            for (k, &i) in live.iter().enumerate() {
+                let f = &feeds[k];
+                // Rows whose fed tokens all follow the plain greedy sequence compare bitwise.
+                let valid = f
+                    .iter()
+                    .enumerate()
+                    .take_while(|&(j, &t)| toks[i][at[i] + j] == t)
+                    .count();
+                for j in 0..valid {
+                    total += 1;
+                    equal += (h[r + j] == alone[i][at[i] + j]) as usize;
+                }
+                // Accept as the server does: each row's token while it equals the next draft.
+                let mut j = 0;
+                loop {
+                    let t = next[r + j];
+                    out[i].push(t);
+                    if j + 1 < f.len() && t == f[j + 1] && at[i] + j + 1 < steps {
+                        j += 1;
+                        continue;
+                    }
+                    break;
+                }
+                at[i] += j + 1;
+                states[i].truncate(before[k] + j + 1);
+                r += f.len();
+            }
+            rounds += 1;
+        }
+        failures += total - equal;
+        let same = (0..seqs)
+            .filter(|&i| out[i][..=steps] == toks[i][..=steps])
+            .count();
+        failures += seqs - same;
+        println!(
+            "  batched speculative steps: {equal}/{total} rows bitwise equal to decoding alone; tokens equal to plain greedy decoding in {same}/{seqs} sequences ({rounds} steps, {fed_rows} rows, widths 1..8: {:?})",
+            &widths[1..]
+        );
+        // D: throughput of batched decode steps.
+        if time_steps > 0 {
+            let mut n = 1;
+            while n <= seqs {
+                for (st, p) in states.iter_mut().zip(&prompts) {
+                    st.trim(p.len());
+                }
+                let mut last: Vec<i32> = first[..n].to_vec();
+                let mut timed = 0.0;
+                for j in 0..time_steps + 2 {
+                    let feed: Vec<[i32; 1]> = last.iter().map(|&t| [t]).collect();
+                    let feed: Vec<&[i32]> = feed.iter().map(|f| &f[..]).collect();
+                    let t1 = Instant::now();
+                    let mut refs: Vec<&mut FlintState> = states[..n].iter_mut().collect();
+                    model.forward_batch(&mut refs, &mut ws, &s, &feed)?;
+                    last = fl::argmax(&ws, n, &s)?;
+                    if j >= 2 {
+                        timed += t1.elapsed().as_secs_f64();
+                    }
+                }
+                let per = timed / time_steps as f64;
+                println!(
+                    "  {n} sequence(s): {:.2} ms per step, {:.1} tok/s per sequence, {:.1} tok/s together",
+                    per * 1e3,
+                    1.0 / per,
+                    n as f64 / per
+                );
+                n *= 2;
+            }
+        }
+    }
+    anyhow::ensure!(failures == 0, "{failures} mismatches");
+    println!("batch check passed");
     Ok(())
 }
 
@@ -209,7 +463,7 @@ fn ppl(dir: &Path, file: &Path, ctx: usize, chunks: usize) -> Result<()> {
     let t0 = Instant::now();
     for c in 0..n_chunks {
         let toks = &ids[c * ctx..(c + 1) * ctx];
-        let mut seq = FlintSeq::new(&model, ctx)?;
+        let mut seq = FlintState::new(&model, ctx, &s)?;
         // Logits of positions half .. ctx-2 predict the next token (llama-perplexity's first = n_ctx / 2).
         fl::prefill(&model, &ws, &mut seq, &toks[..half], &s)?;
         let mut at = half;
@@ -268,7 +522,7 @@ fn generate(dir: &Path, prompt: &str, raw: bool, n: usize, context: usize) -> Re
     println!("prompt: {} tokens", ids.len());
     let (model, s) = load(dir)?;
     let ws = Workspace::new(1)?;
-    let mut seq = FlintSeq::new(&model, context)?;
+    let mut seq = FlintState::new(&model, context, &s)?;
     let t0 = Instant::now();
     fl::prefill(&model, &ws, &mut seq, &ids, &s)?;
     let mut next = fl::argmax(&ws, 1, &s)?[0];
