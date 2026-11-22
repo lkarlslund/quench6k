@@ -108,6 +108,8 @@ mod ffi {
             y: *mut f32,
             ldy: c_int,
             accumulate: c_int,
+            xw: *mut c_void,
+            rn: *mut f32,
             st: Stream,
         ) -> Error;
         pub fn quench6k_flint_gemv_max_m() -> c_int;
@@ -562,7 +564,8 @@ pub fn gemv(
 }
 
 /// As [`gemv`] with m = 1 for each of `m` rows (any number): every row bitwise as the single-token
-/// GEMV computes it. K = 2048 (with or without `norm`) or 4096 (without).
+/// GEMV computes it. K = 2048 (with or without `norm`) or 4096 (without). `prenorm`: scratch for a
+/// normalized input staged once (BF16 [m, 2048] rows, then FP32 [m]; 0: staged in every CTA).
 #[allow(clippy::too_many_arguments)]
 pub fn gemv_rows(
     s: &Stream,
@@ -573,6 +576,7 @@ pub fn gemv_rows(
     y: u64,
     ldy: usize,
     accumulate: bool,
+    prenorm: (u64, u64),
 ) -> Result<()> {
     let (codes, scales, s2, n, k) = mat_ptrs(mats);
     check(
@@ -589,6 +593,8 @@ pub fn gemv_rows(
                 pm(y),
                 ldy as c_int,
                 accumulate as c_int,
+                opt(prenorm.0),
+                opt(prenorm.1),
                 s.raw(),
             )
         },

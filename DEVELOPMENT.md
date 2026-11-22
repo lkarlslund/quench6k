@@ -106,7 +106,10 @@ reproduces (`--dump FILE` writes every step's token and logits hash, to compare 
 `--widths` times steps of 1..8 tokens). `batch-check` decodes several sequences (different prompts and
 lengths) alone, then together in batched steps, then in speculative steps of mixed widths, and requires
 every row's logits to be bitwise those of decoding alone and the speculative tokens to equal plain
-greedy decoding; then it times batched decode steps of 1, 2, 4 and 8 sequences.
+greedy decoding; then it times batched decode steps of 1, 2, 4 and 8 sequences (`--batches`).
+`--repeat N` runs it all N times from fresh states and requires the same logits and tokens every time;
+compare a run with `QUENCH6K_PDL=0` (kernels in plain stream order) to catch reads that race their
+producer.
 
 ## Model variants
 

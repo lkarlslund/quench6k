@@ -466,6 +466,9 @@ struct LayerCache {
     v: VmBuffer,
     ks: Option<VmBuffer>,
     vs: Option<VmBuffer>,
+    /// Bytes from the start of k, v, ks, vs known to be zeroed or written (newly mapped memory is
+    /// zeroed before a step uses it).
+    clean: [usize; 4],
 }
 
 impl LayerCache {
@@ -552,6 +555,7 @@ impl FlintState {
                 v: VmBuffer::reserve(rows * row)?,
                 ks: scales()?,
                 vs: scales()?,
+                clean: [0; 4],
             });
         }
         Ok(Self {
@@ -679,15 +683,36 @@ impl FlintState {
             } else {
                 positions
             };
-            for (b, row) in l.parts(fp8) {
+            let mut clean = l.clean;
+            for (i, (b, row)) in l.parts(fp8).enumerate() {
                 // Unmapping only fails on a broken context; the memory stays mapped then.
                 let _ = b.unmap_to(rows * row);
+                clean[i] = clean[i].min(b.mapped());
             }
+            l.clean = clean;
         }
         self.mapped = self.mapped_positions();
         if positions == 0 {
             self.snap = None;
         }
+    }
+
+    /// Zeroes cache memory mapped since the last call (before any step writes or reads it), so that
+    /// no cache row ever holds stale bits from other allocations.
+    fn clear_new(&mut self, s: &Stream) -> Result<()> {
+        let fp8 = self.fp8;
+        for l in &mut self.layers {
+            let mut clean = l.clean;
+            for (i, (b, _)) in l.parts(fp8).enumerate() {
+                let m = b.mapped();
+                if m > clean[i] {
+                    s.memset(b.addr() + clean[i] as u64, 0, m - clean[i])?;
+                }
+                clean[i] = m;
+            }
+            l.clean = clean;
+        }
+        Ok(())
     }
 
     /// Forgets the cached tokens from `positions` on (their memory stays mapped).
@@ -769,6 +794,7 @@ impl FlintState {
             l.k.map_to(bytes)?;
             l.v.map_to(bytes)?;
         }
+        self.clear_new(s)?;
         let sn = self.snap.as_ref().unwrap();
         let mut at = 0u64;
         for l in self.layers.iter().filter(|l| l.sliding) {
@@ -856,7 +882,7 @@ pub struct Workspace {
     logit_rows: usize,
     argmax_scratch: u64,
     pub argmax_out: u64,
-    /// Router tickets, one per group of 8 tokens.
+    /// Router tickets, one per group of tokens (at most one per token).
     ticket: u64,
     /// Attention merge tickets, one per (64-row tile, KV head).
     attn_tickets: u64,
@@ -936,7 +962,7 @@ impl Workspace {
             argmax_out: a(logit_rows * 4)?,
             rows: a(3 * MAX_ROWS * 4)?,
             ticket: {
-                let b = DeviceBuffer::zeroed(MAX_ROWS.div_ceil(8) * 4)?;
+                let b = DeviceBuffer::zeroed(MAX_ROWS * 4)?;
                 let addr = b.addr();
                 bufs.push(b);
                 addr
@@ -1000,6 +1026,10 @@ pub fn forward(
 ) -> Result<()> {
     let t = tokens.len();
     ensure!(t > 0 && t <= MAX_CHUNK, "chunk of {t} tokens");
+    ensure!(
+        tokens.iter().all(|&t| (0..VOCAB as i32).contains(&t)),
+        "token id out of range"
+    );
     let start = seq.tokens.len();
     ensure!(
         start + t <= seq.capacity,
@@ -1007,6 +1037,7 @@ pub fn forward(
         seq.capacity
     );
     seq.reserve(start + t)?;
+    seq.clear_new(s)?;
     s.upload_to(ws.tok, tokens)?;
     s.upload_to(ws.start, &[start as i32])?;
     body(model, ws, seq, t, Some(start), all_logits, s)?;
@@ -1064,6 +1095,10 @@ impl FlintModel {
             tokens.iter().all(|t| (1..=MAX_STEP).contains(&t.len())),
             "batched step with a sequence of no or more than {MAX_STEP} tokens"
         );
+        ensure!(
+            tokens.iter().flat_map(|t| t.iter()).all(|&t| (0..VOCAB as i32).contains(&t)),
+            "token id out of range"
+        );
         let rows: usize = tokens.iter().map(|t| t.len()).sum();
         ensure!(
             rows <= ws.logit_rows,
@@ -1082,6 +1117,9 @@ impl FlintModel {
                 st.capacity
             );
             st.reserve(st.tokens.len() + t.len())?;
+        }
+        for st in states.iter_mut() {
+            st.clear_new(s)?;
         }
         // Rows and cache tables into pinned staging (after the previous upload has been consumed).
         ws.io_done.synchronize()?;
@@ -1139,12 +1177,19 @@ fn body_rows(model: &FlintModel, ws: &Workspace, rows: usize, fp8: bool, s: &Str
     );
     fk::embed(s, tok, rows, model.embed, ws.h)?;
     let fuse = quench6k_cuda::variants::get("flint.fuse_norm", 1) != 0;
+    // Normalized inputs staged once per step (flint.prenorm) instead of in every CTA: BF16 rows in
+    // `qb` (free until qk_prep), RMS factors in `rlogits` (free until the router).
+    let prenorm = if quench6k_cuda::variants::get("flint.prenorm", 1) != 0 {
+        (ws.qb, ws.rlogits)
+    } else {
+        (0, 0)
+    };
     // The single-token GEMV for one row, else its row-wise twin (bitwise the same per row).
     let gemv = |x: u64, norm: Option<u64>, mats: &[Fp4], y: u64, ldy: usize, acc: bool| {
         if rows == 1 {
             fk::gemv(s, x, norm, 1, mats, y, ldy, acc)
         } else {
-            fk::gemv_rows(s, x, norm, rows, mats, y, ldy, acc)
+            fk::gemv_rows(s, x, norm, rows, mats, y, ldy, acc, prenorm)
         }
     };
     // A GEMV over normalized rows: RMSNorm folded into it (flint.fuse_norm) or a separate kernel.

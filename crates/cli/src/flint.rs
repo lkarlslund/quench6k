@@ -83,6 +83,10 @@ pub enum FlintCmd {
         /// Batch sizes to time.
         #[arg(long, num_args = 1.., default_values_t = [1usize, 2, 4, 8])]
         batches: Vec<usize>,
+        /// Run everything (from fresh states and prefills) this many times; every run's logits and
+        /// tokens must be the same (determinism).
+        #[arg(long, default_value_t = 1)]
+        repeat: usize,
     },
 }
 
@@ -126,7 +130,8 @@ pub fn run(cmd: FlintCmd) -> Result<()> {
             steps,
             time_steps,
             batches,
-        } => batch_check(&model, &text, seqs, &ctx, steps, time_steps, &batches),
+            repeat,
+        } => batch_check(&model, &text, seqs, &ctx, steps, time_steps, &batches, repeat),
     }
 }
 
@@ -204,14 +209,18 @@ fn bench(
             let mut line = String::new();
             for w in 1..=fl::MAX_STEP.min(out.len()) {
                 let reps = 16;
-                let t2 = Instant::now();
-                for _ in 0..reps {
+                let mut tt = 0.0;
+                for r in 0..reps + 1 {
+                    let t2 = Instant::now();
                     let before = seq.tokens.len();
                     fl::step(&model, &mut ws, &mut seq, &out[..w], &s)?;
                     fl::argmax(&ws, w, &s)?;
                     seq.tokens.truncate(before);
+                    if r > 0 {
+                        tt += t2.elapsed().as_secs_f64();
+                    }
                 }
-                let ms = t2.elapsed().as_secs_f64() * 1e3 / reps as f64;
+                let ms = tt * 1e3 / reps as f64;
                 line.push_str(&format!(" {w}:{ms:.2}"));
             }
             println!("ctx {ctx:>6}: ms per step by tokens{line}");
@@ -246,6 +255,7 @@ fn batch_check(
     steps: usize,
     time_steps: usize,
     batches: &[usize],
+    repeat: usize,
 ) -> Result<()> {
     anyhow::ensure!(
         (1..=fl::MAX_SEQS).contains(&seqs),
@@ -257,8 +267,13 @@ fn batch_check(
     let (model, s) = load(dir)?;
     let mut ws = Workspace::new(fl::MAX_ROWS)?;
     let mut failures = 0usize;
+    let mut digests: Vec<(usize, u64)> = Vec::new();
+    for rep_i in 0..repeat.max(1) {
     for &ctx in ctxs {
-        let lens: Vec<usize> = (0..seqs).map(|i| (ctx - 97 * i).max(ctx / 2).max(1)).collect();
+        let time_steps = if rep_i == 0 { time_steps } else { 0 };
+        let lens: Vec<usize> = (0..seqs)
+            .map(|i| ctx.saturating_sub(97 * i).max(ctx / 2).max(1))
+            .collect();
         anyhow::ensure!(ids.len() > ctx + 1, "the text has {} tokens", ids.len());
         let prompts: Vec<&[i32]> = lens
             .iter()
@@ -272,7 +287,7 @@ fn batch_check(
         let mut first = Vec::new();
         let t0 = Instant::now();
         for p in &prompts {
-            let mut st = FlintState::new(&model, p.len() + steps + 2 * fl::MAX_STEP, &s)?;
+            let mut st = FlintState::new(&model, p.len() + steps.max(time_steps + 2) + 2 * fl::MAX_STEP, &s)?;
             fl::prefill(&model, &ws, &mut st, p, &s)?;
             first.push(fl::argmax(&ws, 1, &s)?[0]);
             states.push(st);
@@ -291,8 +306,9 @@ fn batch_check(
             let (mut h, mut t) = (Vec::new(), vec![f]);
             for j in 0..steps {
                 fl::step(&model, &mut ws, st, &[t[j]], &s)?;
-                h.push(logits_hash(&s, ws.logits, 1)?[0]);
+                // The greedy pick right after the step (as a server samples), then the logits.
                 t.push(fl::argmax(&ws, 1, &s)?[0]);
+                h.push(logits_hash(&s, ws.logits, 1)?[0]);
             }
             alone.push(h);
             toks.push(t);
@@ -307,13 +323,21 @@ fn batch_check(
             let feed: Vec<&[i32]> = feed.iter().map(|f| &f[..]).collect();
             let mut refs: Vec<&mut FlintState> = states.iter_mut().collect();
             model.forward_batch(&mut refs, &mut ws, &s, &feed)?;
+            let next = fl::argmax(&ws, seqs, &s)?;
             let h = logits_hash(&s, ws.logits, seqs)?;
             for i in 0..seqs {
                 total += 1;
-                equal += (h[i] == alone[i][j]) as usize;
+                equal += (h[i] == alone[i][j] && next[i] == toks[i][j + 1]) as usize;
             }
         }
         failures += total - equal;
+        let digest = alone
+            .iter()
+            .flatten()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, &x| {
+                (h ^ x).wrapping_mul(0x100_0000_01b3)
+            });
+        println!("  decoding alone: logits digest {digest:016x}");
         println!("  batched plain decode: {equal}/{total} rows bitwise equal to decoding alone");
         // C: speculative steps of mixed widths; sequences leave the batch as they finish.
         for (st, p) in states.iter_mut().zip(&prompts) {
@@ -322,6 +346,7 @@ fn batch_check(
         let mut at = vec![0usize; seqs];
         let mut out: Vec<Vec<i32>> = first.iter().map(|&f| vec![f]).collect();
         let (mut equal, mut total, mut rounds, mut fed_rows) = (0usize, 0usize, 0usize, 0usize);
+        let mut spec_hashes: Vec<u64> = Vec::new();
         let mut widths = [0usize; fl::MAX_STEP + 1];
         while at.iter().any(|&a| a < steps) {
             let live: Vec<usize> = (0..seqs).filter(|&i| at[i] < steps).collect();
@@ -357,8 +382,9 @@ fn batch_check(
             }
             let rows: usize = feeds.iter().map(|f| f.len()).sum();
             fed_rows += rows;
-            let h = logits_hash(&s, ws.logits, rows)?;
             let next = fl::argmax(&ws, rows, &s)?;
+            let h = logits_hash(&s, ws.logits, rows)?;
+            spec_hashes.extend_from_slice(&h);
             let mut r = 0;
             for (k, &i) in live.iter().enumerate() {
                 let f = &feeds[k];
@@ -370,7 +396,16 @@ fn batch_check(
                     .count();
                 for j in 0..valid {
                     total += 1;
-                    equal += (h[r + j] == alone[i][at[i] + j]) as usize;
+                    let same = h[r + j] == alone[i][at[i] + j];
+                    equal += same as usize;
+                    if !same && total - equal <= 12 {
+                        println!(
+                            "    differs: sequence {i} position {} (row {j} of {}, prompt {})",
+                            before[k] + j,
+                            f.len(),
+                            prompts[i].len()
+                        );
+                    }
                 }
                 // Accept as the server does: each row's token while it equals the next draft.
                 let mut j = 0;
@@ -393,6 +428,22 @@ fn batch_check(
         let same = (0..seqs)
             .filter(|&i| out[i][..=steps] == toks[i][..=steps])
             .count();
+        // This run's digest: decoding alone, then the speculative rows' logits and tokens.
+        let run_digest = std::iter::once(digest)
+            .chain(spec_hashes.iter().copied())
+            .chain(out.iter().flatten().map(|&t| t as u64))
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, x| (h ^ x).wrapping_mul(0x100_0000_01b3));
+        if repeat > 1 {
+            println!("  run {} digest {run_digest:016x}", rep_i + 1);
+        }
+        match digests.iter().find(|(c, _)| *c == ctx) {
+            Some(&(_, d)) if d != run_digest => {
+                failures += 1;
+                println!("  run {}: differs from run 1", rep_i + 1);
+            }
+            Some(_) => {}
+            None => digests.push((ctx, run_digest)),
+        }
         failures += seqs - same;
         println!(
             "  batched speculative steps: {equal}/{total} rows bitwise equal to decoding alone; tokens equal to plain greedy decoding in {same}/{seqs} sequences ({rounds} steps, {fed_rows} rows, widths 1..8: {:?})",
@@ -426,6 +477,7 @@ fn batch_check(
                 );
             }
         }
+    }
     }
     anyhow::ensure!(failures == 0, "{failures} mismatches");
     println!("batch check passed");

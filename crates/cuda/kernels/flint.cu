@@ -866,8 +866,8 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv2_kernel(const void* xi
 // are read once for all rows. x: BF16 [M, K] rows, or with NORM the FP32 residual rows. y row m at
 // y + m * ldy.
 template <int STEPS, int R, bool NORM, int G>
-__global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemvb_kernel(const void* xin, const float* norm_w, Mats mats, float* y, int ldy, int M,
-                                                                  int accumulate) {
+__global__ void __launch_bounds__(GV_WARPS * 32, 2) fp4_gemvb_kernel(const void* xin, const float* norm_w, Mats mats, float* y, int ldy, int M,
+                                                                  int accumulate, const float* rn_in) {
     pdl_launch_dependents();
     constexpr int K = STEPS * 1024;
     extern __shared__ __align__(16) uint4 gb_x[];  // [G][K / 8], chunks swizzled per row
@@ -895,7 +895,29 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemvb_kernel(const void* xi
     pdl_wait();
     for (int m0 = 0; m0 < M; m0 += G) {
         const int gn = min(G, M - m0);
-        for (int g = 0; g < gn; ++g) {
+        if constexpr (!NORM) {
+            // All of the group's loads in flight at once, then the swizzled stores.
+            constexpr int PER = G * (K / 8) / (GV_WARPS * 32);
+            static_assert(PER * GV_WARPS * 32 == G * (K / 8), "staging covers the group");
+            const uint4* x = static_cast<const uint4*>(xin) + (size_t)m0 * (K / 8);
+            constexpr int BATCH_LD = PER < 4 ? PER : 4;
+#pragma unroll
+            for (int i0 = 0; i0 < PER; i0 += BATCH_LD) {
+                uint4 v[BATCH_LD];
+#pragma unroll
+                for (int i = 0; i < BATCH_LD; ++i) {
+                    const int idx = threadIdx.x + (i0 + i) * GV_WARPS * 32;
+                    if (idx / (K / 8) < gn) v[i] = x[idx];
+                }
+#pragma unroll
+                for (int i = 0; i < BATCH_LD; ++i) {
+                    const int idx = threadIdx.x + (i0 + i) * GV_WARPS * 32, g = idx / (K / 8), j = idx % (K / 8);
+                    if (g < gn) gb_x[(size_t)g * (K / 8) + swz16(j)] = v[i];
+                }
+            }
+            if (threadIdx.x < gn) rns[threadIdx.x] = rn_in ? rn_in[m0 + threadIdx.x] : 1.0f;
+        }
+        for (int g = 0; g < gn && NORM; ++g) {
             uint4* xs = gb_x + (size_t)g * (K / 8);
             if constexpr (NORM) {
                 const float* h = static_cast<const float*>(xin) + (size_t)(m0 + g) * K;
@@ -910,10 +932,6 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemvb_kernel(const void* xi
                 }
                 const float rn = rsqrtf(block_sum(ss, red) / K + 1e-6f);
                 if (threadIdx.x == 0) rns[g] = rn;
-            } else {
-                const uint4* x = static_cast<const uint4*>(xin) + (size_t)(m0 + g) * (K / 8);
-                for (int j = threadIdx.x; j < K / 8; j += blockDim.x) xs[swz16(j)] = x[j];
-                if (threadIdx.x == 0) rns[g] = 1.0f;
             }
         }
         __syncthreads();
@@ -924,20 +942,20 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemvb_kernel(const void* xi
 #pragma unroll
                 for (int r = 0; r < R; ++r) {
                     const float s0 = e4m3f(sb[r][u] & 0xff), s1 = e4m3f(sb[r][u] >> 8);
-                    float w[32];
-                    fp4x8(c[r][u].x, s0, w);
-                    fp4x8(c[r][u].y, s0, w + 8);
-                    fp4x8(c[r][u].z, s1, w + 16);
-                    fp4x8(c[r][u].w, s1, w + 24);
+                    const uint32_t cq[4] = {c[r][u].x, c[r][u].y, c[r][u].z, c[r][u].w};
+                    // Eight weights at a time (products of a row in the same order as fp4_gemv2_kernel).
 #pragma unroll
-                    for (int g = 0; g < G; ++g) {
-                        if (g < gn) {
-                            const uint4* xs = gb_x + (size_t)g * (K / 8);
-                            float xv[32];
+                    for (int q = 0; q < 4; ++q) {
+                        float w[8];
+                        fp4x8(cq[q], q < 2 ? s0 : s1, w);
 #pragma unroll
-                            for (int q = 0; q < 4; ++q) load_bf16x8(reinterpret_cast<const __nv_bfloat16*>(&xs[swz16(u * 128 + lane * 4 + q)]), xv + 8 * q);
+                        for (int g = 0; g < G; ++g) {
+                            if (g < gn) {
+                                float xv[8];
+                                load_bf16x8(reinterpret_cast<const __nv_bfloat16*>(&gb_x[(size_t)g * (K / 8) + swz16(u * 128 + lane * 4 + q)]), xv);
 #pragma unroll
-                            for (int i = 0; i < 32; ++i) acc[r][g] = fmaf(w[i], xv[i], acc[r][g]);
+                                for (int i = 0; i < 8; ++i) acc[r][g] = fmaf(w[i], xv[i], acc[r][g]);
+                            }
                         }
                     }
                 }
@@ -961,6 +979,30 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemvb_kernel(const void* xi
         }
         __syncthreads();
     }
+}
+
+// The staging of fp4_gemv2_kernel's NORM path done once per row: xw[m] = bf16(h[m] * norm_w) (K = 2048)
+// and rn[m] = rsqrt(mean(h[m]^2) + 1e-6), summed in the same order (256 threads, one 8-value chunk each).
+// fp4_gemvb_kernel then reads xw with rn as a plain BF16 input: bitwise the same rows.
+__global__ void __launch_bounds__(256) prenorm_kernel(const float* h, const float* norm_w, __nv_bfloat16* xw, float* rn) {
+    pdl_launch_dependents();
+    pdl_wait();
+    constexpr int K = 2048;
+    __shared__ float red[32];
+    const int m = blockIdx.x;
+    const float* hr = h + (size_t)m * K;
+    uint4* xo = reinterpret_cast<uint4*>(xw + (size_t)m * K);
+    float ss = 0.0f;
+    for (int j = threadIdx.x; j < K / 8; j += blockDim.x) {
+        const float4 a = *reinterpret_cast<const float4*>(hr + 8 * j), b = *reinterpret_cast<const float4*>(hr + 8 * j + 4);
+        const float4 wa = *reinterpret_cast<const float4*>(norm_w + 8 * j), wb = *reinterpret_cast<const float4*>(norm_w + 8 * j + 4);
+        ss += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w + b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+        __nv_bfloat162 p[4] = {__floats2bfloat162_rn(a.x * wa.x, a.y * wa.y), __floats2bfloat162_rn(a.z * wa.z, a.w * wa.w),
+                               __floats2bfloat162_rn(b.x * wb.x, b.y * wb.y), __floats2bfloat162_rn(b.z * wb.z, b.w * wb.w)};
+        xo[j] = *reinterpret_cast<uint4*>(p);
+    }
+    const float r = rsqrtf(block_sum(ss, red) / K + 1e-6f);
+    if (threadIdx.x == 0) rn[m] = r;
 }
 
 // ---- Routing --------------------------------------------------------------------------------------------
@@ -1093,15 +1135,15 @@ __global__ void __launch_bounds__(GV_WARPS * 32) moe_down_kernel(const float* ac
         acc = warp_sum(acc);
         total = fmaf(sel_w[t * S + s], acc * d2[e], total);
     }
-    if (lane == 0) h[(size_t)t * D + n] += total;
+    if (lane == 0) h[(size_t)t * D + n] = h[(size_t)t * D + n] + total;
 }
 
 // ---- Router, few tokens ----------------------------------------------------------------------------
 // logits[t, e] = xn[t] . Wr[e] (BF16 [256, 2048]) with xn = RMSNorm(h[t]) computed per CTA (CTA 0 also
 // writes it for the experts); the last CTA to finish (ticket) routes every token as route_kernel and
 // resets the ticket. Grid E / GV_WARPS, a warp per expert row.
-// Tokens per CTA row; groups (and their tickets) per call.
-constexpr int RT_TMAX = 8, RT_GROUPS = 8;
+// Most tokens per call (a ticket per CTA row of `per` tokens).
+constexpr int RT_TMAX = 64;
 
 SQ_DEVICE void route_token(const float* logits, int t, int lane, int* sel_e, float* sel_w) {
     float v[E / 32];
@@ -1141,7 +1183,7 @@ SQ_DEVICE void route_token(const float* logits, int t, int lane, int* sel_e, flo
 }
 
 __global__ void __launch_bounds__(128) router_kernel(const float* h, const float* norm_w, const __nv_bfloat16* W, int T, float* logits,
-                                                    __nv_bfloat16* xn, int* ticket, int* sel_e, float* sel_w) {
+                                                    __nv_bfloat16* xn, int* ticket, int* sel_e, float* sel_w, int per) {
     pdl_launch_dependents();
     __shared__ bool last;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -1152,8 +1194,8 @@ __global__ void __launch_bounds__(128) router_kernel(const float* h, const float
     pdl_wait();
     // logit = rsqrt(mean(h^2) + eps) * (Wr . (h * norm_w)); the warp reads the whole row, so it also
     // has the sum of squares. Warp 0 of CTA 0 writes the normalized row for the experts. CTA row y takes
-    // tokens [y RT_TMAX, (y + 1) RT_TMAX) with its own ticket.
-    const int t_lo = blockIdx.y * RT_TMAX, t_hi = min(T, t_lo + RT_TMAX);
+    // tokens [y per, (y + 1) per) with its own ticket.
+    const int t_lo = blockIdx.y * per, t_hi = min(T, t_lo + per);
     ticket += blockIdx.y;
     for (int t = t_lo; t < t_hi; ++t) {
         const float* hr = h + (size_t)t * D;
@@ -1299,7 +1341,7 @@ __global__ void __launch_bounds__(GV_WARPS * 32) moe_down2_kernel(const float* a
     if (threadIdx.x < DN_ROWS) {
         float total = 0.0f;
         for (int s = 0; s < S; ++s) total += part[s][threadIdx.x];
-        h[(size_t)t * D + n0 + threadIdx.x] += total;
+        h[(size_t)t * D + n0 + threadIdx.x] = h[(size_t)t * D + n0 + threadIdx.x] + total;
     }
 }
 
@@ -1378,7 +1420,7 @@ __global__ void combine_kernel(const float* yd, const int* pair_row, const float
     for (int d = threadIdx.x; d < D; d += blockDim.x) {
         float acc = 0.0f;
         for (int s = 0; s < S; ++s) acc = fmaf(sel_w[t * S + s], yd[(size_t)pair_row[t * S + s] * D + d], acc);
-        h[(size_t)t * D + d] += acc;
+        h[(size_t)t * D + d] = h[(size_t)t * D + d] + acc;
     }
 }
 
@@ -1580,7 +1622,7 @@ cudaError_t gemv_m(const void* x, const float* norm_w, int K, const Mats& mats, 
 
 template <int STEPS, int R, bool NORM, int G>
 cudaError_t gemvb_launch(const void* x, const float* norm_w, const Mats& mats, int total, float* y, int ldy, int M, int accumulate,
-                         cudaStream_t st) {
+                         cudaStream_t st, const float* rn = nullptr) {
     const size_t smem = (size_t)min(G, M) * STEPS * 1024 * 2;
     static bool configured = false;
     if (!configured) {
@@ -1589,7 +1631,7 @@ cudaError_t gemvb_launch(const void* x, const float* norm_w, const Mats& mats, i
         configured = true;
     }
     const unsigned grid = (total + GV_WARPS * R - 1) / (GV_WARPS * R);
-    SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemvb_kernel<STEPS, R, NORM, G>, grid, GV_WARPS * 32, smem, st, x, norm_w, mats, y, ldy, M, accumulate));
+    SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemvb_kernel<STEPS, R, NORM, G>, grid, GV_WARPS * 32, smem, st, x, norm_w, mats, y, ldy, M, accumulate, rn));
     SQ_RETURN_LAUNCH();
 }
 
@@ -1626,8 +1668,11 @@ cudaError_t quench6k_flint_gemv(const void* x, const float* norm_w, int M, int K
 
 // Rows of a batched step (any M >= 1), each bitwise as the single-token GEMV computes it (K = 2048 with
 // or without the folded RMSNorm, K = 4096 without).
+// With `xw` (BF16 [M, 2048] scratch) and `rn` ([M] scratch), a normalized input is staged once by
+// prenorm_kernel instead of in every CTA.
 cudaError_t quench6k_flint_gemv_rows(const void* x, const float* norm_w, int M, int K, const uint8_t* const* codes, const uint8_t* const* scales,
-                                     const float* const* s2, const int* n, float* y, int ldy, int accumulate, cudaStream_t st) {
+                                     const float* const* s2, const int* n, float* y, int ldy, int accumulate, void* xw, float* rn,
+                                     cudaStream_t st) {
     if (M == 0) return cudaSuccess;
     if (!(K == 2048 || (K == 4096 && !norm_w))) return cudaErrorInvalidValue;
     Mats mats{};
@@ -1640,6 +1685,11 @@ cudaError_t quench6k_flint_gemv_rows(const void* x, const float* norm_w, int M, 
         mats.end[i] = total;
     }
     const int r = sq_variant("flint.gemvb_r", 0);
+    if (norm_w && xw && rn) {
+        SQ_CHECK_LAUNCH(fl_launch(16, prenorm_kernel, M, 256, 0, st, static_cast<const float*>(x), norm_w, static_cast<__nv_bfloat16*>(xw), rn));
+        return r == 1 ? gemvb_launch<2, 1, false, 8>(xw, nullptr, mats, total, y, ldy, M, accumulate, st, rn)
+                      : gemvb_launch<2, 2, false, 8>(xw, nullptr, mats, total, y, ldy, M, accumulate, st, rn);
+    }
     if (K == 4096) return r == 2 ? gemvb_launch<4, 2, false, 4>(x, norm_w, mats, total, y, ldy, M, accumulate, st)
                                  : gemvb_launch<4, 1, false, 4>(x, norm_w, mats, total, y, ldy, M, accumulate, st);
     if (norm_w) return r == 1 ? gemvb_launch<2, 1, true, 8>(x, norm_w, mats, total, y, ldy, M, accumulate, st)
@@ -1651,9 +1701,11 @@ cudaError_t quench6k_flint_gemv_rows(const void* x, const float* norm_w, int M, 
 cudaError_t quench6k_flint_router(const float* h, const float* norm_w, const void* w, int T, float* logits, void* xn, int* ticket, int* sel_e,
                                   float* sel_w, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    if (T > RT_TMAX * RT_GROUPS) return cudaErrorInvalidValue;
-    SQ_CHECK_LAUNCH(fl_launch(32, router_kernel, dim3(E / 4, (T + RT_TMAX - 1) / RT_TMAX), 128, 0, st, h, norm_w, static_cast<const __nv_bfloat16*>(w), T, logits,
-                              static_cast<__nv_bfloat16*>(xn), ticket, sel_e, sel_w));
+    if (T > RT_TMAX) return cudaErrorInvalidValue;
+    // Tokens per CTA row (flint.router_per); every token's logits and routing are the same for any.
+    const int per = max(1, sq_variant("flint.router_per", 2));
+    SQ_CHECK_LAUNCH(fl_launch(32, router_kernel, dim3(E / 4, (T + per - 1) / per), 128, 0, st, h, norm_w, static_cast<const __nv_bfloat16*>(w), T, logits,
+                              static_cast<__nv_bfloat16*>(xn), ticket, sel_e, sel_w, per));
     SQ_RETURN_LAUNCH();
 }
 
