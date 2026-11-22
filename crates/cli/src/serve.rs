@@ -515,7 +515,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
             } else if hy4 {
                 crate::hy4::load(&model_dir).map(|(model, stream)| {
                     started(&mut ready);
-                    let engine = hy4::Engine::new(&model, &stream, context);
+                    let engine = hy4::Engine::new(&model, &stream);
                     let exit = serve_slots(engine, &cfg, &jobs_rx, &metrics, std::mem::take(&mut waiting));
                     drop(model);
                     drop(stream);

@@ -26,7 +26,13 @@ Modes:
                level's cache does not serve the next).
   consistency  each conversation alone, one after another, then all at once; compares the texts turn
                by turn and reports the first differing turn and character (batch invariance end to
-               end). Exit status 1 when anything differs or fails.
+               end). Exit status 1 when anything differs or fails. To compare like with like, each
+               conversation gets a system prompt of its own (--shared-system: one for all) and the
+               model is unloaded between the phases (--between none: not), so both phases start from
+               an empty cache and each turn reuses the same cached prefix; give the server at least
+               as many slots as conversations. (A server that keeps contexts across an unload, such
+               as quench6k's Qwen session with its context store, still serves the second phase from
+               them.) Turns served from cache differently in the two phases are counted.
   fill         --conversations grown concurrently to --target each, a row per request (prompt, reused,
                new, timing), then one short revisit turn per conversation to show what stayed cached.
 
@@ -176,12 +182,14 @@ TASKS = [
 class Conversation:
     """One synthetic conversation: its messages and how much filler the next turn gets."""
 
-    def __init__(self, cid, key, corpus, turns, target, chars_per_token, min_filler):
+    def __init__(self, cid, key, corpus, turns, target, chars_per_token, min_filler, unique_system=False):
         self.cid, self.corpus, self.turns, self.target = cid, corpus, turns, target
         self.rng = Rng("conversation", key, cid)
         self.ratio = chars_per_token
         self.min_filler = min_filler
-        self.messages = [{"role": "system", "content": SYSTEM}]
+        # A system prompt of its own: no other conversation shares a cached beginning with it.
+        system = f"Session {key[0]}-{cid}. {SYSTEM}" if unique_system else SYSTEM
+        self.messages = [{"role": "system", "content": system}]
         self.last_prompt = None  # prompt tokens and completion tokens of the last request
         self.last_completion = 0
         self.sent_chars = 0
@@ -251,6 +259,18 @@ class Client:
     def conn(self, timeout):
         cls = http.client.HTTPSConnection if self.https else http.client.HTTPConnection
         return cls(self.host, self.port, timeout=timeout)
+
+    def post_json(self, path, timeout=600):
+        c = self.conn(timeout)
+        try:
+            c.request("POST", self.prefix + path, body=b"{}", headers={"Content-Type": "application/json"})
+            r = c.getresponse()
+            body = r.read()
+            if r.status != 200:
+                raise RuntimeError(f"POST {path}: HTTP {r.status}: {body[:200]!r}")
+            return json.loads(body)
+        finally:
+            c.close()
 
     def get_json(self, path):
         c = self.conn(30)
@@ -570,7 +590,8 @@ def compare(alone, together):
                 if i is not None:
                     diff = {"turn": t, "kind": field, "char": i,
                             "alone": a[field][max(0, i - 30): i + 50], "together": b[field][max(0, i - 30): i + 50],
-                            "alone_tokens": a.get("completion_tokens"), "together_tokens": b.get("completion_tokens")}
+                            "alone_tokens": a.get("completion_tokens"), "together_tokens": b.get("completion_tokens"),
+                            "alone_cached": a.get("cached_tokens"), "together_cached": b.get("cached_tokens")}
                     break
             if diff:
                 break
@@ -585,8 +606,9 @@ def compare(alone, together):
 
 # ---- modes ----------------------------------------------------------------------------------------
 
-def make_convs(args, corpus, key, n, target, turns=None):
-    return [Conversation(i, key, corpus, turns or args.turns, target, args.chars_per_token, args.min_filler)
+def make_convs(args, corpus, key, n, target, turns=None, unique_system=False):
+    return [Conversation(i, key, corpus, turns or args.turns, target, args.chars_per_token, args.min_filler,
+                         unique_system)
             for i in range(n)]
 
 
@@ -617,8 +639,17 @@ def mode_consistency(args, client, corpus, target, out):
     n = args.conversations
     phases = {}
     order = ["alone", "together"] if args.order == "alone-first" else ["together", "alone"]
-    for phase in order:
-        convs = make_convs(args, corpus, key, n, target)
+    for k, phase in enumerate(order):
+        if k > 0 and args.between == "unload":
+            # The second phase starts from an empty cache, as the first did (the server keeps no context
+            # across an unload; the next request loads the model again).
+            try:
+                client.post_json("/v1/unload")
+                print("between phases: model unloaded (cached contexts dropped)", flush=True)
+            except (OSError, RuntimeError, ValueError, http.client.HTTPException) as e:
+                print(f"between phases: could not unload ({e}); the second phase may reuse the first's cache",
+                      flush=True)
+        convs = make_convs(args, corpus, key, n, target, unique_system=args.unique_system)
         recs, wall = run(client, convs, 1 if phase == "alone" else n, args, out.request, phase)
         s = summarize(recs, wall, 1 if phase == "alone" else n)
         out.summary(s, phase=phase)
@@ -638,9 +669,20 @@ def mode_consistency(args, client, corpus, target, out):
                   f"(alone {diff['alone_tokens']} tokens, together {diff['together_tokens']})")
             print(f"    alone:    {diff['alone']!r}")
             print(f"    together: {diff['together']!r}")
+            print(f"    prompt tokens served from cache: alone {diff['alone_cached']}, together {diff['together_cached']}")
     note = admission_note(out.records)
     if note:
         print(note)
+    # Turns whose prompts were served from cache differently in the two phases (prefill chunks then start
+    # elsewhere, and cached reply tokens come from decode steps rather than prefill): how many differ.
+    a_by = {(r["conv"], r["turn"]): r for r in phases["alone"][0]}
+    b_by = {(r["conv"], r["turn"]): r for r in phases["together"][0]}
+    both = [(a_by[k], b_by[k]) for k in a_by if k in b_by and not a_by[k]["error"] and not b_by[k]["error"]]
+    other = [(a, b) for a, b in both if (a.get("cached_tokens") or 0) != (b.get("cached_tokens") or 0)]
+    if other:
+        changed = sum(a["content"] != b["content"] or a["reasoning"] != b["reasoning"] for a, b in other)
+        print(f"turns served from cache differently in the two phases: {len(other)} of {len(both)}, "
+              f"{changed} of them with different text")
     print(f"\nconsistency: {same}/{n} conversations identical alone and {n} at once")
     return 0 if same == n else 1
 
@@ -737,6 +779,12 @@ def main(argv=None):
     c = sub.add_parser("consistency", help="texts alone vs all at once, turn by turn")
     c.add_argument("--conversations", type=int, default=8)
     c.add_argument("--order", choices=["alone-first", "together-first"], default="alone-first")
+    c.add_argument("--shared-system", dest="unique_system", action="store_false",
+                   help="one system prompt for all conversations (default: one each, so no conversation "
+                        "reuses another's cached beginning)")
+    c.add_argument("--between", choices=["unload", "none"], default="unload",
+                   help="between the phases, POST /v1/unload so the second starts from an empty cache as "
+                        "the first did (the model loads again), or nothing")
     fl = sub.add_parser("fill", help="grow conversations to a target context each")
     fl.add_argument("--conversations", type=int, default=4)
     fl.add_argument("--no-revisit", dest="revisit", action="store_false",

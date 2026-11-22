@@ -155,6 +155,12 @@ impl SlotEngine for Mock {
     fn growable(&self) -> bool {
         self.o.growable
     }
+    fn batched(&self) -> bool {
+        true
+    }
+    fn bytes_per_position(&self) -> usize {
+        1
+    }
     fn reserve(&mut self, st: &mut MState, positions: usize) -> Result<()> {
         if !self.o.growable {
             return Ok(());
@@ -212,6 +218,7 @@ impl SlotEngine for Mock {
     }
     fn prefill(&mut self, st: &mut MState, tokens: &[i32], _last: bool) -> Result<[i32; 8]> {
         self.log.lock().unwrap().push(format!("prefill {}", st.id));
+        self.log.lock().unwrap().push(format!("chunk {} {}..{}", st.id, st.hist.len(), st.hist.len() + tokens.len()));
         std::thread::sleep(Duration::from_millis(self.o.prefill_ms));
         let rows = self.feed(st, tokens)?;
         // The last token's logits in row 0.
@@ -450,7 +457,11 @@ fn growable_memory_is_shared() {
     // Nothing else holds memory and it still does not fit: an error.
     let srv = server(2, 400, Opts { total: 100, growable: true, ..Default::default() });
     let (_, end) = collect(srv.send(prompt(1, 150), 5, true));
-    assert!(end.as_ref().is_err_and(|e| e.contains("out of memory")), "{end:?}");
+    assert!(end.as_ref().is_err_and(|e| e.contains("does not fit in device memory") && e.contains("about 100 positions")), "{end:?}");
+    // The prompt fits, its completion runs out of memory: an error that says so.
+    let (g, end) = collect(srv.send(prompt(3, 80), 50, true));
+    assert!(end.as_ref().is_err_and(|e| e.contains("device memory is full at")), "{end:?}");
+    assert!(!g.is_empty() && g.len() < 50 && g == expected(&prompt(3, 80), g.len(), &[]));
     // The slot works afterwards.
     let p = prompt(2, 10);
     let (g, end) = collect(srv.send(p.clone(), 5, true));
@@ -570,5 +581,56 @@ fn prefill_interleaves_with_decode() {
     let last = log.iter().rposition(|l| l == "prefill 2").unwrap();
     let between = log[first..last].iter().filter(|l| l.starts_with("step ")).count();
     assert!(between > 5, "{between} steps during the prefill: {:?}", &log[first..=last]);
+    srv.stop();
+}
+
+/// The step-cost fit follows observed steps; a sequence's shares add up to the step.
+#[test]
+fn step_cost_shares() {
+    let mut c = StepCost::new(0.010, 0.0018);
+    for i in 0..400 {
+        let r = [1.0, 2.0, 4.0, 8.0, 12.0, 32.0][i % 6];
+        c.add(r, 0.0078 + 0.002 * r);
+    }
+    let (a, b) = c.fit();
+    assert!((a - 0.0078).abs() < 0.0003 && (b - 0.002).abs() < 0.0001, "{a} {b}");
+    assert_eq!(c.share(1, 4, 4), 1.0);
+    let widths = [1, 4, 2, 1];
+    let total: f64 = widths.iter().map(|&w| c.share(4, w, 8)).sum();
+    assert!((total - 1.0).abs() < 1e-9, "{total}");
+    // Eight sequences: a plain row costs (a/8 + b), three more drafts 3b more.
+    let plain = c.share(8, 1, 8) * (a + 8.0 * b);
+    assert!((plain - (a / 8.0 + b)).abs() < 1e-9);
+}
+
+/// A new conversation sharing only a beginning (a system prompt) with an idle slot's takes a free
+/// slot; the idle conversation keeps its own.
+#[test]
+fn shared_beginning_does_not_take_a_slot() {
+    let srv = server(2, 512, Opts::default());
+    let system = prompt(7, 6);
+    let a = [system.clone(), prompt(1, 30)].concat();
+    let (ga, _) = collect(srv.send(a.clone(), 5, false));
+    let b = [system.clone(), prompt(2, 30)].concat();
+    let (gb, end) = collect(srv.send(b.clone(), 5, false));
+    assert_eq!((gb, end), (expected(&b, 5, &[]), Ok((Finish::Length, 0))));
+    let a2 = [a.clone(), ga.clone(), vec![9]].concat();
+    let (_, end) = collect(srv.send(a2, 3, false));
+    assert_eq!(end, Ok((Finish::Length, a.len() + ga.len() - 1)));
+    srv.stop();
+}
+
+/// Prefill chunks end at multiples of the chunk size whatever was reused.
+#[test]
+fn prefill_chunks_are_aligned() {
+    let srv = server(1, 512, Opts { chunk: 8, ..Default::default() });
+    let a = prompt(1, 13);
+    let (ga, _) = collect(srv.send(a.clone(), 4, false));
+    // Continues a's conversation: 13 + 3 tokens reused, the rest from position 16 in chunks of 8.
+    let a2 = [a.clone(), ga.clone(), prompt(2, 20)].concat();
+    let (_, end) = collect(srv.send(a2.clone(), 2, false));
+    assert_eq!(end, Ok((Finish::Length, a.len() + ga.len() - 1)));
+    let chunks: Vec<String> = srv.log().into_iter().filter(|l| l.starts_with("chunk ")).collect();
+    assert_eq!(chunks, ["chunk 1 0..8", "chunk 1 8..13", "chunk 1 16..24", "chunk 1 24..32", "chunk 1 32..37"]);
     srv.stop();
 }

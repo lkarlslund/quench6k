@@ -24,15 +24,16 @@ pub(super) struct Engine<'m> {
     model: &'m InklingModel,
     s: &'m Stream,
     ws: Workspace,
-    /// Bytes of a state (all the same size: --context positions).
+    /// Bytes of a state (all the same size: --context positions) and its positions.
     state_bytes: usize,
+    capacity: usize,
 }
 
 impl<'m> Engine<'m> {
     pub(super) fn new(model: &'m InklingModel, s: &'m Stream) -> Result<Self> {
         let ws = Workspace::new(model, CHUNK, MAX_STEP)?;
         eprintln!("inkling worker: workspace {:.2} GiB", ws.device_bytes as f64 / (1u64 << 30) as f64);
-        Ok(Self { model, s, ws, state_bytes: 0 })
+        Ok(Self { model, s, ws, state_bytes: 0, capacity: 0 })
     }
 }
 
@@ -67,10 +68,18 @@ impl<'m> SlotEngine for Engine<'m> {
     fn new_state(&mut self, capacity: usize) -> Result<State> {
         let st = State::new(self.model, capacity, self.s)?;
         self.state_bytes = st.device_bytes;
+        self.capacity = capacity;
         Ok(st)
     }
     fn growable(&self) -> bool {
         false
+    }
+    fn batched(&self) -> bool {
+        false
+    }
+    fn bytes_per_position(&self) -> usize {
+        // Interim: a state's whole size spread over its positions.
+        self.state_bytes / self.capacity.max(1)
     }
     fn reserve(&mut self, _st: &mut State, _positions: usize) -> Result<()> {
         Ok(())
