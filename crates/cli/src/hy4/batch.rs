@@ -478,6 +478,117 @@ fn staggered(model: &Hy4Model, s: &Stream, ws: &mut Workspace, prompts: &[Vec<i3
     Ok(bad)
 }
 
+/// The server's order with drafts: running sequences verify their drafts in one batched step, then draft
+/// together (draft_batch); a new prompt is prefilled right after that (one step, Logits::Last) and drafts
+/// alone. Every sequence's tokens compared with the plain greedy tokens of its prompt alone.
+fn staggered_drafted(model: &Hy4Model, s: &Stream, ws: &mut Workspace, prompts: &[Vec<i32>], n: usize, slots: usize) -> Result<usize> {
+    let alone: Vec<Vec<i32>> = prompts
+        .iter()
+        .map(|p| {
+            let mut st = State::new(model, 1024, s)?;
+            model.forward(&mut st, ws, s, p, Logits::Last)?;
+            let mut out = vec![argmax_rows(model, ws, s, 1)?[0]];
+            while out.len() < n {
+                model.forward(&mut st, ws, s, &[*out.last().unwrap()], Logits::Last)?;
+                out.push(argmax_rows(model, ws, s, 1)?[0]);
+            }
+            Ok(out)
+        })
+        .collect::<Result<_>>()?;
+    let d = 3;
+    let mut states: Vec<State> = Vec::new();
+    let mut outs: Vec<Vec<i32>> = Vec::new();
+    let mut drafts: Vec<Vec<i32>> = Vec::new();
+    let mut started = 0;
+    loop {
+        // New prompts while slots are free, each right after the previous GPU work (a batched step and
+        // its drafter pass, or another prefill).
+        while started < prompts.len() && outs.iter().filter(|o| o.len() < n).count() < slots {
+            let mut st = State::new(model, 1024, s)?;
+            model.forward(&mut st, ws, s, &prompts[started], Logits::Last)?;
+            let first = argmax_rows(model, ws, s, 1)?[0];
+            let row = st.last_t - 1;
+            let dr = model.draft(&mut st, ws, s, first, row)?;
+            outs.push(vec![first]);
+            drafts.push(dr);
+            states.push(st);
+            started += 1;
+        }
+        let live: Vec<usize> = (0..outs.len()).filter(|&i| outs[i].len() < n).collect();
+        if live.is_empty() {
+            break;
+        }
+        let toks: Vec<Vec<i32>> = live
+            .iter()
+            .map(|&i| {
+                let mut t = vec![*outs[i].last().unwrap()];
+                t.extend(drafts[i].iter().take(d.min(n - outs[i].len())));
+                t
+            })
+            .collect();
+        let mut refs: Vec<&mut State> = Vec::new();
+        for (i, st) in states.iter_mut().enumerate() {
+            if live.contains(&i) {
+                refs.push(st);
+            }
+        }
+        let before: Vec<usize> = refs.iter().map(|st| st.pos).collect();
+        let tr: Vec<&[i32]> = toks.iter().map(|t| t.as_slice()).collect();
+        model.forward_batch(&mut refs, ws, s, &tr)?;
+        let rows: usize = toks.iter().map(|t| t.len()).sum();
+        let picks = argmax_rows(model, ws, s, rows)?;
+        let (mut at, mut pend, mut srcs) = (0, Vec::new(), Vec::new());
+        for (j, &i) in live.iter().enumerate() {
+            let mut a = 0;
+            loop {
+                outs[i].push(picks[at + a]);
+                if a + 1 < toks[j].len() && picks[at + a] == toks[j][a + 1] && outs[i].len() < n {
+                    a += 1;
+                    continue;
+                }
+                break;
+            }
+            refs[j].truncate(before[j] + 1 + a);
+            pend.push(*outs[i].last().unwrap());
+            srcs.push(a);
+            at += toks[j].len();
+        }
+        let dr = model.draft_batch(&mut refs, ws, s, &pend, &srcs)?;
+        for (j, &i) in live.iter().enumerate() {
+            drafts[i] = dr[j].clone();
+        }
+    }
+    let mut bad = 0;
+    for (i, p) in prompts.iter().enumerate() {
+        let first = (0..n).find(|&k| alone[i][k] != outs[i][k]);
+        if first.is_some() || i < 2 {
+            println!(
+                "  prompt {i} ({} tokens): {}",
+                p.len(),
+                first.map_or("same tokens".to_string(), |k| format!("DIFFERENT from token {k}"))
+            );
+        }
+        bad += first.is_some() as usize;
+    }
+    println!("  {} of {} prompts differ", bad, prompts.len());
+    Ok(bad)
+}
+
+const NAMES: [&str; 16] = [
+    "Amber", "Basil", "Cedar", "Delta", "Ember", "Fjord", "Garnet", "Harbor", "Indigo", "Jasper", "Kelp", "Lumen", "Marble",
+    "Nectar", "Onyx", "Pepper",
+];
+const QUESTIONS: [&str; 8] = [
+    "explain how a binary heap works",
+    "list five uses of a hash set",
+    "write a haiku about rain",
+    "describe the water cycle briefly",
+    "give three tips for code review",
+    "explain TCP slow start",
+    "compare arrays and linked lists",
+    "summarize what a mutex is for",
+];
+
 const PROMPTS: [&str; 8] = [
     "Rust ownership explained for a C programmer, in five short paragraphs:\n",
     "Write a Python function that merges two sorted lists, then explain its complexity.\n",
@@ -516,6 +627,14 @@ pub fn run(
     if std::env::var_os("QUENCH6K_HY4_INTERLEAVE").is_some() && fx.len() >= 2 {
         println!("interleaved steps:");
         bad += interleave(&model, &s, &mut ws, &fx[0], &fx[1])?;
+    }
+    if let Some(slots) = std::env::var("QUENCH6K_HY4_STAGGER_DRAFTS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let chat = crate::chat::Chat::load(dir, None)?;
+        let prompts: Vec<Vec<i32>> = (0..NAMES.len())
+            .map(|i| chat.encode(&format!("{} asks: {}.\n", NAMES[i], QUESTIONS[i % QUESTIONS.len()])))
+            .collect::<Result<_>>()?;
+        println!("staggered short prompts with drafts, {slots} slots:");
+        bad += staggered_drafted(&model, &s, &mut ws, &prompts, 24, slots)?;
     }
     if std::env::var_os("QUENCH6K_HY4_STAGGER").is_some() {
         let chat = crate::chat::Chat::load(dir, None)?;
