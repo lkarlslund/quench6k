@@ -94,6 +94,8 @@ __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__
     }
     const unsigned threshold = s_prefix, take_equal = s_remaining;
     const unsigned greater = k - take_equal;
+    // Values equal to the k-th: the last pass's bin of the threshold counts them.
+    const unsigned equal = hist[threshold & 255];
     for (int i = tid; i < n; i += THREADS) {
         const float v = row[i];
         const unsigned u = order_key(v);
@@ -101,12 +103,34 @@ __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__
             const unsigned slot = atomicAdd(&s_gt, 1u);
             pick_idx[slot] = gidx(i);
             pick_val[slot] = v;
-        } else if (u == threshold) {
+        } else if (u == threshold && equal <= take_equal) {
             const unsigned slot = atomicAdd(&s_eq, 1u);
-            if (slot < take_equal) {
-                pick_idx[greater + slot] = gidx(i);
-                pick_val[greater + slot] = v;
+            pick_idx[greater + slot] = gidx(i);
+            pick_val[greater + slot] = v;
+        }
+    }
+    if (equal > take_equal) {
+        // More values equal the k-th than are taken: the first ones in row order (MODE 2: the candidates'
+        // order, which is row order among equal values), so the picks do not depend on thread timing.
+        __shared__ unsigned s_wcnt[THREADS / 32];
+        const int lane = tid & 31, warp = tid >> 5;
+        for (int base = 0;; base += THREADS) {
+            const int i = base + tid;
+            const bool eq = i < n && order_key(row[i]) == threshold;
+            const unsigned ballot = __ballot_sync(0xffffffffu, eq);
+            if (lane == 0) s_wcnt[warp] = __popc(ballot);
+            __syncthreads();
+            unsigned before = s_eq + __popc(ballot & ((1u << lane) - 1));
+            for (int w = 0; w < warp; ++w) before += s_wcnt[w];
+            if (eq && before < take_equal) {
+                pick_idx[greater + before] = gidx(i);
+                pick_val[greater + before] = row[i];
             }
+            __syncthreads();
+            if (tid == 0)
+                for (int w = 0; w < THREADS / 32; ++w) s_eq += s_wcnt[w];
+            __syncthreads();
+            if (s_eq >= take_equal || base + THREADS >= n) break;
         }
     }
     __syncthreads();
