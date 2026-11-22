@@ -3,6 +3,7 @@
 //! (the body's "model"): when another model is loaded, the server switches only once that model has been
 //! idle (no request running) for the settle period; until then the request gets an error (503 with
 //! Retry-After), so two clients asking for different models cannot make it load and unload in turns.
+//! Reads (GET) never load a model.
 //!
 //! Each model runs as its own `quench6k serve` child process on a local port (ending it frees all of its
 //! GPU memory); requests are passed through to it, streams included.
@@ -30,7 +31,7 @@ use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use serde_json::{Value, json};
@@ -222,7 +223,9 @@ fn error(status: StatusCode, code: Option<&str>, msg: String, anthropic: bool) -
 }
 
 /// Every other route: requests naming a model go to it (loading it when allowed); the rest go to the
-/// loaded model, if any.
+/// loaded model, if any. Reads (GET, HEAD) never load a model: with no model loaded, or another model
+/// than the one named (`?model=`) loaded, they get 404, the answer clients expect from a server that
+/// does not offer an endpoint (llama.cpp's /props, say) - not an error that makes them give up probing.
 async fn pass(State(app): State<Arc<App>>, req: Request) -> Response {
     let anthropic = req.uri().path().starts_with("/v1/messages");
     let (parts, body) = req.into_parts();
@@ -231,6 +234,23 @@ async fn pass(State(app): State<Arc<App>>, req: Request) -> Response {
         Err(e) => return error(StatusCode::BAD_REQUEST, None, format!("reading the request: {e}"), anthropic),
     };
     let named = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v["model"].as_str().map(str::to_string));
+    if parts.method == Method::GET || parts.method == Method::HEAD {
+        let asked = named.or_else(|| {
+            axum::extract::Query::<HashMap<String, String>>::try_from_uri(&parts.uri).ok()?.0.remove("model")
+        });
+        let loaded = loaded_entry(&app).await;
+        let serves = match (&asked, loaded) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(name), Some(l)) => find(&app, name) == Some(l),
+        };
+        if !serves {
+            let what = asked.map_or_else(|| "no model is loaded".to_string(), |n| format!("'{n}' is not loaded"));
+            let msg = format!("{} is answered by a loaded model only, and {what}; model details are at /v1/models", parts.uri.path());
+            return error(StatusCode::NOT_FOUND, Some("not_found"), msg, anthropic);
+        }
+        return forward(&app, None, parts, bytes, anthropic).await;
+    }
     let entry = match &named {
         Some(name) => match find(&app, name) {
             Some(i) => Some(i),
@@ -238,7 +258,12 @@ async fn pass(State(app): State<Arc<App>>, req: Request) -> Response {
         },
         None => None,
     };
-    let port = match acquire(&app, entry).await {
+    forward(&app, entry, parts, bytes, anthropic).await
+}
+
+/// Passes a request to the model of `entry` (the loaded one for `None`), loading it when allowed.
+async fn forward(app: &Arc<App>, entry: Option<usize>, parts: axum::http::request::Parts, bytes: axum::body::Bytes, anthropic: bool) -> Response {
+    let port = match acquire(app, entry).await {
         Ok(p) => p,
         Err(r) => return with_anthropic(r, anthropic),
     };
@@ -324,7 +349,7 @@ async fn acquire(app: &Arc<App>, entry: Option<usize>) -> std::result::Result<u1
             (None, Some(b)) => b.entry,
             (None, None) => {
                 return Err(Rejection {
-                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    status: StatusCode::BAD_REQUEST,
                     code: "no_model_loaded",
                     message: "no model is loaded; name one (see /v1/models)".into(),
                     retry_after: None,
