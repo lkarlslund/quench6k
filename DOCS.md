@@ -5,6 +5,7 @@
 | Command | Purpose |
 |---|---|
 | `quench6k serve` | HTTP server (OpenAI and Anthropic APIs) |
+| `quench6k serve-models` | One HTTP endpoint for several models, each loaded when a request names it ([Several models](#several-models)) |
 | `quench6k chat` | One chat turn from the command line, streamed to stdout (`--image`, `--video`, `--think`, `--temperature`) |
 | `quench6k bench` | Prefill and decode throughput at given context lengths ([BENCHMARK.md](BENCHMARK.md)) |
 
@@ -247,6 +248,35 @@ model again and is processed once loading finishes; requests arriving meanwhile 
 a request whose prompt was stored continues from the store. If loading fails, the waiting requests
 get the error and the next request tries again. Tokenizing, `/health`, `/metrics` and the dashboard
 answer without loading the model.
+
+### Several models
+
+`quench6k serve-models --catalog FILE --listen ADDR [--settle SECS]` serves every model of a catalog
+from one endpoint and loads none at start. Each model runs as its own `quench6k serve` process on a
+local port, one at a time; requests (streams included) pass through to it.
+
+```json
+{"settle_secs": 60,
+ "models": [
+   {"args": ["--model", "/models/qwen", "--name", "qwen", "--context", "262144", "--kv", "fp8"]},
+   {"args": ["--model", "/models/inkling", "--name", "inkling", "--context", "131072"], "env": {}}
+ ]}
+```
+
+`args` are `serve` arguments without `--listen`; `env` adds environment variables. A model's names (its
+`--name`, and the adapted or steered name with `--adapter` or `--steering`) and context come from them.
+
+- `GET /v1/models` and `/v1/models/{id}` answer from the catalog without loading anything: names,
+  `context_length` / `max_model_len`, and `loaded`. `/health` reports the loaded model and its state.
+- A request names its model (the body's `model`). Nothing loaded: that model loads and the request
+  waits for it. Another model loaded: the server switches (stopping that model's process, which frees its
+  memory, then loading the requested one) only when the loaded model has been idle, with no request
+  running, for the settle period (default 60 s). Until then the request is rejected with HTTP 503, code
+  `model_switch_blocked` (Anthropic paths: `overloaded_error`) and a `Retry-After` header, so clients
+  asking for different models cannot make the server load and unload in turns.
+- Requests without a model (`/`, `/metrics`, tokenizing) go to the loaded model; with none loaded they get
+  HTTP 503 `no_model_loaded`. `POST /v1/unload` stops the loaded model when no request is running.
+- A failed load is reported to the waiting requests; the next request tries again.
 
 A prompt of `--context` tokens or more is rejected with HTTP 400 and code `context_length_exceeded`.
 

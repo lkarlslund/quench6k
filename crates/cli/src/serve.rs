@@ -707,7 +707,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         .route("/health", get(health))
         .route("/v1/unload", post(unload))
         .route("/v1/models", get(models))
-        .route("/v1/models/{id}", get(model))
+        .route("/v1/models/{*id}", get(model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))

@@ -6,6 +6,7 @@ mod inkling;
 mod gpumon;
 mod kbench;
 mod mtp;
+mod multi;
 mod overlay;
 mod sass;
 mod serve;
@@ -223,6 +224,19 @@ enum Command {
         video: Vec<PathBuf>,
         #[command(flatten)]
         steer: SteerArgs,
+    },
+    /// One HTTP endpoint for several models, each loaded when a request names it (a `serve` process per
+    /// model, one at a time); switching waits until the loaded model has been idle for the settle period.
+    ServeModels {
+        /// JSON catalog: {"settle_secs": 60, "models": [{"args": [<serve arguments>], "env": {..}}, ..]}.
+        #[arg(long)]
+        catalog: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: std::net::SocketAddr,
+        /// Seconds the loaded model must be idle before a request for another model may unload it
+        /// (overrides the catalog's settle_secs; default 60).
+        #[arg(long, value_name = "SECS")]
+        settle: Option<f64>,
     },
     /// HTTP server: OpenAI (/v1/chat/completions, /v1/models) and Anthropic (/v1/messages) APIs.
     Serve {
@@ -541,6 +555,23 @@ enum Command {
     },
 }
 
+/// The model names and context `quench6k serve <args>` serves (for `serve-models`).
+fn serve_identity(args: &[String]) -> Result<(Vec<String>, usize)> {
+    let argv = ["quench6k", "serve"].into_iter().map(String::from).chain(args.iter().cloned());
+    let cli = Cli::try_parse_from(argv).map_err(|e| anyhow::anyhow!("catalog serve arguments {args:?}: {e}"))?;
+    let Command::Serve { name, context, steer, steered_name, adapted_name, .. } = cli.command else {
+        unreachable!()
+    };
+    let mut names = vec![name.clone()];
+    if steer.steering.is_some() {
+        names.push(steered_name.unwrap_or_else(|| format!("{name}-steered")));
+    }
+    if steer.adapter.is_some() {
+        names.push(adapted_name.unwrap_or_else(|| format!("{name}-adapted")));
+    }
+    Ok((names, context))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     quench6k_engine::forward::KV_FP8.store(cli.kv == "fp8", std::sync::atomic::Ordering::Relaxed);
@@ -648,6 +679,7 @@ fn main() -> Result<()> {
             batch2,
             &steer,
         )?,
+        Command::ServeModels { catalog, listen, settle } => multi::run(multi::Options { catalog, listen, settle }, serve_identity)?,
         Command::Serve {
             model,
             listen,
