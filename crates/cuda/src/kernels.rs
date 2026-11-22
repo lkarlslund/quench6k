@@ -23,6 +23,8 @@ pub enum WeightFormat {
     Int8Group = 3,
     /// FP8 E4M3 with a power-of-two (UE8M0 byte) scale per 32 consecutive weights of a row.
     Mxfp8 = 4,
+    /// FP8 E4M3 with an FP32 scale per 128 x 128 block (`[ceil(N / 128), K / 128]`).
+    Fp8Block = 5,
 }
 
 pub fn int8_group() -> usize {
@@ -275,6 +277,46 @@ pub fn gemm_bf16(
     check(err, "gemm_bf16_bf16")
 }
 
+/// Batched BF16 GEMM with BF16 output: for b < batch, Y_b = X_b . W_b^T with X_b = X + b * xs,
+/// W_b = W + b * ws, Y_b = Y + b * ys (strides in elements).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_bf16_batched(
+    s: &Stream,
+    x: u64,
+    ldx: usize,
+    xs: usize,
+    w: u64,
+    ldw: usize,
+    ws: usize,
+    y: u64,
+    ldy: usize,
+    ys: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    batch: usize,
+) -> Result<()> {
+    let err = unsafe {
+        ffi::quench6k_gemm_bf16_batched(
+            p(x),
+            ldx as i32,
+            xs,
+            p(w),
+            ldw as i32,
+            ws,
+            pm(y),
+            ldy as i32,
+            ys,
+            m as i32,
+            n as i32,
+            k as i32,
+            batch as i32,
+            s.raw(),
+        )
+    };
+    check(err, "gemm_bf16_batched")
+}
+
 pub fn gemv_max_m() -> usize {
     unsafe { ffi::quench6k_gemv_max_m() as usize }
 }
@@ -319,6 +361,43 @@ pub fn gemv(
         )
     };
     check(err, "gemv")
+}
+
+/// [`gemv`] of one weight matrix [n, k] (BF16 or INT8 group) in row segments with their own inputs
+/// and outputs: `segs` = (rows, x, y, ldy) in row order (2 or 3; rows multiples of 4), shared `ldx`.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_seg(s: &Stream, m: usize, fmt: WeightFormat, w: u64, scale: u64, ldx: usize, segs: &[(usize, u64, u64, usize)], k: usize) -> Result<()> {
+    if segs.len() < 2 || segs.len() > 3 {
+        return Err(anyhow::anyhow!("gemv_seg: {} segments", segs.len()));
+    }
+    let g = |i: usize| segs.get(i).copied().unwrap_or((0, 0, 0, 0));
+    let (end0, end1) = (g(0).0, g(0).0 + g(1).0);
+    let n: usize = segs.iter().map(|x| x.0).sum();
+    let err = unsafe {
+        ffi::quench6k_gemv_seg(
+            fmt as i32,
+            m as i32,
+            p(g(0).1),
+            p(g(1).1),
+            p(g(2).1),
+            ldx as i32,
+            p(w),
+            opt_f(scale),
+            g(0).2 as *mut f32,
+            g(1).2 as *mut f32,
+            g(2).2 as *mut f32,
+            g(0).3 as i32,
+            g(1).3 as i32,
+            g(2).3 as i32,
+            end0 as i32,
+            end1 as i32,
+            segs.len() as i32,
+            n as i32,
+            k as i32,
+            s.raw(),
+        )
+    };
+    check(err, "gemv_seg")
 }
 
 /// W[n, k] *= 1 + g[k] in place (BF16).
@@ -944,10 +1023,10 @@ pub fn fp4_quant_rows(s: &Stream, x: u64, rows: usize, k: usize, out: u64) -> Re
     )
 }
 
-/// Gathers quantized token rows (`t` tokens at `src`) into routed-pair order (t * 10 rows at `dst`).
-pub fn fp4_gather(s: &Stream, src: u64, t: usize, k: usize, pair_row: u64, dst: u64) -> Result<()> {
+/// Gathers quantized token rows (`t` tokens at `src`) into routed-pair order (t * topk rows at `dst`).
+pub fn fp4_gather(s: &Stream, src: u64, t: usize, k: usize, topk: usize, pair_row: u64, dst: u64) -> Result<()> {
     let (c, sc, r) = fp4_rows_layout(src, t, k);
-    let (gc, gsc, gr) = fp4_rows_layout(dst, t * 10, k);
+    let (gc, gsc, gr) = fp4_rows_layout(dst, t * topk, k);
     launch!(
         "fp4_gather",
         ffi::quench6k_fp4_gather(
@@ -957,6 +1036,7 @@ pub fn fp4_gather(s: &Stream, src: u64, t: usize, k: usize, pair_row: u64, dst: 
             i(pair_row),
             n32(t),
             n32(k),
+            n32(topk),
             gc as *mut u8,
             gsc as *mut u8,
             fm(gr),
@@ -1640,6 +1720,204 @@ pub fn moe_experts_t1(
             im(pair_row),
             pm(act),
             fm(yd),
+            s.raw()
+        )
+    )
+}
+
+/// [`moe_experts_t1`] in two halves (routing and gate/up into `act`, then down into `yd`), so the
+/// activations can be edited between them.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_t1_gate_up(
+    s: &Stream,
+    m: u64,
+    logits: u64,
+    gate: (u64, u64, u64),
+    up: (u64, u64, u64),
+    top_i: u64,
+    top_w: u64,
+    pair_row: u64,
+    act: u64,
+) -> Result<()> {
+    let t = |a: u64| a as *const u64;
+    launch!(
+        "moe_t1_gate_up",
+        ffi::quench6k_moe_t1_gate_up(
+            p(m),
+            f(logits),
+            t(gate.0),
+            t(gate.1),
+            f(gate.2),
+            t(up.0),
+            t(up.1),
+            f(up.2),
+            im(top_i),
+            fm(top_w),
+            im(pair_row),
+            pm(act),
+            s.raw()
+        )
+    )
+}
+
+pub fn moe_t1_down(
+    s: &Stream,
+    act: u64,
+    down: (u64, u64, u64),
+    top_i: u64,
+    yd: u64,
+    logits: u64,
+) -> Result<()> {
+    let t = |a: u64| a as *const u64;
+    launch!(
+        "moe_t1_down",
+        ffi::quench6k_moe_t1_down(
+            p(act),
+            t(down.0),
+            t(down.1),
+            f(down.2),
+            i(top_i),
+            fm(yd),
+            f(logits),
+            s.raw()
+        )
+    )
+}
+
+/// Atlas recording of expert activations (BF16 rows of 640): per (pair, unit) of expert `e`,
+/// `sum[e, unit] += |act|` and `top[e, unit]` = max of (|act| bits << 32 | negative << 31 | token);
+/// `counts[e] += 1` per pair (`counts` may be 0). With `top_i`, pair `p` is token `token0 + p / 10`
+/// at row `pair_row[p]`; with `top_i == 0`, row `p` is token `token0 + p` of the shared expert.
+#[allow(clippy::too_many_arguments)]
+pub fn atlas_record(
+    s: &Stream,
+    act: u64,
+    top_i: u64,
+    pair_row: u64,
+    pairs: usize,
+    token0: usize,
+    sum: u64,
+    top: u64,
+    counts: u64,
+) -> Result<()> {
+    launch!(
+        "atlas_record",
+        ffi::quench6k_atlas_record(
+            p(act),
+            i(top_i),
+            i(pair_row),
+            n32(pairs),
+            n32(token0),
+            fm(sum),
+            top as *mut u64,
+            counts as *mut u32,
+            s.raw()
+        )
+    )
+}
+
+/// Columns of routed experts' NVFP4 down projections: `out[p]` (F32 [2560]) = `scale2[e] * W_e[:, unit]`
+/// for `e = experts[p]`, `unit = units[p]` (I32 arrays of `count`).
+pub fn nvfp4_columns(
+    s: &Stream,
+    down: (u64, u64, u64),
+    experts: u64,
+    units: u64,
+    count: usize,
+    out: u64,
+) -> Result<()> {
+    let t = |a: u64| a as *const u64;
+    launch!(
+        "nvfp4_columns",
+        ffi::quench6k_nvfp4_columns(
+            t(down.0),
+            t(down.1),
+            f(down.2),
+            i(experts),
+            i(units),
+            n32(count),
+            fm(out),
+            s.raw()
+        )
+    )
+}
+
+/// Neuron edits on expert activations (BF16 rows of 640): `act[row, unit] = act * scale + add` for
+/// each edit `k` (arrays of `n` at `edits`: experts I32, units I32, scale F32, add F32) whose expert is
+/// routed for `pair` (row `pair_row[pair]`); with `top_i == 0`, on rows 0..pairs (the shared expert).
+pub fn edit_act(
+    s: &Stream,
+    act: u64,
+    top_i: u64,
+    pair_row: u64,
+    pairs: usize,
+    edits: u64,
+    n: usize,
+) -> Result<()> {
+    let at = |k: u64| edits + k * 4 * n as u64;
+    launch!(
+        "edit_act",
+        ffi::quench6k_edit_act(
+            pm(act),
+            i(top_i),
+            i(pair_row),
+            n32(pairs),
+            i(at(0)),
+            i(at(1)),
+            f(at(2)),
+            f(at(3)),
+            n32(n),
+            s.raw()
+        )
+    )
+}
+
+/// Router edits: `logits[r, experts[k]] += bias[k]` for `t` rows of stride `ld` (arrays of `n` at
+/// `edits`: experts I32, bias F32).
+pub fn router_bias(
+    s: &Stream,
+    logits: u64,
+    ld: usize,
+    t: usize,
+    edits: u64,
+    n: usize,
+) -> Result<()> {
+    launch!(
+        "router_bias",
+        ffi::quench6k_router_bias(
+            fm(logits),
+            n32(ld),
+            n32(t),
+            i(edits),
+            f(edits + 4 * n as u64),
+            n32(n),
+            s.raw()
+        )
+    )
+}
+
+/// Per-neuron readouts of routed experts: `out[p, j] = scale2[e] * down_e[:, j] . r[p]` for expert
+/// `e = experts[p]` (`down`: the (codes, scales, weight_scale_2) tables; `r`: F32 [pairs, 2560]; `out`:
+/// F32 [pairs, 640]).
+pub fn nvfp4_column_dots(
+    s: &Stream,
+    down: (u64, u64, u64),
+    experts: u64,
+    pairs: usize,
+    r: u64,
+    out: u64,
+) -> Result<()> {
+    let t = |a: u64| a as *const u64;
+    launch!(
+        "nvfp4_column_dots",
+        ffi::quench6k_nvfp4_column_dots(
+            t(down.0),
+            t(down.1),
+            f(down.2),
+            i(experts),
+            n32(pairs),
+            f(r),
+            fm(out),
             s.raw()
         )
     )
@@ -2437,6 +2715,110 @@ pub fn dflash_select(
             im(drafts),
             pm(qs),
             pm(params),
+            s.raw()
+        )
+    )
+}
+
+/// [`fp4_quant_rows`] with a second term: the residual quantized at the same row scale, its codes and
+/// block scales in `out2` (an `fp4_rows_layout` buffer whose row scales stay unused).
+/// With `out3` (non-zero): a third term, the residual of the first two.
+pub fn fp4_quant_rows2(s: &Stream, x: u64, rows: usize, k: usize, out: u64, out2: u64, out3: u64) -> Result<()> {
+    let (c, sc, r) = fp4_rows_layout(out, rows, k);
+    let (c2, sc2, _) = fp4_rows_layout(out2, rows, k);
+    let (c3, sc3, _) = if out3 != 0 { fp4_rows_layout(out3, rows, k) } else { (0, 0, 0) };
+    launch!(
+        "fp4_quant_rows2",
+        ffi::quench6k_fp4_quant_rows2(
+            p(x),
+            n32(rows),
+            n32(k),
+            c as *mut u8,
+            sc as *mut u8,
+            fm(r),
+            c2 as *mut u8,
+            sc2 as *mut u8,
+            c3 as *mut u8,
+            sc3 as *mut u8,
+            s.raw()
+        )
+    )
+}
+
+/// [`fp4_gather`] of two-term rows (`src2` / `dst2`: the second terms).
+#[allow(clippy::too_many_arguments)]
+pub fn fp4_gather2(s: &Stream, src: u64, src2: u64, t: usize, k: usize, topk: usize, pair_row: u64, dst: u64, dst2: u64) -> Result<()> {
+    let (c, sc, r) = fp4_rows_layout(src, t, k);
+    let (c2, sc2, _) = fp4_rows_layout(src2, t, k);
+    let (gc, gsc, gr) = fp4_rows_layout(dst, t * topk, k);
+    let (gc2, gsc2, _) = fp4_rows_layout(dst2, t * topk, k);
+    launch!(
+        "fp4_gather2",
+        ffi::quench6k_fp4_gather2(
+            c as *const u8,
+            sc as *const u8,
+            f(r),
+            c2 as *const u8,
+            sc2 as *const u8,
+            i(pair_row),
+            n32(t),
+            n32(k),
+            n32(topk),
+            gc as *mut u8,
+            gsc as *mut u8,
+            fm(gr),
+            gc2 as *mut u8,
+            gsc2 as *mut u8,
+            s.raw()
+        )
+    )
+}
+
+/// [`moe_fp4_gemm`] with two- or three-term activations (`a2`, `a3`: the further terms of the `rows` rows
+/// at `a`; `a3` 0 for two), F32 out.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_fp4_gemm2(
+    s: &Stream,
+    a: u64,
+    a2: u64,
+    a3: u64,
+    rows: usize,
+    w_ptr: u64,
+    s_ptr: u64,
+    ws2: u64,
+    offsets: u64,
+    tile_expert: u64,
+    tile_row: u64,
+    num_tiles: u64,
+    max_tiles: usize,
+    y: u64,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let (c, sc, r) = fp4_rows_layout(a, rows, k);
+    let (c2, sc2, _) = fp4_rows_layout(a2, rows, k);
+    let (c3, sc3, _) = if a3 != 0 { fp4_rows_layout(a3, rows, k) } else { (0, 0, 0) };
+    launch!(
+        "moe_fp4_gemm2",
+        ffi::quench6k_moe_fp4_gemm2(
+            c as *const u8,
+            sc as *const u8,
+            f(r),
+            c2 as *const u8,
+            sc2 as *const u8,
+            c3 as *const u8,
+            sc3 as *const u8,
+            w_ptr as *const u64,
+            s_ptr as *const u64,
+            f(ws2),
+            i(offsets),
+            i(tile_expert),
+            i(tile_row),
+            i(num_tiles),
+            n32(max_tiles),
+            fm(y),
+            n32(n),
+            n32(k),
             s.raw()
         )
     )

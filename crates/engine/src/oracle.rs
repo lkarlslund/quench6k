@@ -151,8 +151,13 @@ pub struct FixtureVerdict {
 
 /// Applies the dev/GOAL.md gate to a teacher-forced candidate against fixture references A and B.
 pub fn gate(fixture: &Path, candidate: &Distributions) -> Result<FixtureVerdict> {
-    let a = Distributions::load(&fixture.join("llama-w4a4"))?;
-    let b = Distributions::load(&fixture.join("llama-q8"))?;
+    gate_with(fixture, candidate, "llama-w4a4", "llama-q8")
+}
+
+/// [`gate`] against references A and B stored as `<fixture>/<ref_a>` and `<fixture>/<ref_b>`.
+pub fn gate_with(fixture: &Path, candidate: &Distributions, ref_a: &str, ref_b: &str) -> Result<FixtureVerdict> {
+    let a = Distributions::load(&fixture.join(ref_a))?;
+    let b = Distributions::load(&fixture.join(ref_b))?;
     let p = a.meta.positions;
     ensure!(
         b.meta.positions == p && candidate.meta.positions == p,

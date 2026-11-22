@@ -19,7 +19,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 minijinja = { version = "2", features = ["json", "loop_controls"] }
 libloading = "0.8"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal", "process", "time"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 tokio-stream = "0.1"
 axum = "0.8"
 base64 = "0.22"

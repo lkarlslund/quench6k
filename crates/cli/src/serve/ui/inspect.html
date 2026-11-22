@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Why the model predicts a token: its logit split into the blocks, experts and neurons that wrote it.">
+  <title>quench6k · Inspector</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff8956'/%3E%3Cpath d='M9 10h14M9 16h10M9 22h6' stroke='%23111316' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/dashboard.css">
+  <style>
+    .form { display: grid; gap: 12px; }
+    .form textarea { width: 100%; min-height: 64px; resize: vertical; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .form-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    .form-row label { display: flex; gap: 8px; align-items: center; color: var(--muted); }
+    .form-row input, .form-row select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; }
+    .button.primary { background: var(--accent); color: #111316; border-color: var(--accent); font-weight: 600; }
+    .button[disabled] { opacity: .5; cursor: wait; }
+    .tok { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; background: #24282d; border-radius: 4px; padding: 1px 4px; }
+    .context { display: flex; flex-wrap: wrap; gap: 3px; line-height: 1.9; }
+    .context .tok.last { background: var(--accent); color: #111316; }
+    .context .arrow { color: var(--muted); padding: 0 6px; }
+    .predictions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .predictions button { border: 1px solid var(--border); background: var(--bg); border-radius: 6px; padding: 4px 8px; display: flex; gap: 8px; align-items: baseline; }
+    .predictions button.selected { border-color: var(--accent); }
+    .predictions small { color: var(--muted); }
+    .checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 16px; }
+    .checks div { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+    .checks b { display: block; font-size: 18px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .checks span { color: var(--muted); font-size: 12px; }
+    .bar { position: relative; height: 14px; min-width: 160px; }
+    .bar::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; border-left: 1px solid var(--border); }
+    .bar i { position: absolute; top: 2px; bottom: 2px; border-radius: 2px; }
+    .bar i.pos { left: 50%; background: var(--green); }
+    .bar i.neg { right: 50%; background: #ff6b6b; }
+    tr.clickable { cursor: pointer; }
+    tr.open td { background: #1f2327; }
+    .detail td { background: #16191c; padding: 12px 16px 16px; }
+    .detail h4 { margin: 0 0 8px; font-size: 12px; color: var(--muted); font-weight: 500; letter-spacing: .04em; text-transform: uppercase; }
+    .pushes { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+    .pushes .label { color: var(--muted); font-size: 12px; min-width: 52px; }
+    .pushes .tok.up { box-shadow: inset 0 -2px 0 var(--green); }
+    .pushes .tok.down { box-shadow: inset 0 -2px 0 #ff6b6b; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .pos-text { color: var(--green); }
+    .neg-text { color: #ff6b6b; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+    /* Dense tables: many rows of small numbers. */
+    main { gap: 12px; }
+    .panel { margin-bottom: 12px; }
+    .panel-heading { padding: 14px 16px 10px; }
+    .panel-heading p { margin: 4px 0 0; font-size: 12px; }
+    .panel > .form, .panel > .context, .panel > .predictions, .panel > .checks, .panel > h4 { margin-left: 16px; margin-right: 16px; }
+    .panel > .form { margin: 16px; }
+    .panel > .checks { margin-bottom: 16px; }
+    .heading { padding-bottom: 8px; }
+    table.dense { width: auto; }
+    table.dense th { padding: 5px 12px; }
+    table.dense td { height: auto; padding: 2px 12px; font-size: 12px; line-height: 1.35; }
+    table.dense td.numeric { font-variant-numeric: tabular-nums; }
+    .bar { width: 180px; min-width: 0; height: 10px; }
+    .bar i { top: 1px; bottom: 1px; }
+    .detail td { padding: 8px 12px 12px; }
+    .detail table.dense td { padding: 1px 8px; }
+    .pushes { gap: 2px; }
+    .pushes .tok { font-size: 11px; padding: 0 3px; }
+    .checks div { padding: 6px 10px; }
+    .checks b { font-size: 15px; margin-top: 2px; }
+    .predictions button { padding: 2px 6px; }
+    .mini { font-size: 11px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--muted); }
+    .mini:hover { color: var(--text); border-color: var(--accent); }
+    .edits { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .edit-chip { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--accent); border-radius: 6px; padding: 2px 4px 2px 8px; }
+    .edit-chip button { border: 0; background: none; color: var(--muted); }
+    .continuation { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin: 0; font-size: 12px; max-height: 360px; overflow: auto; }
+    h4.sub { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 500; }
+  </style>
+  <script defer src="/assets/inspect.js"></script>
+  <script defer src="/assets/alpine.min.js"></script>
+</head>
+<body x-data="inspector">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="quench6k dashboard">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>quench<span class="brand-suffix">6k</span></span>
+    </a>
+    <span class="nav-label">INSPECTOR</span>
+    <div class="topbar-right"><a href="/atlas" class="text-link">Neuron atlas <span aria-hidden="true">↗</span></a> <a href="/" class="text-link">Engine monitor <span aria-hidden="true">↗</span></a></div>
+  </header>
+
+  <main>
+    <section class="heading" aria-labelledby="page-title">
+      <div><p class="eyebrow">MODEL / ATTRIBUTION</p><h1 id="page-title">Why this token<span class="heading-dot">.</span></h1>
+        <p class="model-name">The next token's logit, split exactly into what the embedding, each block, each expert and each neuron added (direct effects; the final mixer is held at its values for this prompt).</p></div>
+    </section>
+
+    <section class="panel">
+      <div class="form">
+        <textarea x-model="prompt" placeholder="Prompt" spellcheck="false"></textarea>
+        <div class="form-row">
+          <div class="segmented" role="group" aria-label="Prompt format">
+            <button :class="{ selected: mode === 'chat' }" @click="mode = 'chat'">Chat message</button>
+            <button :class="{ selected: mode === 'raw' }" @click="mode = 'raw'">Raw text</button>
+          </div>
+          <label x-show="mode === 'chat'"><input type="checkbox" x-model="thinking"> Thinking</label>
+          <label>Model <select x-model="model"><template x-for="m in models" :key="m"><option :value="m" x-text="m"></option></template></select></label>
+          <label>Target <input x-model="target" placeholder="most likely token" size="16"></label>
+          <button class="button primary" :disabled="busy" @click="run()" x-text="busy ? 'Inspecting…' : 'Inspect'"></button>
+          <button class="button" :disabled="comparing" @click="generate()" x-text="comparing ? 'Generating…' : (edits.length ? 'Compare outputs' : 'Generate')"></button>
+          <label>Tokens <input x-model="tokens" size="4"></label>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading"><div><div class="section-kicker">EDITS</div><h2>Model edits</h2><p>Applied to inspections and comparisons. Add them from the neuron and expert rows below, or here: an expert number (or "shared") with a unit edits a neuron (activation × scale + add); without a unit it bans the expert.</p></div></div>
+      <div class="form" style="margin:10px 16px 14px">
+        <div class="edits" x-show="edits.length"><template x-for="(e, i) in edits" :key="e.label"><span class="edit-chip"><span class="mono" x-text="e.label"></span><button @click="edits.splice(i, 1)" aria-label="Remove edit">×</button></span></template><button class="button" @click="edits = []">Clear all</button></div>
+        <div class="form-row">
+          <label>Layer <input x-model="manual.layer" size="3"></label>
+          <label>Expert <input x-model="manual.expert" size="6" placeholder="or shared"></label>
+          <label>Unit <input x-model="manual.unit" size="4" placeholder="none: ban"></label>
+          <label>Scale <input x-model="manual.scale" size="4"></label>
+          <label>Add <input x-model="manual.add" size="4"></label>
+          <button class="button" @click="addManual()">Add edit</button>
+        </div>
+      </div>
+    </section>
+
+    <template x-if="compare">
+      <section class="panel">
+        <div class="panel-heading"><div><div class="section-kicker">COMPARE</div><h2>Greedy continuation</h2></div></div>
+        <div class="grid2" style="margin:10px 16px 16px">
+          <div><h4 class="sub">Unedited</h4><pre class="continuation" x-text="compare.base"></pre></div>
+          <div x-show="compare.edited !== null"><h4 class="sub">With edits</h4><pre class="continuation" x-text="compare.edited"></pre></div>
+        </div>
+      </section>
+    </template>
+
+    <div class="notice error-notice" role="alert" x-show="error" x-cloak><div><strong>Inspection failed</strong><span x-text="error"></span></div></div>
+
+    <template x-if="result">
+      <div>
+        <section class="panel">
+          <div class="panel-heading"><div><div class="section-kicker">01 / PREDICTION</div><h2>Next token</h2><p>The prompt's end; the highlighted token is the one whose output is analysed. Click a prediction to explain it instead.</p></div><span class="unit" x-text="result.prompt_tokens + ' prompt tokens · ' + result.model"></span></div>
+          <div class="context"><template x-for="(id, i) in result.context" :key="i"><span class="tok" :class="{ last: i === result.context.length - 1 }" x-text="show(id)"></span></template><span class="arrow">→</span><span class="tok last" x-text="show(r.target)"></span></div>
+          <h4 style="margin:16px 0 8px;color:var(--muted);font-weight:500">Most likely next tokens</h4>
+          <div class="predictions"><template x-for="p in r.top" :key="p.id"><button :class="{ selected: p.id === r.target }" @click="target = String(p.id); run()"><span class="tok" x-text="show(p.id)"></span><small x-text="pct(p.value) + delta(p)"></small></button></template></div>
+          <div class="checks">
+            <div><span>Target logit</span><b x-text="fixed(r.logit)"></b><span x-text="'p = ' + pct(r.logprob) + (baseTop ? ' (unedited ' + pct(baseTop.target) + ')' : '')"></span></div>
+            <div><span>Sum of contributions</span><b x-text="fixed(r.sum)"></b><span x-text="'linearized ' + fixed(r.linear_logit)"></span></div>
+            <div><span>Residual rebuilt from parts</span><b x-text="r.residual_error.toExponential(1)"></b><span>largest difference</span></div>
+            <div><span>Neurons cover experts</span><b x-text="(100 * r.neuron_coverage).toFixed(2) + '%'"></b><span x-text="'shared experts ' + (100 * r.shared_coverage).toFixed(2) + '%'"></span></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading"><div><div class="section-kicker">02 / LAYERS</div><h2>Where the logit comes from</h2><p>Each layer's mixer (gated DeltaNet or attention) and MoE output. Click a row for its experts and what it pushes toward.</p></div></div>
+          <div class="table-scroll"><table class="dense">
+            <thead><tr><th>Part</th><th class="numeric">Mixer</th><th></th><th class="numeric">MoE</th><th></th><th class="numeric">Shared expert</th></tr></thead>
+            <tbody>
+              <tr><td>Embedding</td><td class="numeric" :class="sign(r.embedding)" x-text="fixed(r.embedding)"></td><td><div class="bar" x-html="bar(r.embedding)"></div></td><td colspan="3"></td></tr>
+              <tr><td>PLE (layer 1)</td><td class="numeric" :class="sign(r.ple)" x-text="fixed(r.ple)"></td><td><div class="bar" x-html="bar(r.ple)"></div></td><td colspan="3"></td></tr>
+            </tbody>
+              <template x-for="l in r.layers" :key="l.layer">
+                <tbody>
+                  <tr class="clickable" :class="{ open: open === l.layer }" @click="open = open === l.layer ? null : l.layer">
+                    <td x-text="'L' + l.layer + ' · ' + (l.mixer === 'attention' ? 'attention' : 'DeltaNet')"></td>
+                    <td class="numeric" :class="sign(l.mixer_contribution)" x-text="fixed(l.mixer_contribution)"></td><td><div class="bar" x-html="bar(l.mixer_contribution)"></div></td>
+                    <td class="numeric" :class="sign(l.moe_contribution)" x-text="fixed(l.moe_contribution)"></td><td><div class="bar" x-html="bar(l.moe_contribution)"></div></td>
+                    <td class="numeric" :class="sign(l.shared_contribution)" x-text="fixed(l.shared_contribution)"></td>
+                  </tr>
+                  <tr class="detail" x-show="open === l.layer"><td colspan="6">
+                    <div class="grid2">
+                      <div>
+                        <h4>Routed experts</h4>
+                        <table class="dense"><thead><tr><th>Expert</th><th class="numeric">Weight</th><th class="numeric">Contribution</th><th></th></tr></thead><tbody>
+                          <template x-for="e in l.experts" :key="e.expert"><tr><td class="mono"><span x-text="'E' + e.expert"></span> <button class="mini" @click.stop="banExpert(l.layer, e.expert)" title="Ban this expert in this layer">ban</button></td><td class="numeric" x-text="pct(Math.log(e.weight))"></td><td class="numeric" :class="sign(e.contribution)" x-text="fixed(e.contribution)"></td><td><div class="pushes" x-show="e.pushes" x-html="pushes(e.pushes)"></div></td></tr></template>
+                        </tbody></table>
+                        <p class="table-note" x-text="'Next in line: ' + l.runners_up.map(e => 'E' + e.id + ' (' + (100 * e.value).toFixed(1) + '%)').join(', ')"></p>
+                      </div>
+                      <div>
+                        <h4>Injection weights per stream</h4>
+                        <p class="mono" x-text="'mixer ' + l.inject_mixer.map(v => v.toFixed(3)).join(' ') + ' · MoE ' + l.inject_moe.map(v => v.toFixed(3)).join(' ')"></p>
+                        <template x-if="l.mixer_pushes"><div><h4>Mixer output pushes</h4><div class="pushes" x-html="pushes(l.mixer_pushes)"></div></div></template>
+                        <template x-if="l.moe_pushes"><div style="margin-top:12px"><h4>MoE output pushes</h4><div class="pushes" x-html="pushes(l.moe_pushes)"></div></div></template>
+                        <h4 style="margin-top:12px">Top neurons in this layer</h4>
+                        <div class="mono"><template x-for="n in r.neurons.filter(n => n.layer === l.layer).slice(0, 8)"><div><button class="mini" @click.stop="editNeuron(n, 0)">off</button> <span x-text="neuronName(n)"></span> <span :class="sign(n.contribution)" x-text="fixed(n.contribution)"></span> <span style="color:var(--muted)" x-text="'act ' + n.activation.toFixed(3)"></span></div></template></div>
+                      </div>
+                    </div>
+                  </td></tr>
+                </tbody>
+              </template>
+          </table></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading"><div><div class="section-kicker">03 / NEURONS</div><h2>Neurons that matter most</h2><p>An expert's intermediate unit: its activation times its routing weight times its down-projection column, read out to the target logit.</p></div></div>
+          <div class="table-scroll"><table class="dense">
+            <thead><tr><th>Neuron</th><th class="numeric">Activation</th><th class="numeric">Contribution</th><th></th><th>Edit</th></tr></thead>
+            <tbody><template x-for="n in r.neurons.slice(0, 60)" :key="neuronName(n)"><tr><td class="mono" x-text="neuronName(n)"></td><td class="numeric" x-text="n.activation.toFixed(3)"></td><td class="numeric" :class="sign(n.contribution)" x-text="fixed(n.contribution)"></td><td><div class="bar" x-html="bar(n.contribution, neuronScale)"></div></td><td><button class="mini" @click="editNeuron(n, 0)">off</button> <button class="mini" @click="editNeuron(n, -1)">flip</button> <button class="mini" @click="editNeuron(n, 2)">×2</button> <button class="mini" @click="editNeuron(n, 1, n.contribution * n.activation > 0 ? 10 : -10)" title="Add 10 to the activation in the direction that raises the target">push</button></td></tr></template></tbody>
+          </table></div>
+        </section>
+      </div>
+    </template>
+  </main>
+</body>
+</html>

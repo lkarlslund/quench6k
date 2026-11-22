@@ -11,6 +11,12 @@ pub struct Chat {
     /// Generation stops at these tokens (`generation_config.json` eos ids and `<|im_end|>`).
     pub stop_tokens: Vec<i32>,
     im_start: Option<i32>,
+    /// Hy4-flash's tags (`<think:opensource>`, `<tool_call:opensource>`, ...): decoded output is rewritten to
+    /// the plain tags the server parses, and reasoning efforts map to the template's no_think/high/max.
+    pub hy4: bool,
+    /// Inkling 2's message tokens (`<|message_model|>`, `<|content_thinking|>`, ...): decoded output is
+    /// rewritten to `<think>` / `<tool_call>` text (see [`InkState`]).
+    pub inkling: bool,
     /// Encodings of `<|im_start|>`-delimited prompt segments (see [`Chat::encode`]) and their total
     /// text bytes.
     segments: std::sync::Mutex<(std::collections::HashMap<String, Vec<i32>>, usize)>,
@@ -29,6 +35,10 @@ impl Chat {
             .unwrap_or_else(|| model_dir.join("chat_template.jinja"));
         let source = std::fs::read_to_string(&template_path)
             .with_context(|| format!("chat template {}", template_path.display()))?;
+        // transformers' {% generation %} marks the assistant tokens for training masks; it renders its body.
+        let source = ["{%- generation -%}", "{%- endgeneration -%}", "{% generation %}", "{% endgeneration %}"]
+            .iter()
+            .fold(source, |s, tag| s.replace(tag, ""));
         let mut env = minijinja::Environment::new();
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -58,6 +68,27 @@ impl Chat {
                 },
             );
         }
+        if source.contains("separators=") {
+            // Templates passing Python json.dumps arguments (Inkling's): sort_keys, separators (compact
+            // when given, else ", " and ": "), ensure_ascii (ignored: non-ASCII is kept).
+            env.add_filter(
+                "tojson",
+                |v: minijinja::Value,
+                 kwargs: minijinja::value::Kwargs|
+                 -> Result<minijinja::Value, minijinja::Error> {
+                    let sort: Option<bool> = kwargs.get("sort_keys")?;
+                    let seps: Option<minijinja::Value> = kwargs.get("separators")?;
+                    let _: Option<minijinja::Value> = kwargs.get("ensure_ascii")?;
+                    kwargs.assert_all_used()?;
+                    let json = serde_json::to_value(&v).map_err(|e| {
+                        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+                    })?;
+                    let json = if sort.unwrap_or(false) { sorted_json(&json) } else { json };
+                    let text = if seps.is_some() { json.to_string() } else { py_json(&json) };
+                    Ok(minijinja::Value::from_safe_string(text))
+                },
+            );
+        }
         env.add_template_owned("chat", source)?;
         let mut stop_tokens = Vec::new();
         if let Ok(text) = std::fs::read_to_string(model_dir.join("generation_config.json")) {
@@ -76,7 +107,11 @@ impl Chat {
             }
         }
         let im_start = tokenizer.token_to_id("<|im_start|>").map(|i| i as i32);
+        let hy4 = tokenizer.token_to_id("<think:opensource>").is_some();
+        let inkling = tokenizer.token_to_id("<|content_invoke_tool_json|>").is_some();
         Ok(Self {
+            hy4,
+            inkling,
             tokenizer,
             env,
             stop_tokens,
@@ -119,11 +154,31 @@ impl Chat {
         if let Some(t) = tools.filter(|t| !t.is_null()) {
             ctx.insert("tools".into(), t.clone());
         }
-        if let Some(e) = enable_thinking {
-            ctx.insert("enable_thinking".into(), Value::Bool(e));
-        }
-        if let Some(r) = reasoning_effort {
-            ctx.insert("reasoning_effort".into(), Value::String(r.into()));
+        if self.hy4 {
+            // The Hy4-flash template takes only reasoning_effort: no_think, high (default) or max.
+            let effort = match (enable_thinking, reasoning_effort) {
+                (Some(false), _) | (_, Some("none" | "minimal" | "no_think")) => "no_think",
+                (_, Some("max" | "xhigh")) => "max",
+                _ => "high",
+            };
+            ctx.insert("reasoning_effort".into(), Value::String(effort.into()));
+        } else if self.inkling {
+            // The Inkling template takes only reasoning_effort (none .. max); thinking off is "none".
+            let effort = match (enable_thinking, reasoning_effort) {
+                (_, Some(e)) => Some(e),
+                (Some(false), None) => Some("none"),
+                _ => None,
+            };
+            if let Some(e) = effort {
+                ctx.insert("reasoning_effort".into(), Value::String(e.into()));
+            }
+        } else {
+            if let Some(e) = enable_thinking {
+                ctx.insert("enable_thinking".into(), Value::Bool(e));
+            }
+            if let Some(r) = reasoning_effort {
+                ctx.insert("reasoning_effort".into(), Value::String(r.into()));
+            }
         }
         Ok(tmpl.render(minijinja::Value::from_serialize(&ctx))?)
     }
@@ -263,9 +318,117 @@ impl Chat {
 
     pub fn decode(&self, ids: &[i32], skip_special: bool) -> Result<String> {
         let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-        self.tokenizer
+        if self.inkling {
+            let ids: Vec<i32> = ids.iter().map(|&i| i as i32).collect();
+            return self.inkling_text(&ids, &mut InkState::Outside);
+        }
+        let text = self
+            .tokenizer
             .decode(&ids, skip_special)
-            .map_err(|e| anyhow!("detokenize: {e}"))
+            .map_err(|e| anyhow!("detokenize: {e}"))?;
+        Ok(if self.hy4 { hy4_plain_tags(&text) } else { text })
+    }
+
+    /// Inkling output from `state` on, with its message tokens as plain tags: thinking as
+    /// `<think>...</think>`, a tool call as `<tool_call>\n{json}\n</tool_call>` (the call's header name
+    /// dropped), text messages as their text; `state` advances to the end of `ids`.
+    pub fn inkling_text(&self, ids: &[i32], state: &mut InkState) -> Result<String> {
+        let mut out = String::new();
+        let mut run: Vec<u32> = Vec::new();
+        let flush = |run: &mut Vec<u32>, out: &mut String| -> Result<()> {
+            if !run.is_empty() {
+                out.push_str(&self.tokenizer.decode(run, false).map_err(|e| anyhow!("detokenize: {e}"))?);
+                run.clear();
+            }
+            Ok(())
+        };
+        for &id in ids {
+            let special = match id {
+                ink::MESSAGE_MODEL => Some((InkState::Header, "")),
+                ink::THINKING => Some((InkState::Thinking, "<think>")),
+                ink::TEXT => Some((InkState::Text, "")),
+                ink::TOOL_JSON | ink::TOOL_TEXT => Some((InkState::Tool, "<tool_call>\n")),
+                ink::END_MESSAGE => Some((
+                    InkState::Outside,
+                    match state {
+                        InkState::Thinking => "</think>",
+                        InkState::Tool => "\n</tool_call>",
+                        _ => "",
+                    },
+                )),
+                _ if self.tokenizer.id_to_token(id as u32).is_some_and(|t| t.starts_with("<|") && t.ends_with("|>")) => {
+                    Some((*state, ""))
+                }
+                _ => None,
+            };
+            match special {
+                Some((next, text)) => {
+                    flush(&mut run, &mut out)?;
+                    out.push_str(text);
+                    *state = next;
+                }
+                // A tool call's header names the function (the JSON body names it again).
+                None if *state == InkState::Header => {}
+                None => run.push(id as u32),
+            }
+        }
+        flush(&mut run, &mut out)?;
+        Ok(out)
+    }
+
+    /// Whether a rendered prompt ends inside an open reasoning block.
+    pub fn opens_thinking(&self, text: &str) -> bool {
+        text.ends_with("<think>\n") || (self.hy4 && text.ends_with("<think:opensource>"))
+    }
+}
+
+/// Hy4-flash output with its tags in the plain spelling the server parses: `<think>`, `<tool_call>`,
+/// `<arg_key>`, `<arg_value>` (the `<tool_calls>` wrapper is dropped).
+pub fn hy4_plain_tags(text: &str) -> String {
+    if !text.contains(":opensource>") {
+        return text.to_string();
+    }
+    text.replace("<tool_calls:opensource>", "")
+        .replace("</tool_calls:opensource>", "")
+        .replace(":opensource>", ">")
+}
+
+/// Inkling 2 message token ids.
+mod ink {
+    pub const MESSAGE_MODEL: i32 = 200001;
+    pub const TEXT: i32 = 200004;
+    pub const THINKING: i32 = 200008;
+    pub const END_MESSAGE: i32 = 200010;
+    pub const TOOL_JSON: i32 = 200049;
+    pub const TOOL_TEXT: i32 = 200057;
+}
+
+/// Where an Inkling output stands: outside a message, in a message header (before its content token),
+/// or in thinking, text or tool-call content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InkState {
+    #[default]
+    Outside,
+    Header,
+    Thinking,
+    Text,
+    Tool,
+}
+
+/// `v` with every object's keys in sorted order.
+fn sorted_json(v: &Value) -> Value {
+    match v {
+        Value::Array(a) => Value::Array(a.iter().map(sorted_json).collect()),
+        Value::Object(o) => {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            let mut m = serde_json::Map::new();
+            for k in keys {
+                m.insert(k.clone(), sorted_json(&o[k]));
+            }
+            Value::Object(m)
+        }
+        other => other.clone(),
     }
 }
 
@@ -294,15 +457,23 @@ pub struct TextStream {
     /// length of the generation.
     prefix: usize,
     read: usize,
+    /// Inkling: the output's state at `prefix`.
+    ink: InkState,
 }
 
 impl TextStream {
     /// A stream continuing after `ids` (already shown).
-    pub fn after(_chat: &Chat, ids: &[i32]) -> Result<Self> {
+    pub fn after(chat: &Chat, ids: &[i32]) -> Result<Self> {
+        let prefix = ids.len().saturating_sub(6);
+        let mut ink = InkState::Outside;
+        if chat.inkling {
+            chat.inkling_text(&ids[..prefix], &mut ink)?;
+        }
         Ok(Self {
             ids: ids.to_vec(),
-            prefix: ids.len().saturating_sub(6),
+            prefix,
             read: ids.len(),
+            ink,
         })
     }
 
@@ -313,8 +484,16 @@ impl TextStream {
     /// Appends `id`; returns the text it completes (empty while a character is still incomplete).
     pub fn push(&mut self, chat: &Chat, id: i32) -> Result<String> {
         self.ids.push(id);
-        let shown = chat.decode(&self.ids[self.prefix..self.read], true)?;
-        let text = chat.decode(&self.ids[self.prefix..], true)?;
+        let mut at_read = self.ink;
+        let (shown, text) = if chat.inkling {
+            let shown = chat.inkling_text(&self.ids[self.prefix..self.read], &mut at_read)?;
+            (shown, chat.inkling_text(&self.ids[self.prefix..], &mut self.ink.clone())?)
+        } else {
+            (
+                chat.decode(&self.ids[self.prefix..self.read], true)?,
+                chat.decode(&self.ids[self.prefix..], true)?,
+            )
+        };
         if text.len() <= shown.len()
             || text.ends_with('\u{FFFD}')
             || !text.is_char_boundary(shown.len())
@@ -324,6 +503,7 @@ impl TextStream {
         }
         self.prefix = self.read;
         self.read = self.ids.len();
+        self.ink = at_read;
         Ok(text[shown.len()..].to_string())
     }
 }
@@ -363,4 +543,34 @@ mod tests {
             chat.decode(&ids, true).unwrap()
         );
     }
+    /// Inkling's message tokens decode to the plain tags, and streaming yields the same text.
+    #[test]
+    fn inkling_output_maps_to_plain_tags() {
+        let dir = std::path::Path::new("/storage/ai/huggingface/main/thinkingmachines/Inkling-2-Mini");
+        if !dir.join("tokenizer.json").exists() {
+            return;
+        }
+        let chat = Chat::load(dir, None).unwrap();
+        assert!(chat.inkling);
+        let text = "<|message_model|><|content_thinking|>Need weather.<|end_message|><|message_model|><|content_text|>Checking.<|end_message|>\
+                    <|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Århus\"}}<|end_message|>\
+                    <|content_model_end_sampling|>";
+        let ids = chat.encode_plain(text).unwrap();
+        let want = "<think>Need weather.</think>Checking.<tool_call>\n{\"name\":\"get_weather\",\"args\":{\"city\":\"Århus\"}}\n</tool_call>";
+        assert_eq!(chat.decode(&ids, true).unwrap(), want);
+        let mut stream = TextStream::default();
+        let mut out = String::new();
+        for &id in &ids {
+            out += &stream.push(&chat, id).unwrap();
+        }
+        assert_eq!(out, want);
+        let half = ids.len() / 2;
+        let mut stream = TextStream::after(&chat, &ids[..half]).unwrap();
+        let mut rest = String::new();
+        for &id in &ids[half..] {
+            rest += &stream.push(&chat, id).unwrap();
+        }
+        assert_eq!(chat.decode(&ids[..half], true).unwrap() + &rest, want);
+    }
+
 }

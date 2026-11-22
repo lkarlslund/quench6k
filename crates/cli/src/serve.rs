@@ -23,7 +23,10 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::chat::{Chat, TextStream};
 
+mod atlas;
 mod dashboard;
+mod hy4;
+mod inkling;
 
 pub struct ServeOptions {
     pub model: PathBuf,
@@ -52,6 +55,8 @@ pub struct ServeOptions {
     pub plan_tokens: usize,
     pub prefill_share: f64,
     pub capture_dir: Option<PathBuf>,
+    /// Canonical directory of text files atlases may be built from by path.
+    pub atlas_dir: Option<PathBuf>,
     pub vision: bool,
     pub image_max_pixels: usize,
     pub video_max_frames: usize,
@@ -79,10 +84,39 @@ pub fn model_id(model_dir: &std::path::Path) -> String {
 
 enum Work {
     Generate(QueuedJob),
+    /// Logit attribution of the next-token prediction after a prompt.
+    Inspect(InspectJob),
+    /// Neuron statistics over a corpus (see `atlas`).
+    Scan(atlas::ScanJob),
+    /// What neurons write toward.
+    Lens(atlas::LensJob),
     /// Write stored contexts to disk, then acknowledge.
     Persist(mpsc::Sender<()>),
     /// Unload the model once no request is running or queued, then acknowledge.
     Unload(mpsc::Sender<()>),
+}
+
+/// Answers work that cannot run (the model failed to load).
+fn fail_work(w: Work, metrics: &Metrics, msg: &str) {
+    match w {
+        Work::Generate(queued) => {
+            metrics.queued.fetch_sub(1, Ordering::Relaxed);
+            metrics.errors.fetch_add(1, Ordering::Relaxed);
+            let _ = queued.job.tx.send(Msg::Error(msg.to_string()));
+        }
+        Work::Inspect(job) => {
+            let _ = job.tx.send(Err(msg.to_string()));
+        }
+        Work::Scan(job) => {
+            let _ = job.tx.send(Err(msg.to_string()));
+        }
+        Work::Lens(job) => {
+            let _ = job.tx.send(Err(msg.to_string()));
+        }
+        Work::Persist(ack) | Work::Unload(ack) => {
+            let _ = ack.send(());
+        }
+    }
 }
 
 /// Why a GPU worker's scheduler returned.
@@ -107,6 +141,15 @@ struct Job {
     tx: tmpsc::UnboundedSender<Msg>,
     /// Activation capture: the output file and metadata to embed.
     capture: Option<(PathBuf, Value)>,
+}
+
+struct InspectJob {
+    ids: Vec<i32>,
+    params: GenParams,
+    target: Option<i32>,
+    contrast: Option<i32>,
+    edits_last: bool,
+    tx: tokio::sync::oneshot::Sender<std::result::Result<quench6k_engine::inspect::Report, String>>,
 }
 
 struct QueuedJob {
@@ -165,6 +208,10 @@ struct Metrics {
     /// Attention-cache memory mapped per slot (bytes).
     kv_bytes: Vec<AtomicU64>,
     errors: AtomicU64,
+    /// Tool calls aimed at Alibaba's training-time fetch proxy (see [`proxy_call`]), and calls dropped
+    /// because every retry produced one.
+    proxy_calls: AtomicU64,
+    proxy_dropped: AtomicU64,
     /// Requests waiting for a slot, and requests running.
     queued: AtomicU64,
     running: AtomicU64,
@@ -295,6 +342,12 @@ impl Metrics {
         );
         let _ = writeln!(
             out,
+            "# HELP quench6k_proxy_tool_calls_total Tool calls with an Alibaba fetch-proxy URL (regenerated).\n# TYPE quench6k_proxy_tool_calls_total counter\nquench6k_proxy_tool_calls_total {}\n# HELP quench6k_proxy_tool_calls_dropped_total Tool calls dropped because every retry produced a proxy URL.\n# TYPE quench6k_proxy_tool_calls_dropped_total counter\nquench6k_proxy_tool_calls_dropped_total {}",
+            self.proxy_calls.load(Ordering::Relaxed),
+            self.proxy_dropped.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
             "# HELP quench6k_requests_waiting Requests waiting for a slot.\n# TYPE quench6k_requests_waiting gauge\nquench6k_requests_waiting {}",
             self.queued.load(Ordering::Relaxed)
         );
@@ -336,6 +389,8 @@ struct App {
     thinking: bool,
     tool_call_token: Option<i32>,
     capture_dir: Option<PathBuf>,
+    atlas_dir: Option<PathBuf>,
+    atlases: atlas::Atlases,
     model_id: String,
     /// Longest prompt + completion in tokens (per slot), reported as `max_model_len`.
     context: usize,
@@ -365,7 +420,15 @@ impl App {
 
 pub fn run(opts: ServeOptions) -> Result<()> {
     let chat = Chat::load(&opts.model, opts.chat_template.as_deref())?;
-    let tool_call_token = chat.token_id("<tool_call>");
+    // The token a tool-call block starts with (rewinding to it drops the whole block).
+    let tool_call_token = if chat.inkling {
+        // A call's message header precedes its JSON token: no rewinding to the block's start.
+        None
+    } else if chat.hy4 {
+        chat.token_id("<tool_calls:opensource>")
+    } else {
+        chat.token_id("<tool_call>")
+    };
     let (jobs_tx, jobs_rx) = mpsc::channel::<Work>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<f32>>();
     let (model_dir, context, drafts, steer, slots, plan_tokens, prefill_share) = (
@@ -387,14 +450,18 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         model_id: model_id(&opts.model),
     };
     let steering = steer.steering.is_some();
-    let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model);
+    let hy4 = quench6k_engine::hy4::Hy4Model::is_hy4(&opts.model);
+    let inkling = quench6k_engine::inkling::InklingModel::is_inkling(&opts.model);
+    // Flint, Hy4-flash and Inkling 2 run one sequence through their own worker loops, without the
+    // session's features (steering, adapters, vision, edits, stored contexts).
+    let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model) || hy4 || inkling;
     anyhow::ensure!(
         !(flint && steering),
-        "steering packs are not supported for Flint"
+        "steering packs are not supported for this model"
     );
     anyhow::ensure!(
         !(flint && steer.adapter.is_some()),
-        "adapters are not supported for Flint"
+        "adapters are not supported for this model"
     );
     let vision = opts.vision && !flint;
     let metrics = Arc::new(Metrics::new(if flint { 1 } else { slots }));
@@ -405,7 +472,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         // The first load reports to startup (a failure ends the server); later loads are started by a
         // request that found the model unloaded and report failures to the requests waiting.
         let mut ready = Some(ready_tx);
-        let mut waiting: Vec<QueuedJob> = Vec::new();
+        let mut waiting: Vec<Work> = Vec::new();
         loop {
             metrics.model_state.store(MODEL_LOADING, Ordering::Relaxed);
             let t0 = std::time::Instant::now();
@@ -417,7 +484,51 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                     println!("model loaded again in {:.1}s", t0.elapsed().as_secs_f64());
                 }
             };
-            let run = if flint {
+            let run = if inkling {
+                crate::inkling::load(&model_dir).map(|(model, stream)| {
+                    if let Some(tx) = ready.take() {
+                        let _ = tx.send(Ok(0.0));
+                    }
+                    loaded(&metrics);
+                    for slot in &metrics.live {
+                        slot.end(false);
+                    }
+                    let exit = inkling::schedule(
+                        &model,
+                        &stream,
+                        context,
+                        &jobs_rx,
+                        &metrics,
+                        std::mem::take(&mut waiting),
+                        unload_idle,
+                    );
+                    drop(model);
+                    drop(stream);
+                    exit
+                })
+            } else if hy4 {
+                crate::hy4::load(&model_dir).map(|(model, stream)| {
+                    if let Some(tx) = ready.take() {
+                        let _ = tx.send(Ok(0.0));
+                    }
+                    loaded(&metrics);
+                    for slot in &metrics.live {
+                        slot.end(false);
+                    }
+                    let exit = hy4::schedule(
+                        &model,
+                        &stream,
+                        context,
+                        &jobs_rx,
+                        &metrics,
+                        std::mem::take(&mut waiting),
+                        unload_idle,
+                    );
+                    drop(model);
+                    drop(stream);
+                    exit
+                })
+            } else if flint {
                 crate::flint::load(&model_dir).map(|(model, stream)| {
                     if let Some(tx) = ready.take() {
                         let _ = tx.send(Ok(0.0));
@@ -517,21 +628,18 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                         return;
                     }
                     eprintln!("loading the model: {e:#}");
-                    for queued in waiting.drain(..) {
-                        metrics.queued.fetch_sub(1, Ordering::Relaxed);
-                        metrics.errors.fetch_add(1, Ordering::Relaxed);
-                        let _ = queued
-                            .job
-                            .tx
-                            .send(Msg::Error(format!("loading the model: {e:#}")));
+                    for w in waiting.drain(..) {
+                        fail_work(w, &metrics, &format!("loading the model: {e:#}"));
                     }
                 }
             }
             // Unloaded: the next request loads the model again.
             loop {
                 match jobs_rx.recv() {
-                    Ok(Work::Generate(job)) => {
-                        waiting.push(job);
+                    Ok(
+                        w @ (Work::Generate(_) | Work::Inspect(_) | Work::Scan(_) | Work::Lens(_)),
+                    ) => {
+                        waiting.push(w);
                         break;
                     }
                     Ok(Work::Persist(ack) | Work::Unload(ack)) => {
@@ -583,6 +691,8 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         thinking: opts.thinking,
         tool_call_token,
         capture_dir: opts.capture_dir.clone(),
+        atlas_dir: opts.atlas_dir.clone(),
+        atlases: Default::default(),
         model_id: model_id(&opts.model),
         context: opts.context,
         started: now(),
@@ -597,12 +707,20 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         .route("/health", get(health))
         .route("/v1/unload", post(unload))
         .route("/v1/models", get(models))
-        .route("/v1/models/{id}", get(model))
+        .route("/v1/models/{*id}", get(model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/completions", post(completions))
         .route("/tokenize", post(tokenize))
+        .route("/inspect", get(dashboard::inspect_page))
+        .route("/v1/inspect", post(inspect))
+        .route("/atlas", get(dashboard::atlas_page))
+        .route("/v1/atlas", get(atlas::list).post(atlas::create))
+        .route("/v1/atlas/{name}", axum::routing::delete(atlas::delete))
+        .route("/v1/atlas/{name}/neurons", get(atlas::neurons))
+        .route("/v1/atlas/{name}/experts", get(atlas::experts))
+        .route("/v1/lens", post(atlas::lens))
         .route("/detokenize", post(detokenize))
         .route("/metrics", get(metrics_text))
         // axum's default of 2 MB is less than a long conversation with tool output or an image or video data URL.
@@ -644,7 +762,7 @@ fn schedule(
     jobs: &mpsc::Receiver<Work>,
     metrics: &Metrics,
     prefill_share: f64,
-    waiting: Vec<QueuedJob>,
+    waiting: Vec<Work>,
     unload_idle: Option<std::time::Duration>,
 ) -> Exit {
     use quench6k_engine::session::Run;
@@ -667,6 +785,8 @@ fn schedule(
         prompt: usize,
         /// Seconds spent computing the prompt.
         secs: f64,
+        /// A segment of the front scan job (recorded, never decoded).
+        scan: bool,
     }
     let end = |session: &mut Session, slot: usize, failed: bool| {
         metrics.live[slot].end(failed);
@@ -733,7 +853,7 @@ fn schedule(
     };
     let nslots = session.slots();
     let mut slots: Vec<Option<Active>> = (0..nslots).map(|_| None).collect();
-    let mut queue: std::collections::VecDeque<QueuedJob> = waiting.into();
+    let mut queue: std::collections::VecDeque<QueuedJob> = std::collections::VecDeque::new();
     // Unload requests wait until nothing runs or is queued.
     let mut unload: Vec<mpsc::Sender<()>> = Vec::new();
     let mut idle_since = std::time::Instant::now();
@@ -741,11 +861,23 @@ fn schedule(
     let mut prefilling: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
     // Decode time owed to the running requests for the prefill time spent (see --prefill-share).
     let mut decode_credit = 0.0f64;
+    let mut inspects: std::collections::VecDeque<InspectJob> = std::collections::VecDeque::new();
+    let mut scans: std::collections::VecDeque<atlas::ScanJob> = std::collections::VecDeque::new();
     let take = |w: Work,
                 queue: &mut std::collections::VecDeque<QueuedJob>,
                 unload: &mut Vec<mpsc::Sender<()>>,
+                inspects: &mut std::collections::VecDeque<InspectJob>,
+                scans: &mut std::collections::VecDeque<atlas::ScanJob>,
                 session: &mut Session| match w {
         Work::Generate(job) => queue.push_back(job),
+        Work::Inspect(job) => inspects.push_back(job),
+        Work::Scan(job) => scans.push_back(job),
+        Work::Lens(job) => {
+            let r = session
+                .lens(model, s, &job.neurons)
+                .map_err(|e| format!("{e:#}"));
+            let _ = job.tx.send(r);
+        }
         Work::Persist(ack) => {
             if let Err(e) = session.persist() {
                 eprintln!("persisting contexts: {e:#}");
@@ -754,6 +886,17 @@ fn schedule(
         }
         Work::Unload(ack) => unload.push(ack),
     };
+    // Requests that arrived while the model was unloaded.
+    for w in waiting {
+        take(
+            w,
+            &mut queue,
+            &mut unload,
+            &mut inspects,
+            &mut scans,
+            session,
+        );
+    }
     loop {
         if let Err(e) = session.poll_cache() {
             eprintln!("background context persistence: {e:#}");
@@ -762,7 +905,12 @@ fn schedule(
             (slots.iter().flatten().count() + prefilling.len()) as u64,
             Ordering::Relaxed,
         );
-        if slots.iter().all(Option::is_none) && queue.is_empty() && prefilling.is_empty() {
+        if slots.iter().all(Option::is_none)
+            && queue.is_empty()
+            && prefilling.is_empty()
+            && inspects.is_empty()
+            && scans.is_empty()
+        {
             if !unload.is_empty() || unload_idle.is_some_and(|d| idle_since.elapsed() >= d) {
                 // Keep the slots' contexts: the reloaded model starts from the store.
                 if let Err(e) = session.persist() {
@@ -771,13 +919,95 @@ fn schedule(
                 return Exit::Unload(unload);
             }
             match jobs.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(w) => take(w, &mut queue, &mut unload, session),
+                Ok(w) => take(
+                    w,
+                    &mut queue,
+                    &mut unload,
+                    &mut inspects,
+                    &mut scans,
+                    session,
+                ),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Exit::Closed,
             }
         }
         while let Ok(w) = jobs.try_recv() {
-            take(w, &mut queue, &mut unload, session);
+            take(
+                w,
+                &mut queue,
+                &mut unload,
+                &mut inspects,
+                &mut scans,
+                session,
+            );
+        }
+        // Inspections run whole between steps on a free slot (the one holding most of the prompt).
+        while let Some(job) = inspects.front() {
+            let key = quench6k_engine::session::prompt_key(&job.ids, &[]);
+            let free = (0..nslots)
+                .filter(|&i| slots[i].is_none() && !prefilling.iter().any(|p| p.pf.slot() == i))
+                .map(|i| {
+                    let (reusable, held) = session.cached_prefix_key(i, &key, job.params.variant());
+                    (reusable, std::cmp::Reverse(held), std::cmp::Reverse(i))
+                })
+                .max();
+            let Some((_, _, std::cmp::Reverse(slot))) = free else {
+                break;
+            };
+            if !session.admits(slot, job.ids.len(), 1) {
+                break;
+            }
+            let job = inspects.pop_front().unwrap();
+            let t0 = std::time::Instant::now();
+            let r = session
+                .inspect(model, s, slot, &job.ids, &job.params, job.target, job.contrast, job.edits_last)
+                .map_err(|e| format!("{e:#}"));
+            eprintln!(
+                "inspect: slot {slot}, prompt {} in {:.2}s{}",
+                job.ids.len(),
+                t0.elapsed().as_secs_f64(),
+                r.as_ref().err().map_or(String::new(), |e| format!(": {e}"))
+            );
+            let _ = job.tx.send(r);
+        }
+        // Scan jobs: one segment at a time, prefilled like a request (taking turns with running
+        // requests by --prefill-share) with the recorder attached.
+        if let Some(job) = scans.front_mut()
+            && !prefilling.iter().any(|p| p.scan)
+        {
+            let free = (0..nslots)
+                .filter(|&i| slots[i].is_none() && !prefilling.iter().any(|p| p.pf.slot() == i))
+                .min_by_key(|&i| session.cached_prefix_key(i, &[], job.variant).1);
+            if job.tx.is_closed() {
+                scans.pop_front();
+            } else if job.next == job.segments.len() {
+                // Every segment recorded.
+                let job = scans.pop_front().unwrap();
+                let r = job
+                    .recorder
+                    .as_ref()
+                    .map_or(Err(anyhow::anyhow!("empty corpus")), |r| r.download(s))
+                    .map_err(|e| format!("{e:#}"));
+                let _ = job.tx.send(r);
+            } else if let Some(slot) = free
+                && session.admits(slot, job.segment_len(), 1)
+            {
+                match job.start(session, s, slot) {
+                    Ok(pf) => prefilling.push_back(Pending {
+                        prompt: pf.remaining(),
+                        pf,
+                        tx: job.keep.0.clone(),
+                        capture: None,
+                        secs: 0.0,
+                        scan: true,
+                    }),
+                    Err(e) => {
+                        session.end(slot);
+                        let job = scans.pop_front().unwrap();
+                        let _ = job.tx.send(Err(format!("{e:#}")));
+                    }
+                }
+            }
         }
         idle_since = std::time::Instant::now();
         // Admit queued requests into free slots: the one whose GPU cache holds the most of the prompt,
@@ -823,6 +1053,7 @@ fn schedule(
                         capture: job.capture,
                         prompt: job.ids.len(),
                         secs: t0.elapsed().as_secs_f64(),
+                        scan: false,
                     });
                 }
                 Err(e) => {
@@ -867,6 +1098,13 @@ fn schedule(
             }
             match r {
                 Ok(false) => {}
+                Ok(true) if p.scan => {
+                    let p = prefilling.pop_front().unwrap();
+                    session.end(p.pf.slot());
+                    if let Some(job) = scans.front() {
+                        job.done(p.prompt);
+                    }
+                }
                 Ok(true) => {
                     let p = prefilling.pop_front().unwrap();
                     let (slot, reused) = (p.pf.slot(), p.pf.reused());
@@ -896,6 +1134,14 @@ fn schedule(
                             end(session, slot, true);
                             let _ = p.tx.send(Msg::Error(format!("{e:#}")));
                         }
+                    }
+                }
+                Err(e) if p.scan => {
+                    let p = prefilling.pop_front().unwrap();
+                    eprintln!("scanning a corpus segment on slot {}: {e:#}", p.pf.slot());
+                    session.end(p.pf.slot());
+                    if let Some(job) = scans.pop_front() {
+                        let _ = job.tx.send(Err(format!("{e:#}")));
                     }
                 }
                 Err(e) => {
@@ -984,7 +1230,7 @@ fn schedule_flint(
     context: usize,
     jobs: &mpsc::Receiver<Work>,
     metrics: &Metrics,
-    waiting: Vec<QueuedJob>,
+    waiting: Vec<Work>,
     unload_idle: Option<std::time::Duration>,
 ) -> Exit {
     use quench6k_engine::flint as fl;
@@ -1000,9 +1246,8 @@ fn schedule_flint(
         Err(e) => {
             // Unload; the next request tries again.
             eprintln!("flint worker: {e:#}");
-            for queued in waiting {
-                metrics.queued.fetch_sub(1, Ordering::Relaxed);
-                let _ = queued.job.tx.send(Msg::Error(format!("{e:#}")));
+            for w in waiting {
+                fail_work(w, metrics, &format!("{e:#}"));
             }
             return Exit::Unload(Vec::new());
         }
@@ -1010,7 +1255,7 @@ fn schedule_flint(
     let mut waiting = waiting.into_iter();
     loop {
         let w = match (waiting.next(), unload_idle) {
-            (Some(queued), _) => Work::Generate(queued),
+            (Some(w), _) => w,
             (None, Some(idle)) => match jobs.recv_timeout(idle) {
                 Ok(w) => w,
                 Err(mpsc::RecvTimeoutError::Timeout) => return Exit::Unload(Vec::new()),
@@ -1028,6 +1273,22 @@ fn schedule_flint(
             }
             Work::Unload(ack) => return Exit::Unload(vec![ack]),
             Work::Generate(queued) => queued.job,
+            Work::Inspect(job) => {
+                let _ = job
+                    .tx
+                    .send(Err("inspection is not supported for this model".into()));
+                continue;
+            }
+            Work::Scan(job) => {
+                let _ = job
+                    .tx
+                    .send(Err("atlases are not supported for this model".into()));
+                continue;
+            }
+            Work::Lens(job) => {
+                let _ = job.tx.send(Err("not supported for this model".into()));
+                continue;
+            }
         };
         metrics.queued.fetch_sub(1, Ordering::Relaxed);
         if job.ids.len() >= context {
@@ -1343,7 +1604,7 @@ fn prepare(app: &App, req: &Value) -> Result<Prepared, ApiError> {
             .chat
             .decode(&ids[ids.len().saturating_sub(4)..], false)
             .unwrap_or_default();
-        thinking = tail.ends_with("<think>\n");
+        thinking = app.chat.opens_thinking(&tail);
     }
     prepare_ids(app, req, ids, images, thinking, tools)
 }
@@ -1399,7 +1660,7 @@ fn render_chat(
         .chat
         .render(&messages, tools, enable_thinking, effort)
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")))?;
-    let thinking = text.ends_with("<think>\n");
+    let thinking = app.chat.opens_thinking(&text);
     let t1 = std::time::Instant::now();
     let ids = app
         .chat
@@ -1439,6 +1700,57 @@ fn raw_ids(app: &App, prompt: Option<&Value>) -> Result<Vec<i32>, ApiError> {
             "prompt must be a string or a list of token ids (one prompt per request)",
         )),
     }
+}
+
+/// Model edits of a request ("edits": a list). A neuron: {"layer", "expert" or "shared": true, "unit",
+/// "scale" (default 1), "add" (default 0)}; activation = activation * scale + add. A router edit:
+/// {"layer", "expert", "ban": true} or {"layer", "expert", "router_bias"}.
+fn parse_edits(v: Option<&Value>) -> Result<Option<Arc<quench6k_engine::edits::Edits>>, ApiError> {
+    use quench6k_engine::edits::{Edit, Edits};
+    let Some(list) = v.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let bad = |m: &str| error(StatusCode::BAD_REQUEST, format!("edits: {m}"));
+    let list = list.as_array().ok_or_else(|| bad("must be a list"))?;
+    if list.is_empty() {
+        return Ok(None);
+    }
+    let mut edits = Vec::new();
+    for e in list {
+        let int = |k: &str| e.get(k).and_then(Value::as_u64).map(|v| v as usize);
+        let num = |k: &str| e.get(k).and_then(Value::as_f64).map(|v| v as f32);
+        let layer = int("layer").ok_or_else(|| bad("each edit needs a layer"))?;
+        let shared = e.get("shared").and_then(Value::as_bool).unwrap_or(false);
+        let expert = int("expert");
+        edits.push(if let Some(unit) = int("unit") {
+            if expert.is_some() == shared {
+                return Err(bad("a neuron edit names an expert or \"shared\": true"));
+            }
+            Edit::Neuron {
+                layer,
+                expert,
+                unit,
+                scale: num("scale").unwrap_or(1.0),
+                add: num("add").unwrap_or(0.0),
+            }
+        } else {
+            let expert = expert.ok_or_else(|| bad("a router edit names an expert"))?;
+            let bias = if e.get("ban").and_then(Value::as_bool) == Some(true) {
+                f32::NEG_INFINITY
+            } else {
+                num("router_bias")
+                    .ok_or_else(|| bad("a router edit needs \"ban\" or \"router_bias\""))?
+            };
+            Edit::Router {
+                layer,
+                expert,
+                bias,
+            }
+        });
+    }
+    Edits::new(edits)
+        .map(|e| Some(Arc::new(e)))
+        .map_err(|e| bad(&format!("{e:#}")))
 }
 
 /// Sampling and request options common to the chat and raw completion endpoints.
@@ -1571,14 +1883,23 @@ fn prepare_ids(
         capture: capture.is_some(),
         images,
         progress: None,
+        edits: parse_edits(req.get("edits"))?,
+        record: None,
+        fresh: false,
     };
+    if app.flint && params.edits.is_some() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "edits are not supported for this model",
+        ));
+    }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let progress = stream
         && req
             .get("return_progress")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let mtp = req.get("mtp").and_then(Value::as_bool).unwrap_or(true);
+    let mtp = req.get("mtp").and_then(Value::as_bool).unwrap_or(true) && params.edits.is_none();
     Ok(Prepared {
         capture,
         ids,
@@ -1735,7 +2056,8 @@ fn parse_tool_call(body: &str, tools: Option<&Value>) -> Option<Value> {
     if body.trim_start().starts_with('{') {
         let v: Value = serde_json::from_str(body.trim()).ok()?;
         let name = v.get("name")?.as_str()?.to_string();
-        let args = match v.get("arguments") {
+        // Inkling names them "args".
+        let args = match v.get("arguments").or_else(|| v.get("args")) {
             Some(Value::String(a)) => serde_json::from_str::<Value>(a).ok()?,
             Some(a @ Value::Object(_)) => a.clone(),
             None => json!({}),
@@ -2070,7 +2392,10 @@ async fn drive(
 /// Runs a prepared request to completion. When the output contains tool calls that fail validation,
 /// the text before the first `<tool_call>` is kept and the call is regenerated from there (sampled, a
 /// new seed per attempt) up to `tool_retries` times, so a malformed call is retried instead of being
-/// returned as text. Returns (segmenter, generated tokens, finish, cached prompt tokens).
+/// returned as text. A call with a URL of Alibaba's fetch proxy ([`proxy_call`]) is treated as invalid
+/// and retried at least [`PROXY_RETRIES`] times; if every attempt produces one, the calls are dropped
+/// and the text before them returned. Returns (segmenter, generated tokens, finish, cached prompt
+/// tokens).
 async fn generate(
     app: &App,
     p: &Prepared,
@@ -2081,7 +2406,7 @@ async fn generate(
     let (mut total, mut cached_first) = (0usize, None);
     let mut params = p.params.clone();
     let mut ids = p.ids.clone();
-    for attempt in 0..=app.tool_retries {
+    for attempt in 0.. {
         let (tx, mut rx) = tmpsc::unbounded_channel();
         if p.progress {
             let ptx = tx.clone();
@@ -2122,7 +2447,17 @@ async fn generate(
         } else {
             seg.text.as_str()
         };
+        let proxy = proxy_call(body);
+        if proxy {
+            app.metrics.proxy_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        let retries = if proxy {
+            app.tool_retries.max(PROXY_RETRIES)
+        } else {
+            app.tool_retries
+        };
         let problem = match validate_calls(body, tools) {
+            Ok(()) if proxy => Some("URL of Alibaba's fetch proxy".to_string()),
             // QUENCH6K_TEST_TOOL_RETRY: treat the first attempt's tool calls as invalid (exercises retries).
             Ok(())
                 if attempt == 0
@@ -2141,8 +2476,17 @@ async fn generate(
         let Some(at) = generated.iter().position(|&t| t == tc) else {
             return Ok((seg, total, finish, cached_first.unwrap_or(0)));
         };
-        if attempt == app.tool_retries || params.max_tokens <= n {
+        if attempt >= retries || params.max_tokens <= n {
             eprintln!("tool call still invalid after {attempt} retries: {problem}");
+            if proxy {
+                // Never hand out a proxy call: keep only the text before it.
+                app.metrics.proxy_dropped.fetch_add(1, Ordering::Relaxed);
+                seg.text = app
+                    .chat
+                    .decode(&generated[..at], true)
+                    .map_err(|e| format!("{e:#}"))?;
+                seg.sent = seg.sent.min(seg.text.len());
+            }
             return Ok((seg, total, finish, cached_first.unwrap_or(0)));
         }
         eprintln!(
@@ -2165,6 +2509,36 @@ async fn generate(
         params.seed = params.seed.wrapping_add(0x9e37_79b9 * (attempt as u64 + 1));
     }
     unreachable!()
+}
+
+/// Minimum retries for a tool call with a fetch-proxy URL (they come back in a few percent of
+/// resamples, so the configured `tool_retries` may be too few).
+const PROXY_RETRIES: usize = 4;
+
+/// Whether a `<tool_call>` block contains a URL of the fetch proxy Qwen3.8 models learned in training
+/// (`routify-file-proxy-sg.oss-ap-southeast-1.aliyuncs.com/proxy_temp_file/production/...` with an
+/// invented signature, or the `routify.alibaba-inc.com` gateway). The model writes these instead of
+/// the URL it means in roughly 1% of URL-bearing calls; a client that runs the call contacts
+/// Alibaba Cloud.
+fn proxy_call(body: &str) -> bool {
+    const MARKERS: [&str; 3] = [
+        "routify-file-proxy",
+        "routify.alibaba-inc",
+        "proxy_temp_file/production",
+    ];
+    let mut cursor = 0;
+    while let Some(start) = body[cursor..].find("<tool_call>") {
+        let b0 = cursor + start;
+        let end = body[b0..]
+            .find("</tool_call>")
+            .map_or(body.len(), |e| b0 + e);
+        let block = body[b0..end].to_ascii_lowercase();
+        if MARKERS.iter().any(|m| block.contains(m)) {
+            return true;
+        }
+        cursor = end;
+    }
+    false
 }
 
 /// Checks every `<tool_call>` block: it parses, is closed, names a declared function, has the required
@@ -2588,6 +2962,104 @@ async fn tokenize(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Respon
     }
 }
 
+/// `/v1/inspect`: splits the logit of the next token after a prompt ("messages", rendered with the
+/// generation prompt, or a raw "prompt") into the parts of the model that wrote it. "target" is the
+/// token to explain (an id or text; default: the most likely next token); "model" picks the variant.
+async fn inspect(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
+    if app.flint {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "inspection is not supported for this model",
+        )
+        .into_response();
+    }
+    let p = if req.get("messages").is_some() {
+        prepare(&app, &req)
+    } else {
+        raw_ids(&app, req.get("prompt"))
+            .and_then(|ids| prepare_ids(&app, &req, ids, Vec::new(), false, None))
+    };
+    let p = match p.and_then(|p| check_context(&app, &p).map(|()| p)) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    if !p.params.images.is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "inspection of image prompts is not supported",
+        )
+        .into_response();
+    }
+    // "target" and "contrast": a token id, or text (its first token).
+    let token = |key: &str| -> Result<Option<i32>, ApiError> {
+        match req.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(n)) => Ok(n.as_i64().map(|v| v as i32)),
+            Some(Value::String(t)) if !t.is_empty() => match app.chat.encode(t) {
+                Ok(ids) if !ids.is_empty() => Ok(Some(ids[0])),
+                _ => Err(error(
+                    StatusCode::BAD_REQUEST,
+                    format!("{key} must encode to a token"),
+                )),
+            },
+            _ => Err(error(
+                StatusCode::BAD_REQUEST,
+                format!("{key} must be a token id or text"),
+            )),
+        }
+    };
+    let (target, contrast) = match (token("target"), token("contrast")) {
+        (Ok(t), Ok(c)) => (t, c),
+        (Err(e), _) | (_, Err(e)) => return e.into_response(),
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let job = InspectJob {
+        ids: p.ids.clone(),
+        params: p.params.clone(),
+        target,
+        contrast,
+        edits_last: req.get("edits_at").and_then(Value::as_str) == Some("last"),
+        tx,
+    };
+    if app.jobs.send(Work::Inspect(job)).is_err() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "worker stopped").into_response();
+    }
+    let report = match rx.await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "worker stopped").into_response(),
+    };
+    // Texts of every token the report names, and of the prompt's end (the inspected token last).
+    let mut named: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+    named.insert(report.target);
+    named.extend(report.contrast);
+    named.extend(report.top.iter().map(|t| t.id));
+    for l in &report.layers {
+        let pushes = [&l.mixer_pushes, &l.moe_pushes]
+            .into_iter()
+            .chain(l.experts.iter().map(|e| &e.pushes))
+            .flatten();
+        for ps in pushes {
+            named.extend(ps.up.iter().chain(&ps.down).map(|t| t.id));
+        }
+    }
+    let context = &p.ids[p.ids.len().saturating_sub(48)..];
+    named.extend(context.iter().copied());
+    let text = |id: i32| app.chat.decode(&[id], false).unwrap_or_default();
+    let tokens: serde_json::Map<String, Value> = named
+        .iter()
+        .map(|&id| (id.to_string(), json!(text(id))))
+        .collect();
+    Json(json!({
+        "model": p.model,
+        "prompt_tokens": p.ids.len(),
+        "context": context,
+        "tokens": tokens,
+        "report": report,
+    }))
+    .into_response()
+}
+
 /// `/detokenize`: the text of `tokens` (special tokens included), as vLLM's `prompt` and llama.cpp's
 /// `content`.
 async fn detokenize(State(app): State<Arc<App>>, Json(req): Json<Value>) -> Response {
@@ -2901,6 +3373,12 @@ mod tests {
                 .unwrap_err()
                 .contains("not a integer")
         );
+        let proxy = "<tool_call>\n<function=get_weather>\n<parameter=city>\nhttps://routify-file-proxy-sg.oss-ap-southeast-1.aliyuncs.com/proxy_temp_file/production/2026-10-23/x?Expires=1\n</parameter>\n</function>\n</tool_call>";
+        assert!(proxy_call(proxy));
+        assert!(proxy_call(&proxy.to_uppercase().replace("TOOL_CALL", "tool_call")));
+        assert!(!proxy_call(ok));
+        assert!(!proxy_call("routify-file-proxy mentioned outside a call"));
+        assert!(!proxy_call("<tool_call>\n<function=f>\n<parameter=url>\nhttps://help.aliyun.com/\n</parameter>\n</function>\n</tool_call>"));
         let json_style = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n</tool_call>";
         assert!(
             validate_calls(json_style, &tools()).is_ok(),
@@ -3014,7 +3492,7 @@ fn write_capture(
             "F32",
             L::TOP_W,
             vec![10],
-            L::BYTES - L::TOP_W,
+            L::INJ_ATTN - L::TOP_W,
         ),
     ];
     let mut header = serde_json::Map::new();

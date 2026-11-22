@@ -166,7 +166,23 @@ table was stored uncompressed (2026-10-26).
 critical-path contribution: its end minus the latest earlier end. Raw durations under PDL include
 the wait on the predecessor and add up to ~2x the busy time; the credits add up to it exactly. Weight
 loads issued before `griddepcontrol.wait` are credited to the predecessor, so a kernel's credit is
-what it costs after its inputs are ready. `--shape` splits by grid and stream (which GEMV is which).
+what it costs after its inputs are ready. `--shape` splits by grid and stream (which GEMV is which);
+`--side REGEX` keeps side-stream kernels (L2 prefetches) out of the chain.
+
+`--record NAME -- <bench command>` runs nsys itself with node-level graph tracing and GPU metrics
+sampled at 200 kHz (5 us), then reports. With the samples each kernel's credited time also gets the
+DRAM read bandwidth measured during it (percent of peak), and a summary line gives its distribution
+over the busy time. Decode is a memory-bound chain with latency-bound links: the summary says how much
+of the step leaves DRAM idle, and the column says which links do. Node tracing adds a few percent per
+round; the bench's own number is the one without it.
+
+### A/B
+
+`tools/ab.py` runs variants of a bench command interleaved (A B B A per round, `--runs` rounds) and
+prints each throughput's median and range per variant with the change against the first. Variants are
+environment settings (`-v off:QUENCH6K_INK_ATTN_FUSED=0`) or another binary (`--bin old=PATH`).
+Interleaving cancels clock and temperature drift: Inkling decode repeats within 0.1-0.2%, so 1%
+differences are real, where a single A-then-B pair could not tell them from drift.
 
 2026-10-27, full model, fp8 KV, 64K context, MTP 3 (4-row verify), 20 rounds, 600 W: 8.87 ms busy
 per round (verify ~8.1, draft ~0.77), 957 kernels, 0.23 ms idle.

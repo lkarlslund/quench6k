@@ -38,22 +38,44 @@ pub struct GenParams {
     pub images: Vec<std::sync::Arc<ImageInput>>,
     /// Called during prefill with (prompt tokens computed so far, of which served from cache).
     pub progress: Option<Progress>,
+    /// Model edits (the request decodes alone and eagerly; see [`crate::edits`]).
+    pub edits: Option<std::sync::Arc<crate::edits::Edits>>,
+    /// Atlas recording of the prompt's expert activations: the recorder and the corpus token of prompt
+    /// position 0.
+    pub record: Option<(std::sync::Arc<crate::atlas::Recorder>, usize)>,
+    /// Compute the whole prompt (no cached prefix is reused).
+    pub fresh: bool,
 }
 
 impl GenParams {
-    /// (steering strength, adapter scale): which variant of the model the request runs.
-    pub fn variant(&self) -> (f32, f32) {
-        (self.steering_strength, self.adapter_scale)
+    /// Which variant of the model the request runs.
+    pub fn variant(&self) -> Variant {
+        (
+            self.steering_strength,
+            self.adapter_scale,
+            self.edits.as_ref().map_or(0, |e| e.id),
+        )
     }
 }
 
+/// A model variant: (steering strength, adapter scale, edit set ID or 0). Cached states are only
+/// reused within a variant.
+pub type Variant = (f32, f32, u64);
+
 /// The context store's tag of a model variant ("" for the base model).
-fn variant_tag((strength, adapter): (f32, f32)) -> String {
-    if (strength, adapter) == (0.0, 0.0) {
+fn variant_tag((strength, adapter, edits): Variant) -> String {
+    let mut tag = if (strength, adapter) == (0.0, 0.0) {
         String::new()
     } else {
         format!("steer={strength}/adapter={adapter}")
+    };
+    if edits != 0 {
+        tag += &format!(
+            "{}edits={edits:016x}",
+            if tag.is_empty() { "" } else { "/" }
+        );
     }
+    tag
 }
 
 /// A prefill progress callback: (prompt tokens computed so far, of which served from cache).
@@ -210,7 +232,7 @@ struct Lane {
     /// Recurrent-state snapshots at prompt positions, oldest first.
     snapshots: Vec<Snapshot>,
     /// Steering strength and adapter scale the cached state was computed with (reuse needs the same).
-    kv_variant: (f32, f32),
+    kv_variant: Variant,
     /// Prompt tokens served from the cache in the slot's last request.
     reused: usize,
     /// A request is running on the slot (its context cannot be evicted).
@@ -256,7 +278,7 @@ impl Lane {
             kv_tokens: Vec::new(),
             kv_marks: Vec::new(),
             snapshots: Vec::new(),
-            kv_variant: (0.0, 0.0),
+            kv_variant: (0.0, 0.0, 0),
             reused: 0,
             busy: false,
             used: std::time::Instant::now(),
@@ -682,6 +704,83 @@ impl Session {
         }))
     }
 
+    /// Inspects the next-token prediction after `prompt` on idle `slot`: prefills all but the last
+    /// token (reusing cached prefixes), runs the last one as a single-token step with activation
+    /// capture, and splits the logit of `target` (default: the most likely token) into its parts.
+    /// With `edits_last`, the request's edits apply to the inspected token only: the prefix is the
+    /// unedited model's (and reuses its cache), and the slot's state is dropped afterwards so the
+    /// edited token is never reused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inspect(
+        &mut self,
+        model: &Model,
+        s: &Stream,
+        slot: usize,
+        prompt: &[i32],
+        p: &GenParams,
+        target: Option<i32>,
+        contrast: Option<i32>,
+        edits_last: bool,
+    ) -> Result<crate::inspect::Report> {
+        ensure!(
+            prompt.len() >= 2,
+            "inspection needs at least two prompt tokens"
+        );
+        let mut p = p.clone();
+        p.capture = false;
+        p.max_tokens = 1;
+        p.temperature = 0.0;
+        let edits_last = edits_last && p.edits.is_some();
+        let raw = (|| {
+            let (last, head) = prompt.split_last().unwrap();
+            let head_params = GenParams {
+                edits: if edits_last { None } else { p.edits.clone() },
+                ..p.clone()
+            };
+            self.begin(model, s, slot, head, &head_params, false)?;
+            let buf = self.capture_buf()?;
+            let lane = &mut self.lanes[slot];
+            let pos = lane.state.len();
+            self.ws.capture = Some(forward::CaptureTarget { pos, buf });
+            if let Some(e) = &p.edits {
+                e.upload(s)?;
+            }
+            self.ws.edits = p.edits.clone();
+            let r = forward::forward(model, &mut lane.state, &mut self.ws, s, &[*last]);
+            self.ws.capture = None;
+            self.ws.edits = None;
+            r?;
+            lane.sync_kv_tokens();
+            if edits_last {
+                lane.kv_tokens.clear();
+                lane.kv_marks.clear();
+                lane.snapshots.clear();
+                lane.state.tokens.clear();
+                lane.state.trim_kv(0)?;
+            }
+            forward::head_logits(model, &self.hw, s, self.ws.out)?;
+            Ok::<_, anyhow::Error>(crate::inspect::Raw {
+                records: s.download(buf, crate::model::LAYERS * CAPTURE_LAYER_BYTES)?,
+                h: s.download(self.ws.h, crate::model::H)?,
+                u: forward::final_gates(model, &self.ws, s)?,
+                out: s.download(self.ws.out, crate::model::D)?,
+                logits: s.download(self.hw.logits_addr(), VOCAB)?,
+            })
+        })();
+        self.end(slot);
+        crate::inspect::analyze(model, s, &self.hw_batch, &raw?, target, contrast)
+    }
+
+    /// What neurons write toward (see [`crate::inspect::lens`]).
+    pub fn lens(
+        &self,
+        model: &Model,
+        s: &Stream,
+        neurons: &[crate::atlas::NeuronId],
+    ) -> Result<Vec<crate::inspect::Pushes>> {
+        crate::inspect::lens(model, s, &self.hw_batch, neurons)
+    }
+
     /// Adds slots up to `slots` (at most [`MAX_SLOTS`]), each with speculative decoding and a prefix
     /// cache of its own. Concurrent requests decode in group rounds (speculative) or batched steps
     /// (plain). Attention-cache memory is mapped as the slots' contexts grow; when the device is full,
@@ -998,12 +1097,7 @@ impl Session {
 
     /// As [`cached_prefix`](Self::cached_prefix), using an already prepared content-aware key.
     /// This path never visits image pixels and is safe to repeat while a request waits for memory.
-    pub fn cached_prefix_key(
-        &self,
-        slot: usize,
-        key: &[i32],
-        variant: (f32, f32),
-    ) -> (usize, usize) {
+    pub fn cached_prefix_key(&self, slot: usize, key: &[i32], variant: Variant) -> (usize, usize) {
         let lane = &self.lanes[slot];
         let reusable = if lane.kv_variant == variant {
             lane.cached_prefix(key)
@@ -1075,12 +1169,13 @@ impl Session {
             &p.boundaries,
             p.variant(),
             p.progress.as_ref(),
+            p.fresh,
         )?;
         Ok(Prefill {
             run,
             prompt: prompt.to_vec(),
             plan,
-            speculate: speculate && !p.capture,
+            speculate: speculate && !p.capture && p.edits.is_none(),
         })
     }
 
@@ -1120,6 +1215,11 @@ impl Session {
             stop
         };
         self.ws.capture = capture;
+        if let Some(e) = &pf.run.params.edits {
+            e.upload(s)?;
+        }
+        self.ws.edits = pf.run.params.edits.clone();
+        self.ws.record = pf.run.params.record.clone();
         let progress = pf.run.params.progress.clone();
         let chunk = if capture.is_some() || self.lanes[slot].dec.dflash.is_some() {
             self.chunk
@@ -1137,6 +1237,8 @@ impl Session {
             progress.as_ref(),
         );
         self.ws.capture = None;
+        self.ws.edits = None;
+        self.ws.record = None;
         r?;
         if let Some(c) = capture {
             let logits = self.lanes[slot].dec.last_logits_addr();
@@ -1201,7 +1303,33 @@ impl Session {
         }
         let mut out = vec![Vec::new(); runs.len()];
         let spec: Vec<usize> = (0..runs.len()).filter(|&i| runs[i].spec).collect();
-        let plain: Vec<usize> = (0..runs.len()).filter(|&i| !runs[i].spec).collect();
+        // Edited runs step alone and eagerly.
+        let edited: Vec<usize> = (0..runs.len())
+            .filter(|&i| !runs[i].spec && runs[i].params.edits.is_some())
+            .collect();
+        let plain: Vec<usize> = (0..runs.len())
+            .filter(|&i| !runs[i].spec && runs[i].params.edits.is_none())
+            .collect();
+        for &i in &edited {
+            let run = &mut *runs[i];
+            let lane = &mut self.lanes[run.slot];
+            lane.pen.generated(s, run.pending)?;
+            self.ws.edits = run.params.edits.clone();
+            let r = forward::forward(model, &mut lane.state, &mut self.ws, s, &[run.pending]);
+            self.ws.edits = None;
+            r?;
+            forward::head_logits(model, &self.hw, s, self.ws.out)?;
+            lane.sync_kv_tokens();
+            let tok = self.sample(
+                s,
+                self.hw.logits_addr(),
+                &run.params.clone(),
+                &self.lanes[run.slot].pen,
+                &mut run.rng,
+            )?;
+            run.pending = tok;
+            out[i] = vec![tok];
+        }
         if let [i] = spec[..] {
             let lane = &mut self.lanes[runs[i].slot];
             out[i] = lane
@@ -1420,11 +1548,12 @@ impl Session {
         prompt: &[i32],
         images: &[std::sync::Arc<ImageInput>],
         boundaries: &[usize],
-        variant: (f32, f32),
+        variant: Variant,
         progress: Option<&Progress>,
     ) -> Result<()> {
-        let mut plan =
-            self.prefill_setup(s, slot, prompt, images, boundaries, variant, progress)?;
+        let mut plan = self.prefill_setup(
+            s, slot, prompt, images, boundaries, variant, progress, false,
+        )?;
         self.prefill_advance(
             model,
             s,
@@ -1447,8 +1576,9 @@ impl Session {
         prompt: &[i32],
         images: &[std::sync::Arc<ImageInput>],
         boundaries: &[usize],
-        variant: (f32, f32),
+        variant: Variant,
         progress: Option<&Progress>,
+        fresh: bool,
     ) -> Result<PrefillPlan> {
         // Memory for the whole prompt (a stored context loaded below is a prefix of it).
         self.ensure_kv(slot, prompt.len() + 2 * (self.lanes[slot].dec.drafts + 2))?;
@@ -1463,19 +1593,23 @@ impl Session {
         let lane = &self.lanes[slot];
         let marks = image_marks(images);
         let key = keyed(prompt, &marks);
-        let mut lcp = lane
-            .kv_tokens
-            .iter()
-            .zip(&key)
-            .take_while(|(a, b)| a == b)
-            .count();
+        let mut lcp = if fresh {
+            0
+        } else {
+            lane.kv_tokens
+                .iter()
+                .zip(&key)
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
         if self.store.enabled() {
             // The new prompt overwrites the cached conversation past `lcp`: keep its boundary state.
             if lane.snapshots.iter().any(|sn| sn.pos > lcp) {
                 self.stash(slot, usize::MAX)?;
             }
             let gpu_best = self.lanes[slot].cached_prefix(&key);
-            if let Some((i, len)) = self.store.best(&key, &variant_tag(variant)) {
+            if fresh {
+            } else if let Some((i, len)) = self.store.best(&key, &variant_tag(variant)) {
                 if len > gpu_best {
                     match self.load_entry(s, slot, i) {
                         Ok(()) => lcp = len,

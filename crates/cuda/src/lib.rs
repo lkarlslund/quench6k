@@ -112,6 +112,22 @@ pub mod ffi {
             accumulate: c_int,
             stream: Stream,
         ) -> Error;
+        pub fn quench6k_gemm_bf16_batched(
+            x: *const c_void,
+            ldx: c_int,
+            xs: usize,
+            w: *const c_void,
+            ldw: c_int,
+            ws: usize,
+            y: *mut c_void,
+            ldy: c_int,
+            ys: usize,
+            m: c_int,
+            n: c_int,
+            k: c_int,
+            batch: c_int,
+            stream: Stream,
+        ) -> Error;
         pub fn quench6k_vit_layernorm(
             x: *const f32,
             t: c_int,
@@ -178,6 +194,28 @@ pub mod ffi {
             stream: Stream,
         ) -> Error;
         pub fn quench6k_gemv_max_m() -> c_int;
+        pub fn quench6k_gemv_seg(
+            fmt: c_int,
+            m: c_int,
+            x0: *const c_void,
+            x1: *const c_void,
+            x2: *const c_void,
+            ldx: c_int,
+            w: *const c_void,
+            scale: *const f32,
+            y0: *mut f32,
+            y1: *mut f32,
+            y2: *mut f32,
+            ldy0: c_int,
+            ldy1: c_int,
+            ldy2: c_int,
+            end0: c_int,
+            end1: c_int,
+            segments: c_int,
+            n: c_int,
+            k: c_int,
+            stream: Stream,
+        ) -> Error;
         pub fn quench6k_gemv(
             fmt: c_int,
             m: c_int,
@@ -549,6 +587,83 @@ pub mod ffi {
             pair_row: *mut i32,
             act: *mut c_void,
             yd: *mut f32,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_moe_t1_gate_up(
+            m: *const c_void,
+            logits: *const f32,
+            gw: *const u64,
+            gs: *const u64,
+            g2: *const f32,
+            uw: *const u64,
+            us: *const u64,
+            u2: *const f32,
+            top_i: *mut i32,
+            top_w: *mut f32,
+            pair_row: *mut i32,
+            act: *mut c_void,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_moe_t1_down(
+            act: *const c_void,
+            dw: *const u64,
+            ds: *const u64,
+            d2: *const f32,
+            top_i: *const i32,
+            yd: *mut f32,
+            logits: *const f32,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_atlas_record(
+            act: *const c_void,
+            top_i: *const i32,
+            pair_row: *const i32,
+            pairs: c_int,
+            token0: c_int,
+            sum: *mut f32,
+            top: *mut u64,
+            counts: *mut u32,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_nvfp4_columns(
+            dw: *const u64,
+            ds: *const u64,
+            d2: *const f32,
+            experts: *const i32,
+            units: *const i32,
+            count: c_int,
+            out: *mut f32,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_edit_act(
+            act: *mut c_void,
+            top_i: *const i32,
+            pair_row: *const i32,
+            pairs: c_int,
+            experts: *const i32,
+            units: *const i32,
+            scale: *const f32,
+            add: *const f32,
+            n: c_int,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_router_bias(
+            logits: *mut f32,
+            ld: c_int,
+            t: c_int,
+            experts: *const i32,
+            bias: *const f32,
+            n: c_int,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_nvfp4_column_dots(
+            dw: *const u64,
+            ds: *const u64,
+            d2: *const f32,
+            experts: *const i32,
+            pairs: c_int,
+            r: *const f32,
+            out: *mut f32,
             stream: Stream,
         ) -> Error;
         pub fn quench6k_quantize_nvfp4(
@@ -955,6 +1070,57 @@ pub mod ffi {
             rscale: *mut f32,
             stream: Stream,
         ) -> Error;
+        pub fn quench6k_fp4_quant_rows2(
+            x: *const c_void,
+            rows: c_int,
+            k: c_int,
+            codes: *mut u8,
+            scales: *mut u8,
+            rscale: *mut f32,
+            codes2: *mut u8,
+            scales2: *mut u8,
+            codes3: *mut u8,
+            scales3: *mut u8,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_fp4_gather2(
+            codes: *const u8,
+            scales: *const u8,
+            rscale: *const f32,
+            codes2: *const u8,
+            scales2: *const u8,
+            pair_row: *const i32,
+            t: c_int,
+            k: c_int,
+            topk: c_int,
+            gcodes: *mut u8,
+            gscales: *mut u8,
+            grscale: *mut f32,
+            gcodes2: *mut u8,
+            gscales2: *mut u8,
+            stream: Stream,
+        ) -> Error;
+        pub fn quench6k_moe_fp4_gemm2(
+            a: *const u8,
+            a_scales: *const u8,
+            a_rscale: *const f32,
+            a2: *const u8,
+            a2_scales: *const u8,
+            a3: *const u8,
+            a3_scales: *const u8,
+            w_ptr: *const u64,
+            s_ptr: *const u64,
+            ws2: *const f32,
+            offsets: *const i32,
+            tile_expert: *const i32,
+            tile_row: *const i32,
+            num_tiles: *const i32,
+            max_tiles: c_int,
+            y: *mut f32,
+            n: c_int,
+            k: c_int,
+            stream: Stream,
+        ) -> Error;
         pub fn quench6k_fp4_gather(
             codes: *const u8,
             scales: *const u8,
@@ -962,6 +1128,7 @@ pub mod ffi {
             pair_row: *const i32,
             t: c_int,
             k: c_int,
+            topk: c_int,
             gcodes: *mut u8,
             gscales: *mut u8,
             grscale: *mut f32,
@@ -1060,6 +1227,8 @@ pub mod ffi {
 
 pub mod bf16;
 pub mod flint;
+pub mod hy4;
+pub mod inkling;
 pub mod kernels;
 
 /// Runtime kernel variants (dev/KBENCH.md): tuning keys that kernel launchers read when they launch

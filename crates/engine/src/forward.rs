@@ -363,6 +363,12 @@ pub struct Workspace {
     /// Activation capture for the next eager steps: the row at absolute position `pos` is recorded into
     /// `buf` (see `CaptureLayout`). Not for captured graphs.
     pub capture: Option<CaptureTarget>,
+    /// Model edits for the next eager steps of one sequence (see [`crate::edits`]). Not for captured
+    /// graphs or batched steps.
+    pub edits: Option<std::sync::Arc<crate::edits::Edits>>,
+    /// Atlas recording for the next eager steps of one sequence: the recorder and the corpus token of
+    /// the sequence's position 0.
+    pub record: Option<(std::sync::Arc<crate::atlas::Recorder>, usize)>,
     /// DFlash feature capture for the next steps (eager or captured into graphs); see [`crate::dflash::Taps`].
     pub taps: Option<crate::dflash::Taps>,
     /// DFlash drafter scratch, when the model has the drafter.
@@ -512,6 +518,8 @@ impl Workspace {
         Self {
             max_tokens,
             capture: None,
+            edits: None,
+            record: None,
             taps: None,
             dflash: None,
             score_cols,
@@ -982,7 +990,10 @@ pub struct CaptureTarget {
 /// Per-layer record of an activation capture (byte offsets): the pre-mix lane state (F32 [4, 2560],
 /// before the attention-input HyperConnection), the mixed block input (BF16 [2560]), the attention or
 /// GDN block output (F32 [2560]), the MoE output (F32 [2560]), the router logits (F32 [512]) and the
-/// routed experts (I32 [10]) with their weights (F32 [10]).
+/// routed experts (I32 [10]) with their weights (F32 [10]). Then, for inspection: the injection
+/// weights of the block and MoE outputs (F32 [4] each) and, in single-token steps only, each routed
+/// expert's output (F32 [10, 2560], before its routing weight) and activations (BF16 [10, 640]), and
+/// the shared expert's gate and up projections and gate logit (F32 [640], [640], [1]).
 pub struct CaptureLayout;
 
 impl CaptureLayout {
@@ -993,7 +1004,12 @@ impl CaptureLayout {
     pub const ROUTER: usize = Self::MOE + D * 4;
     pub const TOP_I: usize = Self::ROUTER + EXPERTS * 4;
     pub const TOP_W: usize = Self::TOP_I + TOP_K * 4;
-    pub const BYTES: usize = Self::TOP_W + TOP_K * 4;
+    pub const INJ_ATTN: usize = Self::TOP_W + TOP_K * 4;
+    pub const INJ_MLP: usize = Self::INJ_ATTN + S * 4;
+    pub const YD: usize = Self::INJ_MLP + S * 4;
+    pub const ACT: usize = Self::YD + TOP_K * D * 4;
+    pub const SHARED: usize = Self::ACT + TOP_K * EXPERT_WIDTH * 2;
+    pub const BYTES: usize = Self::SHARED + (2 * EXPERT_WIDTH + 1) * 4;
 }
 
 /// Byte offsets inside the step block: [start: i32 | pad][tokens: i32 x max][pos3: i32 x 3 x max][PLE rows: BF16 x D x max].
@@ -1316,6 +1332,8 @@ pub fn forward_segments(
         adapter: model.adapter.as_ref().map(|a| (a, 0)),
         batch: Some(segs),
         capture: None,
+        edits: None,
+        record: None,
         taps: ws.taps,
     };
     let mut carry = Carry::new(ws, from_ple);
@@ -1620,6 +1638,8 @@ pub fn forward_part(
             .map(|a| (a, state.adapter_scale.addr())),
         batch: None,
         capture,
+        edits: ws.edits.as_deref(),
+        record: ws.record.as_ref().map(|(r, base)| (&**r, base + first)),
         taps: ws.taps,
     };
     if !from_ple {
@@ -1718,6 +1738,10 @@ fn layer_weight_ranges(layer: &crate::model::Layer) -> Vec<(u64, u64)> {
                 v.extend([(l.addr, n), (l.scale, n / k::int8_group() as u64 * 4)])
             }
             k::WeightFormat::Mxfp8 => v.extend([(l.addr, n), (l.scale, n / 32)]),
+            k::WeightFormat::Fp8Block => v.extend([
+                (l.addr, n),
+                (l.scale, (l.n.div_ceil(128) * (l.k / 128) * 4) as u64),
+            ]),
         }
     }
     fn proj(v: &mut Vec<(u64, u64)>, p: &Proj) {
@@ -1771,6 +1795,9 @@ struct LayerCtx<'a> {
     batch: Option<&'a [Seg<'a>]>,
     /// Activation capture: (record buffer, row of this step).
     capture: Option<(u64, usize)>,
+    edits: Option<&'a crate::edits::Edits>,
+    /// Atlas recorder and the corpus token of the step's first row.
+    record: Option<(&'a crate::atlas::Recorder, usize)>,
     /// DFlash feature capture.
     taps: Option<crate::dflash::Taps>,
 }
@@ -1903,6 +1930,18 @@ fn final_mixer(
             prof,
         )
     }
+}
+
+/// The final mixer's gate pre-activations (F32 [4, 2560]) for the residual in row 0 of `ws.h` (after a
+/// step): the mixer output is the mean over streams of sigmoid(u) x (1 + norm) times the stream's RMS
+/// factor. Recomputed with the batch kernels (the decoding kernel keeps them on chip).
+pub fn final_gates(model: &Model, ws: &Workspace, s: &Stream) -> Result<Vec<f32>> {
+    let hc = &model.final_hc;
+    k::grouped_rmsnorm(s, ws.h, 0, ws.n, 1)?;
+    project(s, ws, ws.n, &hc.down, ws.proj, 1)?;
+    k::hc_act(s, ws.proj, hc.down.n, ws.low_bf, 0, 1)?;
+    linear(s, ws, ws.low_bf, &hc.up, ws.up, 1)?;
+    s.download(ws.up, H)
 }
 
 /// One decoder layer (SPEC §3) over the step's tokens, with the layer's own GDN or QSA state.
@@ -2134,6 +2173,11 @@ fn layer_forward(
             buf + CaptureLayout::MIX as u64,
             ws.m + (row * D * 2) as u64,
             D * 2,
+        )?;
+        s.copy_d2d(
+            buf + CaptureLayout::INJ_ATTN as u64,
+            carry.inj + (row * S * 4) as u64,
+            S * 4,
         )?;
     }
     match &layer.block {
@@ -2429,7 +2473,7 @@ fn layer_forward(
                     t,
                     prof.as_deref_mut(),
                 )?;
-                return finish_layer(layer, ctx, carry, prof, None);
+                return finish_layer(index, layer, ctx, carry, prof, None);
             }
             let c = qsa.expect("QSA layer cache");
             op!(
@@ -2563,7 +2607,7 @@ fn layer_forward(
             D * 4,
         )?;
     }
-    finish_layer(layer, ctx, carry, prof, rec)
+    finish_layer(index, layer, ctx, carry, prof, rec)
 }
 
 /// Prefill experts on the FP4 tensor cores (W4A4, activations quantized per row with least-error block
@@ -2597,6 +2641,7 @@ fn fp4_mode() -> u8 {
 
 /// The second half of a layer: the MLP HyperConnection, the MoE block and its output.
 fn finish_layer(
+    index: usize,
     layer: &crate::model::Layer,
     ctx: &LayerCtx,
     carry: &mut Carry,
@@ -2633,10 +2678,37 @@ fn finish_layer(
             prof.as_deref_mut(),
         )?;
     }
+    if let Some((buf, row)) = rec {
+        s.copy_d2d(
+            buf + CaptureLayout::INJ_MLP as u64,
+            carry.inj + (row * S * 4) as u64,
+            S * 4,
+        )?;
+    }
     let moe = &layer.moe;
     let (ld, x) = (moe.proj.n, ws.proj);
     let col = |j: usize| x + (moe.proj.col(j) * 4) as u64;
     op!(prof, "moe proj", s, project(s, ws, ws.m, &moe.proj, x, t));
+    let edits = ctx.edits.and_then(|e| e.layer(index));
+    if let Some(r) = edits.and_then(|e| e.router.as_ref()) {
+        k::router_bias(s, col(0), ld, t, r.buf.addr(), r.n)?;
+    }
+    let routed_edits = edits.and_then(|e| e.routed.as_ref());
+    let shared_edits = edits.and_then(|e| e.shared.as_ref());
+    let record = ctx.record.filter(|_| index < LAYERS);
+    // Routed activations of every (token, slot) pair (token-major, the first pair's token row `r0`
+    // of the step): neuron edits on those routed to an edited expert, then atlas recording.
+    let act_hook = |top_i: u64, pair_row: u64, pairs: usize, r0: usize| -> Result<()> {
+        if let Some(r) = routed_edits {
+            k::edit_act(s, ws.act, top_i, pair_row, pairs, r.buf.addr(), r.n)?;
+        }
+        if let Some((rec, token0)) = record {
+            rec.routed(s, index, ws.act, top_i, pair_row, pairs, token0 + r0)?;
+        }
+        Ok(())
+    };
+    let routed_hook = routed_edits.is_some() || record.is_some();
+    let shared_hook = shared_edits.is_some() || record.is_some();
     let tables = |p: &crate::model::ExpertProj| (p.weights, p.scales, p.scale2);
     // Small batches: the shared expert's SwiGLU and down projection depend only on the projection, so
     // they run on a side stream while the routing (one block) and the routed experts run.
@@ -2644,12 +2716,29 @@ fn finish_layer(
     // kernels' rows (each slice's expert outputs and pair indices at its own offsets).
     let small_moe = t <= k::moe_small_tokens() || ctx.small;
     let slice = k::moe_small_tokens();
-    let side = t > 1 && small_moe && quench6k_cuda::variants::get("moe.shared_side", 1) != 0;
+    let side = t > 1
+        && small_moe
+        && !shared_hook
+        && quench6k_cuda::variants::get("moe.shared_side", 1) != 0;
     // FP4 prefill: the routed experts' down projection is written in BF16 (QUENCH6K_YD_BF16=0: FP32).
     let yd_bf16 = !small_moe
         && matches!(fp4_mode(), 1 | 3)
         && std::env::var("QUENCH6K_YD_BF16").map_or(true, |v| v != "0");
-    if t == 1 {
+    if t == 1 && routed_hook {
+        k::moe_t1_gate_up(
+            s,
+            ws.m,
+            col(0),
+            tables(&moe.gate),
+            tables(&moe.up),
+            ws.top_i,
+            ws.top_w,
+            ws.pair_row,
+            ws.act,
+        )?;
+        act_hook(ws.top_i, ws.pair_row, TOP_K, 0)?;
+        k::moe_t1_down(s, ws.act, tables(&moe.down), ws.top_i, ws.yd, col(0))?;
+    } else if t == 1 {
         op!(
             prof,
             "experts t1",
@@ -2727,6 +2816,7 @@ fn finish_layer(
                     ws.act
                 )
             );
+            act_hook(ws.top_i + pairs, ws.pair_row + pairs, ts * TOP_K, r0)?;
             op!(
                 prof,
                 "experts down",
@@ -2825,7 +2915,7 @@ fn finish_layer(
                     prof,
                     "fp4 gather",
                     s,
-                    k::fp4_gather(s, ws.yd, t, D, ws.pair_row, ws.xs)
+                    k::fp4_gather(s, ws.yd, t, D, 10, ws.pair_row, ws.xs)
                 );
                 op!(
                     prof,
@@ -2861,6 +2951,7 @@ fn finish_layer(
                     k::swiglu(s, ws.eg, ws.eu, EXPERT_WIDTH, EXPERT_WIDTH, ws.act, pairs)
                 );
             }
+            act_hook(ws.top_i, ws.pair_row, pairs, 0)?;
             if mode == 1 || mode == 3 {
                 op!(
                     prof,
@@ -2938,6 +3029,7 @@ fn finish_layer(
                     t * TOP_K
                 )
             );
+            act_hook(ws.top_i, ws.pair_row, t * TOP_K, 0)?;
             if fake_fp4 {
                 k::fake_fp4_act(s, ws.act, t * TOP_K, EXPERT_WIDTH)?;
             }
@@ -2951,7 +3043,7 @@ fn finish_layer(
     }
     // One token: the shared-expert tail (SwiGLU, down projection, combine) in one kernel. Larger
     // batches are faster as three kernels; the arithmetic is the same either way.
-    if t == 1 {
+    if t == 1 && !shared_hook {
         let down = (
             moe.shared_down.fmt,
             moe.shared_down.addr,
@@ -2984,6 +3076,12 @@ fn finish_layer(
                 s,
                 k::swiglu(s, col(1), col(2), ld, EXPERT_WIDTH, ws.sact, t)
             );
+            if let Some(e) = shared_edits {
+                k::edit_act(s, ws.sact, 0, 0, t, e.buf.addr(), e.n)?;
+            }
+            if let Some((rec, token0)) = record {
+                rec.shared(s, index, ws.sact, t, token0)?;
+            }
             op!(
                 prof,
                 "shared down",
@@ -3046,6 +3144,19 @@ fn finish_layer(
             ws.top_w + (row * TOP_K * 4) as u64,
             TOP_K * 4,
         )?;
+        if t == 1 {
+            // Single-token steps keep the routed outputs and activations in routing-slot order.
+            s.copy_d2d(buf + CaptureLayout::YD as u64, ws.yd, TOP_K * D * 4)?;
+            s.copy_d2d(
+                buf + CaptureLayout::ACT as u64,
+                ws.act,
+                TOP_K * EXPERT_WIDTH * 2,
+            )?;
+            for (j, n) in [(1, EXPERT_WIDTH), (2, EXPERT_WIDTH), (3, 1)] {
+                let at = [0, 0, EXPERT_WIDTH, 2 * EXPERT_WIDTH][j];
+                s.copy_d2d(buf + (CaptureLayout::SHARED + at * 4) as u64, col(j), n * 4)?;
+            }
+        }
     }
     // The block output is added to the residual by whatever reads it next (the next HyperConnection
     // fuses it with its norm).
@@ -3177,6 +3288,8 @@ pub fn forward_mtp_staged(
         adapter: None,
         batch: None,
         capture: None,
+        edits: None,
+        record: None,
         taps: None,
     };
     let mut carry = Carry::new(ws, false);
@@ -3466,6 +3579,10 @@ pub struct HeadWorkspace {
 
 impl HeadWorkspace {
     /// Device address of the logits ([rows, VOCAB] F32).
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
     pub fn logits_addr(&self) -> u64 {
         self.logits.addr()
     }

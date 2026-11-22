@@ -1,12 +1,17 @@
 pub mod adapter;
+pub mod atlas;
 pub mod checkpoint;
 pub mod context_store;
 pub mod csf;
 pub mod dflash;
+pub mod edits;
 pub mod fileio;
 pub mod flint;
 pub mod forward;
 pub mod gguf;
+pub mod hy4;
+pub mod inkling;
+pub mod inspect;
 pub mod loader;
 pub mod model;
 pub mod oracle;

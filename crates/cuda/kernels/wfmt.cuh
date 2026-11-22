@@ -7,7 +7,14 @@
 
 // MX8: FP8 E4M3 with a power-of-two scale per 32 consecutive weights of a row (scale bytes [N, K / 32],
 // UE8M0: 2^(byte - 127)).
-enum class WFmt { BF16 = 0, FP8 = 1, INT8 = 2, INT8G = 3, MX8 = 4 };
+// FP8B: FP8 E4M3 with an FP32 scale per 128 x 128 block (scales [ceil(N / 128), K / 128]), the
+// DeepSeek / Hy4-flash block-FP8 layout.
+enum class WFmt { BF16 = 0, FP8 = 1, INT8 = 2, INT8G = 3, MX8 = 4, FP8B = 5 };
+
+// Scale of the 128 x 128 block holding weight (n, k) of an FP8B matrix with K columns.
+SQ_DEVICE float fp8b_scale(const float* scale, int n, int k, int K) {
+    return ld_stream_f32(scale + (size_t)(n >> 7) * (K >> 7) + (k >> 7));
+}
 
 SQ_DEVICE float ue8m0_value(uint8_t b) { return __uint_as_float((uint32_t)b << 23); }
 
@@ -133,7 +140,7 @@ SQ_DEVICE void decode_raw16(const Raw16<F>& r, float* w) {
                 w[8 * h + 2 * i + 1] = f.y;
             }
         }
-    } else if constexpr (F == WFmt::FP8 || F == WFmt::MX8) {
+    } else if constexpr (F == WFmt::FP8 || F == WFmt::MX8 || F == WFmt::FP8B) {
         const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&r.v[0]);
 #pragma unroll
         for (int i = 0; i < 8; ++i) {

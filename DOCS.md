@@ -5,6 +5,7 @@
 | Command | Purpose |
 |---|---|
 | `quench6k serve` | HTTP server (OpenAI and Anthropic APIs) |
+| `quench6k serve-models` | One HTTP endpoint for several models, each loaded when a request names it ([Several models](#several-models)) |
 | `quench6k chat` | One chat turn from the command line, streamed to stdout (`--image`, `--video`, `--think`, `--temperature`) |
 | `quench6k bench` | Prefill and decode throughput at given context lengths ([BENCHMARK.md](BENCHMARK.md)) |
 
@@ -32,6 +33,108 @@ judge other checkpoints, whose numerics differ by design.
 Not supported: NVFP4 shared experts or FP8 block-scaled MTP experts (e.g.
 [nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)),
 compressed-tensors exports, GGUF.
+
+### Hy4-flash
+
+Tencent's Hy4-flash (`hy_v4_flash`: 42 layers of gated MLA attention, sliding-window or indexer-selected,
+512 latent experts per layer, hashed n-gram "Engram" memory) runs from an NVFP4 export with routed experts
+stacked per layer and attention projections BF16 or FP8 with a scale per 128 x 128 block:
+
+| Checkpoint | |
+|---|---|
+| [Avifenesh/Hy4-flash-NVFP4](https://huggingface.co/Avifenesh/Hy4-flash-NVFP4) | NVFP4 experts with a scale per expert, FP8 attention, FP8 Engram tables with a scale per row (161 GB) |
+
+`quench6k serve --model DIR` detects the model and serves one sequence at a time (prefix reuse,
+drafted decoding, tool calls, reasoning efforts `none`/`high`/`max`); steering, adapters, vision,
+edits and stored contexts are not available for it. About 87 GiB of weights load onto the GPU; the
+shared experts, the latent projections around the routed experts and the LM head are quantized to FP8 at
+load (`QUENCH6K_HY4_FP8`). The four Engram tables (63 GB) stay on the host, memory-mapped; 64 random
+rows per token are gathered from them, so keep them in the page cache (`QUENCH6K_HY4_ENGRAM_PRELOAD=1`
+reads them in at load) and on uncompressed storage, as for the PLE table below. The vision tower is not
+supported yet.
+
+The checkpoint's DFly2 drafter (5 layers) drafts five tokens after each step in one pass: the accepted
+token and four mask tokens attend through the target's caches of layers 25 to 41 (and the key lists
+their indexers chose), then a hidden correction picks the drafts in order through the target's LM head.
+Each step verifies as many of them as are expected to pay off, from running estimates of each draft
+position's acceptance and of step times by width (`QUENCH6K_HY4_DRAFTS=N` fixes the count in `quench6k
+hy4`; requests with `"mtp": false` decode without drafts; `QUENCH6K_HY4_DFLY=0` does not load the
+drafter, and prompt-lookup drafts are used instead). Greedy and sampled decoding stay exact: a draft is
+kept only when it is the token the target picks.
+
+The hyper-connection lanes (the residual streams) are kept in FP32, where the transformers model keeps
+them in BF16: on the gate's fixtures the generated positions' log-probabilities are closer to an FP32
+forward that way (mean |dlogp| 5 to 30% lower), at no measurable cost.
+
+Its correctness gate compares teacher-forced distributions against `tools/ref/hy4_ref.py`, an
+independent PyTorch implementation run on the same weights in BF16 (reference A; `--fp32 lanes` keeps the
+lanes in FP32 as the engine does, `--fp32 moe_sum` the routed experts' sum) and FP32 (B):
+
+```
+python3 -I tools/ref/hy4_fixtures.py --model $M --qwen $SWIFT --out out/hy4-fixtures
+python3 -I tools/ref/hy4_ref.py --model $M --fixture out/hy4-fixtures/* --out out/hy4-ref --suffix=-bf16
+python3 -I tools/ref/hy4_ref.py --model $M --dtype fp32 --fixture out/hy4-fixtures/* --out out/hy4-ref --suffix=-fp32
+# copy each <fixture>-bf16/-fp32 pair into its fixture directory as ref-bf16 / ref-fp32, then
+quench6k hy4 score --model $M --fixture out/hy4-fixtures/* --out out/hy4-eng
+quench6k gate --fixtures out/hy4-fixtures --candidates out/hy4-eng --ref-a ref-bf16 --ref-b ref-fp32
+```
+
+`quench6k hy4 generate` and `quench6k hy4 bench` run greedy generation and throughput measurements
+(`--dfly`: drafted decoding).
+
+### Inkling 2
+
+Thinking Machines' Inkling 2 Mini (`inkling2_loop`: 24 layers of which 6 .. 17 run three times, 128
+experts per layer, sliding-window and full attention with a learned relative-position bias instead of
+rotary embeddings, causal convolutions on keys, values and both sublayer outputs, and "block attention
+residuals" that mix earlier block sums into each sublayer's input) runs from its original release:
+
+| Checkpoint | |
+|---|---|
+| [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | NVFP4 experts (MXFP8 in the last four layers), BF16 elsewhere, DSpark drafter in `mtp.safetensors` (20 GB) |
+
+`quench6k serve --model DIR` detects the model and serves one sequence at a time (prefix reuse while
+the rings still hold it, drafted decoding, tool calls, reasoning efforts `none` .. `max`); steering,
+adapters, vision, edits and stored contexts are not available for it, and the vision tower is not
+supported yet. The model's message tokens (`<|message_model|>`, `<|content_thinking|>`,
+`<|content_invoke_tool_json|>`, ...) are decoded to the `<think>` and `<tool_call>` text the server parses,
+so `reasoning_content` and `tool_calls` work as for the Qwen models. About 18 GiB of weights load onto
+the GPU; the LM head is quantized to FP8 at load (`QUENCH6K_INK_FP8`): it does not move the gate's
+distributions measurably, while FP8 layer projections move them by about half the BF16 noise floor.
+
+The residual stream and the block sums are kept in FP32, where the transformers model keeps them in
+BF16. The looped model amplifies rounding: its BF16 and FP32 references differ by 0.1 to 0.2 nats per
+position on average (Qwen and Hy4-flash: under 0.04), and the engine's generated positions are at least
+as close to the FP32 reference as the BF16 reference is. With differences that large, a fixture of a
+few hundred positions can fail the gate on a single position where the two references themselves
+disagree by nats.
+
+The DSpark drafter (3 dense layers and a recurrent "Markov" head) drafts seven tokens after each step:
+the accepted token and seven mask tokens attend, bidirectionally within the block, to context keys and
+values computed from four target features of every earlier position (the inputs of layer visits 5, 23
+and 41 and the final norm's output, mixed per drafter layer); then the Markov head picks the drafts in
+order, biasing the LM head's logits of each block row by a state carried from the previous pick (among
+each 256-token block's four best tokens by the LM head alone). The head also states each draft's
+probability; the draft policy calibrates those online against what verification keeps, verifies the
+number of drafts with the most expected tokens per second, and runs the drafter only while drafted steps
+beat plain ones (`QUENCH6K_INK_DRAFTS=N` fixes the count in `quench6k inkling`; `QUENCH6K_INK_DRAFT=0`
+does not load the drafter). Decoding stays exact.
+
+Its correctness gate compares teacher-forced distributions against `tools/ref/inkling_ref.py`, which
+drives the transformers implementation's decoder layers (transformers 5.24 or later) one layer at a time
+on the GPU, in BF16 (reference A) and FP32 (B):
+
+```
+python3 -I tools/ref/inkling_fixtures.py --model $M --qwen $SWIFT --out out/inkling-fixtures
+python3 -I tools/ref/inkling_ref.py --model $M --fixture out/inkling-fixtures/* --out out/inkling-ref --suffix=-bf16
+python3 -I tools/ref/inkling_ref.py --model $M --dtype fp32 --fixture out/inkling-fixtures/* --out out/inkling-ref --suffix=-fp32
+# copy each <fixture>-bf16/-fp32 pair into its fixture directory as ref-bf16 / ref-fp32, then
+quench6k inkling score --model $M --fixture out/inkling-fixtures/* --out out/inkling-eng
+quench6k gate --fixtures out/inkling-fixtures --candidates out/inkling-eng --ref-a ref-bf16 --ref-b ref-fp32
+```
+
+`quench6k inkling generate` and `quench6k inkling bench` run greedy generation and throughput
+measurements (`--draft`: drafted decoding).
 
 Keep the PLE n-gram table's files (Swift: 92 GiB of BF16 in `embedding-model-*.safetensors`) on
 storage without filesystem compression. The table is memory-mapped and gathered on the host, 16 random
@@ -146,6 +249,35 @@ a request whose prompt was stored continues from the store. If loading fails, th
 get the error and the next request tries again. Tokenizing, `/health`, `/metrics` and the dashboard
 answer without loading the model.
 
+### Several models
+
+`quench6k serve-models --catalog FILE --listen ADDR [--settle SECS]` serves every model of a catalog
+from one endpoint and loads none at start. Each model runs as its own `quench6k serve` process on a
+local port, one at a time; requests (streams included) pass through to it.
+
+```json
+{"settle_secs": 60,
+ "models": [
+   {"args": ["--model", "/models/qwen", "--name", "qwen", "--context", "262144", "--kv", "fp8"]},
+   {"args": ["--model", "/models/inkling", "--name", "inkling", "--context", "131072"], "env": {}}
+ ]}
+```
+
+`args` are `serve` arguments without `--listen`; `env` adds environment variables. A model's names (its
+`--name`, and the adapted or steered name with `--adapter` or `--steering`) and context come from them.
+
+- `GET /v1/models` and `/v1/models/{id}` answer from the catalog without loading anything: names,
+  `context_length` / `max_model_len`, and `loaded`. `/health` reports the loaded model and its state.
+- A request names its model (the body's `model`). Nothing loaded: that model loads and the request
+  waits for it. Another model loaded: the server switches (stopping that model's process, which frees its
+  memory, then loading the requested one) only when the loaded model has been idle, with no request
+  running, for the settle period (default 60 s). Until then the request is rejected with HTTP 503, code
+  `model_switch_blocked` (Anthropic paths: `overloaded_error`) and a `Retry-After` header, so clients
+  asking for different models cannot make the server load and unload in turns.
+- Requests without a model (`/`, `/metrics`, tokenizing) go to the loaded model; with none loaded they get
+  HTTP 503 `no_model_loaded`. `POST /v1/unload` stops the loaded model when no request is running.
+- A failed load is reported to the waiting requests; the next request tries again.
+
 A prompt of `--context` tokens or more is rejected with HTTP 400 and code `context_length_exceeded`.
 
 ### Request fields
@@ -214,6 +346,15 @@ before `<tool_call>` with a new seed and a temperature of at least 0.7, up to `-
 the text before it is kept. While a tool call is being generated, streaming clients receive
 `tool_call_progress` chunks with the byte count instead of partial text.
 
+Qwen3.8 models sometimes write a URL of the fetch proxy Alibaba used in their training environment
+(`https://routify-file-proxy-sg.oss-ap-southeast-1.aliyuncs.com/proxy_temp_file/production/...` with an
+invented signature) instead of the URL they mean; a client that runs such a call contacts Alibaba Cloud.
+A tool call containing `routify-file-proxy`, `routify.alibaba-inc` or `proxy_temp_file/production` is
+treated as invalid and regenerated at least four times (more if `--tool-retries` is higher); if every
+attempt produces one, the calls are dropped and only the text before them is returned.
+`/metrics` counts them (`quench6k_proxy_tool_calls_total`, `quench6k_proxy_tool_calls_dropped_total`).
+This only covers calls this server generates: block the domain at the client's egress as well.
+
 ## Context cache
 
 - The GPU holds the current conversation of each slot plus recurrent-state snapshots at turn
@@ -254,6 +395,67 @@ A capture request writes `<name>.safetensors` to `--capture-dir`: per-layer acti
 log-probabilities at the last prompt token and at the last generated token, with the request as JSON
 metadata. Capture requests use plain decoding.
 
+## Inspection
+
+`/inspect` is a page for asking why the model predicts a token; `POST /v1/inspect` is its API. It
+takes `messages` (rendered with the generation prompt) or a raw `prompt`, an optional `target` (a token
+id or text; default: the most likely next token), an optional `contrast` token (then everything splits
+logit(target) − logit(contrast), e.g. why the model prefers one token over another) and `model` (the
+variant). The answer splits the target's logit at the prompt's last token into what wrote it: the embedding, the PLE injection, each
+layer's mixer (gated DeltaNet or attention) and MoE output, each routed expert and the shared expert,
+and every expert neuron (an intermediate unit: activation times routing weight times its
+down-projection column). The residual is a plain sum of these parts, each written into the four streams
+with its injection weights, and the final mixer is linear in the residual once its gates and the
+streams' RMS factors are held at the values this prompt gave, so the split is exact; the report shows
+the checks (the residual rebuilt from its parts, the neurons' share of their experts). These are direct
+effects: what a part changes through later layers is credited to those layers. For the largest parts
+it also lists the tokens their outputs push up and down, and for each layer the experts the router
+ranked next.
+
+An inspection runs between steps on a free slot: the prompt is prefilled (cached prefixes reused, so
+asking about another target of the same prompt is quick), then its last token runs as a single-token
+step with activation capture. Image prompts are not supported. With `"edits_at": "last"`, an
+inspection's edits apply to the inspected token only: the prefix comes from the unedited model's cache
+(so a sweep over many edits of one long prompt costs about a second each), and the slot's state is
+dropped afterwards.
+
+### Edits
+
+Any request (chat, completion or inspection) can carry model edits as `"edits"`, a list of:
+
+| Edit | |
+|---|---|
+| `{"layer": L, "expert": E, "unit": U, "scale": S, "add": A}` | A routed expert's neuron: activation × S + A (defaults 1 and 0), wherever a token routes to the expert |
+| `{"layer": L, "shared": true, "unit": U, ...}` | The same for the shared expert's neuron |
+| `{"layer": L, "expert": E, "ban": true}` | The router never picks the expert |
+| `{"layer": L, "expert": E, "router_bias": B}` | Adds B to the expert's router logit |
+
+Scale 0 switches a neuron off, −1 flips it, and `add` pushes it. A request with edits decodes alone
+and without speculation (one eager step per token), so it never affects other requests; its cached
+states are kept apart by the edit set and reused only by requests with the same edits. An edit that
+changes nothing (scale 1) gives the same output as no edit. The inspector page adds edits from its
+neuron and expert rows, shows the prediction before and after, and compares greedy continuations.
+
+### Neuron atlas
+
+`/atlas` builds atlases: the model runs over a corpus while every expert neuron's activations are
+recorded on the GPU (the sum of |activation|, the strongest activation with its token, and how often
+each expert is routed). The corpus is an uploaded text, a file under `--atlas-dir` (the only way to
+name server files), or text the model writes about a topic (`samples` texts of up to `max_tokens`, at
+temperature 1). Scans run in 2048-token segments taking turns with running requests, like prefill.
+
+| Endpoint | |
+|---|---|
+| `POST /v1/atlas` | `{"name", "topic", "samples", "max_tokens"}`, `{"name", "text"}` or `{"name", "file"}`; `"model"` picks the variant |
+| `GET /v1/atlas`, `DELETE /v1/atlas/{name}` | List (with progress), delete |
+| `GET /v1/atlas/{name}/neurons?base=&by=mean\|peak&layer=&limit=` | Neurons by mean \|activation\| per token or by peak, minus a baseline atlas's; each with its strongest example in context |
+| `GET /v1/atlas/{name}/experts?base=` | Experts by routing rate, minus the baseline's |
+| `POST /v1/lens` | `{"neurons": [{"layer", "expert" or "shared": true, "unit"}]}`: tokens each neuron's output raises and lowers |
+
+A baseline atlas of ordinary text (the model writing about anything) turns "fires often" into "fires on
+this topic". Atlases live in memory (at most 6, about 190 MB each). The page sends neurons and experts to
+the inspector's edits.
+
 ## Environment variables
 
 | Variable | |
@@ -262,3 +464,23 @@ metadata. Capture requests use plain decoding.
 | `QUENCH6K_TIMING=1` | Logs chat-template rendering and tokenization times |
 | `QUENCH6K_SAMPLED_DRAFTS=P` | Sampled requests draw drafts at P% of the temperature (default 100; 0: greedy drafts) |
 | `QUENCH6K_PLE_WARM_THREADS=N` | Threads that read embedding rows ahead of prefill (default 64) |
+| `QUENCH6K_HY4_FP8=LIST` | Hy4-flash: BF16 projections quantized to FP8 at load, as name fragments (`all`, `none`; default `shared_experts,routed_expert,lm_head`) |
+| `QUENCH6K_HY4_ENGRAM_PRELOAD=1` | Hy4-flash: read the Engram tables into the page cache at load |
+| `QUENCH6K_HY4_GRAPHS=0` | Hy4-flash: run small steps eagerly instead of as CUDA graphs |
+| `QUENCH6K_HY4_DFLY=0` | Hy4-flash: do not load the DFly2 drafter (the server then drafts by prompt lookup) |
+| `QUENCH6K_HY4_DRAFTS=N` | Hy4-flash, `quench6k hy4 ... --dfly`: verify N drafts per step instead of choosing the count |
+| `QUENCH6K_HY4_W4A4=1` | Hy4-flash: prefill experts with NVFP4 activations on the FP4 tensor cores (faster; fails the gate) |
+| `QUENCH6K_HY4_DUMP=DIR`, `QUENCH6K_HY4_TIMING=1` | Hy4-flash debugging: per-layer hidden states, per-step host timings |
+| `QUENCH6K_INK_INT8=LIST` | Inkling 2: BF16 projections quantized to INT8 (a scale per 64 weights) at load, as name fragments (`all`, `none`; default the layers' and the drafter's attention and MLP projections) |
+| `QUENCH6K_INK_FP8=LIST` | Inkling 2: BF16 projections quantized to FP8 at load, as name fragments (`all`, `none`; default `model.llm.unembed`, the LM head) |
+| `QUENCH6K_INK_FP4_TC=1`, `QUENCH6K_INK_FP4_TERMS=N` | Inkling 2: prefill experts of the NVFP4 layers with NVFP4 activations of N terms (default 2; 3 for the experts' input) on the FP4 tensor cores (faster; fails the gate) |
+| `QUENCH6K_INK_SKINNY=N` | Inkling 2: small steps of N or more tokens run the INT8 projections as a tensor-core GEMM (default 1: every step, so a token's result never depends on the step's width; 0: the GEMV) |
+| `QUENCH6K_INK_MARKOV_CAND=N` | Inkling 2: the drafter's Markov head picks among each 256-token block's N best tokens (default 4; 0: the whole vocabulary) |
+| `QUENCH6K_INK_PREFETCH=0`, `QUENCH6K_INK_CLUSTER=0` | Inkling 2: small steps without the L2 prefetch of the next visit's weights / without the 8-block cluster residual mixture |
+| `QUENCH6K_INK_GUESS=0`, `QUENCH6K_INK_GUESS_K=k1,k2,..` | Inkling 2: steps of up to 4 tokens without the guessed experts (the next visit's router on this visit's MLP input; the best guesses' gate/up weights requested into L2 after the next visit's output projection) / the guesses per row for steps of 1, 2, .. tokens (default 3,2,2,1) |
+| `QUENCH6K_INK_GRAPHS=0` | Inkling 2: run small steps and the drafter eagerly instead of as CUDA graphs |
+| `QUENCH6K_INK_DRAFT=0` | Inkling 2: do not load the DSpark drafter (the server then drafts by prompt lookup) |
+| `QUENCH6K_INK_DRAFTS=N` | Inkling 2, `quench6k inkling ... --draft`: verify N drafts per step instead of choosing the count |
+| `QUENCH6K_INK_DUMP=DIR`, `QUENCH6K_INK_DUMP_DRAFT=DIR`, `QUENCH6K_INK_TIMING=1` | Inkling 2 debugging: the stream after each layer visit, the drafter's inputs and outputs, per-step timings |
+| `QUENCH6K_INK_PROFILE_STEPS=N`, `QUENCH6K_INK_PROFILE_WIDTH=W`, `QUENCH6K_INK_CONF_LOG=FILE` | Inkling 2 profiling (`inkling bench`): N decode steps of W tokens in a profiler capture range; (`inkling generate --draft`) each judged draft's position, stated probability and outcome |
+| `QUENCH6K_PDL=0` | Launch kernels without programmatic dependent launch (checks whether a result depends on PDL ordering) |

@@ -13,14 +13,15 @@
 
 namespace {
 
-constexpr int TOPK = 10;
-
 // x BF16 [rows, K] -> codes, scales, row scales. A CTA takes QROWS rows: each warp finds the absolute
 // maximum of QROWS / 8 rows, then the CTA's threads quantize the rows' 16-value blocks.
 constexpr int QROWS = 16;
 
+// With codes2/scales2: a second term, the residual x / rs - dequant(first term) quantized the same way
+// (same row scale), so that the two terms' products accumulate in one sum.
 __global__ void __launch_bounds__(256) quant_rows_kernel(const __nv_bfloat16* __restrict__ x, int rows, int K,
-                                                          uint8_t* codes, uint8_t* scales, float* rscale) {
+                                                          uint8_t* codes, uint8_t* scales, float* rscale, uint8_t* codes2 = nullptr,
+                                                          uint8_t* scales2 = nullptr, uint8_t* codes3 = nullptr, uint8_t* scales3 = nullptr) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float rs_s[QROWS];
@@ -64,23 +65,56 @@ __global__ void __launch_bounds__(256) quant_rows_kernel(const __nv_bfloat16* __
         const int code = rs > 0.0f ? fp4_block_scale(v, q) : 0;
         *reinterpret_cast<uint2*>(codes + (size_t)row * (K / 2) + 8 * b) = q;
         scales[(size_t)row * (K / 16) + b] = (uint8_t)code;
+        if (codes2) {
+            const float bs = rs > 0.0f ? ue4m3_value(code) : 0.0f;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const uint32_t word = j < 8 ? q.x : q.y;
+                v[j] -= e2m1_value((uint8_t)((word >> (4 * (j & 7))) & 15)) * bs;
+            }
+            uint2 q2 = make_uint2(0, 0);
+            const int code2 = rs > 0.0f ? fp4_block_scale(v, q2) : 0;
+            *reinterpret_cast<uint2*>(codes2 + (size_t)row * (K / 2) + 8 * b) = q2;
+            scales2[(size_t)row * (K / 16) + b] = (uint8_t)code2;
+            if (codes3) {
+                const float bs2 = rs > 0.0f ? ue4m3_value(code2) : 0.0f;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const uint32_t word = j < 8 ? q2.x : q2.y;
+                    v[j] -= e2m1_value((uint8_t)((word >> (4 * (j & 7))) & 15)) * bs2;
+                }
+                uint2 q3 = make_uint2(0, 0);
+                const int code3 = rs > 0.0f ? fp4_block_scale(v, q3) : 0;
+                *reinterpret_cast<uint2*>(codes3 + (size_t)row * (K / 2) + 8 * b) = q3;
+                scales3[(size_t)row * (K / 16) + b] = (uint8_t)code3;
+            }
+        }
     }
 }
 
-// Quantized row of token pair / 10 -> grouped row pair_row[pair] (K = 2560).
+// Quantized row of token pair / topk -> grouped row pair_row[pair].
 __global__ void gather_fp4_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
-                                  const float* __restrict__ rscale, const int* __restrict__ pair_row, int K,
-                                  uint8_t* gcodes, uint8_t* gscales, float* grscale) {
+                                  const float* __restrict__ rscale, const int* __restrict__ pair_row, int K, int topk,
+                                  uint8_t* gcodes, uint8_t* gscales, float* grscale, const uint8_t* codes2 = nullptr,
+                                  const uint8_t* scales2 = nullptr, uint8_t* gcodes2 = nullptr, uint8_t* gscales2 = nullptr) {
     pdl_launch_dependents();
     pdl_wait();
-    const int pair = blockIdx.x, tok = pair / TOPK, dst = pair_row[pair];
+    const int pair = blockIdx.x, tok = pair / topk, dst = pair_row[pair];
     const uint4* src = reinterpret_cast<const uint4*>(codes + (size_t)tok * (K / 2));
     uint4* out = reinterpret_cast<uint4*>(gcodes + (size_t)dst * (K / 2));
     for (int i = threadIdx.x; i < K / 32; i += blockDim.x) out[i] = src[i];
     const uint4* ssrc = reinterpret_cast<const uint4*>(scales + (size_t)tok * (K / 16));
     uint4* sout = reinterpret_cast<uint4*>(gscales + (size_t)dst * (K / 16));
     for (int i = threadIdx.x; i < K / 256; i += blockDim.x) sout[i] = ssrc[i];
-    if (threadIdx.x == 0) grscale[dst] = rscale[tok];
+    if (threadIdx.x == 0 && grscale) grscale[dst] = rscale[tok];
+    if (codes2) {
+        const uint4* src2 = reinterpret_cast<const uint4*>(codes2 + (size_t)tok * (K / 2));
+        uint4* out2 = reinterpret_cast<uint4*>(gcodes2 + (size_t)dst * (K / 2));
+        for (int i = threadIdx.x; i < K / 32; i += blockDim.x) out2[i] = src2[i];
+        const uint4* ssrc2 = reinterpret_cast<const uint4*>(scales2 + (size_t)tok * (K / 16));
+        uint4* sout2 = reinterpret_cast<uint4*>(gscales2 + (size_t)dst * (K / 16));
+        for (int i = threadIdx.x; i < K / 256; i += blockDim.x) sout2[i] = ssrc2[i];
+    }
 }
 
 SQ_DEVICE void cp_async8(void* smem, const void* gmem, bool valid) {
@@ -105,11 +139,21 @@ constexpr int MI = BM / 32, WTM = BM / 2;  // m16 tiles per warp; warp tile rows
 
 SQ_DEVICE int swz(int r, int c) { return r * RB + ((c ^ ((r >> 1) & 3)) << 4); }
 
-struct __align__(16) Stage {
+// X: the activations' further terms (0 to 2).
+template <int X>
+struct __align__(16) StageT {
     uint8_t a[BM * RB];
     uint8_t b[BN * RB];
     uint8_t as[BM * 8];
     uint8_t bs[BN * 8];
+    uint8_t ax[X > 0 ? X : 1][X > 0 ? BM * RB : 16];
+    uint8_t asx[X > 0 ? X : 1][X > 0 ? BM * 8 : 16];
+};
+using Stage = StageT<0>;
+
+struct TwoArgs {
+    const uint8_t* a[2];
+    const uint8_t* as[2];
 };
 
 // GU: gate and up projections together with SwiGLU in the epilogue. The CTA's 128 columns are gate
@@ -122,17 +166,18 @@ struct UpArgs {
     __nv_bfloat16* act;
 };
 
-template <bool GU = false, typename OT = float>
+template <bool GU = false, typename OT = float, int X = 0>
 __global__ void __launch_bounds__(THREADS, 2) fp4_gemm_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ As,
                                                            const float* __restrict__ Ar, const uint64_t* __restrict__ w_ptr,
                                                            const uint64_t* __restrict__ s_ptr, const float* __restrict__ ws2,
                                                            const int* __restrict__ offsets, const int* __restrict__ tile_expert,
                                                            const int* __restrict__ tile_row, const int* __restrict__ num_tiles,
-                                                           OT* Y, int N, int K, UpArgs up = {}) {
+                                                           OT* Y, int N, int K, UpArgs up = {}, TwoArgs two = {}) {
     pdl_launch_dependents();
     pdl_wait();
     extern __shared__ __align__(16) uint8_t fp4_smem[];
-    Stage* st = reinterpret_cast<Stage*>(fp4_smem);
+    using St = StageT<X>;
+    St* st = reinterpret_cast<St*>(fp4_smem);
     if ((int)blockIdx.y >= *num_tiles) return;
     const int e = tile_expert[blockIdx.y], r0 = tile_row[blockIdx.y];
     const int r_end = min(r0 + BM, offsets[e + 1]);
@@ -150,12 +195,19 @@ __global__ void __launch_bounds__(THREADS, 2) fp4_gemm_kernel(const uint8_t* __r
     const int k_tiles = K / BK, KB = K / 2, KS = K / 16;
 
     auto load = [&](int s, int kt) {
-        Stage& g = st[s];
+        St& g = st[s];
 #pragma unroll
         for (int i = 0; i < BM * 4 / THREADS; ++i) {  // A: BM rows x 4 chunks
             const int idx = tid + i * THREADS, r = idx >> 2, c = idx & 3;
             const bool ok = r0 + r < r_end;
             cp_async16(&g.a[swz(r, c)], A + (size_t)(ok ? r0 + r : r0) * KB + kt * RB + c * 16, ok);
+#pragma unroll
+            for (int x = 0; x < X; ++x) cp_async16(&g.ax[x][swz(r, c)], two.a[x] + (size_t)(ok ? r0 + r : r0) * KB + kt * RB + c * 16, ok);
+        }
+        if (tid < BM) {
+            const bool ok = r0 + tid < r_end;
+#pragma unroll
+            for (int x = 0; x < X; ++x) cp_async8(&g.asx[x][tid * 8], two.as[x] + (size_t)(ok ? r0 + tid : r0) * KS + kt * 8, ok);
         }
 #pragma unroll
         for (int i = 0; i < 2; ++i) {  // B: 128 rows x 4 chunks
@@ -187,15 +239,21 @@ __global__ void __launch_bounds__(THREADS, 2) fp4_gemm_kernel(const uint8_t* __r
         const int next = kt + STAGES - 1;
         if (next < k_tiles) load(next % STAGES, next);
         cp_async_commit();
-        const Stage& g = st[kt % STAGES];
+        const St& g = st[kt % STAGES];
 #pragma unroll
         for (int s = 0; s < 2; ++s) {  // two k64 steps per k-tile
             uint32_t a[MI][4], b[4][2], sa[MI], sb[4];
+            uint32_t ax[X > 0 ? X : 1][MI][4], sax[X > 0 ? X : 1][MI];
 #pragma unroll
             for (int i = 0; i < MI; ++i) {
                 const int r = warp_m * WTM + i * 16 + (lane & 15);
                 ldmatrix_x4(a[i], &g.a[swz(r, s * 2 + (lane >> 4))]);
                 sa[i] = *reinterpret_cast<const uint32_t*>(&g.as[(warp_m * WTM + i * 16 + ta) * 8 + s * 4]);
+#pragma unroll
+                for (int x = 0; x < X; ++x) {
+                    ldmatrix_x4(ax[x][i], &g.ax[x][swz(r, s * 2 + (lane >> 4))]);
+                    sax[x][i] = *reinterpret_cast<const uint32_t*>(&g.asx[x][(warp_m * WTM + i * 16 + ta) * 8 + s * 4]);
+                }
             }
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
@@ -209,7 +267,11 @@ __global__ void __launch_bounds__(THREADS, 2) fp4_gemm_kernel(const uint8_t* __r
 #pragma unroll
             for (int i = 0; i < MI; ++i)
 #pragma unroll
-                for (int j = 0; j < 4; ++j) mma_fp4(acc[i][j], a[i], b[j], sa[i], sb[j]);
+                for (int j = 0; j < 4; ++j) {
+                    mma_fp4(acc[i][j], a[i], b[j], sa[i], sb[j]);
+#pragma unroll
+                    for (int x = 0; x < X; ++x) mma_fp4(acc[i][j], ax[x][i], b[j], sax[x][i], sb[j]);
+                }
         }
     }
     cp_async_wait<0>();
@@ -290,15 +352,16 @@ extern "C" cudaError_t quench6k_fp4_quant_rows(const void* x, int rows, int K, u
     if (K % 256 != 0 && K % 128 != 0) return cudaErrorInvalidValue;
     if (rows == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(quant_rows_kernel, (rows + QROWS - 1) / QROWS, 256, 0, st, static_cast<const __nv_bfloat16*>(x), rows, K, codes,
-                              scales, rscale));
+                              scales, rscale, (uint8_t*)nullptr, (uint8_t*)nullptr, (uint8_t*)nullptr, (uint8_t*)nullptr));
     SQ_RETURN_LAUNCH();
 }
 
 extern "C" cudaError_t quench6k_fp4_gather(const uint8_t* codes, const uint8_t* scales, const float* rscale, const int* pair_row,
-                                         int T, int K, uint8_t* gcodes, uint8_t* gscales, float* grscale, cudaStream_t st) {
+                                         int T, int K, int topk, uint8_t* gcodes, uint8_t* gscales, float* grscale, cudaStream_t st) {
     if (K % 256 != 0) return cudaErrorInvalidValue;
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(gather_fp4_kernel, T * TOPK, 64, 0, st, codes, scales, rscale, pair_row, K, gcodes, gscales, grscale));
+    SQ_CHECK_LAUNCH(sq_launch(gather_fp4_kernel, T * topk, 64, 0, st, codes, scales, rscale, pair_row, K, topk, gcodes, gscales, grscale,
+                              (const uint8_t*)nullptr, (const uint8_t*)nullptr, (uint8_t*)nullptr, (uint8_t*)nullptr));
     SQ_RETURN_LAUNCH();
 }
 
@@ -320,10 +383,10 @@ extern "C" cudaError_t quench6k_moe_fp4_gemm(const uint8_t* a, const uint8_t* as
     const dim3 grid((N + BN - 1) / BN, max_tiles);
     if (out_bf16)
         SQ_CHECK_LAUNCH(sq_launch(fp4_gemm_kernel<false, __nv_bfloat16>, grid, THREADS, smem, st, a, as, ar, w_ptr, s_ptr, ws2, offsets,
-                                  tile_expert, tile_row, num_tiles, static_cast<__nv_bfloat16*>(y), N, K, UpArgs{}));
+                                  tile_expert, tile_row, num_tiles, static_cast<__nv_bfloat16*>(y), N, K, UpArgs{}, TwoArgs{}));
     else
         SQ_CHECK_LAUNCH(sq_launch(fp4_gemm_kernel<false>, grid, THREADS, smem, st, a, as, ar, w_ptr, s_ptr, ws2, offsets, tile_expert,
-                                  tile_row, num_tiles, static_cast<float*>(y), N, K, UpArgs{}));
+                                  tile_row, num_tiles, static_cast<float*>(y), N, K, UpArgs{}, TwoArgs{}));
     SQ_RETURN_LAUNCH();
 }
 
@@ -344,6 +407,55 @@ extern "C" cudaError_t quench6k_moe_fp4_gate_up(const uint8_t* a, const uint8_t*
     }
     const UpArgs up{u_ptr, us_ptr, us2, static_cast<__nv_bfloat16*>(act)};
     SQ_CHECK_LAUNCH(sq_launch(fp4_gemm_kernel<true>, dim3((N + BN / 2 - 1) / (BN / 2), max_tiles), THREADS, smem, st, a, as, ar, w_ptr,
-                              s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, (float*)nullptr, N, K, up));
+                              s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, (float*)nullptr, N, K, up, TwoArgs{}));
     SQ_RETURN_LAUNCH();
+}
+
+// Two-term activations (codes2 / scales2: the residual's, same row scale): quantization, gather and the
+// grouped GEMM (F32 output).
+extern "C" cudaError_t quench6k_fp4_quant_rows2(const void* x, int rows, int K, uint8_t* codes, uint8_t* scales, float* rscale,
+                                              uint8_t* codes2, uint8_t* scales2, uint8_t* codes3, uint8_t* scales3, cudaStream_t st) {
+    if (K % 256 != 0 && K % 128 != 0) return cudaErrorInvalidValue;
+    if (rows == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(quant_rows_kernel, (rows + QROWS - 1) / QROWS, 256, 0, st, static_cast<const __nv_bfloat16*>(x), rows, K, codes,
+                              scales, rscale, codes2, scales2, codes3, scales3));
+    SQ_RETURN_LAUNCH();
+}
+
+extern "C" cudaError_t quench6k_fp4_gather2(const uint8_t* codes, const uint8_t* scales, const float* rscale, const uint8_t* codes2,
+                                          const uint8_t* scales2, const int* pair_row, int T, int K, int topk, uint8_t* gcodes,
+                                          uint8_t* gscales, float* grscale, uint8_t* gcodes2, uint8_t* gscales2, cudaStream_t st) {
+    if (K % 256 != 0) return cudaErrorInvalidValue;
+    if (T == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(gather_fp4_kernel, T * topk, 64, 0, st, codes, scales, rscale, pair_row, K, topk, gcodes, gscales, grscale,
+                              codes2, scales2, gcodes2, gscales2));
+    SQ_RETURN_LAUNCH();
+}
+
+template <int X>
+cudaError_t fp4_gemm_terms(const uint8_t* a, const uint8_t* as, const float* ar, TwoArgs two, const uint64_t* w_ptr, const uint64_t* s_ptr,
+                           const float* ws2, const int* offsets, const int* tile_expert, const int* tile_row, const int* num_tiles, int max_tiles,
+                           float* y, int N, int K, cudaStream_t st) {
+    constexpr size_t smem = STAGES * sizeof(StageT<X>);
+    static bool configured = false;
+    if (!configured) {
+        cudaError_t err = cudaFuncSetAttribute(fp4_gemm_kernel<false, float, X>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        if (err != cudaSuccess) return err;
+        configured = true;
+    }
+    SQ_CHECK_LAUNCH(sq_launch(fp4_gemm_kernel<false, float, X>, dim3((N + BN - 1) / BN, max_tiles), THREADS, smem, st, a, as, ar, w_ptr, s_ptr,
+                              ws2, offsets, tile_expert, tile_row, num_tiles, y, N, K, UpArgs{}, two));
+    SQ_RETURN_LAUNCH();
+}
+
+// a3 / as3 null: two terms.
+extern "C" cudaError_t quench6k_moe_fp4_gemm2(const uint8_t* a, const uint8_t* as, const float* ar, const uint8_t* a2, const uint8_t* as2,
+                                            const uint8_t* a3, const uint8_t* as3, const uint64_t* w_ptr, const uint64_t* s_ptr,
+                                            const float* ws2, const int* offsets, const int* tile_expert, const int* tile_row,
+                                            const int* num_tiles, int max_tiles, float* y, int N, int K, cudaStream_t st) {
+    if (K % BK != 0) return cudaErrorInvalidValue;
+    if (max_tiles == 0) return cudaSuccess;
+    const TwoArgs two{{a2, a3}, {as2, as3}};
+    if (a3) return fp4_gemm_terms<2>(a, as, ar, two, w_ptr, s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, max_tiles, y, N, K, st);
+    return fp4_gemm_terms<1>(a, as, ar, two, w_ptr, s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, max_tiles, y, N, K, st);
 }

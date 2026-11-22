@@ -13,5 +13,10 @@ kernels only.
   ```
 
   `--act-quant` emulates NVFP4 W4A4 expert activations; `--fp64` computes in FP64.
-- `census.py`: per-kernel critical-path time of a decode or MTP round from an Nsight Systems trace
-  (dev/KBENCH.md "Census").
+- `census.py`: per-kernel critical-path time of a decode or MTP round from an Nsight Systems trace, with
+  the DRAM bandwidth sampled during each kernel; `--record` takes the trace too (dev/KBENCH.md "Census").
+- `ab.py`: interleaved A/B runs of a bench command, medians and ranges per variant (dev/KBENCH.md "A/B").
+- `ref/hy4_ref.py`, `ref/hy4_fixtures.py`, `ref/hy4_compare.py`: the Hy4-flash reference (an independent
+  PyTorch implementation after transformers' `hy_v4_flash`, streaming one layer of weights at a time and
+  scoring several fixtures per pass), the Hy4-flash versions of the oracle fixtures, and a per-layer
+  comparison of hidden states with the engine's `QUENCH6K_HY4_DUMP` output (see DOCS.md, Hy4-flash).

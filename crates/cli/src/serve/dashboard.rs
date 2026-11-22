@@ -341,8 +341,27 @@ pub(super) async fn index() -> Response {
     asset_response("text/html; charset=utf-8", include_bytes!("ui/index.html"))
 }
 
+pub(super) async fn atlas_page() -> Response {
+    asset_response("text/html; charset=utf-8", include_bytes!("ui/atlas.html"))
+}
+
+pub(super) async fn inspect_page() -> Response {
+    asset_response(
+        "text/html; charset=utf-8",
+        include_bytes!("ui/inspect.html"),
+    )
+}
+
 pub(super) async fn asset(Path(file): Path<String>) -> Response {
     match file.as_str() {
+        "atlas.js" => asset_response(
+            "text/javascript; charset=utf-8",
+            include_bytes!("ui/atlas.js"),
+        ),
+        "inspect.js" => asset_response(
+            "text/javascript; charset=utf-8",
+            include_bytes!("ui/inspect.js"),
+        ),
         "dashboard.css" => asset_response(
             "text/css; charset=utf-8",
             include_bytes!("ui/dashboard.css"),

@@ -1,9 +1,12 @@
 mod bench;
 mod chat;
 mod flint;
+mod hy4;
+mod inkling;
 mod gpumon;
 mod kbench;
 mod mtp;
+mod multi;
 mod overlay;
 mod sass;
 mod serve;
@@ -222,6 +225,19 @@ enum Command {
         #[command(flatten)]
         steer: SteerArgs,
     },
+    /// One HTTP endpoint for several models, each loaded when a request names it (a `serve` process per
+    /// model, one at a time); switching waits until the loaded model has been idle for the settle period.
+    ServeModels {
+        /// JSON catalog: {"settle_secs": 60, "models": [{"args": [<serve arguments>], "env": {..}}, ..]}.
+        #[arg(long)]
+        catalog: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: std::net::SocketAddr,
+        /// Seconds the loaded model must be idle before a request for another model may unload it
+        /// (overrides the catalog's settle_secs; default 60).
+        #[arg(long, value_name = "SECS")]
+        settle: Option<f64>,
+    },
     /// HTTP server: OpenAI (/v1/chat/completions, /v1/models) and Anthropic (/v1/messages) APIs.
     Serve {
         #[arg(long)]
@@ -295,6 +311,10 @@ enum Command {
         /// Directory for activation captures requested per request ("capture": {"name": ...}).
         #[arg(long)]
         capture_dir: Option<PathBuf>,
+        /// Directory whose text files neuron atlases may be built from by path (otherwise only
+        /// uploaded text and model-written text).
+        #[arg(long)]
+        atlas_dir: Option<PathBuf>,
         /// Do not load the vision tower (requests with images are rejected).
         #[arg(long)]
         no_vision: bool,
@@ -510,6 +530,12 @@ enum Command {
     /// Recursive Flint (NVFP4 GGUF) commands.
     #[command(subcommand)]
     Flint(flint::FlintCmd),
+    /// Hy4-flash (hy_v4_flash) commands.
+    #[command(subcommand)]
+    Hy4(hy4::Hy4Cmd),
+    /// Inkling 2 (inkling2_loop) commands.
+    #[command(subcommand)]
+    Inkling(inkling::InklingCmd),
     Gate {
         /// Fixture root containing one directory per fixture.
         #[arg(long, default_value = "oracle/fixtures")]
@@ -520,7 +546,30 @@ enum Command {
         /// Candidate file suffix: files are named `<fixture><suffix>.{json,bin}`.
         #[arg(long, default_value = "")]
         suffix: String,
+        /// Reference A of each fixture (`<fixture>/<ref_a>.{json,bin}`).
+        #[arg(long, default_value = "llama-w4a4")]
+        ref_a: String,
+        /// Reference B, whose distance to A sets the noise floor.
+        #[arg(long, default_value = "llama-q8")]
+        ref_b: String,
     },
+}
+
+/// The model names and context `quench6k serve <args>` serves (for `serve-models`).
+fn serve_identity(args: &[String]) -> Result<(Vec<String>, usize)> {
+    let argv = ["quench6k", "serve"].into_iter().map(String::from).chain(args.iter().cloned());
+    let cli = Cli::try_parse_from(argv).map_err(|e| anyhow::anyhow!("catalog serve arguments {args:?}: {e}"))?;
+    let Command::Serve { name, context, steer, steered_name, adapted_name, .. } = cli.command else {
+        unreachable!()
+    };
+    let mut names = vec![name.clone()];
+    if steer.steering.is_some() {
+        names.push(steered_name.unwrap_or_else(|| format!("{name}-steered")));
+    }
+    if steer.adapter.is_some() {
+        names.push(adapted_name.unwrap_or_else(|| format!("{name}-adapted")));
+    }
+    Ok((names, context))
 }
 
 fn main() -> Result<()> {
@@ -630,6 +679,7 @@ fn main() -> Result<()> {
             batch2,
             &steer,
         )?,
+        Command::ServeModels { catalog, listen, settle } => multi::run(multi::Options { catalog, listen, settle }, serve_identity)?,
         Command::Serve {
             model,
             listen,
@@ -653,6 +703,7 @@ fn main() -> Result<()> {
             plan_tokens,
             prefill_share,
             capture_dir,
+            atlas_dir,
             no_vision,
             image_max_pixels,
             video_max_frames,
@@ -680,6 +731,10 @@ fn main() -> Result<()> {
             plan_tokens,
             prefill_share,
             capture_dir,
+            atlas_dir: atlas_dir
+                .map(|d| d.canonicalize())
+                .transpose()
+                .context("--atlas-dir")?,
             vision: !no_vision,
             image_max_pixels,
             video_max_frames,
@@ -887,10 +942,14 @@ fn main() -> Result<()> {
             binary,
         } => sass::run(binary.as_deref(), &file, kernel.as_deref(), top, &check)?,
         Command::Flint(cmd) => flint::run(cmd)?,
+        Command::Hy4(cmd) => hy4::run(cmd)?,
+        Command::Inkling(cmd) => inkling::run(cmd)?,
         Command::Gate {
             fixtures,
             candidates,
             suffix,
+            ref_a,
+            ref_b,
         } => {
             let mut all = true;
             let mut any = false;
@@ -902,7 +961,7 @@ fn main() -> Result<()> {
                     continue;
                 }
                 any = true;
-                let verdict = oracle::gate(&dir, &oracle::Distributions::load(&stem)?)?;
+                let verdict = oracle::gate_with(&dir, &oracle::Distributions::load(&stem)?, &ref_a, &ref_b)?;
                 for r in &verdict.regions {
                     println!(
                         "{name:14} {:10} n={:4} {}  |dlogp| mean {:.4} p99 {:.4} (bound {:.4} / {:.4}; floor {:.4} / {:.4}; vs B {:.4} / {:.4})  top1 agree {:.3}",
@@ -1216,6 +1275,9 @@ fn chat_once(
     let text = chat.render(&messages, None, Some(think), None)?;
     let (ids, images) = chat.expand_media(&chat.encode(&text)?, inputs, clips)?;
     let params = quench6k_engine::session::GenParams {
+        edits: None,
+        record: None,
+        fresh: false,
         max_tokens,
         temperature,
         top_p,
