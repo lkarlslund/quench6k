@@ -35,11 +35,13 @@ mod ffi {
             cv_src: *const f32,
             cv_cy: *const f32,
             cv_cw: *const f32,
-            cv_ring: *mut c_void,
+            cv_sq: *const c_void,
+            cv_visit: c_int,
+            cv_slot: c_int,
             cv_ring_rows: c_int,
             cv_conv: *const c_void,
             cv_base: *const f32,
-            cv_start: *const i32,
+            small: c_int,
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_msg_gates(
@@ -68,17 +70,13 @@ mod ffi {
             lin_k: *const f32,
             lin_v: *const f32,
             ldk: c_int,
-            kring: *mut c_void,
-            vring: *mut c_void,
             kconv: *const c_void,
             vconv: *const c_void,
             kstatic: *const c_void,
             vstatic: *const c_void,
-            kcache: *mut c_void,
-            vcache: *mut c_void,
             ring_rows: c_int,
-            cache_rows: c_int,
-            start: *const i32,
+            sq: *const c_void,
+            visit: c_int,
             t: c_int,
             st: Stream,
         ) -> Error;
@@ -86,11 +84,12 @@ mod ffi {
             src: *const f32,
             cy: *const f32,
             cw: *const f32,
-            ring: *mut c_void,
+            sq: *const c_void,
+            visit: c_int,
+            slot: c_int,
             ring_rows: c_int,
             conv: *const c_void,
             base: *const f32,
-            start: *const i32,
             t: c_int,
             out: *mut f32,
             st: Stream,
@@ -100,13 +99,11 @@ mod ffi {
             q: *const c_void,
             rel: *const f32,
             sink: *const f32,
-            kcache: *const c_void,
-            vcache: *const c_void,
-            cache_rows: c_int,
+            sq: *const c_void,
+            visit: c_int,
             proj: *const c_void,
             window: c_int,
             block: c_int,
-            start: *const i32,
             t: c_int,
             splits: c_int,
             min_keys: c_int,
@@ -115,6 +112,7 @@ mod ffi {
             gate_off: c_int,
             part: *mut f32,
             out: *mut c_void,
+            small: c_int,
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_route(
@@ -235,6 +233,7 @@ mod ffi {
         pub fn quench6k_ink_mix(
             feats: *const c_void,
             rows_from: *const i32,
+            sq: *const c_void,
             alpha: *const f32,
             w: *const c_void,
             out: *mut c_void,
@@ -242,31 +241,22 @@ mod ffi {
             rows: c_int,
             st: Stream,
         ) -> Error;
-        pub fn quench6k_ink_ctx_kv(
-            kv: *const f32,
-            knorm: *const c_void,
-            theta: f32,
-            start: *const i32,
-            t: c_int,
-            kcache: *mut c_void,
-            vcache: *mut c_void,
-            st: Stream,
-        ) -> Error;
+        pub fn quench6k_ink_ctx_kv(kv: *const f32, knorm: *const c_void, theta: f32, sq: *const c_void, visit: c_int, t: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_draft_qkv(
             qkv: *const f32,
             qnorm: *const c_void,
             knorm: *const c_void,
             theta: f32,
-            start: *const i32,
+            sq: *const c_void,
+            visit: c_int,
             t: c_int,
             q: *mut c_void,
-            kcache: *mut c_void,
-            vcache: *mut c_void,
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_silu_mul(gu: *const f32, n: c_int, t: c_int, out: *mut c_void, st: Stream) -> Error;
         pub fn quench6k_ink_block_embed(
             anchor: *const i32,
+            sq: *const c_void,
             table: *const c_void,
             w: *const c_void,
             mask: *const c_void,
@@ -276,8 +266,10 @@ mod ffi {
         ) -> Error;
         pub fn quench6k_ink_markov_blocks(v: c_int) -> usize;
         pub fn quench6k_ink_markov(
+            nseq: c_int,
             w: *const c_void,
             ctx: *const f32,
+            ctx_ss: c_int,
             bias: *const c_void,
             state_in: *const c_void,
             w1: *const c_void,
@@ -287,16 +279,22 @@ mod ffi {
             fold_w: *const c_void,
             fold_b: *const f32,
             base: *const f32,
+            base_ss: c_int,
             v: c_int,
             cap: f32,
             best_v: *mut f32,
             best_i: *mut i32,
             out: *mut i32,
             conf: *mut f32,
+            out_ss: c_int,
             cand: *const i32,
+            cand_ss: c_int,
             ncand: c_int,
             st: Stream,
         ) -> Error;
+        pub fn quench6k_ink_seqs_bytes() -> c_int;
+        pub fn quench6k_ink_tab_slots() -> c_int;
+        pub fn quench6k_ink_small_rows() -> c_int;
     }
 }
 
@@ -362,23 +360,68 @@ pub fn rms_bf16(s: &Stream, x: u64, w: u64, out: u64, t: usize) -> Result<()> {
     rms(s, &[RmsSet { x, w, out, ldo: 2304 }], t)
 }
 
-/// A sublayer output's convolution (see [`hidden_conv`]) computed inside [`attn_res`] as its last source.
+/// Sequences of a step (the kernels' `Seqs`, device memory): up to [`MAX_SEQ`] runs of consecutive rows,
+/// sequence s at rows row0[s] .. row0[s + 1] from position start[s], its caches and rings in its table
+/// `tab[s]` ([`TAB`] u64 slots per layer visit: see the `T_*` slots).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Seqs {
+    pub tab: [u64; MAX_SEQ],
+    pub start: [i32; MAX_SEQ],
+    pub row0: [i32; MAX_SEQ + 1],
+    pub nseq: i32,
+}
+
+pub const MAX_SEQ: usize = 8;
+/// Table slots per layer visit (and per drafter layer, after the visits).
+pub const TAB: usize = 8;
+pub const T_K: usize = 0;
+pub const T_V: usize = 1;
+pub const T_KRING: usize = 2;
+pub const T_VRING: usize = 3;
+pub const T_ARING: usize = 4;
+pub const T_MRING: usize = 5;
+/// The cache's rows (positions modulo them).
+pub const T_ROWS: usize = 6;
+
+impl Seqs {
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts((self as *const Self).cast::<u8>(), std::mem::size_of::<Self>()) }
+    }
+}
+
+/// Most rows of a small step (the kernels' SMALL_ROWS).
+pub fn small_rows() -> usize {
+    unsafe { ffi::quench6k_ink_small_rows() as usize }
+}
+
+/// Checks that the kernels' descriptor layout matches [`Seqs`].
+pub fn check_layout() -> Result<()> {
+    let (b, t) = unsafe { (ffi::quench6k_ink_seqs_bytes() as usize, ffi::quench6k_ink_tab_slots() as usize) };
+    anyhow::ensure!(b == std::mem::size_of::<Seqs>() && t == TAB, "inkling: sequence descriptor layout mismatch ({b} / {t} bytes)");
+    Ok(())
+}
+
+/// A sublayer output's convolution (see [`hidden_conv`]) computed inside [`attn_res`] as its last source:
+/// each row's ring is table slot `slot` of visit `visit` of its sequence in `sq` (0: no convolution).
 #[derive(Clone, Copy, Default)]
 pub struct ConvSrc {
     pub src: u64,
     pub cy: u64,
     pub cw: u64,
-    pub ring: u64,
+    pub sq: u64,
+    pub visit: usize,
+    pub slot: usize,
     pub ring_rows: usize,
     pub conv: u64,
     pub base: u64,
-    pub start: u64,
 }
 
 /// Block attention residual of `t` tokens: `nq` queries (F32 [nq, 2304]) over the sources (F32 [t, 2304]
 /// each, the partial sum last); out F32 [nq][t, 2304] (0: none); `norms`: per query (weight, BF16 output
 /// rows at stride `ldo`) of its RMSNorm, or empty. With `conv`, the last source is that convolution's
-/// output, computed here and stored at the last source's address.
+/// output, computed here and stored at the last source's address. `small`: a small step's kernel (each
+/// row's sums independent of the step's rows; at most [`small_rows`] rows).
 #[allow(clippy::too_many_arguments)]
 pub fn attn_res(
     s: &Stream,
@@ -390,6 +433,7 @@ pub fn attn_res(
     norms: &[(u64, u64)],
     ldo: usize,
     conv: Option<ConvSrc>,
+    small: bool,
 ) -> Result<()> {
     let ptrs: Vec<*const f32> = src.iter().map(|&a| f(a)).collect();
     let w: Vec<*const c_void> = norms.iter().map(|x| p(x.0)).collect();
@@ -410,11 +454,13 @@ pub fn attn_res(
             f(c.src),
             f(c.cy),
             f(c.cw),
-            pm(c.ring),
+            p(c.sq),
+            n(c.visit),
+            n(c.slot),
             n(c.ring_rows),
             p(c.conv),
             f(c.base),
-            i(c.start),
+            small as c_int,
             s.raw()
         )
     )
@@ -455,18 +501,17 @@ pub fn msg_gates(s: &Stream, gates: &[MsgGate], t: usize, cat: u64, z: u64) -> R
     )
 }
 
-/// Keys or values of [`qkv_prep`]: projection ring, static taps (sliding: `conv`; full: `static_w`), cache.
+/// Keys or values of [`qkv_prep`]: static taps (sliding: `conv`; full: `static_w`).
 #[derive(Clone, Copy)]
 pub struct KvSide {
-    pub ring: u64,
     pub conv: u64,
     pub static_w: u64,
-    pub cache: u64,
 }
 
 /// The query side of an attention layer (q | gate | relative states | sinks rows) and the key and value
 /// convolutions into the caches (`KvSide.conv` [1024, 4] for sliding layers, else `static_w` [4, 1024] with
-/// the per-token taps after the projections in `lin_k` / `lin_v`).
+/// the per-token taps after the projections in `lin_k` / `lin_v`). Rings and caches: table visit `visit`
+/// of each row's sequence in `sq`.
 #[allow(clippy::too_many_arguments)]
 pub fn qkv_prep(
     s: &Stream,
@@ -486,8 +531,8 @@ pub fn qkv_prep(
     k: KvSide,
     v: KvSide,
     ring_rows: usize,
-    cache_rows: usize,
-    start: u64,
+    sq: u64,
+    visit: usize,
     t: usize,
 ) -> Result<()> {
     go!(
@@ -506,42 +551,38 @@ pub fn qkv_prep(
             f(lin_k),
             f(lin_v),
             n(ldk),
-            pm(k.ring),
-            pm(v.ring),
             p(k.conv),
             p(v.conv),
             p(k.static_w),
             p(v.static_w),
-            pm(k.cache),
-            pm(v.cache),
             n(ring_rows),
-            n(cache_rows),
-            i(start),
+            p(sq),
+            n(visit),
             n(t),
             s.raw()
         )
     )
 }
 
-/// out F32 [t, 2304] = base + (conv(x) + x) / sqrt(5) (base 0: none), x from `src` or, with `cy` (F32
-/// [t * 8, 2304]) and `cw` (F32 [t * 8]), the experts' combine; the step's rows join the ring.
-#[allow(clippy::too_many_arguments)]
-pub fn hidden_conv(
-    s: &Stream,
-    src: u64,
-    cy: u64,
-    cw: u64,
-    ring: u64,
-    ring_rows: usize,
-    conv: u64,
-    base: u64,
-    start: u64,
-    t: usize,
-    out: u64,
-) -> Result<()> {
+/// out F32 [t, 2304] = base + (conv(x) + x) / sqrt(5) (base 0: none), x from `c.src` or, with `c.cy` (F32
+/// [t * 8, 2304]) and `c.cw` (F32 [t * 8]), the experts' combine; the step's rows join the rings.
+pub fn hidden_conv(s: &Stream, c: &ConvSrc, t: usize, out: u64) -> Result<()> {
     go!(
         "ink_hidden_conv",
-        ffi::quench6k_ink_hidden_conv(f(src), f(cy), f(cw), pm(ring), n(ring_rows), p(conv), f(base), i(start), n(t), fm(out), s.raw())
+        ffi::quench6k_ink_hidden_conv(
+            f(c.src),
+            f(c.cy),
+            f(c.cw),
+            p(c.sq),
+            n(c.visit),
+            n(c.slot),
+            n(c.ring_rows),
+            p(c.conv),
+            f(c.base),
+            n(t),
+            fm(out),
+            s.raw()
+        )
     )
 }
 
@@ -549,22 +590,22 @@ pub fn attn_part_floats(t: usize, splits: usize) -> usize {
     unsafe { ffi::quench6k_ink_attn_part_floats(n(t), n(splits)) }
 }
 
-/// Attention of `t` queries over the caches, merged with the sinks and gated: out BF16 [t, 3072]. Keys of
-/// query t end at its own position (or with `block` > 0 at the block's last, start + block - 1) and span
-/// `window` positions (0: all); `rel`, `sink` and `lin` (the gate) are optional (0).
+/// Attention of `t` queries over the caches (table visit `visit` of each row's sequence in `sq`), merged
+/// with the sinks and gated: out BF16 [t, 3072]. Keys of a query end at its own position (or, with a
+/// `block` above 0, at its sequence's block's last, start + block - 1) and span `window` positions (0: all); `rel`,
+/// `sink` and `lin` (the gate) are optional (0). `small`: the split kernels, else the tensor-core kernel for
+/// one sequence where it applies.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     s: &Stream,
     q: u64,
     rel: u64,
     sink: u64,
-    kcache: u64,
-    vcache: u64,
-    cache_rows: usize,
+    sq: u64,
+    visit: usize,
     proj: u64,
     window: usize,
     block: usize,
-    start: u64,
     t: usize,
     splits: usize,
     min_keys: usize,
@@ -573,6 +614,7 @@ pub fn attention(
     gate_off: usize,
     part: u64,
     out: u64,
+    small: bool,
 ) -> Result<()> {
     go!(
         "ink_attention",
@@ -580,13 +622,11 @@ pub fn attention(
             p(q),
             f(rel),
             f(sink),
-            p(kcache),
-            p(vcache),
-            n(cache_rows),
+            p(sq),
+            n(visit),
             p(proj),
             n(window),
             n(block),
-            i(start),
             n(t),
             n(splits),
             n(min_keys),
@@ -595,6 +635,7 @@ pub fn attention(
             n(gate_off),
             fm(part),
             pm(out),
+            small as c_int,
             s.raw()
         )
     )
@@ -669,40 +710,27 @@ pub fn to_bf16_rows(s: &Stream, src: u64, t: usize, dst: u64, ldd: usize) -> Res
     go!("ink_to_bf16_rows", ffi::quench6k_ink_to_bf16_rows(f(src), n(t), pm(dst), n(ldd), s.raw()))
 }
 
-/// `rows` rows of bf16(w * rmsnorm(sum_k alpha[k] feats[row, k])) at stride `ldo`; row = r, or the device
-/// int at `rows_from` for every r.
+/// `rows` rows of bf16(w * rmsnorm(sum_k alpha[k] feats[row, k])) at stride `ldo`; row = r, or (with
+/// `rows_from`, device ints per sequence) rows_from[the sequence of row r in `sq`].
 #[allow(clippy::too_many_arguments)]
-pub fn mix(s: &Stream, feats: u64, rows_from: u64, alpha: u64, w: u64, out: u64, ldo: usize, rows: usize) -> Result<()> {
+pub fn mix(s: &Stream, feats: u64, rows_from: u64, sq: u64, alpha: u64, w: u64, out: u64, ldo: usize, rows: usize) -> Result<()> {
     go!(
         "ink_mix",
-        ffi::quench6k_ink_mix(p(feats), i(rows_from), f(alpha), p(w), pm(out), n(ldo), n(rows), s.raw())
+        ffi::quench6k_ink_mix(p(feats), i(rows_from), p(sq), f(alpha), p(w), pm(out), n(ldo), n(rows), s.raw())
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn ctx_kv(s: &Stream, kv: u64, knorm: u64, theta: f32, start: u64, t: usize, kcache: u64, vcache: u64) -> Result<()> {
-    go!(
-        "ink_ctx_kv",
-        ffi::quench6k_ink_ctx_kv(f(kv), p(knorm), theta, i(start), n(t), pm(kcache), pm(vcache), s.raw())
-    )
+/// The drafter's context keys and values of `t` rows into the caches of table visit `visit` of their
+/// sequences in `sq`.
+pub fn ctx_kv(s: &Stream, kv: u64, knorm: u64, theta: f32, sq: u64, visit: usize, t: usize) -> Result<()> {
+    go!("ink_ctx_kv", ffi::quench6k_ink_ctx_kv(f(kv), p(knorm), theta, p(sq), n(visit), n(t), s.raw()))
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn draft_qkv(
-    s: &Stream,
-    qkv: u64,
-    qnorm: u64,
-    knorm: u64,
-    theta: f32,
-    start: u64,
-    t: usize,
-    q: u64,
-    kcache: u64,
-    vcache: u64,
-) -> Result<()> {
+pub fn draft_qkv(s: &Stream, qkv: u64, qnorm: u64, knorm: u64, theta: f32, sq: u64, visit: usize, t: usize, q: u64) -> Result<()> {
     go!(
         "ink_draft_qkv",
-        ffi::quench6k_ink_draft_qkv(f(qkv), p(qnorm), p(knorm), theta, i(start), n(t), pm(q), pm(kcache), pm(vcache), s.raw())
+        ffi::quench6k_ink_draft_qkv(f(qkv), p(qnorm), p(knorm), theta, p(sq), n(visit), n(t), pm(q), s.raw())
     )
 }
 
@@ -710,10 +738,12 @@ pub fn silu_mul(s: &Stream, gu: u64, nn: usize, t: usize, out: u64) -> Result<()
     go!("ink_silu_mul", ffi::quench6k_ink_silu_mul(f(gu), n(nn), n(t), pm(out), s.raw()))
 }
 
-pub fn block_embed(s: &Stream, anchor: u64, table: u64, w: u64, mask: u64, rows: usize, x: u64) -> Result<()> {
+/// The drafter's blocks: per sequence of `sq` its anchor token (device ints `anchor`) then masks.
+#[allow(clippy::too_many_arguments)]
+pub fn block_embed(s: &Stream, anchor: u64, sq: u64, table: u64, w: u64, mask: u64, rows: usize, x: u64) -> Result<()> {
     go!(
         "ink_block_embed",
-        ffi::quench6k_ink_block_embed(i(anchor), p(table), p(w), p(mask), n(rows), fm(x), s.raw())
+        ffi::quench6k_ink_block_embed(i(anchor), p(sq), p(table), p(w), p(mask), n(rows), fm(x), s.raw())
     )
 }
 
@@ -731,11 +761,23 @@ pub struct MarkovW {
     pub fold_b: u64,
 }
 
-/// One Markov step: state_in -> state_out, the pick (from `base` logits F32 [vocab]) to `out` and `prev`,
-/// its probability to `conf` (F32). `best_v` holds 2 * markov_blocks(vocab) values.
+/// Per-sequence strides (elements) of [`markov`]'s inputs and outputs.
+#[derive(Clone, Copy)]
+pub struct MarkovStrides {
+    pub ctx: usize,
+    pub base: usize,
+    pub out: usize,
+    pub cand: usize,
+}
+
+/// One Markov step of `nseq` sequences: state_in -> state_out, the pick (from `base` logits F32 [vocab])
+/// to `out` and `prev`, its probability to `conf` (F32). Per sequence: ctx, base, out / conf and cand at
+/// the strides `ss`; the state ([2, 256] BF16 halves), prev (1), latent (256) and best_v (2 *
+/// markov_blocks(vocab)) / best_i (markov_blocks(vocab)) at their own sizes.
 #[allow(clippy::too_many_arguments)]
 pub fn markov(
     s: &Stream,
+    nseq: usize,
     m: MarkovW,
     ctx: u64,
     state_in: u64,
@@ -750,12 +792,15 @@ pub fn markov(
     out: u64,
     conf: u64,
     cand: Option<(u64, usize)>,
+    ss: MarkovStrides,
 ) -> Result<()> {
     go!(
         "ink_markov",
         ffi::quench6k_ink_markov(
+            n(nseq),
             p(m.w),
             f(ctx),
+            n(ss.ctx),
             p(m.bias),
             p(state_in),
             p(m.w1),
@@ -765,13 +810,16 @@ pub fn markov(
             p(m.fold_w),
             f(m.fold_b),
             f(base),
+            n(ss.base),
             n(vocab),
             cap,
             fm(best_v),
             im(best_i),
             im(out),
             fm(conf),
+            n(ss.out),
             cand.map_or(std::ptr::null(), |c| c.0 as *const i32),
+            n(ss.cand),
             cand.map_or(0, |c| n(c.1)),
             s.raw()
         )
@@ -917,7 +965,7 @@ pub fn nv4_gemm(
     )
 }
 
-/// Skinny tensor-core GEMM for m <= 16 activation rows of INT8 group-64 weights [n, k]: `segs` = (rows, x,
+/// Skinny tensor-core GEMM for m <= [`small_rows`] activation rows of INT8 group-64 weights [n, k]: `segs` = (rows, x,
 /// y, ldy) in row order (1 to 3; rows multiples of 16), shared `ldx`.
 #[allow(clippy::too_many_arguments)]
 pub fn skinny_i8(s: &Stream, m: usize, w: u64, scale: u64, ldx: usize, segs: &[(usize, u64, u64, usize)], k: usize) -> Result<()> {

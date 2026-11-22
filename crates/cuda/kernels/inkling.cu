@@ -42,6 +42,42 @@ constexpr int MAX_SRC = 8, MAX_Q = 4;
 
 SQ_DEVICE float rb(float x) { return bf2f(f2bf(x)); }
 
+// ---------------------------------------------------------------------------------------------------------
+// Sequences of a step. The rows of a step belong to up to MAX_SEQ sequences, each a run of consecutive rows
+// (row0[s] .. row0[s + 1] - 1) at positions start[s] + (row - row0[s]). Each sequence's caches and rings
+// are listed in its table (device, written once per sequence): per layer visit (and after the visits, per
+// drafter layer) TAB slots, see T_*. Kernels find a row's sequence here, so that a captured step serves any
+// set of sequences of the same row count.
+constexpr int MAX_SEQ = 8, TAB = 8;
+enum { T_K = 0, T_V = 1, T_KRING = 2, T_VRING = 3, T_ARING = 4, T_MRING = 5, T_ROWS = 6 };
+struct Seqs {
+    const unsigned long long* tab[MAX_SEQ];
+    int start[MAX_SEQ];
+    int row0[MAX_SEQ + 1];
+    int nseq;
+};
+
+// Row g's sequence s, its index t within the sequence's rows, its position and the sequence's table.
+struct SeqRow {
+    int s, t, pos;
+    const unsigned long long* tab;
+};
+
+SQ_DEVICE SeqRow seq_row(const Seqs* q, int g) {
+    const int n = q->nseq;
+    int s = 0;
+    for (int i = 1; i < n; ++i) s = g >= q->row0[i] ? i : s;
+    const int t = g - q->row0[s];
+    return {s, t, q->start[s] + t, q->tab[s]};
+}
+
+template <typename T>
+SQ_DEVICE T* tab_ptr(const SeqRow& r, int visit, int slot) {
+    return reinterpret_cast<T*>(r.tab[visit * TAB + slot]);
+}
+
+SQ_DEVICE int tab_rows(const SeqRow& r, int visit) { return (int)r.tab[visit * TAB + T_ROWS]; }
+
 SQ_DEVICE float e4m3_value(uint8_t b) {
     __nv_fp8_e4m3 v;
     v.__x = b;
@@ -140,42 +176,46 @@ __global__ void __launch_bounds__(RT) rms_kernel(RmsSets sets) {
 // Hidden-width causal convolution of a sublayer output x (this step's rows from `src`, or with `cy` the
 // experts' combine sum_k w[t, k] cy[t * 8 + k]; earlier positions' from the ring; all as BF16, conv
 // [D, 4]): out = base + (conv + x) / sqrt(5) (base null: 0); the step's rows join the ring.
+// Rows are the step's (g); each row's ring is table slot `slot` of layer visit `visit` of its sequence.
 struct ConvSrc {
     const float* src;
     const float* cy;
     const float* cw;
-    bf16* ring;  // null: no convolution
+    const Seqs* sq;  // null: no convolution
+    int visit, slot;
     int ring_rows;
     const bf16* conv;
     const float* base;
-    const int* start;
     float* out;
 };
 
-SQ_DEVICE float hidden_x(const ConvSrc& v, int t, int c) {
-    if (!v.cy) return rb(v.src[(size_t)t * D + c]);
+SQ_DEVICE float hidden_x(const ConvSrc& v, int g, int c) {
+    if (!v.cy) return rb(v.src[(size_t)g * D + c]);
     float acc = 0.0f;
 #pragma unroll
-    for (int k = 0; k < TOPK; ++k) acc += v.cw[t * TOPK + k] * v.cy[((size_t)t * TOPK + k) * D + c];
+    for (int k = 0; k < TOPK; ++k) acc += v.cw[g * TOPK + k] * v.cy[((size_t)g * TOPK + k) * D + c];
     return rb(acc);
 }
 
-// The convolution's output at (t, c), also stored to v.out and (its input) to the ring.
-SQ_DEVICE float conv_value(const ConvSrc& v, int t, int c) {
-    const int pos = *v.start + t;
+// The convolution's output at (row g, c), also stored to v.out and (its input) to the ring. Lags within the
+// sequence's rows of this step come from them, earlier positions from the ring.
+SQ_DEVICE float conv_value(const ConvSrc& v, int g, int c) {
+    const SeqRow r = seq_row(v.sq, g);
+    bf16* ring = tab_ptr<bf16>(r, v.visit, v.slot);
+    const int pos = r.pos;
     float acc = 0.0f, cur = 0.0f;
 #pragma unroll
     for (int lag = 0; lag < CONVK; ++lag) {
         float x;
-        if (t - lag >= 0)
-            x = hidden_x(v, t - lag, c);
+        if (r.t - lag >= 0)
+            x = hidden_x(v, g - lag, c);
         else
-            x = pos - lag >= 0 ? bf2f(v.ring[(size_t)((pos - lag) % v.ring_rows) * D + c]) : 0.0f;
+            x = pos - lag >= 0 ? bf2f(ring[(size_t)((pos - lag) % v.ring_rows) * D + c]) : 0.0f;
         if (lag == 0) cur = x;
         acc += bf2f(v.conv[c * CONVK + CONVK - 1 - lag]) * x;
     }
-    v.ring[(size_t)(pos % v.ring_rows) * D + c] = f2bf(cur);
-    const size_t i = (size_t)t * D + c;
+    ring[(size_t)(pos % v.ring_rows) * D + c] = f2bf(cur);
+    const size_t i = (size_t)g * D + c;
     const float y = (v.base ? v.base[i] : 0.0f) + (acc + cur) / 2.2360679775f;
     v.out[i] = y;
     return y;
@@ -184,28 +224,32 @@ SQ_DEVICE float conv_value(const ConvSrc& v, int t, int c) {
 // conv_value split around the dependency wait: the taps and the earlier steps' ring rows first.
 struct ConvPre {
     float w[CONVK], xr[CONVK];
+    bf16* ring;
+    int t, pos;
 };
 
-SQ_DEVICE void conv_pre(const ConvSrc& v, int t, int c, ConvPre& pre) {
-    const int pos = *v.start + t;
+SQ_DEVICE void conv_pre(const ConvSrc& v, int g, int c, ConvPre& pre) {
+    const SeqRow r = seq_row(v.sq, g);
+    pre.ring = tab_ptr<bf16>(r, v.visit, v.slot);
+    pre.t = r.t;
+    pre.pos = r.pos;
 #pragma unroll
     for (int lag = 0; lag < CONVK; ++lag) {
         pre.w[lag] = bf2f(v.conv[c * CONVK + CONVK - 1 - lag]);
-        pre.xr[lag] = t - lag < 0 && pos - lag >= 0 ? bf2f(v.ring[(size_t)((pos - lag) % v.ring_rows) * D + c]) : 0.0f;
+        pre.xr[lag] = r.t - lag < 0 && r.pos - lag >= 0 ? bf2f(pre.ring[(size_t)((r.pos - lag) % v.ring_rows) * D + c]) : 0.0f;
     }
 }
 
-SQ_DEVICE float conv_finish(const ConvSrc& v, int t, int c, const ConvPre& pre) {
-    const int pos = *v.start + t;
+SQ_DEVICE float conv_finish(const ConvSrc& v, int g, int c, const ConvPre& pre) {
     float acc = 0.0f, cur = 0.0f;
 #pragma unroll
     for (int lag = 0; lag < CONVK; ++lag) {
-        const float x = t - lag >= 0 ? hidden_x(v, t - lag, c) : pre.xr[lag];
+        const float x = pre.t - lag >= 0 ? hidden_x(v, g - lag, c) : pre.xr[lag];
         if (lag == 0) cur = x;
         acc += pre.w[lag] * x;
     }
-    v.ring[(size_t)(pos % v.ring_rows) * D + c] = f2bf(cur);
-    const size_t i = (size_t)t * D + c;
+    pre.ring[(size_t)(pre.pos % v.ring_rows) * D + c] = f2bf(cur);
+    const size_t i = (size_t)g * D + c;
     const float y = (v.base ? v.base[i] : 0.0f) + (acc + cur) / 2.2360679775f;
     v.out[i] = y;
     return y;
@@ -233,7 +277,7 @@ struct ResNorms {
 };
 
 template <int NS, int NQ>
-// With cv.ring set, the last source (the partial sum) is the output of convolution cv, computed here.
+// With cv.sq set, the last source (the partial sum) is the output of convolution cv, computed here.
 __global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, const float* __restrict__ queries, float* out, size_t qstride, ResNorms norms,
                                                        ConvSrc cv) {
     constexpr int ns = NS, nq = NQ;
@@ -250,7 +294,7 @@ __global__ void __launch_bounds__(ART) attn_res_kernel(Srcs src, const float* __
 #pragma unroll
         for (int i = 0; i < ARPT; ++i) {
             const int c = threadIdx.x + ART * i;
-            x[s][i] = s == ns - 1 && cv.ring ? conv_value(cv, t, c) : src.p[s][(size_t)t * D + c];
+            x[s][i] = s == ns - 1 && cv.sq ? conv_value(cv, t, c) : src.p[s][(size_t)t * D + c];
         }
 #pragma unroll
     for (int i = 0; i < ARPT; ++i) {
@@ -337,7 +381,7 @@ __global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(CL_T) attn_res_cl_k
         nw[q] = norms.o[q] ? bf2f(norms.w[q][c]) : 0.0f;
     }
     ConvPre pre;
-    if (cv.ring) conv_pre(cv, t, c, pre);
+    if (cv.sq) conv_pre(cv, t, c, pre);
     // The finished blocks' sums (every source but the last) are written only by copies, which complete
     // before any later kernel starts: they and their terms come before the dependency wait (read past
     // L1, as the buffers are reused).
@@ -351,7 +395,7 @@ __global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(CL_T) attn_res_cl_k
     pdl_wait();
     {
         constexpr int s = NS - 1;
-        x[s] = cv.ring ? conv_finish(cv, t, c, pre) : src.p[s][(size_t)t * D + c];
+        x[s] = cv.sq ? conv_finish(cv, t, c, pre) : src.p[s][(size_t)t * D + c];
         acc[s] = x[s] * x[s];
 #pragma unroll
         for (int q = 0; q < NQ; ++q) acc[NS + s * NQ + q] = qv[q] * x[s];
@@ -530,11 +574,10 @@ SQ_DEVICE float log_tau(int pos) {
 struct KvConv {
     const float* lin;
     int ld;
-    bf16* ring;
+    int ring_slot, cache_slot;  // the sequence table's ring and cache of this side
     const bf16* conv;
     const bf16* static_w;
     const float* dyn;
-    bf16* cache;
 };
 
 struct QPrep {
@@ -567,36 +610,37 @@ SQ_DEVICE void q_head(const QPrep& qp, const float* row, int hh, int lane, const
     rel = r * rc * tau;
 }
 
-// Key or value head h of step row t (position pos), a warp (lane: channels lane * 4 .. + 3). kv_pre: the
-// taps and earlier steps' ring rows (before the dependency wait); kv_finish: this step's projection rows,
-// the convolution and the head's clip (keys) or RMS normalization (values); with `store`, the row joins
-// the ring.
-SQ_DEVICE void kv_pre(const KvConv& a, int t, int pos, int h, int lane, int ring_rows, float (&xs)[4][CONVK], float (&w)[4][CONVK]) {
+// Key or value head h of step row g (its sequence's row t, position pos), a warp (lane: channels lane * 4
+// .. + 3). kv_pre: the taps and earlier steps' ring rows (before the dependency wait); kv_finish: this
+// step's projection rows (the sequence's rows g - lag), the convolution and the head's clip (keys) or RMS
+// normalization (values); the row joins the ring.
+SQ_DEVICE void kv_pre(const KvConv& a, const bf16* ring, int t, int pos, int h, int lane, int ring_rows, float (&xs)[4][CONVK],
+                      float (&w)[4][CONVK]) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int c = h * HD + lane * 4 + i;
 #pragma unroll
         for (int lag = 0; lag < CONVK; ++lag) {
-            xs[i][lag] = t - lag < 0 && pos - lag >= 0 ? bf2f(a.ring[(size_t)((pos - lag) % ring_rows) * KVD + c]) : 0.0f;
+            xs[i][lag] = t - lag < 0 && pos - lag >= 0 ? bf2f(ring[(size_t)((pos - lag) % ring_rows) * KVD + c]) : 0.0f;
             // Static taps by lag (tap 0 = current position).
             w[i][lag] = a.dyn ? bf2f(a.static_w[lag * KVD + c]) : bf2f(a.conv[c * CONVK + CONVK - 1 - lag]);
         }
     }
 }
 
-SQ_DEVICE void kv_finish(const KvConv& a, bool key, int t, int pos, int h, int lane, int ring_rows, float clip, float (&xs)[4][CONVK],
-                         const float (&w)[4][CONVK], bool store, bf16 (&out)[4]) {
+SQ_DEVICE void kv_finish(const KvConv& a, bf16* ring, bool key, int g, int t, int pos, int h, int lane, int ring_rows, float clip,
+                         float (&xs)[4][CONVK], const float (&w)[4][CONVK], bf16 (&out)[4]) {
     float y[4], ss = 0.0f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int c = h * HD + lane * 4 + i;
 #pragma unroll
         for (int lag = 0; lag < CONVK; ++lag)
-            if (t - lag >= 0) xs[i][lag] = rb(a.lin[(size_t)(t - lag) * a.ld + c]);
-        if (store) a.ring[(size_t)(pos % ring_rows) * KVD + c] = f2bf(xs[i][0]);
+            if (t - lag >= 0) xs[i][lag] = rb(a.lin[(size_t)(g - lag) * a.ld + c]);
+        ring[(size_t)(pos % ring_rows) * KVD + c] = f2bf(xs[i][0]);
         float acc = 0.0f;
 #pragma unroll
-        for (int lag = 0; lag < CONVK; ++lag) acc += (w[i][lag] + (a.dyn ? a.dyn[(size_t)t * a.ld + h * CONVK + lag] : 0.0f)) * xs[i][lag];
+        for (int lag = 0; lag < CONVK; ++lag) acc += (w[i][lag] + (a.dyn ? a.dyn[(size_t)g * a.ld + h * CONVK + lag] : 0.0f)) * xs[i][lag];
         y[i] = (acc + xs[i][0]) / (a.dyn ? 3.0f : 2.2360679775f);  // sqrt(2 * 4 + 1), sqrt(4 + 1)
         ss += y[i] * y[i];
     }
@@ -606,12 +650,15 @@ SQ_DEVICE void kv_finish(const KvConv& a, bool key, int t, int pos, int h, int l
     for (int i = 0; i < 4; ++i) out[i] = f2bf(y[i] * f);
 }
 
-__global__ void __launch_bounds__(256) qkv_prep_kernel(QPrep qp, KvConv k, KvConv v, int ring_rows, int cache_rows, float clip,
-                                                       const int* __restrict__ start_ptr) {
+// Block (step row g, 3): keys, values, query side. Rings and caches are those of layer visit `visit` of the
+// row's sequence (cache row pos % the cache's rows).
+__global__ void __launch_bounds__(256) qkv_prep_kernel(QPrep qp, KvConv k, KvConv v, int ring_rows, float clip, const Seqs* __restrict__ sq,
+                                                       int visit) {
     pdl_launch_dependents();
     // Constants and earlier steps' ring rows load before the dependency wait.
-    const int t = blockIdx.x, lane = threadIdx.x & 31, h = threadIdx.x >> 5;
-    const int pos = *start_ptr + t;
+    const int g = blockIdx.x, lane = threadIdx.x & 31, h = threadIdx.x >> 5;
+    const SeqRow r = seq_row(sq, g);
+    const int pos = r.pos;
     if (blockIdx.y == 2) {
         float qs[3][4], rsc[3];
 #pragma unroll
@@ -623,7 +670,7 @@ __global__ void __launch_bounds__(256) qkv_prep_kernel(QPrep qp, KvConv k, KvCon
         }
         pdl_wait();
         const float tau = qp.full ? log_tau(pos) : 1.0f;
-        const float* row = qp.lin + (size_t)t * qp.ld;
+        const float* row = qp.lin + (size_t)g * qp.ld;
 #pragma unroll
         for (int u = 0; u < 3; ++u) {
             const int hh = h + 8 * u;
@@ -631,19 +678,20 @@ __global__ void __launch_bounds__(256) qkv_prep_kernel(QPrep qp, KvConv k, KvCon
             float rel;
             q_head(qp, row, hh, lane, qs[u], rsc[u], tau, q, rel);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) qp.q[(size_t)t * QD + hh * HD + lane * 4 + i] = q[i];
-            if (lane < DREL) qp.rel[((size_t)t * H + hh) * DREL + lane] = rel;
-            if (lane == 0) qp.sink[(size_t)t * H + hh] = row[2 * QD + H * DREL + hh];
+            for (int i = 0; i < 4; ++i) qp.q[(size_t)g * QD + hh * HD + lane * 4 + i] = q[i];
+            if (lane < DREL) qp.rel[((size_t)g * H + hh) * DREL + lane] = rel;
+            if (lane == 0) qp.sink[(size_t)g * H + hh] = row[2 * QD + H * DREL + hh];
         }
         return;
     }
     const KvConv& a = blockIdx.y == 0 ? k : v;
+    bf16* ring = tab_ptr<bf16>(r, visit, a.ring_slot);
     float xs[4][CONVK], w[4][CONVK];
-    kv_pre(a, t, pos, h, lane, ring_rows, xs, w);
+    kv_pre(a, ring, r.t, pos, h, lane, ring_rows, xs, w);
     pdl_wait();
     bf16 out[4];
-    kv_finish(a, blockIdx.y == 0, t, pos, h, lane, ring_rows, clip, xs, w, true, out);
-    bf16* dst = a.cache + (size_t)(pos % cache_rows) * KVD + h * HD + lane * 4;
+    kv_finish(a, ring, blockIdx.y == 0, g, r.t, pos, h, lane, ring_rows, clip, xs, w, out);
+    bf16* dst = tab_ptr<bf16>(r, visit, a.cache_slot) + (size_t)(pos % tab_rows(r, visit)) * KVD + h * HD + lane * 4;
 #pragma unroll
     for (int i = 0; i < 4; ++i) dst[i] = out[i];
 }
@@ -656,17 +704,16 @@ __global__ void __launch_bounds__(256) qkv_prep_kernel(QPrep qp, KvConv k, KvCon
 // part[(t * H + h) * splits + split] = {max, sum, out[128]} (unnormalized).
 constexpr int AT_T = 32, AT_THREADS = 128;
 
+// Keys and values: the caches of table visit `visit` of each row's sequence.
 struct AttnArgs {
     const bf16* q;
     const float* rel;
-    const bf16* kc;
-    const bf16* vc;
-    int cache_rows;
+    const Seqs* sq;
+    int visit;
     const bf16* proj;
     int window;
     int block;
     int min_keys;
-    const int* start;
     float* part;
 };
 
@@ -799,17 +846,21 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
     pdl_launch_dependents();
     __shared__ AtSmem sm;
     const int t = blockIdx.x, g = blockIdx.y, split = blockIdx.z, splits = gridDim.z, tid = threadIdx.x;
-    const int p = *a.start + t;
+    const SeqRow sr = seq_row(a.sq, t);
+    const int p = sr.pos, start = a.sq->start[sr.s];
+    const bf16* kc = tab_ptr<const bf16>(sr, a.visit, T_K);
+    const bf16* vc = tab_ptr<const bf16>(sr, a.visit, T_V);
+    const int cache_rows = tab_rows(sr, a.visit);
     int k0, k1;
-    attn_split_keys(p, *a.start, a.block, a.window, a.min_keys, split, splits, k0, k1);
+    attn_split_keys(p, start, a.block, a.window, a.min_keys, split, splits, k0, k1);
     // The first tile's keys and values of earlier steps' positions (before start: no kernel of this step
     // writes them) load before the dependency wait; this step's rows after it.
     uint4 pk[AT_PRE], pv[AT_PRE];
-    const int first_new = *a.start;
+    const int first_new = start;
     auto load = [&](int key, int c, uint4& k, uint4& v) {
-        const size_t row = (size_t)(key % a.cache_rows) * KVD + g * HD + c;
-        k = *reinterpret_cast<const uint4*>(a.kc + row);
-        v = *reinterpret_cast<const uint4*>(a.vc + row);
+        const size_t row = (size_t)(key % cache_rows) * KVD + g * HD + c;
+        k = *reinterpret_cast<const uint4*>(kc + row);
+        v = *reinterpret_cast<const uint4*>(vc + row);
     };
 #pragma unroll
     for (int u = 0; u < AT_PRE; ++u) {
@@ -857,7 +908,12 @@ __global__ void __launch_bounds__(TC_W * 32) attn_tc_kernel(AttnArgs a, int T, c
     float* Rs = B2 + TC_W * TC_Q * TC_B2;                     // [3][16][16]
     const int t0 = blockIdx.x * TC_Q, g = blockIdx.y, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const int gq = lane >> 2, t4 = lane & 3;
-    const int start = *a.start;
+    // Prefill: one sequence.
+    const SeqRow sr = seq_row(a.sq, 0);
+    const int start = sr.pos;
+    const bf16* kc = tab_ptr<const bf16>(sr, a.visit, T_K);
+    const bf16* vc = tab_ptr<const bf16>(sr, a.visit, T_V);
+    const int cache_rows = tab_rows(sr, a.visit);
     const int rows = min(TC_Q, T - t0);
     // Q rows (head-major) and relative states.
     for (int i = tid; i < GQ * TC_Q * (HD / 8); i += TC_W * 32) {
@@ -900,9 +956,9 @@ __global__ void __launch_bounds__(TC_W * 32) attn_tc_kernel(AttnArgs a, int T, c
         for (int i = tid; i < TC_K * (HD / 8); i += TC_W * 32) {
             const int j = i / (HD / 8), c = (i % (HD / 8)) * 8;
             const bool ok = kb + j <= p_last;
-            const size_t row = (size_t)((ok ? kb + j : kb) % a.cache_rows) * KVD + g * HD + c;
-            cp_async16(Ks + j * TC_LD + c, a.kc + row, ok);
-            cp_async16(Vs + j * TC_LD + c, a.vc + row, ok);
+            const size_t row = (size_t)((ok ? kb + j : kb) % cache_rows) * KVD + g * HD + c;
+            cp_async16(Ks + j * TC_LD + c, kc + row, ok);
+            cp_async16(Vs + j * TC_LD + c, vc + row, ok);
         }
         cp_async_commit();
         // Relative bias by distance, for the tile's distances dmin .. dmin + 78 (row i, key kb + j:
@@ -1077,14 +1133,15 @@ __global__ void __launch_bounds__(E) route_kernel(const float* __restrict__ logi
     }
 }
 
-// Routing of up to 16 tokens and the pairs' order by expert (ties by pair), one block of 1024 threads
-// (8 tokens at a time, 128 threads a token).
+// Routing of up to SMALL_ROWS tokens and the pairs' order by expert (ties by pair), one block of 1024
+// threads (8 tokens at a time, 128 threads a token).
+constexpr int SMALL_ROWS = 64;
 __global__ void __launch_bounds__(1024) route_order_kernel(const float* __restrict__ logits, const float* __restrict__ bias, float scale, int T,
                                                            int* sel_e, float* sel_w, int* order) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float key[8][E], picked[8][TOPK];
-    __shared__ int se[16 * TOPK];
+    __shared__ int se[SMALL_ROWS * TOPK];
     const int g = threadIdx.x / E, e = threadIdx.x % E;
     for (int t0 = 0; t0 < T; t0 += 8) {
         const int t = t0 + g;
@@ -1113,8 +1170,8 @@ __global__ void __launch_bounds__(1024) route_order_kernel(const float* __restri
         __syncthreads();
     }
     const int pairs = T * TOPK;
-    if (threadIdx.x < pairs) {
-        const int p = threadIdx.x, ep = se[p];
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+        const int ep = se[p];
         int rank = 0;
         for (int q = 0; q < pairs; ++q) rank += se[q] < ep || (se[q] == ep && q < p);
         order[rank] = p;
@@ -1458,7 +1515,7 @@ __global__ void __launch_bounds__(256) nv4_gemm_kernel(const bf16* __restrict__ 
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Skinny GEMM on the tensor cores for small steps (M <= 16 rows of activations): Y[m, n] = X[m] . W[n]
+// Skinny GEMM on the tensor cores for small steps (M <= 64 rows of activations): Y[m, n] = X[m] . W[n]
 // with INT8 weights and an FP32 scale per 64 of a row (weights dequantized to BF16 in the fragments).
 // A block takes 16 weight rows; its 4 warps split K (64-column chunks) and add through shared memory.
 // Each lane reads 16 contiguous weights of its rows per chunk: the chunk's K order is permuted the same way
@@ -1797,16 +1854,16 @@ __global__ void to_bf16_rows_kernel(const float* __restrict__ src, int T, bf16* 
     dst[(i / D) * ldd + i % D] = f2bf(src[i]);
 }
 
-// out row r = bf16(w * rmsnorm(sum_k alpha[k] * feats[row, k])) with row = rows_from ? *rows_from : r
-// (feats BF16 [*, 4, D]).
+// out row r = bf16(w * rmsnorm(sum_k alpha[k] * feats[row, k])) with row = rows_from[the sequence of row r
+// in sq] (or r without rows_from; feats BF16 [*, 4, D]).
 constexpr int TAPS = 4;
-__global__ void __launch_bounds__(RT) mix_kernel(const bf16* __restrict__ feats, const int* __restrict__ rows_from, const float* __restrict__ alpha,
-                                                 const bf16* __restrict__ w, bf16* out, int ldo) {
+__global__ void __launch_bounds__(RT) mix_kernel(const bf16* __restrict__ feats, const int* __restrict__ rows_from, const Seqs* __restrict__ sq,
+                                                 const float* __restrict__ alpha, const bf16* __restrict__ w, bf16* out, int ldo) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float red[32];
     const int r = blockIdx.x;
-    const int row = rows_from ? *rows_from : r;
+    const int row = rows_from ? rows_from[seq_row(sq, r).s] : r;
     const bf16* f = feats + (size_t)row * TAPS * D;
     float v[RPT], ss = 0.0f;
 #pragma unroll
@@ -1853,13 +1910,18 @@ SQ_DEVICE void head_norm(float (&v)[4], const bf16* w) {
 }
 
 // Context keys and values of a drafter layer from kv F32 [T, 2048] (keys | values): keys normalized per head
-// (knorm) and rotated by position start + t; both stored to the caches. Block t, 8 warps (heads).
+// (knorm) and rotated by the row's position; both stored to the caches (table visit `visit` of the row's
+// sequence, row pos % its rows). Block t, 8 warps (heads).
 __global__ void __launch_bounds__(256) ctx_kv_kernel(const float* __restrict__ kv, const bf16* __restrict__ knorm, float theta,
-                                                     const int* __restrict__ start_ptr, bf16* kcache, bf16* vcache) {
+                                                     const Seqs* __restrict__ sq, int visit) {
     pdl_launch_dependents();
     pdl_wait();
     const int t = blockIdx.x, h = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int pos = *start_ptr + t;
+    const SeqRow sr = seq_row(sq, t);
+    const int pos = sr.pos;
+    const size_t at = (size_t)(pos % tab_rows(sr, visit)) * KVD;
+    bf16* kcache = tab_ptr<bf16>(sr, visit, T_K);
+    bf16* vcache = tab_ptr<bf16>(sr, visit, T_V);
     const float* row = kv + (size_t)t * 2 * KVD + h * HD + lane * 4;
     float k[4];
 #pragma unroll
@@ -1868,19 +1930,22 @@ __global__ void __launch_bounds__(256) ctx_kv_kernel(const float* __restrict__ k
     rope_head(k, pos, theta);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        kcache[(size_t)pos * KVD + h * HD + lane * 4 + i] = f2bf(k[i]);
-        vcache[(size_t)pos * KVD + h * HD + lane * 4 + i] = f2bf(row[KVD + i]);
+        kcache[at + h * HD + lane * 4 + i] = f2bf(k[i]);
+        vcache[at + h * HD + lane * 4 + i] = f2bf(row[KVD + i]);
     }
 }
 
-// The drafter block's queries, keys and values from qkv F32 [T, 5120]: q and k normalized per head and
-// rotated (position start + t); q to BF16 [T, 3072], k and v to the caches. Block (t, head of 40), 1 warp.
+// The drafter blocks' queries, keys and values from qkv F32 [T, 5120]: q and k normalized per head and
+// rotated (the row's position); q to BF16 [T, 3072], k and v to the caches (as ctx_kv_kernel). Block (t,
+// head of 40), 1 warp.
 __global__ void __launch_bounds__(32) draft_qkv_kernel(const float* __restrict__ qkv, const bf16* __restrict__ qnorm, const bf16* __restrict__ knorm,
-                                                       float theta, const int* __restrict__ start_ptr, bf16* q, bf16* kcache, bf16* vcache) {
+                                                       float theta, const Seqs* __restrict__ sq, int visit, bf16* q) {
     pdl_launch_dependents();
     pdl_wait();
     const int t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x;
-    const int pos = *start_ptr + t;
+    const SeqRow sr = seq_row(sq, t);
+    const int pos = sr.pos;
+    const size_t at = (size_t)(pos % tab_rows(sr, visit)) * KVD;
     const float* row = qkv + (size_t)t * (QD + 2 * KVD) + h * HD + lane * 4;
     float v[4];
 #pragma unroll
@@ -1893,9 +1958,9 @@ __global__ void __launch_bounds__(32) draft_qkv_kernel(const float* __restrict__
     } else if (h < H + KVH) {
         head_norm(v, knorm);
         rope_head(v, pos, theta);
-        dst = kcache + (size_t)pos * KVD + (h - H) * HD;
+        dst = tab_ptr<bf16>(sr, visit, T_K) + at + (h - H) * HD;
     } else {
-        dst = vcache + (size_t)pos * KVD + (h - H - KVH) * HD;
+        dst = tab_ptr<bf16>(sr, visit, T_V) + at + (h - H - KVH) * HD;
     }
 #pragma unroll
     for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = f2bf(v[i]);
@@ -1912,19 +1977,21 @@ __global__ void silu_mul_kernel(const float* __restrict__ gu, int n, int T, bf16
     out[i] = f2bf(g / (1.0f + expf(-g)) * gu[t * 2 * n + n + c]);
 }
 
-// The drafter's block: row 0 = w * rmsnorm(table[*anchor]), rows 1 .. rows - 1 = mask (F32 [rows, D]).
-__global__ void __launch_bounds__(RT) block_embed_kernel(const int* __restrict__ anchor, const bf16* __restrict__ table, const bf16* __restrict__ w,
-                                                         const bf16* __restrict__ mask, float* x) {
+// The drafter's blocks (one per sequence of sq): a sequence's row 0 = w * rmsnorm(table[anchor[s]]), its
+// other rows = mask (F32 [rows, D]).
+__global__ void __launch_bounds__(RT) block_embed_kernel(const int* __restrict__ anchor, const Seqs* __restrict__ sq, const bf16* __restrict__ table,
+                                                         const bf16* __restrict__ w, const bf16* __restrict__ mask, float* x) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float red[32];
     const int r = blockIdx.x;
-    if (r > 0) {
+    const SeqRow sr = seq_row(sq, r);
+    if (sr.t > 0) {
 #pragma unroll
         for (int i = 0; i < RPT; ++i) x[(size_t)r * D + threadIdx.x + RT * i] = bf2f(mask[threadIdx.x + RT * i]);
         return;
     }
-    const bf16* row = table + (size_t)*anchor * D;
+    const bf16* row = table + (size_t)anchor[sr.s] * D;
     float v[RPT], ss = 0.0f;
 #pragma unroll
     for (int i = 0; i < RPT; ++i) {
@@ -1933,19 +2000,25 @@ __global__ void __launch_bounds__(RT) block_embed_kernel(const int* __restrict__
     }
     const float inv = rsqrtf(block_sum(ss, red) / D + EPS);
 #pragma unroll
-    for (int i = 0; i < RPT; ++i) x[threadIdx.x + RT * i] = rb(bf2f(w[threadIdx.x + RT * i]) * (v[i] * inv));
+    for (int i = 0; i < RPT; ++i) x[(size_t)r * D + threadIdx.x + RT * i] = rb(bf2f(w[threadIdx.x + RT * i]) * (v[i] * inv));
 }
 
 // One Markov step: raw = ctx + bias + W [state, w1[prev]] (W [768, 512]); state' = gate * state + (1 -
 // gate) * tanh(cand), latent = tanh(out), each op rounded to BF16 as the reference. Block b, warp w: channel
-// c = 8 b + w (rows c, 256 + c, 512 + c).
+// c = 8 b + w (rows c, 256 + c, 512 + c). blockIdx.y: the sequence (ctx at a stride of ctx_ss floats; its
+// state, prev and latent at strides of 2 * MR, 1 and MR).
 constexpr int MR = 256;
-__global__ void __launch_bounds__(256) markov_step_kernel(const bf16* __restrict__ w, const float* __restrict__ ctx, const bf16* __restrict__ bias,
+__global__ void __launch_bounds__(256) markov_step_kernel(const bf16* __restrict__ w, const float* __restrict__ ctx, int ctx_ss, const bf16* __restrict__ bias,
                                                           const bf16* state_in, const bf16* __restrict__ w1, const int* prev, bf16* state_out,
                                                           bf16* latent) {
     pdl_launch_dependents();
     pdl_wait();
-    const int lane = threadIdx.x & 31, c = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, c = blockIdx.x * 8 + (threadIdx.x >> 5), sq = blockIdx.y;
+    ctx += (size_t)sq * ctx_ss;
+    state_in += sq * 2 * MR;
+    state_out += sq * 2 * MR;
+    prev += sq;
+    latent += sq * MR;
     // prev and the state are rewritten at the same addresses between steps: read once per block from L2
     // (an SM's non-coherent L1 may still hold an earlier step's line).
     __shared__ uint4 st_s[MR / 8];
@@ -1983,10 +2056,15 @@ __global__ void __launch_bounds__(256) markov_step_kernel(const bf16* __restrict
 // Logits of a Markov step: cap * tanh(bf16(base + fold_b + fold_w . latent) / cap) over V rows, reduced to
 // one (max, index) per block (block 256 threads, warp per row, 64 rows per block).
 constexpr int MV_ROWS = 64;
+// blockIdx.y: the sequence (base at a stride of base_ss; latent MR, best_v 2 * zoff, best_i zoff).
 __global__ void __launch_bounds__(256) markov_vocab_kernel(const bf16* __restrict__ fold_w, const float* __restrict__ fold_b, const float* __restrict__ base,
-                                                           const bf16* latent, int V, float cap, float* best_v, int* best_i, int zoff) {
+                                                           int base_ss, const bf16* latent, int V, float cap, float* best_v, int* best_i, int zoff) {
     pdl_launch_dependents();
     pdl_wait();
+    base += (size_t)blockIdx.y * base_ss;
+    latent += blockIdx.y * MR;
+    best_v += (size_t)blockIdx.y * 2 * zoff;
+    best_i += (size_t)blockIdx.y * zoff;
     __shared__ float bv[8], bz[8];
     __shared__ int bi[8];
     __shared__ uint4 lat_s[MR / 8];
@@ -2087,10 +2165,15 @@ __global__ void __launch_bounds__(MC_ROWS) markov_cand_kernel(const float* base,
 
 // markov_vocab_kernel over a candidate list (-1 entries skipped).
 __global__ void __launch_bounds__(256) markov_vocab_cand_kernel(const bf16* __restrict__ fold_w, const float* __restrict__ fold_b, const float* base,
-                                                                const bf16* latent, const int* cand, int ncand, float cap, float* best_v,
-                                                                int* best_i, int zoff) {
+                                                                int base_ss, const bf16* latent, const int* cand, int cand_ss, int ncand, float cap,
+                                                                float* best_v, int* best_i, int zoff) {
     pdl_launch_dependents();
     pdl_wait();
+    base += (size_t)blockIdx.y * base_ss;
+    latent += blockIdx.y * MR;
+    cand += (size_t)blockIdx.y * cand_ss;
+    best_v += (size_t)blockIdx.y * 2 * zoff;
+    best_i += (size_t)blockIdx.y * zoff;
     __shared__ float bv[8], bz[8];
     __shared__ int bi[8];
     __shared__ uint4 lat_s[MR / 8];
@@ -2155,10 +2238,16 @@ __global__ void __launch_bounds__(256) markov_vocab_cand_kernel(const bf16* __re
 }
 
 // conf: the pick's probability under the head's softmax (over the scored rows).
+// Block s: sequence s (best_v / best_i as markov_vocab_kernel; out and conf at a stride of out_ss, prev 1).
 __global__ void __launch_bounds__(256) markov_pick_kernel(const float* best_v, const int* best_i, int n, int* out, int* prev, int zoff, float cap,
-                                                          float* conf) {
+                                                          float* conf, int out_ss) {
     pdl_launch_dependents();
     pdl_wait();
+    best_v += (size_t)blockIdx.x * 2 * zoff;
+    best_i += (size_t)blockIdx.x * zoff;
+    out += (size_t)blockIdx.x * out_ss;
+    conf += (size_t)blockIdx.x * out_ss;
+    prev += blockIdx.x;
     __shared__ float sv[256], sz[256];
     __shared__ int si[256];
     float v = -INFINITY, z = 0.0f;
@@ -2270,16 +2359,19 @@ cudaError_t quench6k_ink_rms(int sets, const float* const* x, const void* const*
 }
 
 // out (null: none) F32 [nq][T, D]; norm_o[q] (null: none) BF16 rows at stride ldo = norm_w[q] * rmsnorm(out q).
+// cv_sq (null: no convolution): the convolution's ring is slot cv_slot of table visit cv_visit of each row's
+// sequence. small: the cluster kernel (small steps; a token's sums do not depend on the step's rows).
 cudaError_t quench6k_ink_attn_res(const float* const* src, int ns, const float* queries, int nq, int T, float* out, const void* const* norm_w,
-                                  void* const* norm_o, int ldo, const float* cv_src, const float* cv_cy, const float* cv_cw, void* cv_ring,
-                                  int cv_ring_rows, const void* cv_conv, const float* cv_base, const int* cv_start, cudaStream_t st) {
+                                  void* const* norm_o, int ldo, const float* cv_src, const float* cv_cy, const float* cv_cw, const void* cv_sq,
+                                  int cv_visit, int cv_slot, int cv_ring_rows, const void* cv_conv, const float* cv_base, int small,
+                                  cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     if (ns < 1 || ns > MAX_SRC || nq < 1 || nq > MAX_Q) return cudaErrorInvalidValue;
     Srcs s{};
     for (int i = 0; i < ns; ++i) s.p[i] = src[i];
     // With a convolution, the last source's address is where its output goes.
-    const ConvSrc cv{cv_src, cv_cy, cv_cw, static_cast<bf16*>(cv_ring), cv_ring_rows, static_cast<const bf16*>(cv_conv), cv_base, cv_start,
-                     cv_ring ? const_cast<float*>(src[ns - 1]) : nullptr};
+    const ConvSrc cv{cv_src, cv_cy, cv_cw, static_cast<const Seqs*>(cv_sq), cv_visit, cv_slot, cv_ring_rows, static_cast<const bf16*>(cv_conv),
+                     cv_base, cv_sq ? const_cast<float*>(src[ns - 1]) : nullptr};
     ResNorms n{};
     n.ldo = ldo;
     for (int i = 0; i < nq && norm_o; ++i) {
@@ -2302,7 +2394,8 @@ cudaError_t quench6k_ink_attn_res(const float* const* src, int ns, const float* 
         SQ_CHECK_LAUNCH(sq_launch(attn_res_cl_kernel<S_, Q_>, T * CL, CL_T, 0, st, s, queries, out, (size_t)T * D, n, cv)); \
         SQ_RETURN_LAUNCH();                                                                                          \
     }
-    if (cluster && T <= 16) {
+    if (cluster && small) {
+        if (T > SMALL_ROWS) return cudaErrorInvalidValue;
         SQ_ARC(1, 1) SQ_ARC(2, 1) SQ_ARC(3, 1) SQ_ARC(4, 1) SQ_ARC(5, 1) SQ_ARC(6, 1)
         SQ_ARC(1, 3) SQ_ARC(2, 3) SQ_ARC(3, 3) SQ_ARC(4, 3) SQ_ARC(5, 3) SQ_ARC(6, 3)
         SQ_ARC(2, 4)
@@ -2346,40 +2439,41 @@ cudaError_t quench6k_ink_msg_gates(int n, const float* const* hs, const float* c
 // The query side (lin_q [T, ldq]: q | gate | relative states | sinks) and the key and value convolutions
 // (lin_k / lin_v [T, ldk]: projections, then the full layers' per-token taps): conv static taps [KVD, 4]
 // (sliding layers) or null with static_w [4, KVD] (full layers).
+// Rings and caches: table visit `visit` of each row's sequence (sq).
 cudaError_t quench6k_ink_qkv_prep(const float* lin_q, int ldq, const void* qscale, const void* rscale, float qclip, float rclip, int full,
-                                  void* q, float* rel, float* sink, const float* lin_k, const float* lin_v, int ldk, void* kring, void* vring,
-                                  const void* kconv, const void* vconv, const void* kstatic, const void* vstatic, void* kcache, void* vcache,
-                                  int ring_rows, int cache_rows, const int* start, int T, cudaStream_t st) {
+                                  void* q, float* rel, float* sink, const float* lin_k, const float* lin_v, int ldk, const void* kconv,
+                                  const void* vconv, const void* kstatic, const void* vstatic, int ring_rows, const void* sq, int visit, int T,
+                                  cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     const QPrep qp{lin_q, ldq, static_cast<const bf16*>(qscale), static_cast<const bf16*>(rscale), qclip, rclip, full, static_cast<bf16*>(q),
                    rel, sink};
     const bool dyn = kconv == nullptr;
-    const KvConv k{lin_k, ldk, static_cast<bf16*>(kring), static_cast<const bf16*>(kconv), static_cast<const bf16*>(kstatic),
-                   dyn ? lin_k + KVD : nullptr, static_cast<bf16*>(kcache)};
-    const KvConv v{lin_v, ldk, static_cast<bf16*>(vring), static_cast<const bf16*>(vconv), static_cast<const bf16*>(vstatic),
-                   dyn ? lin_v + KVD : nullptr, static_cast<bf16*>(vcache)};
-    SQ_CHECK_LAUNCH(sq_launch(qkv_prep_kernel, dim3(T, 3), 256, 0, st, qp, k, v, ring_rows, cache_rows, qclip, start));
+    const KvConv k{lin_k, ldk, T_KRING, T_K, static_cast<const bf16*>(kconv), static_cast<const bf16*>(kstatic), dyn ? lin_k + KVD : nullptr};
+    const KvConv v{lin_v, ldk, T_VRING, T_V, static_cast<const bf16*>(vconv), static_cast<const bf16*>(vstatic), dyn ? lin_v + KVD : nullptr};
+    SQ_CHECK_LAUNCH(sq_launch(qkv_prep_kernel, dim3(T, 3), 256, 0, st, qp, k, v, ring_rows, qclip, static_cast<const Seqs*>(sq), visit));
     SQ_RETURN_LAUNCH();
 }
 
 // x from src F32 [T, D], or (cy non-null) the combine sum_k cw[t, k] cy[t * 8 + k]; see hidden_conv_kernel.
-cudaError_t quench6k_ink_hidden_conv(const float* src, const float* cy, const float* cw, void* ring, int ring_rows, const void* conv,
-                                     const float* base, const int* start, int T, float* out, cudaStream_t st) {
+cudaError_t quench6k_ink_hidden_conv(const float* src, const float* cy, const float* cw, const void* sq, int visit, int slot, int ring_rows,
+                                     const void* conv, const float* base, int T, float* out, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    const ConvSrc v{src, cy, cw, static_cast<bf16*>(ring), ring_rows, static_cast<const bf16*>(conv), base, start, out};
+    const ConvSrc v{src, cy, cw, static_cast<const Seqs*>(sq), visit, slot, ring_rows, static_cast<const bf16*>(conv), base, out};
     SQ_CHECK_LAUNCH(sq_launch(hidden_conv_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, v, T));
     SQ_RETURN_LAUNCH();
 }
 
 size_t quench6k_ink_attn_part_floats(int T, int splits) { return (size_t)T * H * splits * (2 + HD); }
 
-cudaError_t quench6k_ink_attention(const void* q, const float* rel, const float* sink, const void* kcache, const void* vcache, int cache_rows,
-                                   const void* proj, int window, int block, const int* start, int T, int splits, int min_keys,
-                                   const float* lin, int ld, int gate_off, float* part, void* out, cudaStream_t st) {
+// Caches: table visit `visit` of each row's sequence (sq). small: the split kernels (a token's result does
+// not depend on the step's rows), else (prefill, one sequence) the tensor-core kernel where it applies.
+cudaError_t quench6k_ink_attention(const void* q, const float* rel, const float* sink, const void* sq, int visit, const void* proj, int window,
+                                   int block, int T, int splits, int min_keys, const float* lin, int ld, int gate_off, float* part, void* out,
+                                   int small, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    const AttnArgs a{static_cast<const bf16*>(q), rel, static_cast<const bf16*>(kcache), static_cast<const bf16*>(vcache), cache_rows,
-                     static_cast<const bf16*>(proj), window, block, min_keys, start, part};
-    if (rel && sink && lin && block == 0 && T > 16) {
+    const AttnArgs a{static_cast<const bf16*>(q), rel, static_cast<const Seqs*>(sq), visit, static_cast<const bf16*>(proj), window, block,
+                     min_keys, part};
+    if (rel && sink && lin && block == 0 && !small) {
         static bool configured = false;
         if (!configured) {
             const cudaError_t e = cudaFuncSetAttribute(attn_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TC_SMEM);
@@ -2399,7 +2493,7 @@ cudaError_t quench6k_ink_attention(const void* q, const float* rel, const float*
 cudaError_t quench6k_ink_route(const float* logits, const float* bias, float scale, int T, int* sel_e, float* sel_w, int* order, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     if (order) {
-        if (T > 16) return cudaErrorInvalidValue;
+        if (T > SMALL_ROWS) return cudaErrorInvalidValue;
         SQ_CHECK_LAUNCH(sq_launch(route_order_kernel, 1, 1024, 0, st, logits, bias, scale, T, sel_e, sel_w, order));
         SQ_RETURN_LAUNCH();
     }
@@ -2444,28 +2538,25 @@ cudaError_t quench6k_ink_to_bf16_rows(const float* src, int T, void* dst, int ld
     SQ_RETURN_LAUNCH();
 }
 
-cudaError_t quench6k_ink_mix(const void* feats, const int* rows_from, const float* alpha, const void* w, void* out, int ldo, int rows,
-                             cudaStream_t st) {
+cudaError_t quench6k_ink_mix(const void* feats, const int* rows_from, const void* sq, const float* alpha, const void* w, void* out, int ldo,
+                             int rows, cudaStream_t st) {
     if (rows == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(mix_kernel, rows, RT, 0, st, static_cast<const bf16*>(feats), rows_from, alpha, static_cast<const bf16*>(w),
-                              static_cast<bf16*>(out), ldo));
+    SQ_CHECK_LAUNCH(sq_launch(mix_kernel, rows, RT, 0, st, static_cast<const bf16*>(feats), rows_from, static_cast<const Seqs*>(sq), alpha,
+                              static_cast<const bf16*>(w), static_cast<bf16*>(out), ldo));
     SQ_RETURN_LAUNCH();
 }
 
-cudaError_t quench6k_ink_ctx_kv(const float* kv, const void* knorm, float theta, const int* start, int T, void* kcache, void* vcache,
-                                cudaStream_t st) {
+cudaError_t quench6k_ink_ctx_kv(const float* kv, const void* knorm, float theta, const void* sq, int visit, int T, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(ctx_kv_kernel, T, 256, 0, st, kv, static_cast<const bf16*>(knorm), theta, start, static_cast<bf16*>(kcache),
-                              static_cast<bf16*>(vcache)));
+    SQ_CHECK_LAUNCH(sq_launch(ctx_kv_kernel, T, 256, 0, st, kv, static_cast<const bf16*>(knorm), theta, static_cast<const Seqs*>(sq), visit));
     SQ_RETURN_LAUNCH();
 }
 
-cudaError_t quench6k_ink_draft_qkv(const float* qkv, const void* qnorm, const void* knorm, float theta, const int* start, int T, void* q,
-                                   void* kcache, void* vcache, cudaStream_t st) {
+cudaError_t quench6k_ink_draft_qkv(const float* qkv, const void* qnorm, const void* knorm, float theta, const void* sq, int visit, int T, void* q,
+                                   cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(draft_qkv_kernel, dim3(T, H + 2 * KVH), 32, 0, st, qkv, static_cast<const bf16*>(qnorm),
-                              static_cast<const bf16*>(knorm), theta, start, static_cast<bf16*>(q), static_cast<bf16*>(kcache),
-                              static_cast<bf16*>(vcache)));
+                              static_cast<const bf16*>(knorm), theta, static_cast<const Seqs*>(sq), visit, static_cast<bf16*>(q)));
     SQ_RETURN_LAUNCH();
 }
 
@@ -2475,32 +2566,42 @@ cudaError_t quench6k_ink_silu_mul(const float* gu, int n, int T, void* out, cuda
     SQ_RETURN_LAUNCH();
 }
 
-cudaError_t quench6k_ink_block_embed(const int* anchor, const void* table, const void* w, const void* mask, int rows, float* x, cudaStream_t st) {
-    SQ_CHECK_LAUNCH(sq_launch(block_embed_kernel, rows, RT, 0, st, anchor, static_cast<const bf16*>(table), static_cast<const bf16*>(w),
-                              static_cast<const bf16*>(mask), x));
+cudaError_t quench6k_ink_block_embed(const int* anchor, const void* sq, const void* table, const void* w, const void* mask, int rows, float* x,
+                                     cudaStream_t st) {
+    SQ_CHECK_LAUNCH(sq_launch(block_embed_kernel, rows, RT, 0, st, anchor, static_cast<const Seqs*>(sq), static_cast<const bf16*>(table),
+                              static_cast<const bf16*>(w), static_cast<const bf16*>(mask), x));
     SQ_RETURN_LAUNCH();
 }
 
 size_t quench6k_ink_markov_blocks(int V) { return (size_t)(V + MV_ROWS - 1) / MV_ROWS; }
 
-// One Markov step (see markov_step_kernel / markov_vocab_kernel): writes the pick to *out and *prev.
-cudaError_t quench6k_ink_markov(const void* w, const float* ctx, const void* bias, const void* state_in, const void* w1, int* prev, void* state_out,
-                                void* latent, const void* fold_w, const float* fold_b, const float* base, int V, float cap, float* best_v,
-                                int* best_i, int* out, float* conf, const int* cand, int ncand, cudaStream_t st) {
+// One Markov step of `nseq` sequences (see markov_step_kernel / markov_vocab_kernel): writes the picks to out
+// and prev. Per sequence: ctx, base, cand and out / conf at strides ctx_ss, base_ss, cand_ss and out_ss; the
+// state (two halves of MR), prev, latent and best_v / best_i at their fixed sizes.
+cudaError_t quench6k_ink_markov(int nseq, const void* w, const float* ctx, int ctx_ss, const void* bias, const void* state_in, const void* w1,
+                                int* prev, void* state_out, void* latent, const void* fold_w, const float* fold_b, const float* base, int base_ss,
+                                int V, float cap, float* best_v, int* best_i, int* out, float* conf, int out_ss, const int* cand, int cand_ss,
+                                int ncand, cudaStream_t st) {
+    if (nseq < 1) return cudaSuccess;
     const int zoff = (V + MV_ROWS - 1) / MV_ROWS;
-    SQ_CHECK_LAUNCH(sq_launch(markov_step_kernel, MR / 8, 256, 0, st, static_cast<const bf16*>(w), ctx, static_cast<const bf16*>(bias),
-                              static_cast<const bf16*>(state_in), static_cast<const bf16*>(w1), (const int*)prev, static_cast<bf16*>(state_out),
-                              static_cast<bf16*>(latent)));
+    SQ_CHECK_LAUNCH(sq_launch(markov_step_kernel, dim3(MR / 8, nseq), 256, 0, st, static_cast<const bf16*>(w), ctx, ctx_ss,
+                              static_cast<const bf16*>(bias), static_cast<const bf16*>(state_in), static_cast<const bf16*>(w1), (const int*)prev,
+                              static_cast<bf16*>(state_out), static_cast<bf16*>(latent)));
     const int nb = ((cand ? ncand : V) + MV_ROWS - 1) / MV_ROWS;
     if (cand)
-        SQ_CHECK_LAUNCH(sq_launch(markov_vocab_cand_kernel, nb, 256, 0, st, static_cast<const bf16*>(fold_w), fold_b, base,
-                                  static_cast<const bf16*>(latent), cand, ncand, cap, best_v, best_i, zoff));
+        SQ_CHECK_LAUNCH(sq_launch(markov_vocab_cand_kernel, dim3(nb, nseq), 256, 0, st, static_cast<const bf16*>(fold_w), fold_b, base, base_ss,
+                                  static_cast<const bf16*>(latent), cand, cand_ss, ncand, cap, best_v, best_i, zoff));
     else
-        SQ_CHECK_LAUNCH(sq_launch(markov_vocab_kernel, nb, 256, 0, st, static_cast<const bf16*>(fold_w), fold_b, base,
+        SQ_CHECK_LAUNCH(sq_launch(markov_vocab_kernel, dim3(nb, nseq), 256, 0, st, static_cast<const bf16*>(fold_w), fold_b, base, base_ss,
                                   static_cast<const bf16*>(latent), V, cap, best_v, best_i, zoff));
-    SQ_CHECK_LAUNCH(sq_launch(markov_pick_kernel, 1, 256, 0, st, (const float*)best_v, (const int*)best_i, nb, out, prev, zoff, cap, conf));
+    SQ_CHECK_LAUNCH(sq_launch(markov_pick_kernel, nseq, 256, 0, st, (const float*)best_v, (const int*)best_i, nb, out, prev, zoff, cap, conf,
+                              out_ss));
     SQ_RETURN_LAUNCH();
 }
+
+int quench6k_ink_seqs_bytes() { return (int)sizeof(Seqs); }
+int quench6k_ink_tab_slots() { return TAB; }
+int quench6k_ink_small_rows() { return SMALL_ROWS; }
 
 cudaError_t quench6k_ink_moe_plan(const int* sel_e, int T, int bm, int* offsets, int* tile_expert, int* tile_row, int* num_tiles, int* pair_row,
                                   cudaStream_t st) {
@@ -2608,14 +2709,19 @@ cudaError_t quench6k_ink_skinny_i8(int M, const void* x0, const void* x1, const 
                                    float* y1, float* y2, int ldy0, int ldy1, int ldy2, int end0, int end1, int nseg, int N, int K,
                                    cudaStream_t st) {
     if (M == 0) return cudaSuccess;
-    if (M > 16 || K % 64 != 0 || ldx % 8 != 0 || end0 % 16 != 0 || end1 % 16 != 0) return cudaErrorInvalidValue;
+    if (M > SMALL_ROWS || K % 64 != 0 || ldx % 8 != 0 || end0 % 16 != 0 || end1 % 16 != 0) return cudaErrorInvalidValue;
     SkinnyArgs a{static_cast<const int8_t*>(w), scale, {static_cast<const bf16*>(x0), static_cast<const bf16*>(x1 ? x1 : x0),
                  static_cast<const bf16*>(x2 ? x2 : x0)}, {y0, y1, y2}, {ldy0, ldy1, ldy2}, {end0, end1}, nseg, ldx, M, N, K};
     const unsigned grid = (N + 15) / 16;
-    if (M <= 8)
-        SQ_CHECK_LAUNCH(sq_launch(skinny_i8_kernel<1>, grid, SK_W * 32, 0, st, a));
-    else
-        SQ_CHECK_LAUNCH(sq_launch(skinny_i8_kernel<2>, grid, SK_W * 32, 0, st, a));
+    // Tiles of 8 tokens (a token's sums never depend on the others: its own MMA column, the same order).
+    switch ((M + 7) / 8) {
+#define SQ_SK(n)                                                                    \
+    case n:                                                                         \
+        SQ_CHECK_LAUNCH(sq_launch(skinny_i8_kernel<n>, grid, SK_W * 32, 0, st, a)); \
+        break;
+        SQ_SK(1) SQ_SK(2) SQ_SK(3) SQ_SK(4) SQ_SK(5) SQ_SK(6) SQ_SK(7) SQ_SK(8)
+#undef SQ_SK
+    }
     SQ_RETURN_LAUNCH();
 }
 

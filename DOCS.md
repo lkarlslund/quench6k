@@ -120,6 +120,21 @@ number of drafts with the most expected tokens per second, and runs the drafter 
 beat plain ones (`QUENCH6K_INK_DRAFTS=N` fixes the count in `quench6k inkling`; `QUENCH6K_INK_DRAFT=0`
 does not load the drafter). Decoding stays exact.
 
+Sequences share the GPU's memory by length: a sequence's full-attention caches (8 of the 48 layer
+visits, and the drafter's one full-attention layer: 36 KiB per position in all) are reserved as virtual
+memory for its capacity (up to the model's 1,048,576 positions) and mapped in pieces as positions are
+used (`State::reserve` / `State::trim`); its rings (the sliding layers' keys and values and the
+convolution inputs, 4096 positions each, about 3.1 GiB) are allocated with it. A snapshot at the end of
+a prompt keeps only what resuming there reads (the last 1040 positions of the sliding keys and values,
+the last 4 of the convolution inputs: about 0.17 GiB). Up to 8 sequences decode together
+(`InklingModel::forward_batch`, 1 to 16 tokens each, at most 64 rows; `draft_batch` drafts for them
+in one pass): every kernel of a small step finds each row's sequence, position, caches and rings in a
+small per-step descriptor, so one CUDA graph per row count serves any sequences, and each row's results
+do not depend on the step's other rows (skinny tensor-core GEMM over up to 64 rows, the GEMV in launches
+of at most 16, per-pair experts, per-row attention splits). A sequence's logits, caches and drafts are
+bit-identical alone and batched (`quench6k inkling batch-check` compares them and measures batched
+steps).
+
 Its correctness gate compares teacher-forced distributions against `tools/ref/inkling_ref.py`, which
 drives the transformers implementation's decoder layers (transformers 5.24 or later) one layer at a time
 on the GPU, in BF16 (reference A) and FP32 (B):
