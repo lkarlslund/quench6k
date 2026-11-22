@@ -25,8 +25,10 @@ use crate::chat::{Chat, TextStream};
 
 mod atlas;
 mod dashboard;
+mod flint;
 mod hy4;
 mod inkling;
+mod slots;
 
 pub struct ServeOptions {
     pub model: PathBuf,
@@ -452,8 +454,8 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     let steering = steer.steering.is_some();
     let hy4 = quench6k_engine::hy4::Hy4Model::is_hy4(&opts.model);
     let inkling = quench6k_engine::inkling::InklingModel::is_inkling(&opts.model);
-    // Flint, Hy4-flash and Inkling 2 run one sequence through their own worker loops, without the
-    // session's features (steering, adapters, vision, edits, stored contexts).
+    // Flint, Hy4-flash and Inkling 2 run in the slot scheduler (serve/slots.rs) over their own engines,
+    // without the session's features (steering, adapters, vision, edits, stored contexts).
     let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model) || hy4 || inkling;
     anyhow::ensure!(
         !(flint && steering),
@@ -464,7 +466,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         "adapters are not supported for this model"
     );
     let vision = opts.vision && !flint;
-    let metrics = Arc::new(Metrics::new(if flint { 1 } else { slots }));
+    let metrics = Arc::new(Metrics::new(slots));
     let worker_metrics = metrics.clone();
     let unload_idle = opts.unload_idle;
     std::thread::spawn(move || {
@@ -484,68 +486,46 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                     println!("model loaded again in {:.1}s", t0.elapsed().as_secs_f64());
                 }
             };
+            let cfg = slots::Config {
+                slots,
+                context,
+                plan_tokens,
+                prefill_share,
+                unload_idle,
+            };
+            // A model with an engine of its own loaded: report, then run the slot scheduler.
+            let started = |ready: &mut Option<mpsc::Sender<Result<f32>>>| {
+                if let Some(tx) = ready.take() {
+                    let _ = tx.send(Ok(0.0));
+                }
+                loaded(&metrics);
+                for slot in &metrics.live {
+                    slot.end(false);
+                }
+            };
             let run = if inkling {
                 crate::inkling::load(&model_dir).map(|(model, stream)| {
-                    if let Some(tx) = ready.take() {
-                        let _ = tx.send(Ok(0.0));
-                    }
-                    loaded(&metrics);
-                    for slot in &metrics.live {
-                        slot.end(false);
-                    }
-                    let exit = inkling::schedule(
-                        &model,
-                        &stream,
-                        context,
-                        &jobs_rx,
-                        &metrics,
-                        std::mem::take(&mut waiting),
-                        unload_idle,
-                    );
+                    started(&mut ready);
+                    let engine = inkling::Engine::new(&model, &stream);
+                    let exit = serve_slots(engine, &cfg, &jobs_rx, &metrics, std::mem::take(&mut waiting));
                     drop(model);
                     drop(stream);
                     exit
                 })
             } else if hy4 {
                 crate::hy4::load(&model_dir).map(|(model, stream)| {
-                    if let Some(tx) = ready.take() {
-                        let _ = tx.send(Ok(0.0));
-                    }
-                    loaded(&metrics);
-                    for slot in &metrics.live {
-                        slot.end(false);
-                    }
-                    let exit = hy4::schedule(
-                        &model,
-                        &stream,
-                        context,
-                        &jobs_rx,
-                        &metrics,
-                        std::mem::take(&mut waiting),
-                        unload_idle,
-                    );
+                    started(&mut ready);
+                    let engine = hy4::Engine::new(&model, &stream, context);
+                    let exit = serve_slots(engine, &cfg, &jobs_rx, &metrics, std::mem::take(&mut waiting));
                     drop(model);
                     drop(stream);
                     exit
                 })
             } else if flint {
                 crate::flint::load(&model_dir).map(|(model, stream)| {
-                    if let Some(tx) = ready.take() {
-                        let _ = tx.send(Ok(0.0));
-                    }
-                    loaded(&metrics);
-                    for slot in &metrics.live {
-                        slot.end(false);
-                    }
-                    let exit = schedule_flint(
-                        &model,
-                        &stream,
-                        context,
-                        &jobs_rx,
-                        &metrics,
-                        std::mem::take(&mut waiting),
-                        unload_idle,
-                    );
+                    started(&mut ready);
+                    let engine = flint::Engine::new(&model, &stream);
+                    let exit = serve_slots(engine, &cfg, &jobs_rx, &metrics, std::mem::take(&mut waiting));
                     drop(model);
                     drop(stream);
                     exit
@@ -748,6 +728,27 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         let _ = std::io::stdout().flush();
         std::process::exit(0)
     })
+}
+
+/// The slot scheduler over an engine (Inkling 2, Hy4-flash, Flint), or the engine's setup error for the
+/// requests waiting.
+fn serve_slots<E: slots::SlotEngine>(
+    engine: Result<E>,
+    cfg: &slots::Config,
+    jobs: &mpsc::Receiver<Work>,
+    metrics: &Metrics,
+    waiting: Vec<Work>,
+) -> Exit {
+    match engine {
+        Ok(e) => slots::schedule(e, cfg, jobs, metrics, waiting),
+        Err(e) => {
+            eprintln!("worker setup: {e:#}");
+            for w in waiting {
+                fail_work(w, metrics, &format!("{e:#}"));
+            }
+            Exit::Unload(Vec::new())
+        }
+    }
 }
 
 /// The GPU worker: admits queued requests into free slots and steps the running ones, one alone
@@ -1217,213 +1218,6 @@ fn schedule(
                         let _ = a.tx.send(Msg::Error(format!("{e:#}")));
                     }
                 }
-            }
-        }
-    }
-}
-
-/// The GPU worker for Flint checkpoints: one sequence, requests in turn (prefix reuse across requests),
-/// sampling on the host from the top candidates.
-fn schedule_flint(
-    model: &quench6k_engine::flint::FlintModel,
-    s: &quench6k_cuda::Stream,
-    context: usize,
-    jobs: &mpsc::Receiver<Work>,
-    metrics: &Metrics,
-    waiting: Vec<Work>,
-    unload_idle: Option<std::time::Duration>,
-) -> Exit {
-    use quench6k_engine::flint as fl;
-    let setup = || -> Result<_> {
-        Ok((
-            fl::Workspace::new(fl::MAX_STEP)?,
-            fl::FlintSeq::new(model, context)?,
-            crate::flint::Sampler::new()?,
-        ))
-    };
-    let (mut ws, mut seq, mut sampler) = match setup() {
-        Ok(v) => v,
-        Err(e) => {
-            // Unload; the next request tries again.
-            eprintln!("flint worker: {e:#}");
-            for w in waiting {
-                fail_work(w, metrics, &format!("{e:#}"));
-            }
-            return Exit::Unload(Vec::new());
-        }
-    };
-    let mut waiting = waiting.into_iter();
-    loop {
-        let w = match (waiting.next(), unload_idle) {
-            (Some(w), _) => w,
-            (None, Some(idle)) => match jobs.recv_timeout(idle) {
-                Ok(w) => w,
-                Err(mpsc::RecvTimeoutError::Timeout) => return Exit::Unload(Vec::new()),
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Exit::Closed,
-            },
-            (None, None) => match jobs.recv() {
-                Ok(w) => w,
-                Err(_) => return Exit::Closed,
-            },
-        };
-        let job = match w {
-            Work::Persist(ack) => {
-                let _ = ack.send(());
-                continue;
-            }
-            Work::Unload(ack) => return Exit::Unload(vec![ack]),
-            Work::Generate(queued) => queued.job,
-            Work::Inspect(job) => {
-                let _ = job
-                    .tx
-                    .send(Err("inspection is not supported for this model".into()));
-                continue;
-            }
-            Work::Scan(job) => {
-                let _ = job
-                    .tx
-                    .send(Err("atlases are not supported for this model".into()));
-                continue;
-            }
-            Work::Lens(job) => {
-                let _ = job.tx.send(Err("not supported for this model".into()));
-                continue;
-            }
-        };
-        metrics.queued.fetch_sub(1, Ordering::Relaxed);
-        if job.ids.len() >= context {
-            // Rejected before touching the cached sequence.
-            let _ = job.tx.send(Msg::Error(format!(
-                "prompt of {} tokens exceeds the context of {context}",
-                job.ids.len()
-            )));
-            continue;
-        }
-        metrics.live[0].begin(job.ids.len());
-        let t0 = std::time::Instant::now();
-        metrics.running.store(1, Ordering::Relaxed);
-        let result = (|| -> Result<(Finish, usize, usize, f64, f64)> {
-            let p = &job.params;
-            let reused = seq.rewind(&job.ids, s)?;
-            metrics.live[0].prefill(reused, reused);
-            let mut at = reused;
-            while at < job.ids.len() {
-                let end = (at + fl::MAX_CHUNK).min(job.ids.len());
-                fl::forward(model, &ws, &mut seq, &job.ids[at..end], false, s)?;
-                at = end;
-                metrics.live[0].prefill(at, reused);
-                if let Some(cb) = &p.progress {
-                    s.synchronize()?;
-                    (cb.0)(at, reused);
-                }
-            }
-            seq.snapshot(model, s)?;
-            let prefill = t0.elapsed().as_secs_f64();
-            metrics.live[0].decoding();
-            let budget = p.max_tokens.min(context - job.ids.len()).max(1);
-            // Speculation with prompt-lookup drafts (request field "mtp", default on): the tokens that
-            // followed the latest earlier occurrence of the last few tokens are verified in one step.
-            let lookup = job.mtp && quench6k_cuda::variants::get("flint.lookup", 1) != 0;
-            let mut hist = job.ids.clone();
-            let mut generated = Vec::new();
-            let (mut drafted, mut accepted, mut steps) = (0usize, 0usize, 0usize);
-            let t1 = std::time::Instant::now();
-            // Emits a token; Some when the run ends.
-            let emit =
-                |tok: i32, generated: &mut Vec<i32>, hist: &mut Vec<i32>| -> Option<Finish> {
-                    generated.push(tok);
-                    metrics.live[0].output();
-                    hist.push(tok);
-                    if job.tx.send(Msg::Token(tok)).is_err() {
-                        return Some(Finish::Cancelled);
-                    }
-                    if p.stop_tokens.contains(&tok) {
-                        return Some(Finish::Stop);
-                    }
-                    (generated.len() >= budget).then_some(Finish::Length)
-                };
-            sampler.fetch(s, ws.logits, 1, fl::VOCAB, p)?;
-            let first = sampler.pick(0, p, &generated);
-            let mut done = emit(first, &mut generated, &mut hist);
-            let mut pending = first;
-            // Draft length follows the request's recent acceptance rate (drafts that fail cost a larger step).
-            let mut rate = 0.5f64;
-            while done.is_none() {
-                let cap = if rate < 0.15 {
-                    1
-                } else if rate < 0.35 {
-                    2
-                } else if rate < 0.6 {
-                    4
-                } else {
-                    fl::MAX_STEP - 1
-                };
-                let room = cap.min(budget - generated.len());
-                let draft = if lookup {
-                    crate::flint::lookup_draft(&hist, room)
-                } else {
-                    Vec::new()
-                };
-                let mut toks = Vec::with_capacity(draft.len() + 1);
-                toks.push(pending);
-                toks.extend_from_slice(&draft);
-                let before = seq.tokens.len();
-                fl::step(model, &mut ws, &mut seq, &toks, s)?;
-                steps += 1;
-                drafted += draft.len();
-                sampler.fetch(s, ws.logits, toks.len(), fl::VOCAB, p)?;
-                let mut j = 0;
-                loop {
-                    let tok = sampler.pick(j, p, &generated);
-                    done = emit(tok, &mut generated, &mut hist);
-                    if done.is_none() && j < draft.len() && tok == draft[j] {
-                        j += 1;
-                        continue;
-                    }
-                    pending = tok;
-                    break;
-                }
-                accepted += j;
-                if !draft.is_empty() {
-                    rate = 0.8 * rate + 0.2 * (j as f64 / draft.len() as f64);
-                }
-                // Keep the fed tokens that were accepted; the caches of the rest are overwritten later.
-                seq.tokens.truncate(before + 1 + j);
-            }
-            let finish = done.unwrap();
-            let spec_note = if lookup && steps > 0 {
-                format!(
-                    ", lookup {accepted}/{drafted} drafts accepted, {:.2} tokens/step",
-                    generated.len().saturating_sub(1) as f64 / steps as f64
-                )
-            } else {
-                String::new()
-            };
-            let secs = t1.elapsed().as_secs_f64();
-            eprintln!(
-                "done: prompt {} ({} reused) prefill {:.2}s ({:.0} tok/s), {} generated in {:.2}s ({:.1} tok/s){spec_note}, {:?}",
-                job.ids.len(),
-                reused,
-                prefill,
-                (job.ids.len() - reused) as f64 / prefill.max(1e-9),
-                generated.len(),
-                secs,
-                generated.len().saturating_sub(1) as f64 / secs.max(1e-9),
-                finish
-            );
-            Ok((finish, reused, generated.len(), prefill, secs))
-        })();
-        metrics.running.store(0, Ordering::Relaxed);
-        metrics.live[0].end(result.is_err());
-        match result {
-            Ok((finish, reused, generated, prefill, decode)) => {
-                metrics.done(0, job.ids.len(), reused, generated, prefill, decode);
-                let _ = job.tx.send(Msg::Done(finish, reused));
-            }
-            Err(e) => {
-                // The sequence state may be partial: start over next time.
-                seq.tokens.clear();
-                let _ = job.tx.send(Msg::Error(format!("{e:#}")));
             }
         }
     }

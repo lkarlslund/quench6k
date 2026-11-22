@@ -44,7 +44,8 @@ stacked per layer and attention projections BF16 or FP8 with a scale per 128 x 1
 |---|---|
 | [Avifenesh/Hy4-flash-NVFP4](https://huggingface.co/Avifenesh/Hy4-flash-NVFP4) | NVFP4 experts with a scale per expert, FP8 attention, FP8 Engram tables with a scale per row (161 GB) |
 
-`quench6k serve --model DIR` detects the model and serves one sequence at a time (prefix reuse,
+`quench6k serve --model DIR` detects the model and serves up to `--slots` requests at once (see
+[Slots for Inkling 2, Hy4-flash and Flint](#slots-for-inkling-2-hy4-flash-and-flint); prefix reuse,
 drafted decoding, tool calls, reasoning efforts `none`/`high`/`max`); steering, adapters, vision,
 edits and stored contexts are not available for it. About 87 GiB of weights load onto the GPU; the
 shared experts, the latent projections around the routed experts and the LM head are quantized to FP8 at
@@ -93,7 +94,8 @@ residuals" that mix earlier block sums into each sublayer's input) runs from its
 |---|---|
 | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | NVFP4 experts (MXFP8 in the last four layers), BF16 elsewhere, DSpark drafter in `mtp.safetensors` (20 GB) |
 
-`quench6k serve --model DIR` detects the model and serves one sequence at a time (prefix reuse while
+`quench6k serve --model DIR` detects the model and serves up to `--slots` requests at once (see
+[Slots for Inkling 2, Hy4-flash and Flint](#slots-for-inkling-2-hy4-flash-and-flint); prefix reuse while
 the rings still hold it, drafted decoding, tool calls, reasoning efforts `none` .. `max`); steering,
 adapters, vision, edits and stored contexts are not available for it, and the vision tower is not
 supported yet. The model's message tokens (`<|message_model|>`, `<|content_thinking|>`,
@@ -186,6 +188,32 @@ Requests start by plan: a request starts only when its prompt plus its expected 
 requests, counting what idle slots hold as free. Otherwise it waits for a running request to finish,
 so a newer request never cuts a running one short. A request alone always starts. A completion longer
 than its plan grows into free memory; only if none is left does it fail.
+
+### Slots for Inkling 2, Hy4-flash and Flint
+
+These models run in a scheduler of their own over their engines (`crates/cli/src/serve/slots.rs`), with
+the same policies:
+
+- Up to `--slots` requests at once, each slot with its own sequence state and cached prefix. A request
+  goes to the free slot whose state holds the longest prefix of its prompt, else to the least recently
+  used one. `--context` is each slot's capacity (prompt + completion).
+- One prompt is prefilled at a time, in the engine's chunks; while other requests decode, in slices of
+  about 4096 tokens that take turns with their steps by `--prefill-share`.
+- The decoding requests step together, each with its own drafts (the checkpoint's drafter as each
+  request's own draft policy decides, or prompt lookup; request field `mtp`) and sampling. A request's
+  tokens never depend on which others share its steps: concurrent greedy requests give the same text
+  as alone.
+- Memory: a request starts when its plan fits next to the running requests' plans in free device
+  memory and what idle slots hold; when the device is full, the least recently used idle slot gives
+  its memory up (its cached prefix is lost; these models have no context store). A request that does
+  not fit waits for running ones to finish; one that does not fit with nothing else on the device
+  fails. Cancellation, stop tokens and budgets are per request, and an error in one slot resets only
+  that slot.
+- For now each slot's state holds its whole `--context` from the start (made when the slot first
+  serves a request), and a step runs the slots' sequences one after another: so `--slots` states of
+  `--context` positions must fit next to each other for all slots to run at once, and concurrent
+  requests share the GPU's time rather than speeding up together. The server log prints each state's
+  size (`slot N: state X GiB for N tokens`).
 
 ## HTTP API
 
