@@ -357,9 +357,22 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, chunk: usize,
         if let Some(n) = std::env::var("QUENCH6K_INK_PROFILE_STEPS").ok().and_then(|v| v.parse::<usize>().ok()) {
             s.synchronize()?;
             quench6k_cuda::profiler_start()?;
+            // QUENCH6K_INK_PROFILE_WIDTH=w: steps of w tokens (a verification step's shape; the cache
+            // rolls back after each).
+            ensure!(ctx + generate + 16 <= ids.len(), "corpus too short for the profile steps");
+            let w = std::env::var("QUENCH6K_INK_PROFILE_WIDTH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
             for _ in 0..n {
-                model.forward(&mut st, &mut ws, &s, &[next], Logits::Last)?;
-                next = argmax(&ws, &model, &s)?;
+                if w == 1 {
+                    model.forward(&mut st, &mut ws, &s, &[next], Logits::Last)?;
+                    next = argmax(&ws, &model, &s)?;
+                } else {
+                    let before = st.pos;
+                    // The corpus's own next tokens (as accepted drafts would be).
+                    let mut toks = vec![next];
+                    toks.extend_from_slice(&ids[ctx + generate..ctx + generate + w - 1]);
+                    model.forward(&mut st, &mut ws, &s, &toks, Logits::All)?;
+                    st.truncate(before + 1);
+                }
             }
             s.synchronize()?;
             quench6k_cuda::profiler_stop()?;

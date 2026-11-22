@@ -365,6 +365,7 @@ impl Workspace {
                     latent: a.get(256 * 2)?,
                     best_v: a.get(ik::markov_blocks(vocab) * 4)?,
                     best_i: a.get(ik::markov_blocks(vocab) * 4)?,
+                    cand: a.get(b * ik::markov_cand_blocks(vocab) * MARKOV_CAND_MAX * 4)?,
                     mixed: a.get(t * D * 2)?,
                     kv: a.get(t * 2 * KVD * 4)?,
                     pinned: PinnedBuffer::new(64 + b * 4)?,
@@ -403,6 +404,8 @@ struct DraftWs {
     latent: u64,
     best_v: u64,
     best_i: u64,
+    /// I32 [block - 1][cand blocks * MARKOV_CAND_MAX]: the Markov head's candidate rows.
+    cand: u64,
     mixed: u64,
     kv: u64,
     pinned: PinnedBuffer,
@@ -415,6 +418,13 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
     } else {
         k::gemm_f32(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, 1.0, false)
     }
+}
+
+const MARKOV_CAND_MAX: usize = 8;
+
+fn markov_cand() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QUENCH6K_INK_MARKOV_CAND").ok().and_then(|v| v.parse().ok()).unwrap_or(4).min(MARKOV_CAND_MAX))
 }
 
 fn prefetch_on() -> bool {
@@ -552,6 +562,13 @@ impl InklingModel {
         ik::mix(s, ws.feats, row, d.alpha + (d.layers.len() * 16) as u64, d.markov_norm, dw.hf + (D * 2) as u64, 2 * D, n)?;
         linear(s, dw.hf, 2 * D, n, &self.lm_head, dw.base, cfg.vocab)?;
         linear(s, dw.hf, 2 * D, n, &d.markov_hf, dw.ctx, d.markov_hf.n)?;
+        // The head's picks among each vocabulary block's best rows by base + fold_b (QUENCH6K_INK_MARKOV_CAND:
+        // rows per block, 0 = the whole vocabulary).
+        let c = markov_cand();
+        let per = ik::markov_cand_blocks(cfg.vocab) * c;
+        if c > 0 {
+            ik::markov_cand(s, dw.base, d.markov.fold_b, cfg.vocab, n, c, dw.cand)?;
+        }
         s.memset(dw.state, 0, 256 * 2)?;
         s.copy_d2d(dw.prev, anchor, 4)?;
         for i in 0..n {
@@ -570,6 +587,7 @@ impl InklingModel {
                 dw.best_v,
                 dw.best_i,
                 dw.drafts + (i * 4) as u64,
+                (c > 0).then(|| (dw.cand + (i * per * 4) as u64, per)),
             )?;
         }
         unsafe { s.copy_d2h(dw.pinned.as_ptr().add(64), dw.drafts, n * 4)? };

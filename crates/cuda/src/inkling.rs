@@ -179,6 +179,8 @@ mod ffi {
         ) -> Error;
         pub fn quench6k_ink_msg_apply_rows(hs: *const f32, m: *const f32, fg: *const f32, t: c_int, out: *mut f32, st: Stream) -> Error;
         pub fn quench6k_ink_prefetch(p: *const *const c_void, bytes: *const usize, n: c_int, st: Stream) -> Error;
+        pub fn quench6k_ink_markov_cand_blocks(v: c_int) -> usize;
+        pub fn quench6k_ink_markov_cand(base: *const f32, fold_b: *const f32, v: c_int, n: c_int, c: c_int, cand: *mut i32, st: Stream) -> Error;
         pub fn quench6k_ink_to_bf16_rows(src: *const f32, t: c_int, dst: *mut c_void, ldd: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_mix(
             feats: *const c_void,
@@ -240,6 +242,8 @@ mod ffi {
             best_v: *mut f32,
             best_i: *mut i32,
             out: *mut i32,
+            cand: *const i32,
+            ncand: c_int,
             st: Stream,
         ) -> Error;
     }
@@ -692,6 +696,7 @@ pub fn markov(
     best_v: u64,
     best_i: u64,
     out: u64,
+    cand: Option<(u64, usize)>,
 ) -> Result<()> {
     go!(
         "ink_markov",
@@ -712,6 +717,8 @@ pub fn markov(
             fm(best_v),
             im(best_i),
             im(out),
+            cand.map_or(std::ptr::null(), |c| c.0 as *const i32),
+            cand.map_or(0, |c| n(c.1)),
             s.raw()
         )
     )
@@ -792,4 +799,14 @@ pub fn prefetch(s: &Stream, ranges: &[(u64, usize)]) -> Result<()> {
     let ptrs: Vec<*const c_void> = ranges.iter().map(|r| p(r.0)).collect();
     let bytes: Vec<usize> = ranges.iter().map(|r| r.1).collect();
     go!("ink_prefetch", ffi::quench6k_ink_prefetch(ptrs.as_ptr(), bytes.as_ptr(), n(ranges.len()), s.raw()))
+}
+
+/// Blocks of the Markov candidates' vocabulary split (candidates per base row = blocks * c).
+pub fn markov_cand_blocks(v: usize) -> usize {
+    unsafe { ffi::quench6k_ink_markov_cand_blocks(n(v)) }
+}
+
+/// The Markov head's candidates: per 256-row vocabulary block and base row, the `c` best by base + fold_b.
+pub fn markov_cand(s: &Stream, base: u64, fold_b: u64, vocab: usize, rows: usize, c: usize, cand: u64) -> Result<()> {
+    go!("ink_markov_cand", ffi::quench6k_ink_markov_cand(f(base), f(fold_b), n(vocab), n(rows), n(c), im(cand), s.raw()))
 }
