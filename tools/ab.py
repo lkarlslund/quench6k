@@ -56,7 +56,8 @@ def main():
     variants = []
     for v in args.variant:
         name, _, env = v.partition(":")
-        extra = dict(kv.split("=", 1) for kv in env.split(",") if kv)
+        # VAR=VALUE pairs split at commas that start a new VAR= (values may hold commas).
+        extra = dict(kv.split("=", 1) for kv in re.split(r",(?=[A-Za-z_][A-Za-z0-9_]*=)", env) if kv)
         variants.append((name, extra))
     names = [n for n, _ in variants]
     if len(set(names)) != len(names):

@@ -28,6 +28,7 @@
 #include <cooperative_groups.h>
 
 #include "mma.cuh"
+#include "variants.cuh"
 
 namespace {
 
@@ -2529,7 +2530,10 @@ cudaError_t quench6k_ink_prefetch(const void* const* p, const size_t* bytes, int
         r.p[i] = static_cast<const char*>(p[i]);
         r.bytes[i] = (unsigned)bytes[i];
     }
-    SQ_CHECK_LAUNCH(sq_launch(prefetch_kernel, 4, 128, 0, st, r, n));
+    // Spread over many SMs: each SM's bulk-copy unit takes its prefetch requests one at a time, and four
+    // blocks moved the next visit's weights at ~0.6 TB/s, into the experts' reads (64 x 32: decode +3%).
+    static const int blocks = sq_variant("ink.pf_blocks", 64), threads = sq_variant("ink.pf_threads", 32);
+    SQ_CHECK_LAUNCH(sq_launch(prefetch_kernel, blocks, threads, 0, st, r, n));
     SQ_RETURN_LAUNCH();
 }
 
