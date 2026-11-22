@@ -640,7 +640,12 @@ synthetic routing with 872 tiles, 73% full, 43 to 755 rows per expert).
 `quench6k hy4 batch-check` steps several sequences alone and batched and compares them bitwise
 (teacher-forced logits rows and cache checksums; greedy decoding with drafts: tokens, drafts, logits;
 plain greedy against drafted), and with `--bench-ctx` times batched decode steps. `quench6k hy4
-width-check` compares a fixture's positions run in one-token steps with wider steps.
+width-check` compares a fixture's positions run in one-token steps with wider steps. Extra batch-check
+cases: `QUENCH6K_HY4_INTERLEAVE=1` (one sequence's short step after another's one-token steps),
+`QUENCH6K_HY4_STAGGER=1` (short raw prompts started between running sequences' steps, as a server runs
+them), `QUENCH6K_HY4_PICK=topk` (greedy picks by the top-k kernel, as the server's sampler, instead of
+argmax). `QUENCH6K_TOPK_ATOMIC_TIES=1` restores top-k's old timing-dependent choice among tied values,
+to tell tie effects from other differences.
 
 - Width invariance before this work: steps of 1 to 6 tokens gave the one-token bits, 7 and more did not
   (the attention split each row's keys by the step's width). With a fixed split (16 for sliding, 32 for

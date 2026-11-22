@@ -37,6 +37,11 @@ fn sequences(fixtures: &[Vec<i32>], n: usize, after: usize) -> Result<Vec<Seq>> 
 
 fn argmax_rows(model: &Hy4Model, ws: &Workspace, s: &Stream, rows: usize) -> Result<Vec<i32>> {
     let vocab = model.cfg.vocab;
+    if std::env::var("QUENCH6K_HY4_PICK").is_ok_and(|v| v == "topk") {
+        // As the server's greedy sampler picks: a top-1 (top-k kernel).
+        k::topk(s, ws.out_logits, rows, vocab, vocab, 1, false, ws.top_idx, ws.top_val)?;
+        return s.download::<i32>(ws.top_idx, rows);
+    }
     k::argmax(s, ws.out_logits, rows, vocab, vocab, ws.argmax_scratch, ws.argmax)?;
     s.download::<i32>(ws.argmax, rows)
 }
