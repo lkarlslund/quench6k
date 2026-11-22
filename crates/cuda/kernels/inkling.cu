@@ -1251,6 +1251,120 @@ __global__ void __launch_bounds__(256) experts_down_kernel(const bf16* __restric
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// W4A16 NVFP4 grouped GEMM for prefill (as moe.cu's, with tiles of BM_ rows): Y[row, N] = ws2[e] *
+// Xs[row, K] . dequant(W_e)[N, K]^T. Warps 2 x 4, each (BM_ / 2) x 32 outputs.
+constexpr int NV_BN = 128, NV_BK = 32, NV_LDS = NV_BK + 8;
+
+template <int BM_>
+__global__ void __launch_bounds__(256) nv4_gemm_kernel(const bf16* __restrict__ X, const uint64_t* __restrict__ w_ptr, const uint64_t* __restrict__ s_ptr,
+                                                       const float* __restrict__ ws2, const int* __restrict__ offsets, const int* __restrict__ tile_expert,
+                                                       const int* __restrict__ tile_row, const int* __restrict__ num_tiles, float* Y, int N, int K) {
+    constexpr int MI = BM_ / 32;
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ __align__(16) bf16 sA[2][BM_ * NV_LDS];
+    __shared__ __align__(16) bf16 sB[2][NV_BN * NV_LDS];
+    if ((int)blockIdx.y >= *num_tiles) return;
+    const int e = tile_expert[blockIdx.y], r0 = tile_row[blockIdx.y];
+    const int r_end = min(r0 + BM_, offsets[e + 1]);
+    const uint8_t* W = reinterpret_cast<const uint8_t*>(w_ptr[e]);
+    const uint8_t* Sc = reinterpret_cast<const uint8_t*>(s_ptr[e]);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int warp_m = warp >> 2, warp_n = warp & 3;
+    const int n0 = blockIdx.x * NV_BN;
+    const int k_tiles = K / NV_BK;
+    auto load_a = [&](int stage, int kt) {
+#pragma unroll
+        for (int u = 0; u < BM_ * 4 / 256; ++u) {
+            const int i = tid + u * 256, r = i >> 2, c = (i & 3) * 8;
+            const bool ok = r0 + r < r_end;
+            cp_async16(&sA[stage][r * NV_LDS + c], X + (size_t)(ok ? r0 + r : r0) * K + kt * NV_BK + c, ok);
+        }
+    };
+    uint4 bcodes = make_uint4(0, 0, 0, 0);
+    uint16_t bsc = 0;
+    const bool b_row = tid < NV_BN && n0 + tid < N;
+    auto fetch_b = [&](int kt) {
+        if (b_row) {
+            const int n = n0 + tid, k = kt * NV_BK;
+            bcodes = *reinterpret_cast<const uint4*>(W + (size_t)n * (K / 2) + k / 2);
+            bsc = *reinterpret_cast<const uint16_t*>(Sc + (size_t)n * (K / 16) + k / 16);
+        }
+    };
+    auto store_b = [&](int stage) {
+        if (tid >= NV_BN) return;
+        bf16* dst = &sB[stage][tid * NV_LDS];
+        uint32_t packed[16];
+        if (b_row) {
+            const __half h0 = __float2half(e4m3_value(bsc & 0xff)), h1 = __float2half(e4m3_value(bsc >> 8));
+            const __half2 s0 = __halves2half2(h0, h0), s1 = __halves2half2(h1, h1);
+            const uint8_t* bb = reinterpret_cast<const uint8_t*>(&bcodes);
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const __half2_raw r = __nv_cvt_fp4x2_to_halfraw2(bb[i], __NV_E2M1);
+                const float2 f = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&r), i < 8 ? s0 : s1));
+                const __nv_bfloat162 v = __floats2bfloat162_rn(f.x, f.y);
+                packed[i] = *reinterpret_cast<const uint32_t*>(&v);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) packed[i] = 0;
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            *reinterpret_cast<uint4*>(dst + 8 * i) = make_uint4(packed[4 * i], packed[4 * i + 1], packed[4 * i + 2], packed[4 * i + 3]);
+    };
+    float acc[MI][4][4] = {};
+    load_a(0, 0);
+    cp_async_commit();
+    fetch_b(0);
+    store_b(0);
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        cp_async_wait<0>();
+        __syncthreads();
+        const bool more = kt + 1 < k_tiles;
+        if (more) {
+            load_a((kt + 1) & 1, kt + 1);
+            fetch_b(kt + 1);
+        }
+        cp_async_commit();
+        const bf16* a_tile = sA[kt & 1];
+        const bf16* b_tile = sB[kt & 1];
+#pragma unroll
+        for (int kk = 0; kk < NV_BK; kk += 16) {
+            uint32_t a[MI][4], b[2][4];
+#pragma unroll
+            for (int i = 0; i < MI; ++i)
+                ldmatrix_x4(a[i], &a_tile[(warp_m * (BM_ / 2) + i * 16 + (lane & 15)) * NV_LDS + kk + (lane >> 4) * 8]);
+#pragma unroll
+            for (int j = 0; j < 2; ++j)
+                ldmatrix_x4(b[j], &b_tile[(warp_n * 32 + j * 16 + (lane & 7) + ((lane >> 4) << 3)) * NV_LDS + kk + ((lane >> 3) & 1) * 8]);
+#pragma unroll
+            for (int i = 0; i < MI; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) mma_bf16(acc[i][j], a[i], &b[j >> 1][(j & 1) * 2]);
+        }
+        if (more) store_b((kt + 1) & 1);
+    }
+    const float alpha = ws2[e];
+    const int g8 = lane >> 2, t4 = lane & 3;
+#pragma unroll
+    for (int i = 0; i < MI; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int r = r0 + warp_m * (BM_ / 2) + i * 16 + g8 + h * 8;
+                const int n = n0 + warp_n * 32 + j * 8 + t4 * 2;
+                if (r >= r_end) continue;
+                if (n + 1 < N)
+                    *reinterpret_cast<float2*>(Y + (size_t)r * N + n) = make_float2(alpha * acc[i][j][h * 2], alpha * acc[i][j][h * 2 + 1]);
+                else if (n < N)
+                    Y[(size_t)r * N + n] = alpha * acc[i][j][h * 2];
+            }
+}
+
 // out[t, n] = rb(sum_k w[t, k] * y[t * 8 + k, n]) (F32).
 __global__ void moe_combine_kernel(const float* __restrict__ y, const float* __restrict__ sel_w, int T, float* out) {
     pdl_launch_dependents();
@@ -2205,6 +2319,23 @@ size_t quench6k_ink_markov_cand_blocks(int V) { return (size_t)(V + MC_ROWS - 1)
 cudaError_t quench6k_ink_markov_cand(const float* base, const float* fold_b, int V, int n, int C, int* cand, cudaStream_t st) {
     if (C < 1 || C > MC_MAX) return cudaErrorInvalidValue;
     SQ_CHECK_LAUNCH(sq_launch(markov_cand_kernel, dim3((V + MC_ROWS - 1) / MC_ROWS, n), MC_ROWS, 0, st, base, fold_b, V, C, cand));
+    SQ_RETURN_LAUNCH();
+}
+
+// The W4A16 NVFP4 grouped GEMM with tiles of bm rows (64 or 128; the plan's tile size).
+cudaError_t quench6k_ink_nv4_gemm(const void* xs, const uint64_t* w_ptr, const uint64_t* s_ptr, const float* ws2, const int* offsets,
+                                  const int* tile_expert, const int* tile_row, const int* num_tiles, int max_tiles, int bm, float* y, int N,
+                                  int K, cudaStream_t st) {
+    if (max_tiles == 0) return cudaSuccess;
+    if (K % NV_BK != 0) return cudaErrorInvalidValue;
+    const dim3 grid((N + NV_BN - 1) / NV_BN, max_tiles);
+    const auto x = static_cast<const bf16*>(xs);
+    if (bm == 128)
+        SQ_CHECK_LAUNCH(sq_launch(nv4_gemm_kernel<128>, grid, 256, 0, st, x, w_ptr, s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, y, N, K));
+    else if (bm == 64)
+        SQ_CHECK_LAUNCH(sq_launch(nv4_gemm_kernel<64>, grid, 256, 0, st, x, w_ptr, s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, y, N, K));
+    else
+        return cudaErrorInvalidValue;
     SQ_RETURN_LAUNCH();
 }
 

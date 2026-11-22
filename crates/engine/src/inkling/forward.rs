@@ -892,13 +892,16 @@ impl InklingModel {
                     }
                     ik::moe_combine_rows(s, ws.y, ws.pair_row, ws.sel_w, t, ws.moe)?;
                 } else {
-                ik::moe_plan(s, ws.sel_e, t, MOE_BM, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
+                // NVFP4 layers: tiles of 128 rows once the experts average 96 rows or more (fewer rows: more of
+                // a tall tile would be padding), else 64.
+                let bm = if layer.tables.is_some() && t * TOPK >= 96 * EXPERTS { 128 } else { MOE_BM };
+                ik::moe_plan(s, ws.sel_e, t, bm, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
                 ik::moe_gather(s, ws.xm, ws.pair_row, t, ws.xs)?;
                 let gemm = |x: u64, which: usize, n: usize, kk: usize| {
                     let st = if which == 0 { layer.gate_up } else { layer.down };
                     match &layer.tables {
-                        Some(tb) => k::moe_nvfp4_gemm(
-                            s, x, tb[which].0, tb[which].1, st.s2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.max_tiles, ws.y, n, kk,
+                        Some(tb) => ik::nv4_gemm(
+                            s, x, tb[which].0, tb[which].1, st.s2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.max_tiles, bm, ws.y, n, kk,
                         ),
                         None => ik::mx8_grouped_gemm(s, x, st, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.max_tiles, ws.y, n, kk),
                     }

@@ -181,6 +181,22 @@ mod ffi {
         pub fn quench6k_ink_prefetch(p: *const *const c_void, bytes: *const usize, n: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_markov_cand_blocks(v: c_int) -> usize;
         pub fn quench6k_ink_markov_cand(base: *const f32, fold_b: *const f32, v: c_int, n: c_int, c: c_int, cand: *mut i32, st: Stream) -> Error;
+        pub fn quench6k_ink_nv4_gemm(
+            xs: *const c_void,
+            w_ptr: *const u64,
+            s_ptr: *const u64,
+            ws2: *const f32,
+            offsets: *const i32,
+            tile_expert: *const i32,
+            tile_row: *const i32,
+            num_tiles: *const i32,
+            max_tiles: c_int,
+            bm: c_int,
+            y: *mut f32,
+            n: c_int,
+            k: c_int,
+            st: Stream,
+        ) -> Error;
         pub fn quench6k_ink_to_bf16_rows(src: *const f32, t: c_int, dst: *mut c_void, ldd: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_mix(
             feats: *const c_void,
@@ -813,4 +829,43 @@ pub fn markov_cand_blocks(v: usize) -> usize {
 /// The Markov head's candidates: per 256-row vocabulary block and base row, the `c` best by base + fold_b.
 pub fn markov_cand(s: &Stream, base: u64, fold_b: u64, vocab: usize, rows: usize, c: usize, cand: u64) -> Result<()> {
     go!("ink_markov_cand", ffi::quench6k_ink_markov_cand(f(base), f(fold_b), n(vocab), n(rows), n(c), im(cand), s.raw()))
+}
+
+/// W4A16 NVFP4 grouped GEMM with tiles of `bm` rows (64 or 128, as planned), F32 out.
+#[allow(clippy::too_many_arguments)]
+pub fn nv4_gemm(
+    s: &Stream,
+    xs: u64,
+    w_ptr: u64,
+    s_ptr: u64,
+    ws2: u64,
+    offsets: u64,
+    tile_expert: u64,
+    tile_row: u64,
+    num_tiles: u64,
+    max_tiles: usize,
+    bm: usize,
+    y: u64,
+    nn: usize,
+    k: usize,
+) -> Result<()> {
+    go!(
+        "ink_nv4_gemm",
+        ffi::quench6k_ink_nv4_gemm(
+            p(xs),
+            w_ptr as *const u64,
+            s_ptr as *const u64,
+            f(ws2),
+            im(offsets),
+            im(tile_expert),
+            im(tile_row),
+            im(num_tiles),
+            n(max_tiles),
+            n(bm),
+            fm(y),
+            n(nn),
+            n(k),
+            s.raw()
+        )
+    )
 }
