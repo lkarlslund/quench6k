@@ -80,6 +80,9 @@ pub enum FlintCmd {
         /// Timed batched decode steps per batch size (0: no timing).
         #[arg(long, default_value_t = 64)]
         time_steps: usize,
+        /// Batch sizes to time.
+        #[arg(long, num_args = 1.., default_values_t = [1usize, 2, 4, 8])]
+        batches: Vec<usize>,
     },
 }
 
@@ -122,7 +125,8 @@ pub fn run(cmd: FlintCmd) -> Result<()> {
             ctx,
             steps,
             time_steps,
-        } => batch_check(&model, &text, seqs, &ctx, steps, time_steps),
+            batches,
+        } => batch_check(&model, &text, seqs, &ctx, steps, time_steps, &batches),
     }
 }
 
@@ -241,6 +245,7 @@ fn batch_check(
     ctxs: &[usize],
     steps: usize,
     time_steps: usize,
+    batches: &[usize],
 ) -> Result<()> {
     anyhow::ensure!(
         (1..=fl::MAX_SEQS).contains(&seqs),
@@ -395,8 +400,7 @@ fn batch_check(
         );
         // D: throughput of batched decode steps.
         if time_steps > 0 {
-            let mut n = 1;
-            while n <= seqs {
+            for &n in batches.iter().filter(|&&n| n >= 1 && n <= seqs) {
                 for (st, p) in states.iter_mut().zip(&prompts) {
                     st.trim(p.len());
                 }
@@ -420,7 +424,6 @@ fn batch_check(
                     1.0 / per,
                     n as f64 / per
                 );
-                n *= 2;
             }
         }
     }
