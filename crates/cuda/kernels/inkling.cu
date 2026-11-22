@@ -337,10 +337,20 @@ __global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(CL_T) attn_res_cl_k
     }
     ConvPre pre;
     if (cv.ring) conv_pre(cv, t, c, pre);
-    pdl_wait();
+    // The finished blocks' sums (every source but the last) are written only by copies, which complete
+    // before any later kernel starts: they and their terms come before the dependency wait (read past
+    // L1, as the buffers are reused).
 #pragma unroll
-    for (int s = 0; s < NS; ++s) {
-        x[s] = s == NS - 1 && cv.ring ? conv_finish(cv, t, c, pre) : src.p[s][(size_t)t * D + c];
+    for (int s = 0; s < NS - 1; ++s) {
+        x[s] = __ldcg(src.p[s] + (size_t)t * D + c);
+        acc[s] = x[s] * x[s];
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) acc[NS + s * NQ + q] = qv[q] * x[s];
+    }
+    pdl_wait();
+    {
+        constexpr int s = NS - 1;
+        x[s] = cv.ring ? conv_finish(cv, t, c, pre) : src.p[s][(size_t)t * D + c];
         acc[s] = x[s] * x[s];
 #pragma unroll
         for (int q = 0; q < NQ; ++q) acc[NS + s * NQ + q] = qv[q] * x[s];
