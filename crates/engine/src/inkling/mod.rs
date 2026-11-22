@@ -57,6 +57,8 @@ pub struct Config {
     pub logit_cap: f32,
     pub route_scale: f32,
     pub eos: Vec<i32>,
+    /// Most positions of a sequence (model_max_length).
+    pub max_context: usize,
 }
 
 fn num(v: &Value, key: &str) -> Result<f64> {
@@ -144,6 +146,7 @@ impl Config {
             logit_cap: num(t, "final_logit_softcapping")? as f32,
             route_scale: num(t, "route_scale")? as f32,
             eos,
+            max_context: num(t, "model_max_length").or_else(|_| num(&all, "model_max_length")).map_or(1 << 20, |v| v as usize),
         })
     }
 

@@ -721,3 +721,50 @@ to tell tie effects from other differences.
   with many sequences fewer drafts per sequence should be verified.
 - Dropped: routed experts per run of pairs of one expert (each work item loading its expert's weight rows
   once for up to 8 pairs, the same arithmetic): 4 x 4-row steps 171 ms instead of 41 ms.
+
+## 2026-11-22: Inkling 2, several sequences per step
+
+`quench6k inkling batch-check --model M --text CORPUS --ctx 512 8192 32768 --seqs 1 2 4 8` first decodes
+each sequence alone (its own stretch of the corpus, 37 tokens shorter per sequence; plain steps, then
+drafted steps whose widths vary by sequence and step) and records every step's fed tokens, drafts, draft
+probabilities and logits rows (FNV hashes of the F32 bytes), then replays the same steps in lockstep
+batches (`forward_batch`, `draft_batch`) and compares bitwise. It then times batched steps from the
+prompts' ends: plain steps (one greedy token per sequence, argmax and download included), verify steps
+of 4 tokens per sequence (the corpus's next tokens as drafts, one kept) and drafter passes.
+
+600 W, max clock 3090 MHz, aggregate tokens per second of plain decode (step time); 32K measured before
+the grouped expert kernels (plain steps of up to 8 rows do not use them):
+
+| context | 1 | 2 | 4 | 8 sequences |
+|---|---|---|---|---|
+| 512 | 233 (4.30 ms) | 356 (5.62) | 526 (7.60) | 672 (11.91) |
+| 8192 | 227 (4.41) | 337 (5.93) | 468 (8.55) | 559 (14.30) |
+| 32768 | 197 (5.09) | 276 (7.23) | 368 (10.88) | 428 (18.69) |
+
+Verify steps of 4 tokens per sequence: 550 / 667 / 800 / 911 rows/s at 512 (7.3 / 12.0 / 20.0 / 35.1 ms),
+520 / 610 / 713 / 797 at 8K; 32K (before grouping) 428 / 507 / 545 / 563. Drafter passes for 1 / 2 / 4 /
+8 sequences: 0.86 / 1.18 / 2.07 / 3.96 ms at 512, 1.3 / 2.1 / 4.0 / 7.9 ms at 32K. A plain step's extra
+sequence costs about 1.1 ms at 512: its 8 experts per layer visit (48 visits x 8 x 4 MB of NVFP4 weights,
+about 1.5 GB) are new DRAM traffic. Verify steps grow with their pairs (the per-pair expert kernels
+re-read and re-decode an expert's rows for every pair routed to it), not with the experts read: in an nsys
+capture of these runs (`--cuda-graph-trace=node`) the two expert kernels take a third of all GPU time.
+Grouping up to 4 pairs of an expert per warp item (rows loaded and decoded once, each pair's sums as
+before: the same bits) gives 8 sequences' verify steps 39.0 -> 35.2 ms and 4 sequences' 20.4 -> 20.0 ms,
+but 8-row steps 11.9 -> 13.3 ms, so it starts at 16 rows. The FMAs per pair stay; a tensor-core expert
+kernel (tokens as the MMA's N, so a row's sums still do not depend on the others) would remove that, but
+its sums would differ from today's kernels in order, so it needs the gate, not a bitwise check.
+
+Long contexts, one sequence, `inkling generate --prompt-file` (a needle sentence 40% into repository text,
+then a question about it), 450 W: 253,964 tokens prefilled in 55 s (4.6K tokens/s), decode 97 tokens/s,
+11.9 GiB of caches; 523,508 tokens in 182 s (2.9K tokens/s), 60 tokens/s, 21.1 GiB; 1,042,346 tokens in
+626 s (1.7K tokens/s), 34 tokens/s, 38.9 GiB (58.4 GiB on the device in all). The model quoted the needle
+at 256K and 512K, and was quoting it at 1M when the run's 40 tokens ended. At 1M a decode step reads each full-attention visit's 4 GiB of keys and values.
+
+Canonical prefill (`quench6k inkling canon-check --model M --text CORPUS`): a conversation of 3 turns (a
+5000-token system prompt, user turns of 600 to 800 tokens, 24 greedy reply tokens) decoded cold (a fresh
+sequence per turn), warm (one sequence) and cross (the sequence first serves another conversation with
+the same system prompt, decodes batched with another sequence, and generates 3104 more tokens before the
+last turn, so that turn restores the boundary snapshot): every turn's prompt logits, reply logits and
+tokens are bit-identical in the three. Reuse stops at the last 2048 boundary the previous turns
+prefilled whole: warm turn 2 reused 4096 of 5623 cached tokens (1527 recomputed beyond the new ones),
+turn 3 6144 of 6344 (200).

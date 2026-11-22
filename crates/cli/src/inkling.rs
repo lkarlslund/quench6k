@@ -36,8 +36,11 @@ pub enum InklingCmd {
     Generate {
         #[arg(long)]
         model: PathBuf,
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         prompt: String,
+        /// Read the prompt from a file (long prompts).
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
         #[arg(long)]
         raw: bool,
         /// Thinking effort of the chat template (none, minimal, low, medium, high, xhigh, max).
@@ -72,6 +75,46 @@ pub enum InklingCmd {
         #[arg(long)]
         draft: bool,
     },
+    /// Batched small steps: N sequences (different prompts and lengths from the corpus) decoded alone and
+    /// in lockstep batches (forward_batch / draft_batch), every step's logits and drafts compared bitwise;
+    /// then step time and aggregate tokens per second for each sequence count at each context.
+    BatchCheck {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        /// Contexts (prompt lengths of the first sequence; the others are shorter by 37 tokens each).
+        #[arg(long, num_args = 1.., default_values_t = [512usize])]
+        ctx: Vec<usize>,
+        /// Sequence counts.
+        #[arg(long, num_args = 1.., default_values_t = [1usize, 2, 4, 8])]
+        seqs: Vec<usize>,
+        /// Steps of the bitwise check (each sequence).
+        #[arg(long, default_value_t = 12)]
+        steps: usize,
+        /// Timed steps per sequence count (0: no timing).
+        #[arg(long, default_value_t = 32)]
+        time_steps: usize,
+        /// Skip the bitwise check.
+        #[arg(long)]
+        no_check: bool,
+    },
+    /// Canonical prefill: a multi-turn conversation (system prompt and user turns from the corpus, greedy
+    /// replies) gives the same logits and tokens cold, warm and after serving another conversation.
+    CanonCheck {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        /// System prompt tokens (shared by the conversations).
+        #[arg(long, default_value_t = 5000)]
+        system: usize,
+        #[arg(long, default_value_t = 3)]
+        turns: usize,
+        /// Reply tokens per turn.
+        #[arg(long, default_value_t = 24)]
+        reply: usize,
+    },
 }
 
 pub fn run(cmd: InklingCmd) -> Result<()> {
@@ -94,13 +137,36 @@ pub fn run(cmd: InklingCmd) -> Result<()> {
         InklingCmd::Generate {
             model,
             prompt,
+            prompt_file,
             raw,
             effort,
             n,
             context,
             chunk,
             draft,
-        } => generate(&model, &prompt, raw, &effort, n, context, chunk, draft),
+        } => {
+            let prompt = match prompt_file {
+                Some(f) => std::fs::read_to_string(f)?,
+                None => prompt,
+            };
+            generate(&model, &prompt, raw, &effort, n, context, chunk, draft)
+        }
+        InklingCmd::BatchCheck {
+            model,
+            text,
+            ctx,
+            seqs,
+            steps,
+            time_steps,
+            no_check,
+        } => crate::inkling_batch::run(&model, &text, &ctx, &seqs, steps, time_steps, !no_check),
+        InklingCmd::CanonCheck {
+            model,
+            text,
+            system,
+            turns,
+            reply,
+        } => crate::inkling_batch::canon_check(&model, &text, system, turns, reply),
         InklingCmd::Bench {
             model,
             text,
@@ -121,7 +187,7 @@ pub fn load(dir: &Path) -> Result<(InklingModel, quench6k_cuda::Stream)> {
 }
 
 /// Runs `ids` through the model in chunks; the last chunk produces the logits of its last token.
-fn prefill(model: &InklingModel, st: &mut State, ws: &mut Workspace, s: &quench6k_cuda::Stream, ids: &[i32]) -> Result<()> {
+pub(crate) fn prefill(model: &InklingModel, st: &mut State, ws: &mut Workspace, s: &quench6k_cuda::Stream, ids: &[i32]) -> Result<()> {
     let mut at = 0;
     while at < ids.len() {
         let n = ws.max_t.min(ids.len() - at);
@@ -132,7 +198,7 @@ fn prefill(model: &InklingModel, st: &mut State, ws: &mut Workspace, s: &quench6
     Ok(())
 }
 
-fn argmax(ws: &Workspace, model: &InklingModel, s: &quench6k_cuda::Stream) -> Result<i32> {
+pub(crate) fn argmax(ws: &Workspace, model: &InklingModel, s: &quench6k_cuda::Stream) -> Result<i32> {
     k::argmax(s, ws.out_logits, 1, model.cfg.vocab, model.cfg.vocab, ws.argmax_scratch, ws.argmax)?;
     Ok(s.download::<i32>(ws.argmax, 1)?[0])
 }
@@ -304,15 +370,17 @@ fn generate(dir: &Path, prompt: &str, raw: bool, effort: &str, n: usize, context
     let (model, s) = load(dir)?;
     let mut ws = Workspace::new(&model, chunk, if draft { 8 } else { 1 })?;
     let mut st = State::new(&model, context, &s)?;
-    eprintln!(
-        "inkling: workspace {:.2} GiB, cache {:.2} GiB",
-        ws.device_bytes as f64 / (1u64 << 30) as f64,
-        st.device_bytes as f64 / (1u64 << 30) as f64
-    );
+    let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+    eprintln!("inkling: workspace {:.2} GiB, sequence {:.2} GiB fixed", gib(ws.device_bytes), gib(st.device_bytes()));
     let t0 = Instant::now();
     prefill(&model, &mut st, &mut ws, &s, &ids)?;
     let mut next = argmax(&ws, &model, &s)?;
     let pf = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "inkling: sequence {:.2} GiB after the prompt; device {:.2} GiB used",
+        gib(st.device_bytes()),
+        gib(quench6k_cuda::mem_info().map_or(0, |(free, total)| total - free))
+    );
     let mut out = vec![next];
     let t1 = Instant::now();
     let mut steps = 0;

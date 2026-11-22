@@ -3,6 +3,7 @@ mod chat;
 mod flint;
 mod hy4;
 mod inkling;
+mod inkling_batch;
 mod gpumon;
 mod kbench;
 mod mtp;

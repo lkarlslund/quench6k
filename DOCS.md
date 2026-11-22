@@ -141,6 +141,33 @@ number of drafts with the most expected tokens per second, and runs the drafter 
 beat plain ones (`QUENCH6K_INK_DRAFTS=N` fixes the count in `quench6k inkling`; `QUENCH6K_INK_DRAFT=0`
 does not load the drafter). Decoding stays exact.
 
+Sequences share the GPU's memory by length: a sequence's full-attention caches (8 of the 48 layer
+visits, and the drafter's one full-attention layer: 36 KiB per position in all) are reserved as virtual
+memory for its capacity (up to the model's 1,048,576 positions) and mapped in pieces as positions are
+used (`State::reserve` / `State::trim`); its rings (the sliding layers' keys and values and the
+convolution inputs, 4096 positions each, about 3.1 GiB) are allocated with it.
+
+Prefill is canonical, so a prompt's results depend only on its tokens, not on what the sequence held
+before: prompts are computed in chunks that end at multiples of 2048 positions (`CANON_CHUNK`,
+`InklingModel::prefill`) and at the prompt's end, and `State::rewind` reuses a cached prefix only up to a
+multiple of 2048 at most the common prefix and the sequence's canonical frontier (the boundary up to
+which every position came from such whole chunks; decode steps, drafts and partial chunks never advance
+it, writes below it lower it). Everything after that boundary is recomputed, earlier replies included,
+so a turn recomputes up to 2047 cached prompt tokens plus the previous reply. The rings at a boundary are
+either still live (within 3056 positions) or the boundary snapshot each whole chunk takes (the last 1040
+positions of the sliding keys and values and the last 4 of the convolution inputs, about 0.17 GiB);
+`State::snapshot` does nothing now. Up to 8 sequences decode together
+(`InklingModel::forward_batch`, 1 to 16 tokens each, at most 64 rows; `draft_batch` drafts for them
+in one pass): every kernel of a small step finds each row's sequence, position, caches and rings in a
+small per-step descriptor, so one CUDA graph per row count serves any sequences (each sequence also keeps
+its last step's drafter features, so its drafts do not depend on other sequences' steps in between), and
+each row's results
+do not depend on the step's other rows (skinny tensor-core GEMM over up to 64 rows, the GEMV in launches
+of at most 16, per-pair experts, per-row attention splits). A sequence's logits, caches and drafts are
+bit-identical alone and batched (`quench6k inkling batch-check` compares them and measures batched
+steps). One sequence of 1,042,346 tokens prefilled at 1.7K tokens/s (450 W) and decoded at 34 tokens/s
+with 38.9 GiB of caches (256K: 4.6K and 97 tokens/s, 11.9 GiB; 512K: 2.9K and 60 tokens/s, 21.1 GiB).
+
 Its correctness gate compares teacher-forced distributions against `tools/ref/inkling_ref.py`, which
 drives the transformers implementation's decoder layers (transformers 5.24 or later) one layer at a time
 on the GPU, in BF16 (reference A) and FP32 (B):
@@ -543,6 +570,7 @@ the inspector's edits.
 | `QUENCH6K_INK_PREFETCH=0`, `QUENCH6K_INK_CLUSTER=0` | Inkling 2: small steps without the L2 prefetch of the next visit's weights / without the 8-block cluster residual mixture |
 | `QUENCH6K_INK_GUESS=0`, `QUENCH6K_INK_GUESS_K=k1,k2,..` | Inkling 2: steps of up to 4 tokens without the guessed experts (the next visit's router on this visit's MLP input; the best guesses' gate/up weights requested into L2 after the next visit's output projection) / the guesses per row for steps of 1, 2, .. tokens (default 3,2,2,1) |
 | `QUENCH6K_INK_GRAPHS=0` | Inkling 2: run small steps and the drafter eagerly instead of as CUDA graphs |
+| `QUENCH6K_INK_EXPERT_GROUPS=N` | Inkling 2: small steps of N or more rows (default 16; 0: never) run the routed experts in groups of up to 4 pairs of the same expert (each expert's rows read and decoded once per group; the same bits as per pair) |
 | `QUENCH6K_INK_DRAFT=0` | Inkling 2: do not load the DSpark drafter (the server then drafts by prompt lookup) |
 | `QUENCH6K_INK_DRAFTS=N` | Inkling 2, `quench6k inkling ... --draft`: verify N drafts per step instead of choosing the count |
 | `QUENCH6K_INK_DUMP=DIR`, `QUENCH6K_INK_DUMP_DRAFT=DIR`, `QUENCH6K_INK_TIMING=1` | Inkling 2 debugging: the stream after each layer visit, the drafter's inputs and outputs, per-step timings |
