@@ -129,11 +129,14 @@ a prompt keeps only what resuming there reads (the last 1040 positions of the sl
 the last 4 of the convolution inputs: about 0.17 GiB). Up to 8 sequences decode together
 (`InklingModel::forward_batch`, 1 to 16 tokens each, at most 64 rows; `draft_batch` drafts for them
 in one pass): every kernel of a small step finds each row's sequence, position, caches and rings in a
-small per-step descriptor, so one CUDA graph per row count serves any sequences, and each row's results
+small per-step descriptor, so one CUDA graph per row count serves any sequences (each sequence also keeps
+its last step's drafter features, so its drafts do not depend on other sequences' steps in between), and
+each row's results
 do not depend on the step's other rows (skinny tensor-core GEMM over up to 64 rows, the GEMV in launches
 of at most 16, per-pair experts, per-row attention splits). A sequence's logits, caches and drafts are
 bit-identical alone and batched (`quench6k inkling batch-check` compares them and measures batched
-steps).
+steps). One sequence of 1,042,346 tokens prefilled at 1.7K tokens/s (450 W) and decoded at 34 tokens/s
+with 38.9 GiB of caches (256K: 4.6K and 97 tokens/s, 11.9 GiB; 512K: 2.9K and 60 tokens/s, 21.1 GiB).
 
 Its correctness gate compares teacher-forced distributions against `tools/ref/inkling_ref.py`, which
 drives the transformers implementation's decoder layers (transformers 5.24 or later) one layer at a time

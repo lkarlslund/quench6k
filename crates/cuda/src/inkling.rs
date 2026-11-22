@@ -295,6 +295,8 @@ mod ffi {
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_seqs_bytes() -> c_int;
+        pub fn quench6k_ink_feat_rows() -> c_int;
+        pub fn quench6k_ink_keep_feats(feats: *const c_void, sq: *const c_void, t: c_int, st: Stream) -> Error;
         pub fn quench6k_ink_tab_slots() -> c_int;
         pub fn quench6k_ink_small_rows() -> c_int;
     }
@@ -385,6 +387,20 @@ pub const T_ARING: usize = 4;
 pub const T_MRING: usize = 5;
 /// The cache's rows (positions modulo them).
 pub const T_ROWS: usize = 6;
+/// Visit 0's slot: the sequence's kept drafter features ([`feat_rows`] rows of BF16 [4, 2304]; row t of
+/// its last step at t % feat_rows).
+pub const T_FEAT: usize = 7;
+
+/// Rows of drafter features a sequence keeps from its last step.
+pub fn feat_rows() -> usize {
+    unsafe { ffi::quench6k_ink_feat_rows() as usize }
+}
+
+/// Each sequence's last [`feat_rows`] rows of the step's features `feats` (BF16 [t, 4, 2304]) into its
+/// own buffer ([`T_FEAT`]).
+pub fn keep_feats(s: &Stream, feats: u64, sq: u64, t: usize) -> Result<()> {
+    go!("ink_keep_feats", ffi::quench6k_ink_keep_feats(p(feats), p(sq), n(t), s.raw()))
+}
 
 impl Seqs {
     pub fn as_bytes(&self) -> &[u8] {
@@ -716,8 +732,9 @@ pub fn to_bf16_rows(s: &Stream, src: u64, t: usize, dst: u64, ldd: usize) -> Res
     go!("ink_to_bf16_rows", ffi::quench6k_ink_to_bf16_rows(f(src), n(t), pm(dst), n(ldd), s.raw()))
 }
 
-/// `rows` rows of bf16(w * rmsnorm(sum_k alpha[k] feats[row, k])) at stride `ldo`; row = r, or (with
-/// `rows_from`, device ints per sequence) rows_from[the sequence of row r in `sq`].
+/// `rows` rows of bf16(w * rmsnorm(sum_k alpha[k] f[k])) at stride `ldo`: f = feats row r, or (with
+/// `rows_from`, device ints per sequence) row rows_from[s] of the features kept by sequence s of row r in
+/// `sq` ([`T_FEAT`]).
 #[allow(clippy::too_many_arguments)]
 pub fn mix(s: &Stream, feats: u64, rows_from: u64, sq: u64, alpha: u64, w: u64, out: u64, ldo: usize, rows: usize) -> Result<()> {
     go!(

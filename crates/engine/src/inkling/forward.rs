@@ -111,6 +111,8 @@ pub struct State {
     tab: DeviceBuffer,
     /// Full-length caches (virtual reservations for `ctx` positions, mapped as positions are used).
     grow: Vec<VmBuffer>,
+    /// The drafter's features of the last step's last ik::feat_rows() rows (row t at t % feat_rows).
+    _feat: DeviceBuffer,
     _alloc: Alloc,
 }
 
@@ -181,6 +183,8 @@ impl State {
             e[ik::T_V] = vc;
             e[ik::T_ROWS] = rows as u64;
         }
+        let feat = DeviceBuffer::zeroed(ik::feat_rows() * 4 * D * 2)?;
+        t[ik::T_FEAT] = feat.addr();
         let tab = DeviceBuffer::new(t.len() * 8)?;
         s.upload(&tab, &t)?;
         s.synchronize()?;
@@ -189,7 +193,7 @@ impl State {
             ctx,
             caches,
             history: Vec::new(),
-            device_bytes: a.bytes + tab.bytes(),
+            device_bytes: a.bytes + tab.bytes() + feat.bytes(),
             draft_kv,
             last_t: 0,
             last_row0: 0,
@@ -198,6 +202,7 @@ impl State {
             floor: 0,
             tab,
             grow,
+            _feat: feat,
             _alloc: a,
         })
     }
@@ -859,9 +864,9 @@ impl InklingModel {
     }
 
     /// [`InklingModel::draft`] for several sequences in one pass (their drafts bit-identical to drafting
-    /// each alone): `pending[i]` the token states[i]'s last step chose after its row `rows[i]`. The
-    /// features come from the workspace's last step, which must have fed these sequences (alone or
-    /// batched). Sequences without room for a block (or before any step) get no drafts.
+    /// each alone): `pending[i]` the token states[i]'s last step chose after its row `rows[i]` (one of its
+    /// last 16). Each sequence keeps its last step's features, so other sequences' steps in between do
+    /// not matter. Sequences without room for a block (or before any step) get no drafts.
     pub fn draft_batch(&self, states: &mut [&mut State], ws: &mut Workspace, s: &Stream, pending: &[i32], rows: &[usize]) -> Result<Vec<Vec<i32>>> {
         let n = states.len();
         ensure!(n <= MAX_SEQS && pending.len() == n && rows.len() == n, "a draft batch of {n} sequences (at most {MAX_SEQS})");
@@ -872,7 +877,8 @@ impl InklingModel {
         let b = d.block;
         let live: Vec<usize> = (0..n).filter(|&i| states[i].pos + b <= states[i].ctx && states[i].last_t > 0).collect();
         for &i in &live {
-            ensure!(rows[i] < states[i].last_t, "draft source row {} of a {}-token step", rows[i], states[i].last_t);
+            let lt = states[i].last_t;
+            ensure!(rows[i] < lt && rows[i] + ik::feat_rows() >= lt, "draft source row {} of a {lt}-token step (its last {} rows)", rows[i], ik::feat_rows());
             self.check_tokens(&pending[i..i + 1])?;
         }
         for &i in &live {
@@ -895,7 +901,7 @@ impl InklingModel {
             for (j, &i) in live.iter().enumerate() {
                 let st = &states[i];
                 buf[j * 4..j * 4 + 4].copy_from_slice(&pending[i].to_le_bytes());
-                buf[32 + j * 4..32 + j * 4 + 4].copy_from_slice(&((st.last_row0 + rows[i]) as i32).to_le_bytes());
+                buf[32 + j * 4..32 + j * 4 + 4].copy_from_slice(&(rows[i] as i32).to_le_bytes());
                 sq.tab[j] = st.tab.addr();
                 sq.start[j] = st.pos as i32;
                 sq.row0[j] = (j * b) as i32;
@@ -1416,6 +1422,8 @@ impl InklingModel {
             ik::softcap(s, ws.out_logits, rows, cfg.vocab, cfg.vocab, cfg.logit_cap)?;
         }
         if let (Some(d), Some(dw)) = (&self.drafter, &ws.draft) {
+            // Each sequence's features of its last rows, for its next drafts.
+            ik::keep_feats(s, ws.feats, sq, t)?;
             // The drafter's context keys and values of this step's positions.
             let visits = cfg.visits().len();
             for (i, l) in d.layers.iter().enumerate() {

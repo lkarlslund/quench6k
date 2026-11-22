@@ -49,7 +49,10 @@ SQ_DEVICE float rb(float x) { return bf2f(f2bf(x)); }
 // drafter layer) TAB slots, see T_*. Kernels find a row's sequence here, so that a captured step serves any
 // set of sequences of the same row count.
 constexpr int MAX_SEQ = 8, TAB = 8;
-enum { T_K = 0, T_V = 1, T_KRING = 2, T_VRING = 3, T_ARING = 4, T_MRING = 5, T_ROWS = 6 };
+enum { T_K = 0, T_V = 1, T_KRING = 2, T_VRING = 3, T_ARING = 4, T_MRING = 5, T_ROWS = 6, T_FEAT = 7 };
+// T_FEAT (visit 0's slot): the sequence's drafter features of its last step's last FEAT_ROWS rows (BF16 [FEAT_ROWS,
+// 4, D], row t at t % FEAT_ROWS).
+constexpr int FEAT_ROWS = 16;
 struct Seqs {
     const unsigned long long* tab[MAX_SEQ];
     int start[MAX_SEQ];
@@ -2035,8 +2038,8 @@ __global__ void to_bf16_rows_kernel(const float* __restrict__ src, int T, bf16* 
     dst[(i / D) * ldd + i % D] = f2bf(src[i]);
 }
 
-// out row r = bf16(w * rmsnorm(sum_k alpha[k] * feats[row, k])) with row = rows_from[the sequence of row r
-// in sq] (or r without rows_from; feats BF16 [*, 4, D]).
+// out row r = bf16(w * rmsnorm(sum_k alpha[k] * f[k])): f = feats row r (BF16 [*, 4, D]), or with rows_from,
+// row rows_from[s] % FEAT_ROWS of the features kept by sequence s of row r in sq (T_FEAT).
 constexpr int TAPS = 4;
 __global__ void __launch_bounds__(RT) mix_kernel(const bf16* __restrict__ feats, const int* __restrict__ rows_from, const Seqs* __restrict__ sq,
                                                  const float* __restrict__ alpha, const bf16* __restrict__ w, bf16* out, int ldo) {
@@ -2044,8 +2047,13 @@ __global__ void __launch_bounds__(RT) mix_kernel(const bf16* __restrict__ feats,
     pdl_wait();
     __shared__ float red[32];
     const int r = blockIdx.x;
-    const int row = rows_from ? rows_from[seq_row(sq, r).s] : r;
-    const bf16* f = feats + (size_t)row * TAPS * D;
+    const bf16* f;
+    if (rows_from) {
+        const SeqRow sr = seq_row(sq, r);
+        f = tab_ptr<const bf16>(sr, 0, T_FEAT) + (size_t)(rows_from[sr.s] % FEAT_ROWS) * TAPS * D;
+    } else {
+        f = feats + (size_t)r * TAPS * D;
+    }
     float v[RPT], ss = 0.0f;
 #pragma unroll
     for (int i = 0; i < RPT; ++i) {
@@ -2062,6 +2070,20 @@ __global__ void __launch_bounds__(RT) mix_kernel(const bf16* __restrict__ feats,
         const int c = threadIdx.x + RT * i;
         out[(size_t)r * ldo + c] = f2bf(v[i] * inv * bf2f(w[c]));
     }
+}
+
+// Each sequence's last FEAT_ROWS rows of the step's features (feats BF16 [T, 4, D]) into its own buffer
+// (T_FEAT), so that its drafts do not depend on later steps of other sequences. Block: a row.
+__global__ void __launch_bounds__(256) keep_feats_kernel(const bf16* __restrict__ feats, const Seqs* __restrict__ sq) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int g = blockIdx.x;
+    const SeqRow sr = seq_row(sq, g);
+    const int n = sq->row0[sr.s + 1] - sq->row0[sr.s];
+    if (sr.t < n - FEAT_ROWS) return;
+    const uint4* src = reinterpret_cast<const uint4*>(feats + (size_t)g * TAPS * D);
+    uint4* dst = reinterpret_cast<uint4*>(tab_ptr<bf16>(sr, 0, T_FEAT) + (size_t)(sr.t % FEAT_ROWS) * TAPS * D);
+    for (int i = threadIdx.x; i < TAPS * D / 8; i += blockDim.x) dst[i] = src[i];
 }
 
 // Neox RoPE of one 128-wide head held as 4 values per lane (dims 4 lane .. 4 lane + 3): dims d < 64 pair
@@ -2799,6 +2821,13 @@ cudaError_t quench6k_ink_markov(int nseq, const void* w, const float* ctx, int c
     SQ_RETURN_LAUNCH();
 }
 
+cudaError_t quench6k_ink_keep_feats(const void* feats, const void* sq, int T, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(keep_feats_kernel, T, 256, 0, st, static_cast<const bf16*>(feats), static_cast<const Seqs*>(sq)));
+    SQ_RETURN_LAUNCH();
+}
+
+int quench6k_ink_feat_rows() { return FEAT_ROWS; }
 int quench6k_ink_seqs_bytes() { return (int)sizeof(Seqs); }
 int quench6k_ink_tab_slots() { return TAB; }
 int quench6k_ink_small_rows() { return SMALL_ROWS; }

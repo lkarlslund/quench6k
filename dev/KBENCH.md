@@ -658,4 +658,16 @@ Verify steps of 4 tokens per sequence: 557 / 667 / 787 / 825 rows/s at 512 (7.2 
 428 / 507 / 545 / 563 at 32K; drafter passes 0.85 / 1.17 / 2.08 / 3.98 ms at 512. A plain step's extra
 sequence costs about 1.1 ms at 512: its 8 experts per layer visit (48 visits x 8 x 4 MB of NVFP4 weights,
 about 1.5 GB) are new DRAM traffic. Verify steps grow with their pairs (the per-pair expert kernels
-re-read and re-decode an expert's rows for every pair routed to it), not with the experts read.
+re-read and re-decode an expert's rows for every pair routed to it), not with the experts read: in an nsys
+capture of these runs (`--cuda-graph-trace=node`) the two expert kernels take a third of all GPU time.
+Grouping up to 4 pairs of an expert per warp item (rows loaded and decoded once, each pair's sums as
+before: the same bits) gives 8 sequences' verify steps 39.0 -> 35.2 ms and 4 sequences' 20.4 -> 20.0 ms,
+but 8-row steps 11.9 -> 13.3 ms, so it starts at 16 rows. The FMAs per pair stay; a tensor-core expert
+kernel (tokens as the MMA's N, so a row's sums still do not depend on the others) would remove that, but
+its sums would differ from today's kernels in order, so it needs the gate, not a bitwise check.
+
+Long contexts, one sequence, `inkling generate --prompt-file` (a needle sentence 40% into repository text,
+then a question about it), 450 W: 253,964 tokens prefilled in 55 s (4.6K tokens/s), decode 97 tokens/s,
+11.9 GiB of caches; 523,508 tokens in 182 s (2.9K tokens/s), 60 tokens/s, 21.1 GiB; 1,042,346 tokens in
+626 s (1.7K tokens/s), 34 tokens/s, 38.9 GiB (58.4 GiB on the device in all). The model quoted the needle
+at 256K and 512K, and was quoting it at 1M when the run's 40 tokens ended. At 1M a decode step reads each full-attention visit's 4 GiB of keys and values.
