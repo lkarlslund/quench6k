@@ -1256,10 +1256,13 @@ __global__ void __launch_bounds__(256) experts_down_kernel(const bf16* __restric
 // Xs[row, K] . dequant(W_e)[N, K]^T. Warps 2 x 4, each (BM_ / 2) x 32 outputs.
 constexpr int NV_BN = 128;
 
-template <int BM_, int NV_BK>
+// ACT (gate/up, rows interleaved gate, up): the epilogue writes act BF16 [rows, N / 2] =
+// softcap(g, gcap) sigmoid(g) softcap(u, ucap) (as moe_act_kernel) instead of Y.
+template <int BM_, int NV_BK, bool ACT>
 __global__ void __launch_bounds__(256) nv4_gemm_kernel(const bf16* __restrict__ X, const uint64_t* __restrict__ w_ptr, const uint64_t* __restrict__ s_ptr,
                                                        const float* __restrict__ ws2, const int* __restrict__ offsets, const int* __restrict__ tile_expert,
-                                                       const int* __restrict__ tile_row, const int* __restrict__ num_tiles, float* Y, int N, int K) {
+                                                       const int* __restrict__ tile_row, const int* __restrict__ num_tiles, float* Y, int N, int K, bf16* act,
+                                                       float gcap, float ucap) {
     constexpr int MI = BM_ / 32, NV_LDS = NV_BK + 8, KC = NV_BK / 32;  // KC: 16-byte code chunks a B row
     pdl_launch_dependents();
     pdl_wait();
@@ -1365,10 +1368,16 @@ __global__ void __launch_bounds__(256) nv4_gemm_kernel(const bf16* __restrict__ 
                 const int r = r0 + warp_m * (BM_ / 2) + i * 16 + g8 + h * 8;
                 const int n = n0 + warp_n * 32 + j * 8 + t4 * 2;
                 if (r >= r_end) continue;
-                if (n + 1 < N)
+                if constexpr (ACT) {
+                    if (n + 1 < N) {
+                        const float gv = alpha * acc[i][j][h * 2], uv = alpha * acc[i][j][h * 2 + 1];
+                        act[(size_t)r * (N / 2) + n / 2] = f2bf(softcap(gv, gcap) * sigmoidf(gv) * softcap(uv, ucap));
+                    }
+                } else if (n + 1 < N) {
                     *reinterpret_cast<float2*>(Y + (size_t)r * N + n) = make_float2(alpha * acc[i][j][h * 2], alpha * acc[i][j][h * 2 + 1]);
-                else if (n < N)
+                } else if (n < N) {
                     Y[(size_t)r * N + n] = alpha * acc[i][j][h * 2];
+                }
             }
 }
 
@@ -2330,9 +2339,10 @@ cudaError_t quench6k_ink_markov_cand(const float* base, const float* fold_b, int
 }
 
 // The W4A16 NVFP4 grouped GEMM with tiles of bm rows (64 or 128; the plan's tile size).
+// act (non-null): the gate/up activation instead of y (see nv4_gemm_kernel).
 cudaError_t quench6k_ink_nv4_gemm(const void* xs, const uint64_t* w_ptr, const uint64_t* s_ptr, const float* ws2, const int* offsets,
                                   const int* tile_expert, const int* tile_row, const int* num_tiles, int max_tiles, int bm, float* y, int N,
-                                  int K, cudaStream_t st) {
+                                  int K, void* act, float gcap, float ucap, cudaStream_t st) {
     if (max_tiles == 0) return cudaSuccess;
     const dim3 grid((N + NV_BN - 1) / NV_BN, max_tiles);
     const auto x = static_cast<const bf16*>(xs);
@@ -2343,13 +2353,14 @@ cudaError_t quench6k_ink_nv4_gemm(const void* xs, const uint64_t* w_ptr, const u
             const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
             if (e != cudaSuccess) return e;
         }
-        SQ_CHECK_LAUNCH(sq_launch(kern, grid, 256, smem, st, x, w_ptr, s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, y, N, K));
+        SQ_CHECK_LAUNCH(sq_launch(kern, grid, 256, smem, st, x, w_ptr, s_ptr, ws2, offsets, tile_expert, tile_row, num_tiles, y, N, K,
+                                  static_cast<bf16*>(act), gcap, ucap));
         return cudaSuccess;
     };
     cudaError_t e;
     // k-tiles of 32 (64: fewer CTAs per SM, slower).
-    if (bm == 128) e = go(nv4_gemm_kernel<128, 32>, 128, 32);
-    else if (bm == 64) e = go(nv4_gemm_kernel<64, 32>, 64, 32);
+    if (bm == 128) e = act ? go(nv4_gemm_kernel<128, 32, true>, 128, 32) : go(nv4_gemm_kernel<128, 32, false>, 128, 32);
+    else if (bm == 64) e = act ? go(nv4_gemm_kernel<64, 32, true>, 64, 32) : go(nv4_gemm_kernel<64, 32, false>, 64, 32);
     else return cudaErrorInvalidValue;
     if (e != cudaSuccess) return e;
     SQ_RETURN_LAUNCH();

@@ -900,14 +900,18 @@ impl InklingModel {
                 let gemm = |x: u64, which: usize, n: usize, kk: usize| {
                     let st = if which == 0 { layer.gate_up } else { layer.down };
                     match &layer.tables {
+                        // Gate/up of NVFP4 layers: the activation from the GEMM's epilogue.
                         Some(tb) => ik::nv4_gemm(
                             s, x, tb[which].0, tb[which].1, st.s2, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.max_tiles, bm, ws.y, n, kk,
+                            (which == 0).then_some((ws.act, cfg.gate_cap, cfg.up_cap)),
                         ),
                         None => ik::mx8_grouped_gemm(s, x, st, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.max_tiles, ws.y, n, kk),
                     }
                 };
                 gemm(ws.xs, 0, 2 * FF, D)?;
-                ik::moe_act(s, ws.y, t * TOPK, cfg.gate_cap, cfg.up_cap, ws.act)?;
+                if layer.tables.is_none() {
+                    ik::moe_act(s, ws.y, t * TOPK, cfg.gate_cap, cfg.up_cap, ws.act)?;
+                }
                 gemm(ws.act, 1, D, FF)?;
                 ik::moe_combine_rows(s, ws.y, ws.pair_row, ws.sel_w, t, ws.moe)?;
                 }

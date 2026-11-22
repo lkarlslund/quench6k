@@ -195,6 +195,9 @@ mod ffi {
             y: *mut f32,
             n: c_int,
             k: c_int,
+            act: *mut c_void,
+            gcap: f32,
+            ucap: f32,
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_to_bf16_rows(src: *const f32, t: c_int, dst: *mut c_void, ldd: c_int, st: Stream) -> Error;
@@ -831,7 +834,8 @@ pub fn markov_cand(s: &Stream, base: u64, fold_b: u64, vocab: usize, rows: usize
     go!("ink_markov_cand", ffi::quench6k_ink_markov_cand(f(base), f(fold_b), n(vocab), n(rows), n(c), im(cand), s.raw()))
 }
 
-/// W4A16 NVFP4 grouped GEMM with tiles of `bm` rows (64 or 128, as planned), F32 out.
+/// W4A16 NVFP4 grouped GEMM with tiles of `bm` rows (64 or 128, as planned), F32 out; with `act`
+/// (gate/up) the activation BF16 [rows, nn / 2] (caps `caps`) instead.
 #[allow(clippy::too_many_arguments)]
 pub fn nv4_gemm(
     s: &Stream,
@@ -848,7 +852,9 @@ pub fn nv4_gemm(
     y: u64,
     nn: usize,
     k: usize,
+    act: Option<(u64, f32, f32)>,
 ) -> Result<()> {
+    let (a, gcap, ucap) = act.unwrap_or((0, 0.0, 0.0));
     go!(
         "ink_nv4_gemm",
         ffi::quench6k_ink_nv4_gemm(
@@ -865,6 +871,9 @@ pub fn nv4_gemm(
             fm(y),
             n(nn),
             n(k),
+            pm(a),
+            gcap,
+            ucap,
             s.raw()
         )
     )
