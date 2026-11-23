@@ -25,6 +25,7 @@ use crate::chat::{Chat, TextStream};
 
 mod atlas;
 mod dashboard;
+mod fit;
 mod flint;
 mod hy4;
 mod inkling;
@@ -432,7 +433,9 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         chat.token_id("<tool_call>")
     };
     let (jobs_tx, jobs_rx) = mpsc::channel::<Work>();
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<f32>>();
+    // The first load reports the context the server serves (`--context`, or fewer positions when one
+    // sequence cannot hold that many on this device: serve/fit.rs).
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<usize>>();
     let (model_dir, context, drafts, steer, slots, plan_tokens, prefill_share) = (
         opts.model.clone(),
         opts.context,
@@ -471,6 +474,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     let unload_idle = opts.unload_idle;
     std::thread::spawn(move || {
         let metrics = worker_metrics;
+        let mut context = context;
         // The first load reports to startup (a failure ends the server); later loads are started by a
         // request that found the model unloaded and report failures to the requests waiting.
         let mut ready = Some(ready_tx);
@@ -486,7 +490,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                     println!("model loaded again in {:.1}s", t0.elapsed().as_secs_f64());
                 }
             };
-            let cfg = slots::Config {
+            let mut cfg = slots::Config {
                 slots,
                 context,
                 plan_tokens,
@@ -494,38 +498,36 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                 unload_idle,
             };
             // A model with an engine of its own loaded: report, then run the slot scheduler.
-            let started = |ready: &mut Option<mpsc::Sender<Result<f32>>>| {
+            let started = |ready: &mut Option<mpsc::Sender<Result<usize>>>, context: usize| {
                 if let Some(tx) = ready.take() {
-                    let _ = tx.send(Ok(0.0));
+                    let _ = tx.send(Ok(context));
                 }
                 loaded(&metrics);
                 for slot in &metrics.live {
                     slot.end(false);
                 }
             };
+            let first = ready.is_some();
             let run = if inkling {
-                crate::inkling::load(&model_dir).map(|(model, stream)| {
-                    started(&mut ready);
+                crate::inkling::load(&model_dir).and_then(|(model, stream)| {
                     let engine = inkling::Engine::new(&model, &stream);
-                    let exit = serve_slots(engine, &cfg, &jobs_rx, &metrics, std::mem::take(&mut waiting));
+                    let exit = serve_slots(engine, &mut cfg, first, |c| started(&mut ready, c), &jobs_rx, &metrics, &mut waiting);
                     drop(model);
                     drop(stream);
                     exit
                 })
             } else if hy4 {
-                crate::hy4::load(&model_dir).map(|(model, stream)| {
-                    started(&mut ready);
+                crate::hy4::load(&model_dir).and_then(|(model, stream)| {
                     let engine = hy4::Engine::new(&model, &stream);
-                    let exit = serve_slots(engine, &cfg, &jobs_rx, &metrics, std::mem::take(&mut waiting));
+                    let exit = serve_slots(engine, &mut cfg, first, |c| started(&mut ready, c), &jobs_rx, &metrics, &mut waiting);
                     drop(model);
                     drop(stream);
                     exit
                 })
             } else if flint {
-                crate::flint::load(&model_dir).map(|(model, stream)| {
-                    started(&mut ready);
+                crate::flint::load(&model_dir).and_then(|(model, stream)| {
                     let engine = flint::Engine::new(&model, &stream);
-                    let exit = serve_slots(engine, &cfg, &jobs_rx, &metrics, std::mem::take(&mut waiting));
+                    let exit = serve_slots(engine, &mut cfg, first, |c| started(&mut ready, c), &jobs_rx, &metrics, &mut waiting);
                     drop(model);
                     drop(stream);
                     exit
@@ -555,9 +557,10 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                     );
                     Ok((model, stream, session, strength))
                 })();
-                setup.map(|(model, stream, mut session, strength)| {
+                setup.map(|(model, stream, mut session, _strength)| {
+                    // Fixed-size slots: a sequence of `context` positions fits, or the session failed.
                     if let Some(tx) = ready.take() {
-                        let _ = tx.send(Ok(strength));
+                        let _ = tx.send(Ok(context));
                     }
                     if let Err(e) = session.add_slots(&model, &stream, slots) {
                         eprintln!("{} of {slots} slots: {e:#}", session.slots());
@@ -587,6 +590,8 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                     exit
                 })
             };
+            // Reloads keep the first load's (possibly capped) context.
+            context = cfg.context;
             metrics.model_state.store(MODEL_UNLOADED, Ordering::Relaxed);
             for slot in &metrics.live {
                 slot.unavailable();
@@ -630,7 +635,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
             }
         }
     });
-    let _ = ready_rx.recv().context("worker thread")??;
+    let context = ready_rx.recv().context("worker thread")??;
     let sampler = dashboard::start(metrics.clone(), opts.stats_dir, opts.stats_retention_days)?;
     // With a pack, the base name runs unsteered and the steered name applies --strength (default 1).
     let steered = steering.then(|| {
@@ -674,7 +679,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         atlas_dir: opts.atlas_dir.clone(),
         atlases: Default::default(),
         model_id: model_id(&opts.model),
-        context: opts.context,
+        context,
         started: now(),
         vision,
         image_max_pixels: opts.image_max_pixels,
@@ -688,6 +693,7 @@ pub fn run(opts: ServeOptions) -> Result<()> {
         .route("/v1/unload", post(unload))
         .route("/v1/models", get(models))
         .route("/v1/models/{*id}", get(model))
+        .route("/props", get(props))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
@@ -730,25 +736,24 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     })
 }
 
-/// The slot scheduler over an engine (Inkling 2, Hy4-flash, Flint), or the engine's setup error for the
-/// requests waiting.
+/// The slot scheduler over an engine (Inkling 2, Hy4-flash, Flint) once its setup succeeded, else the
+/// error (like a failed load: the waiting work stays in `waiting`). On the first load the context is capped to what one sequence fits on the
+/// device ([`fit::fit_context`]); `started` gets the context served.
 fn serve_slots<E: slots::SlotEngine>(
     engine: Result<E>,
-    cfg: &slots::Config,
+    cfg: &mut slots::Config,
+    first: bool,
+    started: impl FnOnce(usize),
     jobs: &mpsc::Receiver<Work>,
     metrics: &Metrics,
-    waiting: Vec<Work>,
-) -> Exit {
-    match engine {
-        Ok(e) => slots::schedule(e, cfg, jobs, metrics, waiting),
-        Err(e) => {
-            eprintln!("worker setup: {e:#}");
-            for w in waiting {
-                fail_work(w, metrics, &format!("{e:#}"));
-            }
-            Exit::Unload(Vec::new())
-        }
+    waiting: &mut Vec<Work>,
+) -> Result<Exit> {
+    let mut e = engine.context("worker setup")?;
+    if first {
+        cfg.context = fit::fit_context(&mut e, cfg.slots, cfg.context)?;
     }
+    started(cfg.context);
+    Ok(slots::schedule(e, cfg, jobs, metrics, std::mem::take(waiting)))
 }
 
 /// The GPU worker: admits queued requests into free slots and steps the running ones, one alone
@@ -1268,6 +1273,12 @@ async fn models(State(app): State<Arc<App>>) -> Json<Value> {
         .map(|name| model_object(&app, name))
         .collect();
     Json(json!({"object": "list", "data": data}))
+}
+
+/// GET /props: the context limit and slots under llama.cpp's names, for clients that read them there.
+async fn props(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(json!({"model_alias": app.name, "n_ctx": app.context, "total_slots": app.metrics.live.len(),
+                "default_generation_settings": {"n_ctx": app.context}}))
 }
 
 async fn model(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {

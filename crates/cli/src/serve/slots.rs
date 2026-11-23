@@ -39,6 +39,25 @@ const HEADROOM: usize = 1 << 30;
 /// Positions a request's plan holds beyond its prompt and expected completion.
 const PLAN_MARGIN: usize = 4096;
 
+/// Most positions (at most `limit`) one sequence's plan ([`SlotEngine::plan_bytes`], monotonic) fits in
+/// `avail` device bytes less the headroom.
+pub(super) fn positions_in(avail: usize, limit: usize, plan: impl Fn(usize) -> usize) -> usize {
+    let avail = avail.saturating_sub(HEADROOM);
+    if plan(limit) <= avail {
+        return limit;
+    }
+    // plan(lo) <= avail < plan(hi), or nothing fits.
+    let (mut lo, mut hi) = (0, limit);
+    if plan(0) > avail {
+        return 0;
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if plan(mid) <= avail { lo = mid } else { hi = mid }
+    }
+    lo
+}
+
 /// Where a sampler finds a step's logits.
 pub(super) trait SlotSampler {
     /// A step's logits for one sequence (a device address for the GPU engines).
@@ -538,10 +557,7 @@ impl<E: SlotEngine> Sched<'_, E> {
     /// (less the headroom) and what all states hold now.
     fn positions_alone(&self) -> usize {
         let held: usize = (0..self.cfg.slots).map(|i| self.device_bytes(i)).sum();
-        let avail = (self.e.free_bytes() + held).saturating_sub(HEADROOM);
-        let fixed = self.e.plan_bytes(0);
-        let per = self.e.bytes_per_position().max(1);
-        (avail.saturating_sub(fixed) / per).min(self.cfg.context)
+        positions_in(self.e.free_bytes() + held, self.cfg.context, |p| self.e.plan_bytes(p))
     }
 
     /// Why memory ran out on `slot` at `positions`.
