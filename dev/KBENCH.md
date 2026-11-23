@@ -821,3 +821,39 @@ Snapshot costs: Hy4 copies 30 sliding layers x 512 rows x 1152 bytes (17.7 MB) p
 35 x 2 x 513 x 1 KiB (35 MiB) per 4096-token chunk, both as device copies on the prefill's stream (tens of
 microseconds of copy per chunk of hundreds of milliseconds); the prompt-end snapshots they replace copied
 17.7 MB (Hy4) and up to 560 MiB (Flint) per prompt.
+
+## 2026-11-23: Inkling 2 batched small steps (same bits)
+
+Where a batched step's time went (inkling batch-check, 8 sequences at 512 tokens, kernels without PDL
+overlap): plain 8-row step 12.9 ms, of it routed experts 7.6 ms (per-pair kernels at 1.45 TB/s on the 52
+distinct experts' bytes: the floor is the experts the rows touch, 6.5x one row's), projections 1.3, attention
+1.0, mixtures 0.7, message gates 0.75; 32-row verify step 36 ms (grouped experts 25 ms); a drafter pass for
+8 sequences 4.9 ms, 3.8 of it the FP8 LM head as the GEMV in 16-row launches (0.46 GB re-read per launch,
+compute-bound at 16 rows). Served at 8 at once the sampler's top-k took 0.7 ms a step: Inkling's vocabulary
+(200058) is not a multiple of 32, so every row ran the one-block path (84 us).
+
+Changes, each bitwise against the path it replaces (batch-check digests of tokens, drafts, stated
+probabilities and every logits row; PDL on and off): experts read their input rows from shared memory
+(staged once per warp, swizzled) instead of 64-byte chunks per lane from global memory per item; the LM head
+of verify steps and drafter passes in one pass over the weights (4 rows a warp, inputs in tiles of 8, the
+GEMV's per-row chunk order; drafter blocks without their unused first rows); small-step attention loads a
+sequence's key tiles once for the rows sharing a split start (verify rows, drafter blocks); top-k of long
+rows of any length through 32 slices.
+
+batch-check, 600 W, step ms (512 tokens: A B B A medians; 32768: one run each), before -> after:
+
+| tokens | sequences | plain | verify-4 | drafter pass |
+|---|---|---|---|---|
+| 512 | 1 | 4.24 -> 4.16 | 7.16 -> 7.02 | 0.88 -> 0.81 |
+| 512 | 2 | 5.56 -> 5.58 | 12.12 -> 10.55 | 1.20 -> 1.08 |
+| 512 | 4 | 7.68 -> 7.52 | 20.79 -> 16.55 | 2.17 -> 1.84 |
+| 512 | 8 | 12.31 -> 11.60 | 36.78 -> 29.45 | 4.22 -> 3.22 |
+| 32768 | 1 | 5.93 -> 5.99 | 9.79 -> 9.15 | 1.39 -> 1.26 |
+| 32768 | 8 | 19.02 -> 17.55 | 54.07 -> 42.58 | 8.23 -> 5.48 |
+
+Served (tools/loadgen.py sweep, 1 turn towards 800 tokens, max_tokens 400, greedy; the same texts before
+and after, drafts on and off), summed decode tok/s at 1 / 2 / 4 / 8 at once, 600 W: drafts on 322 / 443 /
+582 / 569 -> 350 / 480 / 653 / 669, drafts off 245 / 377 / 514 / 595 -> 254 / 391 / 547 / 667; 450 W, 8 at
+once (two runs each): 524, 536 -> 632, 612. At 8 at once drafting still only breaks even: the scheduler's
+cap admits few drafts while a drafter pass for 8 sequences costs 3.2 ms and computes all 7 drafts per
+sequence.
