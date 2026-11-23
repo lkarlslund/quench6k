@@ -171,6 +171,20 @@ pub fn run(dir: &Path, text: &Path, ctxs: &[usize], counts: &[usize], steps: usi
                 let recs: Vec<Vec<StepRec>> =
                     (0..nmax).map(|i| alone(&model, &mut ws, &s, prompts[i], cap, i, steps, drafted)).collect::<Result<_>>()?;
                 let rows: usize = recs.iter().map(|r| r.iter().map(|x| x.toks.len()).sum::<usize>()).sum();
+                // A digest of everything the sequences fed, drafted and produced alone (to compare builds).
+                let mut bytes = Vec::new();
+                for r in recs.iter().flatten() {
+                    for v in r.toks.iter().chain(&r.drafts) {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    for v in &r.conf {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    for v in &r.rows {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                println!("digest ctx {ctx} {mode}: {:016x} ({nmax} sequences x {steps} steps alone)", fnv(&bytes));
                 for &n in counts {
                     let bad = batched(&model, &mut ws, &s, &prompts[..n], cap, &recs[..n], drafted)?;
                     println!(

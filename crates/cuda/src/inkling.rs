@@ -143,12 +143,26 @@ mod ffi {
             order: *mut i32,
             ordered: c_int,
             groups: *const i32,
+            staged: c_int,
             act: *mut c_void,
             y: *mut f32,
             out: *mut f32,
             st: Stream,
         ) -> Error;
         pub fn quench6k_ink_softcap(x: *mut f32, rows: c_int, n: c_int, ld: c_int, cap: f32, st: Stream) -> Error;
+        pub fn quench6k_ink_lm_rows(
+            x: *const c_void,
+            ldx: c_int,
+            m: c_int,
+            blk: c_int,
+            w: *const u8,
+            scale: *const f32,
+            y: *mut f32,
+            ldy: c_int,
+            n: c_int,
+            k: c_int,
+            st: Stream,
+        ) -> Error;
         pub fn quench6k_ink_moe_plan(
             sel_e: *const i32,
             t: c_int,
@@ -676,7 +690,9 @@ pub struct ExpertStack {
 
 /// The routed experts of `t` tokens (x BF16 [t, 2304]) into y (per pair) and out F32 [t, 2304] (0: no
 /// combine); `ordered`: `order` already holds the pairs' order ([`route`]); `groups` (non-zero, with
-/// `ordered`): the grouped kernels over [`route`]'s groups, bitwise the same results.
+/// `ordered`): the grouped kernels over [`route`]'s groups, bitwise the same results; `staged` (with
+/// `ordered`, NVFP4, no `groups`): the per-pair kernels with each block's inputs staged in shared memory,
+/// bitwise the same results.
 #[allow(clippy::too_many_arguments)]
 pub fn experts(
     s: &Stream,
@@ -692,6 +708,7 @@ pub fn experts(
     order: u64,
     ordered: bool,
     groups: u64,
+    staged: bool,
     act: u64,
     y: u64,
     out: u64,
@@ -715,12 +732,22 @@ pub fn experts(
             im(order),
             ordered as c_int,
             i(groups),
+            staged as c_int,
             pm(act),
             fm(y),
             fm(out),
             s.raw()
         )
     )
+}
+
+/// Y F32 [m, n] (row stride ldy) = X BF16 [m, k] (row stride ldx) . W^T for FP8 weights with block-128
+/// scales (k <= 2560): every row bitwise the shared GEMV's, any number of rows in one pass over W. With
+/// `blk` above 1, rows in blocks of `blk` without their first rows (logical row m at (m / (blk - 1)) blk
+/// + 1 + m % (blk - 1) of X and Y); 0: all rows.
+#[allow(clippy::too_many_arguments)]
+pub fn lm_rows(s: &Stream, x: u64, ldx: usize, m: usize, blk: usize, w: u64, scale: u64, y: u64, ldy: usize, nn: usize, k: usize) -> Result<()> {
+    go!("ink_lm_rows", ffi::quench6k_ink_lm_rows(p(x), n(ldx), n(m), n(blk), u8p(w), f(scale), fm(y), n(ldy), n(nn), n(k), s.raw()))
 }
 
 pub fn softcap(s: &Stream, x: u64, rows: usize, nn: usize, ld: usize, cap: f32) -> Result<()> {

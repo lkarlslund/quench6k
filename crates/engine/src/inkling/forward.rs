@@ -801,6 +801,34 @@ fn expert_groups_min() -> usize {
     })
 }
 
+/// Small steps of at least this many rows run the per-pair expert kernels with each block's inputs staged
+/// in shared memory on NVFP4 layers (QUENCH6K_INK_EXPERT_STAGED, 0: never). Their results are bitwise the
+/// per-pair kernels'.
+fn expert_staged_min() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("QUENCH6K_INK_EXPERT_STAGED").ok().and_then(|v| v.parse().ok()) {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => 1,
+    })
+}
+
+/// Small steps of more rows than this run the per-pair kernels without staging (QUENCH6K_INK_EXPERT_STAGED_MAX).
+fn expert_staged_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QUENCH6K_INK_EXPERT_STAGED_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(BATCH_ROWS))
+}
+
+/// Small steps of more rows than this run the LM head as ik::lm_rows (one pass over the weights for all
+/// rows; the same bits as the GEMV, which takes at most 16 rows a pass and reaches the weights' bandwidth
+/// up to 4). QUENCH6K_INK_LM_ROWS=0: the GEMV always.
+const LM_ROWS_GEMV: usize = 4;
+
+fn lm_rows_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QUENCH6K_INK_LM_ROWS").map_or(true, |v| v != "0"))
+}
+
 fn prefetch_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("QUENCH6K_INK_PREFETCH").map_or(true, |v| v != "0"))
@@ -1045,7 +1073,13 @@ impl InklingModel {
         let n = b - 1;
         ik::rms(s, &[RmsSet { x: dw.x, w: d.norm, out: dw.hf, ldo: 2 * D }], r)?;
         ik::mix(s, ws.feats, rows_from, sq, d.alpha + (d.layers.len() * 16) as u64, d.markov_norm, dw.hf + (D * 2) as u64, 2 * D, r)?;
-        linear(s, dw.hf, 2 * D, r, &self.lm_head, dw.base, cfg.vocab, true)?;
+        // The block rows that predict drafts (1.. of each block; row 0's logits are not used).
+        if self.lm_head.fmt == WeightFormat::Fp8Block && lm_rows_on() {
+            let l = &self.lm_head;
+            ik::lm_rows(s, dw.hf, 2 * D, m * (b - 1), b, l.w, l.scale, dw.base, cfg.vocab, l.n, l.k)?;
+        } else {
+            linear(s, dw.hf, 2 * D, r, &self.lm_head, dw.base, cfg.vocab, true)?;
+        }
         linear(s, dw.hf, 2 * D, r, &d.markov_hf, dw.ctx, d.markov_hf.n, true)?;
         // The head's picks among each vocabulary block's best rows by base + fold_b (QUENCH6K_INK_MARKOV_CAND:
         // rows per block, 0 = the whole vocabulary).
@@ -1340,7 +1374,8 @@ impl InklingModel {
             linear_narrow(s, ws, ws.xm, D, t, &layer.router, ws.rlogits, EXPERTS, small)?;
             // Small steps route and order the pairs in one launch and fold the combine into the
             // convolution; larger ones group the pairs for the tensor-core GEMMs (NVFP4 layers).
-            let groups = if small && t >= expert_groups_min() { ws.groups } else { 0 };
+            let staged = small && layer.fp4 && t >= expert_staged_min() && t <= expert_staged_max();
+            let groups = if small && !staged && t >= expert_groups_min() { ws.groups } else { 0 };
             ik::route(s, ws.rlogits, layer.bias, cfg.route_scale, t, ws.sel_e, ws.sel_w, if small { ws.order } else { 0 }, groups)?;
             if !small {
                 // QUENCH6K_INK_FP4_TC=1: NVFP4 layers on the FP4 tensor cores, activations quantized to NVFP4
@@ -1419,6 +1454,7 @@ impl InklingModel {
                 ws.order,
                 small,
                 groups,
+                staged,
                 ws.act,
                 ws.y,
                 if small { 0 } else { ws.moe },
@@ -1470,7 +1506,13 @@ impl InklingModel {
         }
         if want != Logits::None {
             let (rows, first) = if want == Logits::All { (t, 0) } else { (1, t - 1) };
-            linear(s, hidden + (first * 4 * D * 2) as u64, 4 * D, rows, &self.lm_head, ws.out_logits, cfg.vocab, small)?;
+            let x = hidden + (first * 4 * D * 2) as u64;
+            let l = &self.lm_head;
+            if small && rows > LM_ROWS_GEMV && l.fmt == WeightFormat::Fp8Block && lm_rows_on() {
+                ik::lm_rows(s, x, 4 * D, rows, 0, l.w, l.scale, ws.out_logits, cfg.vocab, l.n, l.k)?;
+            } else {
+                linear(s, x, 4 * D, rows, l, ws.out_logits, cfg.vocab, small)?;
+            }
             ik::softcap(s, ws.out_logits, rows, cfg.vocab, cfg.vocab, cfg.logit_cap)?;
         }
         if let (Some(d), Some(dw)) = (&self.drafter, &ws.draft) {
