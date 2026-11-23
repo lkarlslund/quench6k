@@ -197,6 +197,8 @@ struct Mock {
     capacity: usize,
     /// The state of the last forward (a draft must follow its own sequence's step).
     last: usize,
+    /// Held by a test while it sends requests that must arrive together: prefill waits for it.
+    gate: Arc<Mutex<()>>,
 }
 
 impl Mock {
@@ -356,6 +358,7 @@ impl SlotEngine for Mock {
         Ok(())
     }
     fn prefill(&mut self, st: &mut MState, tokens: &[i32], _last: bool) -> Result<[i32; 8]> {
+        drop(self.gate.lock().unwrap());
         self.log.lock().unwrap().push(format!("prefill {}", st.id));
         self.log.lock().unwrap().push(format!("chunk {} {}..{}", st.id, st.hist.len(), st.hist.len() + tokens.len()));
         std::thread::sleep(Duration::from_millis(self.o.prefill_ms));
@@ -426,6 +429,7 @@ struct Server {
     log: Arc<Mutex<Vec<String>>>,
     pace: Arc<AtomicU64>,
     used: Arc<AtomicUsize>,
+    gate: Arc<Mutex<()>>,
     worker: std::thread::JoinHandle<bool>,
 }
 
@@ -444,12 +448,13 @@ fn server_cfg(cfg: Config, o: Opts) -> Server {
     let pace = Arc::new(AtomicU64::new(o.step_ms));
     let used = Arc::new(AtomicUsize::new(0));
     let context = cfg.context;
-    let mock = Mock { o, pace: pace.clone(), used: used.clone(), log: log.clone(), ids: 0, capacity: context, last: 0 };
+    let gate = Arc::new(Mutex::new(()));
+    let mock = Mock { o, pace: pace.clone(), used: used.clone(), log: log.clone(), ids: 0, capacity: context, last: 0, gate: gate.clone() };
     let worker = std::thread::spawn(move || {
         let metrics = Metrics::new(cfg.slots);
         matches!(schedule(mock, &cfg, &rx, &metrics, Vec::new()), Exit::Unload(_))
     });
-    Server { jobs, log, pace, used, worker }
+    Server { jobs, log, pace, used, gate, worker }
 }
 
 type Reply = tmpsc::UnboundedReceiver<Msg>;
@@ -499,7 +504,10 @@ fn concurrent_requests_match_alone() {
         for mtp in [false, true] {
             let srv = server(4, 512, Opts { drafter, ..Default::default() });
             let prompts: Vec<Vec<i32>> = (0..4).map(|i| prompt(i, 5 + 7 * i as usize)).collect();
+            // All arrive before the first prefill (see run_layout).
+            let gate = srv.gate.lock().unwrap();
             let rxs: Vec<Reply> = prompts.iter().enumerate().map(|(i, p)| srv.send(p.clone(), 40 + 10 * i, mtp)).collect();
+            drop(gate);
             for (i, rx) in rxs.into_iter().enumerate() {
                 let (toks, end) = collect(rx);
                 assert_eq!(end, Ok((Finish::Length, 0)), "{drafter:?} mtp {mtp} request {i}");
@@ -631,7 +639,11 @@ fn state_bigger_than_device_fails() {
 #[test]
 fn cancellation() {
     let srv = server(2, 4096, Opts { step_ms: 1, ..Default::default() });
-    drop(srv.send(prompt(9, 10), 50, false));
+    // Its client is gone before the scheduler can take it.
+    let (tx, rx) = tmpsc::unbounded_channel();
+    drop(rx);
+    let job = Job { ids: prompt(9, 10), params: params(50, Vec::new()), mtp: false, tx, capture: None };
+    srv.jobs.send(Work::Generate(QueuedJob { job, cache_key: Vec::new() })).unwrap();
     let a = prompt(1, 10);
     let mut ra = srv.send(a.clone(), 3000, false);
     let b = prompt(2, 10);
@@ -793,7 +805,11 @@ fn widest(log: &[String]) -> usize {
 /// their own tokens; returns the most that stepped together.
 fn run_layout(srv: &Server, lens: &[usize]) -> usize {
     let prompts: Vec<Vec<i32>> = lens.iter().enumerate().map(|(i, &n)| prompt(i as i32, n)).collect();
+    // All arrive before the first prefill: else a sending thread descheduled between two sends lets
+    // the requests already sent finish before the next one starts, and fewer step together.
+    let gate = srv.gate.lock().unwrap();
     let rxs: Vec<Reply> = prompts.iter().map(|p| srv.send(p.clone(), 32, false)).collect();
+    drop(gate);
     for (i, rx) in rxs.into_iter().enumerate() {
         let (g, e) = collect(rx);
         assert_eq!(e, Ok((Finish::Length, 0)), "{lens:?}: request {i}");
