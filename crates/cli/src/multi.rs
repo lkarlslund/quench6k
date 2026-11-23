@@ -19,12 +19,16 @@
 //! ```
 //!
 //! `args` are `quench6k serve` arguments without `--listen`; a model's names (its `--name`, plus the
-//! adapted or steered name with `--adapter` or `--steering`) and context come from them.
+//! adapted or steered name with `--adapter` or `--steering`) and context come from them. A model's server
+//! may serve less context than its `--context` (what one sequence fits in device memory): once it has
+//! loaded, its `/v1/models` context is listed instead, and remembered across restarts in a state file
+//! (`$XDG_STATE_HOME/quench6k/serve-models-contexts.json`), keyed by the entry's args and env.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -49,7 +53,10 @@ struct Entry {
     args: Vec<String>,
     env: HashMap<String, String>,
     names: Vec<String>,
-    context: usize,
+    /// The context listed: the catalog's, or (learned) the one its server serves.
+    context: AtomicUsize,
+    /// What learned contexts are stored under ([`entry_key`]).
+    key: String,
 }
 
 /// The running (or starting) child.
@@ -70,6 +77,8 @@ struct Shared {
 
 struct App {
     entries: Vec<Entry>,
+    /// Where learned contexts are kept (none without a state directory).
+    state: Option<PathBuf>,
     settle: Duration,
     exe: PathBuf,
     started: u64,
@@ -97,7 +106,12 @@ pub fn run(opts: Options, identity: impl Fn(&[String]) -> Result<(Vec<String>, u
             .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
             .unwrap_or_default();
         let (names, context) = identity(&args)?;
-        entries.push(Entry { args, env, names, context });
+        let key = entry_key(&args, &env);
+        entries.push(Entry { args, env, names, context: AtomicUsize::new(context), key });
+    }
+    let state = state_file(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"));
+    if let Some(path) = &state {
+        apply_learned(&entries, &read_learned(path));
     }
     let mut seen = std::collections::HashSet::new();
     for n in entries.iter().flat_map(|e| &e.names) {
@@ -106,10 +120,11 @@ pub fn run(opts: Options, identity: impl Fn(&[String]) -> Result<(Vec<String>, u
         }
     }
     for e in &entries {
-        println!("model {} (context {})", e.names.join(", "), e.context);
+        println!("model {} (context {})", e.names.join(", "), e.context.load(Ordering::Relaxed));
     }
     let app = Arc::new(App {
         entries,
+        state,
         settle: Duration::from_secs_f64(settle),
         exe: std::env::current_exe()?,
         started: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
@@ -144,8 +159,95 @@ pub fn run(opts: Options, identity: impl Fn(&[String]) -> Result<(Vec<String>, u
 }
 
 fn model_object(app: &App, e: &Entry, name: &str, loaded: bool) -> Value {
+    let context = e.context.load(Ordering::Relaxed);
     json!({"id": name, "object": "model", "created": app.started, "owned_by": "quench6k",
-           "max_model_len": e.context, "context_length": e.context, "loaded": loaded})
+           "max_model_len": context, "context_length": context, "loaded": loaded})
+}
+
+/// The learned-context state file: `$XDG_STATE_HOME/quench6k/serve-models-contexts.json`, or under
+/// `~/.local/state` without (or with a relative) `XDG_STATE_HOME`.
+fn state_file(xdg_state_home: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let base = xdg_state_home
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("quench6k").join("serve-models-contexts.json"))
+}
+
+/// Lists the learned contexts of the entries that have one (never more than the catalog's).
+fn apply_learned(entries: &[Entry], learned: &HashMap<String, usize>) {
+    for e in entries {
+        if let Some(&c) = learned.get(&e.key) {
+            e.context.fetch_min(c, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A catalog entry's identity for learned contexts: its args and env (a changed entry learns again).
+fn entry_key(args: &[String], env: &HashMap<String, String>) -> String {
+    let mut env: Vec<_> = env.iter().collect();
+    env.sort();
+    json!({"args": args, "env": env}).to_string()
+}
+
+/// Learned contexts by entry key (empty when the file is missing or unreadable).
+fn read_learned(path: &FsPath) -> HashMap<String, usize> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    v["contexts"]
+        .as_object()
+        .map(|o| o.iter().filter_map(|(k, c)| Some((k.clone(), c.as_u64()? as usize))).collect())
+        .unwrap_or_default()
+}
+
+/// Stores a learned context (the file's other entries kept), replacing the file atomically.
+fn write_learned(path: &FsPath, key: &str, context: usize) -> Result<()> {
+    let mut learned = read_learned(path);
+    if learned.get(key) == Some(&context) {
+        return Ok(());
+    }
+    learned.insert(key.to_string(), context);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&json!({"contexts": learned}))? + "\n")
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
+/// The context a loaded model's server serves (its `/v1/models`).
+async fn served_context(app: &App, port: u16) -> Result<usize> {
+    let req = axum::http::Request::get(format!("http://127.0.0.1:{port}/v1/models")).body(Body::empty())?;
+    let resp = app.client.request(req).await?;
+    anyhow::ensure!(resp.status().is_success(), "/v1/models: HTTP {}", resp.status());
+    let body = axum::body::to_bytes(Body::new(resp.into_body()), 1 << 20).await?;
+    let v: Value = serde_json::from_slice(&body)?;
+    v["data"][0]["max_model_len"].as_u64().map(|c| c as usize).context("/v1/models: no max_model_len")
+}
+
+/// Lists (and stores) the context entry `i`'s server serves, once it has loaded.
+async fn learn_context(app: &App, i: usize, port: u16) {
+    let e = &app.entries[i];
+    let served = match served_context(app, port).await {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("{}: reading its context: {err:#}", e.names[0]);
+            return;
+        }
+    };
+    let before = e.context.swap(served, Ordering::Relaxed);
+    if served != before {
+        println!("model {} serves context {served} (listed {before} before)", e.names[0]);
+    }
+    if let Some(path) = &app.state
+        && let Err(err) = write_learned(path, &e.key, served)
+    {
+        eprintln!("storing the learned context of {}: {err:#}", e.names[0]);
+    }
 }
 
 async fn loaded_entry(app: &App) -> Option<usize> {
@@ -414,6 +516,9 @@ async fn acquire(app: &Arc<App>, entry: Option<usize>) -> std::result::Result<u1
                 stop(b).await;
             }
             let result = start(&app2, want).await;
+            if let Ok((_, port)) = &result {
+                learn_context(&app2, want, *port).await;
+            }
             let mut sh = app2.shared.lock().await;
             let status = match result {
                 Ok((child, port)) => {
@@ -473,4 +578,112 @@ async fn stop(b: Backend) {
         }
     }
     println!("model unloaded");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(args: &[&str], context: usize) -> Entry {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let env = HashMap::new();
+        let key = entry_key(&args, &env);
+        Entry { args, env, names: vec!["m".into()], context: AtomicUsize::new(context), key }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("quench6k-multi-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn state_file_follows_xdg() {
+        let f = |x: Option<&str>, h: Option<&str>| state_file(x.map(Into::into), h.map(Into::into));
+        let want = |base: &str| Some(PathBuf::from(base).join("quench6k/serve-models-contexts.json"));
+        assert_eq!(f(Some("/x/state"), Some("/h")), want("/x/state"));
+        // A relative XDG_STATE_HOME is ignored (the XDG spec), as an unset one.
+        assert_eq!(f(Some("rel"), Some("/h")), want("/h/.local/state"));
+        assert_eq!(f(None, Some("/h")), want("/h/.local/state"));
+        assert_eq!(f(None, None), None);
+    }
+
+    #[test]
+    fn entry_keys_follow_args_and_env() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let env = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>();
+        let a = args(&["--model", "/m", "--context", "262144"]);
+        let k = entry_key(&a, &env(&[("A", "1"), ("B", "2")]));
+        assert_eq!(k, entry_key(&a, &env(&[("B", "2"), ("A", "1")])));
+        assert_ne!(k, entry_key(&a, &env(&[("A", "1")])));
+        assert_ne!(k, entry_key(&args(&["--model", "/m", "--context", "131072"]), &env(&[("A", "1"), ("B", "2")])));
+    }
+
+    #[test]
+    fn learned_contexts_persist_per_entry() {
+        let dir = temp_dir("learned");
+        let path = dir.join("quench6k/serve-models-contexts.json");
+        assert!(read_learned(&path).is_empty());
+        let hy4 = entry(&["--model", "/hy4", "--slots", "8", "--context", "262144"], 262_144);
+        let ink = entry(&["--model", "/ink", "--context", "1048576"], 1 << 20);
+        write_learned(&path, &hy4.key, 202_752).unwrap();
+        write_learned(&path, &ink.key, 1 << 20).unwrap();
+        // A restart lists the learned contexts before any load.
+        let fresh = [
+            entry(&["--model", "/hy4", "--slots", "8", "--context", "262144"], 262_144),
+            entry(&["--model", "/ink", "--context", "1048576"], 1 << 20),
+            // A changed entry (other args) is not matched: it lists its catalog context.
+            entry(&["--model", "/hy4", "--slots", "4", "--context", "262144"], 262_144),
+        ];
+        apply_learned(&fresh, &read_learned(&path));
+        let listed: Vec<usize> = fresh.iter().map(|e| e.context.load(Ordering::Relaxed)).collect();
+        assert_eq!(listed, [202_752, 1 << 20, 262_144]);
+        // Relearning replaces the value and keeps the other entries.
+        write_learned(&path, &hy4.key, 200_704).unwrap();
+        let learned = read_learned(&path);
+        assert_eq!(learned.len(), 2);
+        assert_eq!(learned[&hy4.key], 200_704);
+        // A learned value never lists more than the catalog's context.
+        let small = entry(&["--model", "/ink", "--context", "1048576"], 65_536);
+        apply_learned(std::slice::from_ref(&small), &learned);
+        assert_eq!(small.context.load(Ordering::Relaxed), 65_536);
+        // An unreadable file counts as empty and is replaced on the next write.
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_learned(&path).is_empty());
+        write_learned(&path, &hy4.key, 202_752).unwrap();
+        assert_eq!(read_learned(&path)[&hy4.key], 202_752);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn loaded_server_context_is_learned_and_stored() {
+        let dir = temp_dir("serve");
+        let path = dir.join("contexts.json");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // A model server that serves less than its catalog context.
+            let fake = Router::new().route(
+                "/v1/models",
+                get(|| async { Json(json!({"object": "list", "data": [{"id": "m", "max_model_len": 198_656}]})) }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, fake).await });
+            let app = App {
+                entries: vec![entry(&["--model", "/hy4", "--context", "262144"], 262_144)],
+                state: Some(path.clone()),
+                settle: Duration::from_secs(60),
+                exe: PathBuf::new(),
+                started: 0,
+                shared: Mutex::new(Shared { backend: None, running: 0, active: Instant::now() }),
+                client: hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                    .build(hyper_util::client::legacy::connect::HttpConnector::new()),
+            };
+            learn_context(&app, 0, port).await;
+            let listed = model_object(&app, &app.entries[0], "m", true);
+            assert_eq!(listed["max_model_len"], 198_656);
+            assert_eq!(listed["context_length"], 198_656);
+            assert_eq!(read_learned(&path)[&app.entries[0].key], 198_656);
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

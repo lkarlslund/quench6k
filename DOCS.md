@@ -296,15 +296,22 @@ the same policies:
   memory and what idle slots hold; when the device is full, idle slots give memory up, least recently
   used first (memory mapped past what a slot holds, then its whole context: its cached prefix is lost;
   these models have no context store). A request that does not fit waits for running ones to finish.
-  With growable states the per-request limit is device memory as well as `--context`: a prompt that
-  cannot fit even alone fails at once, and a request that runs out of memory with nothing else
-  holding it fails, both with the positions one sequence fits on the device. Cancellation, stop
+  With growable states the per-request limit is device memory as well as `--context`. At start, once
+  the weights and workspace are loaded, the server measures how many positions one sequence fits
+  (free device memory with every slot's sampler and one state allocated, less the scheduler's 1 GiB
+  headroom and the mapping granularity); when that is less than `--context`, it serves that many,
+  rounded down to whole prefill chunks, and logs `context capped to N positions (--context M)`. The
+  capped context is what `/v1/models`, `/props` and `/tokenize` report and what requests are checked
+  and their budgets clamped against; a smaller `--context` stays as given. A prompt that still cannot
+  fit alone (memory taken since) fails at once, and a request that runs out of memory with nothing
+  else holding it fails, both with the positions one sequence fits on the device. Cancellation, stop
   tokens and budgets are per request, and an error in one slot resets only that slot.
 - All three engines run one batched step (`forward_batch`) for the decoding sequences (and Inkling's
   and Hy4-flash's drafters one pass, `draft_batch`), with growable states: a sequence's full-length
   caches are mapped as it grows, so slots share the device memory by their actual lengths.
-  - Hy4-flash: about 17 KB per position plus about 106 MB per sequence. With the weights loaded, about
-    4.5 GB remain on a 96 GB card: some 260K positions for one sequence, or 27K each for eight.
+  - Hy4-flash: about 17 KB per position plus about 150 MB per sequence. With the weights and an
+    eight-slot workspace loaded, about 4.5 GB remain on a 96 GB card: some 200K positions for one
+    sequence after the headroom (`--context 262144` is capped to 198656), or about 17K each for eight.
   - Inkling 2: 36 KB per position plus 3.1 GB per sequence (rings) and a boundary snapshot; with eight
     sequences about 51 GB stay for positions (some 1.4M in all: one of 1M, or eight of 128K).
     Prompts prefill canonically (chunks at multiples of 2048 positions), so output depends only on a
@@ -343,7 +350,10 @@ the same policies:
   `loading` or `unloaded` (see [Unloading](#unloading)).
 - `POST /v1/unload`: unloads the model and answers `{"status": "unloaded"}` once it is gone.
 - `GET /v1/models`, `GET /v1/models/{id}`: the served model names, each with its context limit in
-  `max_model_len` (as vLLM) and `context_length` (as OpenRouter): `--context`.
+  `max_model_len` (as vLLM) and `context_length` (as OpenRouter): `--context`, or less when one
+  sequence does not fit that many positions on the device (see above).
+- `GET /props`: the same limit as llama.cpp reports it (`n_ctx`, `default_generation_settings.n_ctx`),
+  with `total_slots` and `model_alias`.
 - `POST /v1/chat/completions`: OpenAI chat completions, streaming with `"stream": true`. Reasoning is
   returned in `reasoning_content`, tool calls in `tool_calls`; `usage.prompt_tokens_details.cached_tokens`
   counts prompt tokens served from the context cache.
@@ -393,6 +403,12 @@ local port, one at a time; requests (streams included) pass through to it.
 
 - `GET /v1/models` and `/v1/models/{id}` answer from the catalog without loading anything: names,
   `context_length` / `max_model_len`, and `loaded`. `/health` reports the loaded model and its state.
+- The context listed is the catalog's `--context` until the model has loaded once; then it is the
+  context its server reports (less when one sequence does not fit `--context` on the device). The
+  learned value is kept in `$XDG_STATE_HOME/quench6k/serve-models-contexts.json` (default
+  `~/.local/state/quench6k/`), keyed by the entry's `args` and `env`, so after a restart the first
+  `/v1/models` already lists it; a changed entry lists its catalog context until it loads again, and
+  every load refreshes it.
 - A request names its model (the body's `model`). Nothing loaded: that model loads and the request
   waits for it. Another model loaded: the server switches (stopping that model's process, which frees its
   memory, then loading the requested one) only when the loaded model has been idle, with no request
@@ -406,7 +422,8 @@ local port, one at a time; requests (streams included) pass through to it.
   `POST /v1/unload` stops the loaded model when no request is running.
 - A failed load is reported to the waiting requests; the next request tries again.
 
-A prompt of `--context` tokens or more is rejected with HTTP 400 and code `context_length_exceeded`.
+A prompt of as many tokens as the served context (`--context`, or the capped one) or more is rejected
+with HTTP 400 and code `context_length_exceeded`.
 
 ### Request fields
 
