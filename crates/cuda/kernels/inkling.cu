@@ -1472,11 +1472,13 @@ constexpr int EX_U = 9;
 // distinct bank groups (one 128-byte phase, no conflicts).
 SQ_DEVICE int xs_slot(int cc, int h) { return cc * 4 + ((h + (cc >> 1)) & 3); }
 
-// Copies `n` values (a multiple of 32) of a BF16 row into `dst` as xs_slot lays them out (one warp). The
-// rows are rewritten in place every layer visit by the kernel just before (PDL): read through L2.
-SQ_DEVICE void stage_x(const bf16* src, int n, uint4* dst) {
+// Copies `n` values (a multiple of 32) of a BF16 row into `dst` as xs_slot lays them out (one warp); L2:
+// through L2 only (rows the kernel just before wrote in place, under PDL), else as rows_dot reads its
+// input (the warps of a block often stage the same token's row: 8 pairs a token).
+template <bool L2>
+SQ_DEVICE void stage_x(const bf16* __restrict__ src, int n, uint4* dst) {
     const uint4* s = reinterpret_cast<const uint4*>(src);
-    for (int i = threadIdx.x & 31; i < n / 8; i += 32) dst[xs_slot(i >> 2, i & 3)] = __ldcg(s + i);
+    for (int i = threadIdx.x & 31; i < n / 8; i += 32) dst[xs_slot(i >> 2, i & 3)] = L2 ? __ldcg(s + i) : s[i];
     __syncwarp();
 }
 
@@ -1667,7 +1669,7 @@ __global__ void __launch_bounds__(256) experts_gate_up_s_kernel(const bf16* __re
     const int pi = g * 8 + warp;
     if (pi >= pairs) return;
     const int pair = __ldcg(order + pi), t = pair / TOPK, e = __ldcg(sel_e + pair);
-    stage_x(x + (size_t)t * D, D, xs[warp]);
+    stage_x<false>(x + (size_t)t * D, D, xs[warp]);
     const float s2 = wt.s2[e];
     for (int blk = slice; blk < 2 * FF / EX_R; blk += slices) {
         const int n0 = blk * EX_R;
@@ -1704,7 +1706,8 @@ __global__ void __launch_bounds__(256) experts_down_s_kernel(const bf16* __restr
     uint16_t ps[EX_U];
     rows_load<true, EX_R>(wt, e, D, slice * EX_R, FF, lane, pw, ps);
     pdl_wait();
-    stage_x(act + (size_t)pair * FF, FF, xs[warp]);
+    // act: written by the gate/up kernel just before.
+    stage_x<true>(act + (size_t)pair * FF, FF, xs[warp]);
     const float s2 = wt.s2[e];
     auto finish = [&](int n0, const float (&v)[EX_R]) {
         if (lane < EX_R) {
