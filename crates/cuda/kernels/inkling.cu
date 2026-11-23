@@ -845,9 +845,8 @@ SQ_DEVICE void attn_split_keys(int p, int start, int block, int window, int min_
     k1 = min(hi + 1, k0 + per);
 }
 
-__global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
-    pdl_launch_dependents();
-    __shared__ AtSmem sm;
+// Block (t, g, split) of attn_kernel (also attn_rows_kernel's for rows it takes alone).
+SQ_DEVICE void attn_row(const AttnArgs& a, AtSmem& sm) {
     const int t = blockIdx.x, g = blockIdx.y, split = blockIdx.z, splits = gridDim.z, tid = threadIdx.x;
     const SeqRow sr = seq_row(a.sq, t);
     const int p = sr.pos, start = a.sq->start[sr.s];
@@ -888,6 +887,229 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
             dst[1] = sm.ml[i][1];
         }
         dst[2 + tid] = o[i];
+    }
+}
+
+__global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
+    pdl_launch_dependents();
+    __shared__ AtSmem sm;
+    attn_row(a, sm);
+}
+
+// attn_kernel for the rows of one sequence that share a key range's start (verify steps: consecutive
+// positions mostly split their keys at the same boundaries; drafter blocks: every row has the same range):
+// the rows' tiles of keys and values load once for all of them. Rows of a sequence go in groups of AR_Q
+// from its first row; block (t, g, split) of a group's first row takes every row of the group whose split
+// starts where its own does, and any other row whose start differs takes itself (block t). Per row
+// everything is attn_range's: its own tiles from its k0 (the same tiles for rows of the same k0, its own
+// count of keys in its last one), the same score sums, online softmax and value sums in the same order.
+constexpr int AR_Q = 8, AR_C = AR_Q * GQ / 4;  // rows of a group; (row, head) items per warp (4 warps)
+struct ArSmem {
+    float qs[AR_Q][GQ][HD];
+    float rs[AR_Q][GQ][DREL];
+    float ks[AT_T][HD + 1];
+    float vs[AT_T][HD];
+    float ps[AR_Q][GQ][AT_T];
+    float scl[AR_Q][GQ];
+    float ml[AR_Q][GQ][2];
+};
+constexpr size_t AR_SMEM = sizeof(ArSmem);
+
+__global__ void __launch_bounds__(AT_THREADS) attn_rows_kernel(AttnArgs a) {
+    pdl_launch_dependents();
+    extern __shared__ __align__(16) unsigned char ar_raw[];
+    ArSmem& sm = *reinterpret_cast<ArSmem*>(ar_raw);
+    const int t = blockIdx.x, g = blockIdx.y, split = blockIdx.z, splits = gridDim.z, tid = threadIdx.x;
+    const int lane = tid & 31, warp = tid >> 5;
+    const SeqRow sr = seq_row(a.sq, t);
+    const int start = a.sq->start[sr.s], row0 = a.sq->row0[sr.s], rows = a.sq->row0[sr.s + 1] - row0;
+    const int first = row0 + sr.t / AR_Q * AR_Q, gn = min(AR_Q, row0 + rows - first);
+    auto range = [&](int r, int& k0, int& k1) { attn_split_keys(start + (r - row0), start, a.block, a.window, a.min_keys, split, splits, k0, k1); };
+    int k0, k1t, k0f, k1f;
+    range(t, k0, k1t);
+    range(first, k0f, k1f);
+    // The rows this block computes: rows first + i for bits i of `set`.
+    unsigned set = 0;
+    if (t == first) {
+        for (int i = 0; i < gn; ++i) {
+            int r0, r1;
+            range(first + i, r0, r1);
+            if (r0 == k0) set |= 1u << i;
+        }
+    } else if (k0 == k0f) {
+        return;
+    } else {
+        set = 1u << (t - first);
+    }
+    if (set == 1u << (t - first)) {
+        // A row alone: attn_kernel's block.
+        attn_row(a, *reinterpret_cast<AtSmem*>(ar_raw));
+        return;
+    }
+    int k1 = k0;  // the union of the rows' ranges
+    for (int i = 0; i < AR_Q; ++i)
+        if (set >> i & 1) {
+            int r0, r1;
+            range(first + i, r0, r1);
+            k1 = max(k1, r1);
+        }
+    const bf16* kc = tab_ptr<const bf16>(sr, a.visit, T_K);
+    const bf16* vc = tab_ptr<const bf16>(sr, a.visit, T_V);
+    const int cache_rows = tab_rows(sr, a.visit);
+    uint4 pk[AT_PRE], pv[AT_PRE];
+    auto load = [&](int key, int c, uint4& k, uint4& v) {
+        const size_t row = (size_t)(key % cache_rows) * KVD + g * HD + c;
+        k = *reinterpret_cast<const uint4*>(kc + row);
+        v = *reinterpret_cast<const uint4*>(vc + row);
+    };
+#pragma unroll
+    for (int u = 0; u < AT_PRE; ++u) {
+        const int i = tid + u * AT_THREADS, j = i / (HD / 8), c = (i % (HD / 8)) * 8, key = k0 + j;
+        if (key < k1 && key < start) load(key, c, pk[u], pv[u]);
+    }
+    pdl_wait();
+#pragma unroll
+    for (int u = 0; u < AT_PRE; ++u) {
+        const int i = tid + u * AT_THREADS, j = i / (HD / 8), c = (i % (HD / 8)) * 8, key = k0 + j;
+        if (key < k1 && key >= start) load(key, c, pk[u], pv[u]);
+    }
+    for (int q = 0; q < AR_Q; ++q) {
+        if (!(set >> q & 1)) continue;
+        const int r = first + q;
+        for (int i = tid; i < GQ * HD; i += AT_THREADS) sm.qs[q][i / HD][i % HD] = bf2f(a.q[(size_t)r * QD + (g * GQ + i / HD) * HD + i % HD]);
+        if (tid < GQ * DREL) sm.rs[q][tid / DREL][tid % DREL] = a.rel ? a.rel[((size_t)r * H + g * GQ + tid / DREL) * DREL + tid % DREL] : 0.0f;
+    }
+    // Row q's key range end.
+    int rend[AR_Q];
+#pragma unroll
+    for (int q = 0; q < AR_Q; ++q) {
+        int r0, r1 = k0;
+        if (set >> q & 1) range(first + q, r0, r1);
+        rend[q] = r1;
+    }
+    const bool rel = a.rel != nullptr;
+    const float scale = rsqrtf((float)HD);
+    // Per (row, head) item handled by this warp: running maximum and sum (lane-uniform).
+    float m[AR_C], l[AR_C];
+#pragma unroll
+    for (int c = 0; c < AR_C; ++c) {
+        m[c] = -INFINITY;
+        l[c] = 0.0f;
+    }
+    float o[AR_Q][GQ];
+#pragma unroll
+    for (int q = 0; q < AR_Q; ++q)
+#pragma unroll
+        for (int i = 0; i < GQ; ++i) o[q][i] = 0.0f;
+    for (int kb = k0; kb < k1; kb += AT_T) {
+        const int nk = min(AT_T, k1 - kb);
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < AT_PRE; ++u) {
+            const int i = tid + u * AT_THREADS;
+            const int j = i / (HD / 8), c = (i % (HD / 8)) * 8;
+            float kv[8], vv[8];
+            if (j < nk) {
+                const uint4 kr = pk[u], vr = pv[u];
+                const bf16* kp = reinterpret_cast<const bf16*>(&kr);
+                const bf16* vp = reinterpret_cast<const bf16*>(&vr);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    kv[e] = bf2f(kp[e]);
+                    vv[e] = bf2f(vp[e]);
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) kv[e] = vv[e] = 0.0f;
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                sm.ks[j][c + e] = kv[e];
+                sm.vs[j][c + e] = vv[e];
+            }
+        }
+        if (kb + AT_T < k1) {
+#pragma unroll
+            for (int u = 0; u < AT_PRE; ++u) {
+                const int i = tid + u * AT_THREADS, j = i / (HD / 8), c = (i % (HD / 8)) * 8, key = kb + AT_T + j;
+                if (key < k1) load(key, c, pk[u], pv[u]);
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int c = 0; c < AR_C; ++c) {
+            const int item = c * 4 + warp, q = item / GQ, hh = item % GQ;
+            if (q >= AR_Q || !(set >> q & 1) || kb >= rend[q]) continue;
+            const int nq = min(AT_T, rend[q] - kb), p = start + (first + q - row0);
+            const int j = lane, key = kb + j;
+            float s = -INFINITY;
+            if (j < nq) {
+                float acc = 0.0f;
+#pragma unroll 16
+                for (int d = 0; d < HD; ++d) acc += sm.qs[q][hh][d] * sm.ks[j][d];
+                s = acc * scale;
+                const int dist = p - key;
+                if (rel && dist >= 0 && dist < EXT) {
+                    float b = 0.0f;
+#pragma unroll
+                    for (int r = 0; r < DREL; ++r) b += sm.rs[q][hh][r] * bf2f(a.proj[r * EXT + dist]);
+                    s += b;
+                }
+            }
+            const float mx = fmaxf(m[c], warp_max(s));
+            const float pr = j < nq ? __expf(s - mx) : 0.0f;
+            const float cc = __expf(m[c] - mx);
+            l[c] = l[c] * cc + warp_sum(pr);
+            m[c] = mx;
+            sm.ps[q][hh][j] = pr;
+            if (lane == 0) sm.scl[q][hh] = cc;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int q = 0; q < AR_Q; ++q) {
+            if (!(set >> q & 1) || kb >= rend[q]) continue;
+            const int nq = min(AT_T, rend[q] - kb);
+            float acc[GQ];
+#pragma unroll
+            for (int i = 0; i < GQ; ++i) acc[i] = o[q][i] * sm.scl[q][i];
+            auto pvs = [&](int j) {
+                const float v = sm.vs[j][tid];
+#pragma unroll
+                for (int i = 0; i < GQ; ++i) acc[i] += sm.ps[q][i][j] * v;
+            };
+            if (nq == AT_T) {
+#pragma unroll
+                for (int j = 0; j < AT_T; ++j) pvs(j);
+            } else {
+                for (int j = 0; j < nq; ++j) pvs(j);
+            }
+#pragma unroll
+            for (int i = 0; i < GQ; ++i) o[q][i] = acc[i];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int c = 0; c < AR_C; ++c) {
+        const int item = c * 4 + warp, q = item / GQ, hh = item % GQ;
+        if (q < AR_Q && (set >> q & 1) && lane == 0) {
+            sm.ml[q][hh][0] = m[c];
+            sm.ml[q][hh][1] = l[c];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int q = 0; q < AR_Q; ++q) {
+        if (!(set >> q & 1)) continue;
+        const int r = first + q;
+#pragma unroll
+        for (int i = 0; i < GQ; ++i) {
+            float* dst = a.part + (((size_t)r * H + g * GQ + i) * splits + split) * (2 + HD);
+            if (tid == 0) {
+                dst[0] = sm.ml[q][i][0];
+                dst[1] = sm.ml[q][i][1];
+            }
+            dst[2 + tid] = o[q][i];
+        }
     }
 }
 
@@ -2965,7 +3187,18 @@ cudaError_t quench6k_ink_attention(const void* q, const float* rel, const float*
                                   static_cast<bf16*>(out)));
         SQ_RETURN_LAUNCH();
     }
-    SQ_CHECK_LAUNCH(sq_launch(attn_kernel, dim3(T, KVH, splits), AT_THREADS, 0, st, a));
+    // Small steps of several rows: the rows of a sequence share their key tiles (ink.attn_rows=0: per row).
+    if (small && T > 1 && sq_variant("ink.attn_rows", 1)) {
+        static bool configured = false;
+        if (!configured) {
+            const cudaError_t e = cudaFuncSetAttribute(attn_rows_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AR_SMEM);
+            if (e != cudaSuccess) return e;
+            configured = true;
+        }
+        SQ_CHECK_LAUNCH(sq_launch(attn_rows_kernel, dim3(T, KVH, splits), AT_THREADS, AR_SMEM, st, a));
+    } else {
+        SQ_CHECK_LAUNCH(sq_launch(attn_kernel, dim3(T, KVH, splits), AT_THREADS, 0, st, a));
+    }
     SQ_CHECK_LAUNCH(sq_launch(attn_merge_kernel, dim3(T, H), HD, 0, st, part, splits, sink, lin, ld, gate_off, static_cast<bf16*>(out)));
     SQ_RETURN_LAUNCH();
 }
