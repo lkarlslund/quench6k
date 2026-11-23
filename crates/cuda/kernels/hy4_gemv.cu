@@ -1,0 +1,170 @@
+// Hy4-flash small steps of several sequences: Y[m, n] = X[m, :] . W[n, :]^T for any number of rows,
+// bitwise as the shared GEMV (gemv.cu, no K split) computes each row alone, at a fraction of its cost when
+// there are many rows.
+//
+// The arithmetic of a row is the GEMV's: lane l accumulates in FP32 the weights at columns 16 l + 512 c
+// (c ascending, the 16 columns of a chunk in order; FP8 block-scaled weights decoded and multiplied by
+// their block's scale first), then a butterfly warp sum. What differs is the work per instruction: a warp
+// takes R weight rows and MT input rows at once, decodes each weight once for MT inputs and converts each
+// input once for R weights (half a chunk at a time, which keeps every accumulator's order), and the CTAs
+// of one weight tile (one per group of MT input rows) are adjacent, so the weights stream from DRAM about
+// once per step.
+
+#include <cuda_fp8.h>
+
+#include "wfmt.cuh"
+
+namespace {
+
+constexpr int NW = 4;  // warps per CTA
+
+// Raw weights of one row's chunk (16 columns): 16 bytes of FP8, 32 of BF16.
+template <WFmt F>
+struct Chunk {
+    uint4 v[F == WFmt::BF16 ? 2 : 1];
+};
+
+template <WFmt F>
+SQ_DEVICE Chunk<F> load_chunk(const uint8_t* row, int k) {
+    Chunk<F> c;
+    if constexpr (F == WFmt::BF16) {
+        c.v[0] = ld_stream(row + (size_t)k * 2);
+        c.v[1] = ld_stream(row + (size_t)k * 2 + 16);
+    } else {
+        c.v[0] = ld_stream(row + k);
+    }
+    return c;
+}
+
+// Columns 8 h .. 8 h + 7 of a chunk as floats, as decode_raw16 gives them.
+template <WFmt F>
+SQ_DEVICE void decode_half(const Chunk<F>& c, int h, float* w) {
+    if constexpr (F == WFmt::BF16) {
+        const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&c.v[h]);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 f = __bfloat1622float2(p[i]);
+            w[2 * i] = f.x;
+            w[2 * i + 1] = f.y;
+        }
+    } else {
+        const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&c.v[0]) + 4 * h;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(p[i], __NV_E4M3);
+            const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+            w[2 * i] = f.x;
+            w[2 * i + 1] = f.y;
+        }
+    }
+}
+
+// Grid: (tiles of NW * R weight rows) x groups of MT input rows, the group index fastest. `mrows` input
+// rows in all (the last group may hold fewer). BF16 or FP8B weights; Y = the sums (alpha 1, no K split).
+template <WFmt F, int MT, int R>
+__global__ void __launch_bounds__(NW * 32) gemv_wide_kernel(const __nv_bfloat16* __restrict__ X, int ldx, const uint8_t* __restrict__ W,
+                                                            const float* __restrict__ bscale, float* Y, int ldy, int N, int K, int mrows) {
+    pdl_launch_dependents();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int groups = (mrows + MT - 1) / MT, g = blockIdx.x % groups;
+    const int mv = min(MT, mrows - g * MT);
+    X += (size_t)g * MT * ldx;
+    Y += (size_t)g * MT * ldy;
+    const int n0 = (blockIdx.x / groups * NW + warp) * R;
+    const size_t row_bytes = (size_t)K * elem_bytes<F>();
+    const uint8_t* rows[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) rows[r] = W + (size_t)min(n0 + r, N - 1) * row_bytes;
+
+    float acc[R][MT];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < MT; ++m) acc[r][m] = 0.0f;
+
+    int k = lane * 16;
+    Chunk<F> cur[R];
+    if (k < K)
+#pragma unroll
+        for (int r = 0; r < R; ++r) cur[r] = load_chunk<F>(rows[r], k);
+    pdl_wait();
+    for (; k < K; k += 512) {
+        // The next chunk's weights load while this one is consumed.
+        Chunk<F> nxt[R];
+        const bool more = k + 512 < K;
+        if (more)
+#pragma unroll
+            for (int r = 0; r < R; ++r) nxt[r] = load_chunk<F>(rows[r], k + 512);
+        float gs[R];
+        if constexpr (F == WFmt::FP8B)
+#pragma unroll
+            for (int r = 0; r < R; ++r) gs[r] = fp8b_scale(bscale, min(n0 + r, N - 1), k, K);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            float w[R][8];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                decode_half<F>(cur[r], h, w[r]);
+                if constexpr (F == WFmt::FP8B)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) w[r][i] *= gs[r];
+            }
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                float xf[8];
+                load_x8(X + (size_t)min(m, mv - 1) * ldx + k + 8 * h, xf);
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) acc[r][m] = fmaf(w[r][i], xf[i], acc[r][m]);
+            }
+        }
+        if (more)
+#pragma unroll
+            for (int r = 0; r < R; ++r) cur[r] = nxt[r];
+    }
+    // Sums 32 at a time (slot j of a batch: r = j / MT, m = j % MT within the batch), each bitwise as its
+    // own warp_sum.
+    constexpr int NS = R * MT;
+    static_assert(NS % 32 == 0, "R * MT must be a multiple of 32");
+#pragma unroll
+    for (int b = 0; b < NS / 32; ++b) {
+        float v[32];
+#pragma unroll
+        for (int j = 0; j < 32; ++j) v[j] = acc[(b * 32 + j) / MT][(b * 32 + j) % MT];
+        const float sum = warp_sum_slots(v);
+        const int j = b * 32 + lane, r = j / MT, m = j % MT;
+        if (n0 + r < N && m < mv) Y[(size_t)m * ldy + n0 + r] = sum;
+    }
+}
+
+template <WFmt F, int MT, int R>
+cudaError_t launch(int M, const void* X, int ldx, const void* W, const float* scale, float* Y, int ldy, int N, int K, cudaStream_t st) {
+    const int groups = (M + MT - 1) / MT;
+    const int tiles = (N + NW * R - 1) / (NW * R);
+    SQ_CHECK_LAUNCH(sq_launch(gemv_wide_kernel<F, MT, R>, (unsigned)(tiles * groups), NW * 32, 0, st, static_cast<const __nv_bfloat16*>(X),
+                              ldx, static_cast<const uint8_t*>(W), scale, Y, ldy, N, K, M));
+    return cudaSuccess;
+}
+
+template <WFmt F>
+cudaError_t launch_f(int mt, int r, int M, const void* X, int ldx, const void* W, const float* scale, float* Y, int ldy, int N, int K,
+                     cudaStream_t st) {
+    if (mt == 8 && r == 4) return launch<F, 8, 4>(M, X, ldx, W, scale, Y, ldy, N, K, st);
+    if (mt == 16 && r == 4) return launch<F, 16, 4>(M, X, ldx, W, scale, Y, ldy, N, K, st);
+    return cudaErrorInvalidValue;
+}
+
+}  // namespace
+
+// fmt 0 BF16 [N, K], 5 FP8 E4M3 with an FP32 scale per 128 x 128 block; mt x r in {8 x 4, 16 x 4}. K a multiple of 16 (FP8B: of 128), ldx a multiple of 8.
+extern "C" cudaError_t quench6k_hy4_gemv_wide(int fmt, int M, int mt, int r, const void* X, int ldx, const void* W, const float* scale,
+                                            float* Y, int ldy, int N, int K, cudaStream_t st) {
+    if (M == 0) return cudaSuccess;
+    if (K % 16 != 0 || ldx % 8 != 0) return cudaErrorInvalidValue;
+    cudaError_t e = cudaErrorInvalidValue;
+    if (fmt == 0) e = launch_f<WFmt::BF16>(mt, r, M, X, ldx, W, scale, Y, ldy, N, K, st);
+    else if (fmt == 5 && K % 128 == 0) e = launch_f<WFmt::FP8B>(mt, r, M, X, ldx, W, scale, Y, ldy, N, K, st);
+    if (e != cudaSuccess) return e;
+    return cudaGetLastError();
+}

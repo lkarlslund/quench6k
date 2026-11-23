@@ -88,6 +88,21 @@ mod ffi {
             qa: *mut c_void,
             st: Stream,
         ) -> Error;
+        pub fn quench6k_hy4_gemv_wide(
+            fmt: c_int,
+            m: c_int,
+            mt: c_int,
+            r: c_int,
+            x: *const c_void,
+            ldx: c_int,
+            w: *const c_void,
+            scale: *const f32,
+            y: *mut f32,
+            ldy: c_int,
+            n: c_int,
+            k: c_int,
+            st: Stream,
+        ) -> Error;
         pub fn quench6k_hy4_heads_gemv_max_t() -> c_int;
         pub fn quench6k_hy4_heads_gemv(
             x: *const c_void,
@@ -536,11 +551,36 @@ pub fn mla_prep(
     )
 }
 
+/// Y [m, n] F32 = X [m, k] BF16 . W^T for any number of rows `m`, each row bitwise as
+/// [`crate::kernels::gemv`] computes it alone (no K split): warps of `r` weight rows and `mt` input rows,
+/// (mt, r) in {(8, 4), (16, 4)}. Formats BF16 and Fp8Block.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_wide(
+    s: &Stream,
+    m: usize,
+    mt: usize,
+    r: usize,
+    x: u64,
+    ldx: usize,
+    fmt: crate::kernels::WeightFormat,
+    w: u64,
+    scale: u64,
+    y: u64,
+    ldy: usize,
+    nn: usize,
+    k: usize,
+) -> Result<()> {
+    go!(
+        "hy4_gemv_wide",
+        ffi::quench6k_hy4_gemv_wide(fmt as c_int, n(m), n(mt), n(r), p(x), n(ldx), p(w), f(scale), fm(y), n(ldy), n(nn), n(k), s.raw())
+    )
+}
+
 pub fn heads_gemv_max_t() -> usize {
     unsafe { ffi::quench6k_hy4_heads_gemv_max_t() as usize }
 }
 
-/// y[t, h, :N] = W[h] . x[t, h, :K] for t < 16 (BF16 in and out); with `gate` the output is multiplied
+/// y[t, h, :N] = W[h] . x[t, h, :K] for any number of rows t (BF16 in and out; each row as alone); with `gate` the output is multiplied
 /// by bf16(sigmoid(gate[t, h * N + n])).
 #[allow(clippy::too_many_arguments)]
 pub fn heads_gemv(

@@ -274,6 +274,9 @@ pub struct Engram {
     table_off: usize,
     scales: Mmap,
     scales_off: usize,
+    /// Pages of the table and of its scales a read-ahead hint was given for (one bit per 4 KiB page): such
+    /// pages are taken as being in the page cache and get no further hint (a hint is a system call).
+    hinted: [Vec<std::sync::atomic::AtomicU64>; 2],
     pub head_norm: u64,
     /// key_projs 0..3 and value_proj stacked: `[5 * 3072, 1536]` BF16, bias `[5 * 3072]`.
     pub kv: Linear,
@@ -285,15 +288,38 @@ pub struct Engram {
 }
 
 impl Engram {
-    /// Starts reading row `r` into the page cache (no-op elsewhere).
+    /// Starts reading row `r` into the page cache unless its pages were hinted before (no-op elsewhere).
     pub fn prefetch(&self, r: usize) {
         #[cfg(unix)]
         {
-            let _ = self.table.advise_range(memmap2::Advice::WillNeed, self.table_off + r * ENGRAM_DIM, ENGRAM_DIM);
-            let _ = self.scales.advise_range(memmap2::Advice::WillNeed, self.scales_off + r * 4, 4);
+            for (k, (map, at, len)) in [(&self.table, self.table_off + r * ENGRAM_DIM, ENGRAM_DIM), (&self.scales, self.scales_off + r * 4, 4)]
+                .into_iter()
+                .enumerate()
+            {
+                // Pages counted from the mapping's first page (by address: the mapping may start inside a page).
+                let base = map.as_ptr() as usize;
+                if Self::first_hint(&self.hinted[k], (base & 4095) + at, len) {
+                    let _ = map.advise_range(memmap2::Advice::WillNeed, at, len);
+                }
+            }
         }
         #[cfg(not(unix))]
         let _ = r;
+    }
+
+    /// Marks the pages of bytes [at, at + len) as hinted; whether any was not before.
+    fn first_hint(bits: &[std::sync::atomic::AtomicU64], at: usize, len: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut first = false;
+        for page in at >> 12..=(at + len - 1) >> 12 {
+            let (w, b) = (page / 64, 1u64 << (page % 64));
+            if let Some(word) = bits.get(w) {
+                first |= word.fetch_or(b, Ordering::Relaxed) & b == 0;
+            } else {
+                first = true;
+            }
+        }
+        first
     }
 
     /// Reads the whole table and its scales into the page cache with `threads` threads.
@@ -965,12 +991,15 @@ impl Loader<'_> {
         let mut bias_names = names(&|c| format!("{p}.key_projs.{c}.bias"), HC);
         bias_names.push(format!("{p}.value_proj.bias"));
         let bias = self.concat_bf16(&bias_names)?;
+        let bits = |m: &Mmap| (0..(m.len() + 4096).div_ceil(4096 * 64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect::<Vec<_>>();
+        let hinted = [bits(&table), bits(&scales)];
         Ok(Engram {
             hash,
             table,
             table_off,
             scales,
             scales_off,
+            hinted,
             head_norm,
             kv: Linear {
                 w: kv_w,

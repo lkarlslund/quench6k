@@ -310,6 +310,11 @@ __global__ void __launch_bounds__(256) heads_gemv_kernel(const bf16* __restrict_
                                                          bf16* y, int ldy, int yh) {
     pdl_launch_dependents();
     pdl_wait();
+    // blockIdx.z: rows MAXT z .. of the step.
+    x += (size_t)blockIdx.z * MAXT * ldx;
+    y += (size_t)blockIdx.z * MAXT * ldy;
+    if (gate) gate += (size_t)blockIdx.z * MAXT * ldg;
+    T = min(MAXT, T - (int)blockIdx.z * MAXT);
     const int h = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int n0 = blockIdx.y * 32 + warp * 4;
     const bf16* w = W + (size_t)h * wh;
@@ -345,19 +350,35 @@ __global__ void __launch_bounds__(256) heads_gemv_kernel(const bf16* __restrict_
                 for (int j = 0; j < 8; ++j) acc[r][m] = fmaf(wf[r][j], xf[j], acc[r][m]);
         }
     }
+    auto put = [&](int r, int m, float v) {
+        const int n = n0 + r;
+        float o = rb(v);
+        if (gate) o = o * rb(1.0f / (1.0f + expf(-rb(gate[(size_t)m * ldg + h * N + n]))));
+        y[(size_t)m * ldy + (size_t)h * yh + n] = f2bf(o);
+    };
+    if constexpr (MAXT >= 4) {
+        // NS sums at a time, each bitwise as its own warp_sum; slot j (r = j / MAXT, m = j % MAXT of the
+        // batch) ends in lanes j * 32 / NS ...
+        constexpr int NS = 4 * MAXT < 32 ? 4 * MAXT : 32;
 #pragma unroll
-    for (int r = 0; r < 4; ++r)
+        for (int b = 0; b < 4 * MAXT / NS; ++b) {
+            float v[NS];
 #pragma unroll
-        for (int m = 0; m < MAXT; ++m) {
-            if (m >= T) break;
-            const float v = warp_sum(acc[r][m]);
-            if (lane == 0) {
-                const int n = n0 + r;
-                float o = rb(v);
-                if (gate) o = o * rb(1.0f / (1.0f + expf(-rb(gate[(size_t)m * ldg + h * N + n]))));
-                y[(size_t)m * ldy + (size_t)h * yh + n] = f2bf(o);
-            }
+            for (int j = 0; j < NS; ++j) v[j] = acc[(b * NS + j) / MAXT][(b * NS + j) % MAXT];
+            const float sum = warp_sum_slots(v);
+            const int j = b * NS + lane / (32 / NS), r = j / MAXT, m = j % MAXT;
+            if (lane % (32 / NS) == 0 && m < T) put(r, m, sum);
         }
+    } else {
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+#pragma unroll
+            for (int m = 0; m < MAXT; ++m) {
+                if (m >= T) break;
+                const float v = warp_sum(acc[r][m]);
+                if (lane == 0) put(r, m, v);
+            }
+    }
 }
 
 // v[t, h, :] *= bf16(sigmoid(bf16(gate[t, h, :]))) in place (BF16), for the prefill path.
@@ -1252,9 +1273,10 @@ int quench6k_hy4_heads_gemv_max_t() { return 16; }
 
 cudaError_t quench6k_hy4_heads_gemv(const void* x, int ldx, int xh, const void* W, size_t wh, int N, int K, int H, int T, const float* gate,
                                   int ldg, void* y, int ldy, int yh, cudaStream_t st) {
-    if (N % 32 != 0 || K % 8 != 0 || T > 16) return cudaErrorInvalidValue;
+    if (N % 32 != 0 || K % 8 != 0) return cudaErrorInvalidValue;
     if (T == 0) return cudaSuccess;
-    const dim3 grid(H, N / 32);
+    // More than 16 rows: blocks of 16 (grid z).
+    const dim3 grid(H, N / 32, (T + 15) / 16);
     const auto* xp = static_cast<const bf16*>(x);
     const auto* wp = static_cast<const bf16*>(W);
     auto* yp = static_cast<bf16*>(y);
