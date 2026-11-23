@@ -22,14 +22,15 @@ SQ_DEVICE unsigned order_key(float f) {
 // With `start_ptr` set (QSA group selection), row r covers n = (start + r + 1) / group values and is
 // skipped when n <= k: such queries attend densely.
 // MODE 0: one block per row. MODE 1 (first stage of large rows): block b takes slice b % slices of
-// row b / slices (n values at x + row * ld + slice * n) and writes its top k with row-global indices.
+// row b / slices (n values at x + row * ld + slice * n; the last slice `last_n` values when non-zero) and
+// writes its top k with row-global indices.
 // MODE 2 (second stage): block b merges row b's slices * k candidates (values x, indices cand_idx,
 // n = slices * k). The top k of a row is among its slices' top k, so both stages pick the same set.
 template <int MODE>
 __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__ x, int n, size_t ld, int k,
                                                        int sort_by_index, int* out_idx, float* out_val,
                                                        const int* __restrict__ start_ptr, int group, int slices = 1,
-                                                       const int* __restrict__ cand_idx = nullptr) {
+                                                       const int* __restrict__ cand_idx = nullptr, int last_n = 0) {
     pdl_launch_dependents();
     pdl_wait();
     if (start_ptr) {
@@ -38,11 +39,13 @@ __global__ void __launch_bounds__(THREADS) topk_kernel(const float* __restrict__
     }
     const int slice = MODE == 1 ? blockIdx.x % slices : 0;
     const float* row = MODE == 0 ? x + blockIdx.x * ld : MODE == 1 ? x + (blockIdx.x / slices) * ld + (size_t)slice * n : x + (size_t)blockIdx.x * n;
+    const int stride = n;
+    if (MODE == 1 && last_n > 0 && slice == slices - 1) n = last_n;
     // The second stage reads candidates the first stage wrote just before (programmatic dependent launch):
     // through L2, so no stale L1 line of an earlier call's candidates is read.
     auto at = [&](int i) { return MODE == 2 ? __ldcg(row + i) : row[i]; };
     // Row-global index of element i.
-    auto gidx = [&](int i) { return MODE == 0 ? i : MODE == 1 ? slice * n + i : __ldcg(cand_idx + (size_t)blockIdx.x * n + i); };
+    auto gidx = [&](int i) { return MODE == 0 ? i : MODE == 1 ? slice * stride + i : __ldcg(cand_idx + (size_t)blockIdx.x * n + i); };
     __shared__ unsigned hist[256];
     __shared__ unsigned s_prefix, s_mask, s_remaining, s_gt, s_eq, s_digit, s_above, s_wsum[8];
     __shared__ int pick_idx[MAXK];
@@ -191,20 +194,21 @@ extern "C" cudaError_t quench6k_topk(const float* x, int rows, int n, size_t ld,
     static const int atomic_ties = getenv("QUENCH6K_TOPK_ATOMIC_TIES") && getenv("QUENCH6K_TOPK_ATOMIC_TIES")[0] == '1' ? 2 : 0;
     sort_by_index = (sort_by_index & 1) | atomic_ties;
     // Long rows (vocabulary logits): slices in parallel, then a merge of their candidates (one block
-    // per row would stream the whole row through one SM five times).
-    if (n >= 65536 && n % TK_SLICES == 0 && n / TK_SLICES >= k && (size_t)rows * TK_SLICES * k <= TK_CAND &&
-        !getenv("QUENCH6K_TOPK_ONE_PASS")) {
+    // per row would stream the whole row through one SM five times). Rows of a length not divisible by
+    // the slice count end in a shorter slice (at least k values).
+    const int per = (n + TK_SLICES - 1) / TK_SLICES, last = n - (TK_SLICES - 1) * per;
+    if (n >= 65536 && last >= k && (size_t)rows * TK_SLICES * k <= TK_CAND && !getenv("QUENCH6K_TOPK_ONE_PASS")) {
         int* ci;
         float* cv;
         SQ_CHECK_LAUNCH(cudaGetSymbolAddress((void**)&ci, tk_cand_idx));
         SQ_CHECK_LAUNCH(cudaGetSymbolAddress((void**)&cv, tk_cand_val));
-        SQ_CHECK_LAUNCH(sq_launch(topk_kernel<1>, rows * TK_SLICES, THREADS, 0, st, x, n / TK_SLICES, ld, k, atomic_ties, ci, cv, nullptr, 0,
-                                  TK_SLICES, nullptr));
+        SQ_CHECK_LAUNCH(sq_launch(topk_kernel<1>, rows * TK_SLICES, THREADS, 0, st, x, per, ld, k, atomic_ties, ci, cv, nullptr, 0,
+                                  TK_SLICES, nullptr, last));
         SQ_CHECK_LAUNCH(sq_launch(topk_kernel<2>, rows, THREADS, 0, st, (const float*)cv, TK_SLICES * k, ld, k, sort_by_index, out_idx,
-                                  out_val, nullptr, 0, TK_SLICES, (const int*)ci));
+                                  out_val, nullptr, 0, TK_SLICES, (const int*)ci, 0));
         SQ_RETURN_LAUNCH();
     }
-    SQ_CHECK_LAUNCH(sq_launch(topk_kernel<0>, rows, THREADS, 0, st, x, n, ld, k, sort_by_index, out_idx, out_val, nullptr, 0, 1, nullptr));
+    SQ_CHECK_LAUNCH(sq_launch(topk_kernel<0>, rows, THREADS, 0, st, x, n, ld, k, sort_by_index, out_idx, out_val, nullptr, 0, 1, nullptr, 0));
     SQ_RETURN_LAUNCH();
 }
 

@@ -1245,6 +1245,19 @@ struct ExpertW {
 // Nine chunks' weights in flight per lane (R * chunks per row is a multiple of 288 for every shape).
 constexpr int EX_U = 9;
 
+// An input row staged in shared memory for the NVFP4 per-pair kernels: 16-byte piece h (0..3) of chunk cc
+// (32 values) at xs_slot(cc, h), swizzled so that 8 lanes reading piece h of 8 consecutive chunks hit
+// distinct bank groups (one 128-byte phase, no conflicts).
+SQ_DEVICE int xs_slot(int cc, int h) { return cc * 4 + ((h + (cc >> 1)) & 3); }
+
+// Copies `n` values (a multiple of 32) of a BF16 row into `dst` as xs_slot lays them out (one warp). The
+// rows are rewritten in place every layer visit by the kernel just before (PDL): read through L2.
+SQ_DEVICE void stage_x(const bf16* src, int n, uint4* dst) {
+    const uint4* s = reinterpret_cast<const uint4*>(src);
+    for (int i = threadIdx.x & 31; i < n / 8; i += 32) dst[xs_slot(i >> 2, i & 3)] = __ldcg(s + i);
+    __syncwarp();
+}
+
 // One round of a lane's chunks (c0 = lane + 32 * EX_U * round) of rows n0 .. n0 + R - 1 of expert e.
 template <bool FP4, int R, int U = EX_U>
 SQ_DEVICE void rows_load(const ExpertW& wt, int e, int rows_per_expert, int n0, int K, int c0, uint4 (&wv)[U], uint16_t (&sv)[U]) {
@@ -1265,9 +1278,10 @@ SQ_DEVICE void rows_load(const ExpertW& wt, int e, int rows_per_expert, int n0, 
 
 // With `pre`, the first round's chunks are already loaded (rows_load at c0 = lane).
 // U chunks a lane in flight per round (the sums run in chunk order whatever U).
-template <bool FP4, int R, int U = EX_U>
+// XS (NVFP4): x is a row staged in shared memory by stage_x (`xs`), not in global memory.
+template <bool FP4, int R, int U = EX_U, bool XS = false>
 SQ_DEVICE void rows_dot(const ExpertW& wt, int e, int rows_per_expert, int n0, int K, const bf16* x, float (&out)[R],
-                        const uint4* pre_w = nullptr, const uint16_t* pre_s = nullptr) {
+                        const uint4* pre_w = nullptr, const uint16_t* pre_s = nullptr, const uint4* xs_row = nullptr) {
     constexpr int CV = FP4 ? 32 : 16;  // values per chunk
     const int lane = threadIdx.x & 31, cpr = K / CV, total = R * cpr;
 #pragma unroll
@@ -1294,7 +1308,7 @@ SQ_DEVICE void rows_dot(const ExpertW& wt, int e, int rows_per_expert, int n0, i
             const uint4* src = reinterpret_cast<const uint4*>(x + cc * CV);
 #pragma unroll
             for (int h = 0; h < CV / 8; ++h) {
-                const uint4 v = src[h];
+                const uint4 v = XS ? xs_row[xs_slot(cc, h)] : src[h];
                 const bf16* pv = reinterpret_cast<const bf16*>(&v);
 #pragma unroll
                 for (int i = 0; i < 8; ++i) xs[h * 8 + i] = bf2f(pv[i]);
@@ -1413,6 +1427,83 @@ __global__ void __launch_bounds__(256) experts_down_kernel(const bf16* __restric
         float v[EX_R];
         rows_dot<FP4, EX_R>(wt, e, D, n0, FF, act + (size_t)pair * FF, v);
         finish(pair, n0, e, v);
+    }
+}
+
+// The per-pair kernels (NVFP4) with the inputs in shared memory: block b takes the 8 pairs of group
+// b % groups (warp w: pair 8 g + w in expert order) and the 8-row blocks slice, slice + slices, ... of
+// their items (slice = b / groups); each warp stages its pair's input once instead of reading it per item
+// from global memory (64-byte chunks per lane, four times the cache lines of the bytes used). The same
+// items and sums as the per-pair kernels (8-row steps of 8 sequences 6% faster, 32-row ones 13%).
+__global__ void __launch_bounds__(256) experts_gate_up_s_kernel(const bf16* __restrict__ x, const int* __restrict__ sel_e, const int* __restrict__ order,
+                                                                ExpertW wt, int pairs, int slices, float gcap, float ucap, bf16* act) {
+    __shared__ uint4 xs[8][D / 8];
+    pdl_wait();
+    pdl_launch_dependents();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int groups = (pairs + 7) / 8, g = blockIdx.x % groups, slice = blockIdx.x / groups;
+    const int pi = g * 8 + warp;
+    if (pi >= pairs) return;
+    const int pair = __ldcg(order + pi), t = pair / TOPK, e = __ldcg(sel_e + pair);
+    stage_x(x + (size_t)t * D, D, xs[warp]);
+    const float s2 = wt.s2[e];
+    for (int blk = slice; blk < 2 * FF / EX_R; blk += slices) {
+        const int n0 = blk * EX_R;
+        float v[EX_R];
+        rows_dot<true, EX_R, EX_U, true>(wt, e, 2 * FF, n0, D, nullptr, v, nullptr, nullptr, xs[warp]);
+        if (lane < EX_R / 2) {
+            float gv = 0.0f, uv = 0.0f;
+#pragma unroll
+            for (int i = 0; i < EX_R / 2; ++i)
+                if (i == lane) {
+                    gv = v[2 * i];
+                    uv = v[2 * i + 1];
+                }
+            const float gg = gv * s2, u = uv * s2;
+            act[(size_t)pair * FF + n0 / 2 + lane] = f2bf(softcap(gg, gcap) * sigmoidf(gg) * softcap(u, ucap));
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) experts_down_s_kernel(const bf16* __restrict__ act, const int* __restrict__ sel_e, const int* __restrict__ order,
+                                                             ExpertW wt, int pairs, int slices, float* y) {
+    __shared__ uint4 xs[8][FF / 8];
+    pdl_launch_dependents();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int groups = (pairs + 7) / 8, g = blockIdx.x % groups, slice = blockIdx.x / groups;
+    const int pi = g * 8 + warp;
+    if (pi >= pairs) {
+        pdl_wait();
+        return;
+    }
+    // The routing is complete (see experts_gate_up_kernel): the first item's weights load before the wait.
+    const int pair = __ldcg(order + pi), e = __ldcg(sel_e + pair);
+    uint4 pw[EX_U];
+    uint16_t ps[EX_U];
+    rows_load<true, EX_R>(wt, e, D, slice * EX_R, FF, lane, pw, ps);
+    pdl_wait();
+    stage_x(act + (size_t)pair * FF, FF, xs[warp]);
+    const float s2 = wt.s2[e];
+    auto finish = [&](int n0, const float (&v)[EX_R]) {
+        if (lane < EX_R) {
+            float vv = 0.0f;
+#pragma unroll
+            for (int i = 0; i < EX_R; ++i)
+                if (i == lane) vv = v[i];
+            y[(size_t)pair * D + n0 + lane] = vv * s2;
+        }
+    };
+    // The first block (its weights preloaded) apart from the loop, so that the preloaded registers are
+    // free for the others.
+    {
+        float v[EX_R];
+        rows_dot<true, EX_R, EX_U, true>(wt, e, D, slice * EX_R, FF, nullptr, v, pw, ps, xs[warp]);
+        finish(slice * EX_R, v);
+    }
+    for (int blk = slice + slices; blk < D / EX_R; blk += slices) {
+        float v[EX_R];
+        rows_dot<true, EX_R, EX_U, true>(wt, e, D, blk * EX_R, FF, nullptr, v, nullptr, nullptr, xs[warp]);
+        finish(blk * EX_R, v);
     }
 }
 
@@ -1564,6 +1655,193 @@ __global__ void __launch_bounds__(256) experts_down_g_kernel(const bf16* __restr
                     if (i == lane) vv = v[j][i];
                 y[(size_t)pr[j] * D + n0 + lane] = vv * s2;
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// The LM head (FP8 E4M3 weights with an FP32 scale per 128 x 128 block, K <= 2560) for many rows at once:
+// Y[m, n] = X[m] . W[n], bitwise the shared GEMV's (gemv.cu, gemv_kernel<FP8B>) result for every row
+// whatever the rows' count: lane l sums the 16-weight chunks at columns 16 l + 512 c in c order, each as
+// 16 FMAs of (fp8 value * block scale) and the BF16 input in column order, then warp_sum. The GEMV takes
+// at most 16 rows a launch and reads the weights again per launch; here a warp keeps R weight rows and
+// walks the inputs in tiles of MT, decoding 4 weights of each row at a time (every input value read once
+// per R rows). `blk` > 0: logical row m is row (m / (blk - 1)) blk + 1 + m % (blk - 1) of X and Y (the
+// drafter's blocks without their first rows).
+constexpr int LM_CMAX = 5;
+
+SQ_DEVICE int lm_row(int m, int blk) { return blk > 0 ? m / (blk - 1) * blk + 1 + m % (blk - 1) : m; }
+
+// A lane's chunks of its R rows load before the PDL wait.
+template <int R, int MT>
+__global__ void __launch_bounds__(256) lm_rows_kernel(const bf16* __restrict__ X, int ldx, int M, int blk, const uint8_t* __restrict__ W,
+                                                      const float* __restrict__ scale, float* Y, int ldy, int N, int K) {
+    pdl_launch_dependents();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n0 = (blockIdx.x * 8 + warp) * R;
+    uint4 raw[R][LM_CMAX];
+    float gs[R][LM_CMAX];
+#pragma unroll
+    for (int c = 0; c < LM_CMAX; ++c) {
+        const int k = lane * 16 + c * 512;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = min(n0 + r, N - 1);
+            raw[r][c] = k < K ? ld_stream(W + (size_t)row * K + k) : make_uint4(0, 0, 0, 0);
+            gs[r][c] = k < K ? ld_stream_f32(scale + (size_t)(row >> 7) * (K >> 7) + (k >> 7)) : 0.0f;
+        }
+    }
+    pdl_wait();
+    for (int m0 = 0; m0 < M; m0 += MT) {
+        float acc[R][MT];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int q = 0; q < MT; ++q) acc[r][q] = 0.0f;
+#pragma unroll
+        for (int c = 0; c < LM_CMAX; ++c) {
+            const int k = lane * 16 + c * 512;
+            if (k >= K) break;
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+                float w[R][4];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&raw[r][c]) + 2 * h;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        const __half2_raw hh = __nv_cvt_fp8x2_to_halfraw2(p[i], __NV_E4M3);
+                        const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hh));
+                        w[r][2 * i] = f.x * gs[r][c];
+                        w[r][2 * i + 1] = f.y * gs[r][c];
+                    }
+                }
+#pragma unroll
+                for (int q = 0; q < MT; ++q) {
+                    const int m = lm_row(min(m0 + q, M - 1), blk);
+                    const uint2 xv = __ldg(reinterpret_cast<const uint2*>(X + (size_t)m * ldx + k + 4 * h));
+                    const __nv_bfloat162* px = reinterpret_cast<const __nv_bfloat162*>(&xv);
+                    const float2 xa = __bfloat1622float2(px[0]), xb = __bfloat1622float2(px[1]);
+                    const float xf[4] = {xa.x, xa.y, xb.x, xb.y};
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) acc[r][q] = fmaf(w[r][i], xf[i], acc[r][q]);
+                }
+            }
+        }
+        constexpr int NS = R * MT;
+        if constexpr ((NS & (NS - 1)) == 0 && NS <= 32) {
+            float v[NS];
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int q = 0; q < MT; ++q) v[r * MT + q] = acc[r][q];
+            const float sum = warp_sum_slots(v);
+            const int slot = lane / (32 / NS), r = slot / MT, q = slot % MT;
+            if (lane % (32 / NS) == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk) * ldy + n0 + r] = sum;
+        } else {
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int q = 0; q < MT; ++q) {
+                    const float v = warp_sum(acc[r][q]);
+                    if (lane == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk) * ldy + n0 + r] = v;
+                }
+        }
+    }
+}
+
+// lm_rows_kernel with each chunk's weights loaded while the one before computes (two chunks in registers
+// instead of all of a lane's; faster for one tile of inputs).
+template <int R, int MT>
+__global__ void __launch_bounds__(256) lm_rows_stream_kernel(const bf16* __restrict__ X, int ldx, int M, int blk, const uint8_t* __restrict__ W,
+                                                             const float* __restrict__ scale, float* Y, int ldy, int N, int K) {
+    pdl_launch_dependents();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n0 = (blockIdx.x * 8 + warp) * R;
+    const int nc = (K - lane * 16 + 511) / 512;  // this lane's chunks
+    auto load = [&](int c, uint4 (&raw)[R], float (&gs)[R]) {
+        const int k = lane * 16 + c * 512;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = min(n0 + r, N - 1);
+            raw[r] = c < nc ? ld_stream(W + (size_t)row * K + k) : make_uint4(0, 0, 0, 0);
+            gs[r] = c < nc ? ld_stream_f32(scale + (size_t)(row >> 7) * (K >> 7) + (k >> 7)) : 0.0f;
+        }
+    };
+    uint4 raw0[R], raw1[R];
+    float gs0[R], gs1[R];
+    load(0, raw0, gs0);
+    load(1, raw1, gs1);
+    pdl_wait();
+    for (int m0 = 0; m0 < M; m0 += MT) {
+        if (m0 > 0) {
+            load(0, raw0, gs0);
+            load(1, raw1, gs1);
+        }
+        float acc[R][MT];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int q = 0; q < MT; ++q) acc[r][q] = 0.0f;
+        auto chunk = [&](int c, const uint4 (&raw)[R], const float (&gs)[R]) {
+            const int k = lane * 16 + c * 512;
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+                float w[R][4];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&raw[r]) + 2 * h;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        const __half2_raw hh = __nv_cvt_fp8x2_to_halfraw2(p[i], __NV_E4M3);
+                        const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hh));
+                        w[r][2 * i] = f.x * gs[r];
+                        w[r][2 * i + 1] = f.y * gs[r];
+                    }
+                }
+#pragma unroll
+                for (int q = 0; q < MT; ++q) {
+                    const int m = lm_row(min(m0 + q, M - 1), blk);
+                    const uint2 xv = __ldg(reinterpret_cast<const uint2*>(X + (size_t)m * ldx + k + 4 * h));
+                    const __nv_bfloat162* px = reinterpret_cast<const __nv_bfloat162*>(&xv);
+                    const float2 xa = __bfloat1622float2(px[0]), xb = __bfloat1622float2(px[1]);
+                    const float xf[4] = {xa.x, xa.y, xb.x, xb.y};
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) acc[r][q] = fmaf(w[r][i], xf[i], acc[r][q]);
+                }
+            }
+        };
+        // Chunks in order, the next one's weights loading meanwhile (two buffers alternate).
+        for (int c = 0; c < nc; c += 2) {
+            chunk(c, raw0, gs0);
+            if (c + 2 < nc) load(c + 2, raw0, gs0);
+            if (c + 1 < nc) {
+                chunk(c + 1, raw1, gs1);
+                if (c + 3 < nc) load(c + 3, raw1, gs1);
+            }
+        }
+        constexpr int NS = R * MT;
+        if constexpr ((NS & (NS - 1)) == 0 && NS <= 32) {
+            float v[NS];
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int q = 0; q < MT; ++q) v[r * MT + q] = acc[r][q];
+            const float sum = warp_sum_slots(v);
+            const int slot = lane / (32 / NS), r = slot / MT, q = slot % MT;
+            if (lane % (32 / NS) == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk) * ldy + n0 + r] = sum;
+        } else {
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int q = 0; q < MT; ++q) {
+                    const float v = warp_sum(acc[r][q]);
+                    if (lane == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk) * ldy + n0 + r] = v;
+                }
         }
     }
 }
@@ -2712,12 +2990,26 @@ cudaError_t quench6k_ink_route(const float* logits, const float* bias, float sca
 // several pairs share an expert).
 cudaError_t quench6k_ink_experts(const void* x, const int* sel_e, const float* sel_w, int fp4, const uint8_t* gu_w, const uint8_t* gu_sc,
                                  const float* gu_s2, const uint8_t* d_w, const uint8_t* d_sc, const float* d_s2, float gcap, float ucap,
-                                 int T, int* order, int ordered, const int* groups, void* act, float* y, float* out, cudaStream_t st) {
+                                 int T, int* order, int ordered, const int* groups, int staged, void* act, float* y, float* out,
+                                 cudaStream_t st) {
     if (T == 0) return cudaSuccess;
     const int pairs = T * TOPK;
     if (!ordered) SQ_CHECK_LAUNCH(sq_launch(moe_order_kernel, 1, 1024, 0, st, sel_e, pairs, order));
     const ExpertW gu{gu_w, gu_sc, gu_s2}, dn{d_w, d_sc, d_s2};
     const int sms = sm_count();
+    if (staged && ordered && fp4 && !groups) {
+        // Blocks: groups of 8 pairs times slices of their 288 row blocks, about 4 blocks per SM (8 for
+        // steps of 24 rows or more: 32-row steps 3% faster, 8-row ones 2% slower; ink.ex_sbps).
+        const int g = (pairs + 7) / 8;
+        const int bps = sq_variant("ink.ex_sbps", T >= 24 ? 8 : 4);
+        const int slices = std::max(1, std::min(2 * FF / EX_R, (sms * bps + g - 1) / g));
+        const auto ab = static_cast<bf16*>(act);
+        SQ_CHECK_LAUNCH(sq_launch(experts_gate_up_s_kernel, g * slices, 256, 0, st, static_cast<const bf16*>(x), sel_e, (const int*)order, gu, pairs,
+                                  slices, gcap, ucap, ab));
+        SQ_CHECK_LAUNCH(sq_launch(experts_down_s_kernel, g * slices, 256, 0, st, (const bf16*)ab, sel_e, (const int*)order, dn, pairs, slices, y));
+        if (out) SQ_CHECK_LAUNCH(sq_launch(moe_combine_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, (const float*)y, sel_w, T, out));
+        SQ_RETURN_LAUNCH();
+    }
     if (groups && ordered) {
         const auto xb = static_cast<const bf16*>(x);
         const auto ab = static_cast<bf16*>(act);
@@ -2745,6 +3037,22 @@ cudaError_t quench6k_ink_experts(const void* x, const int* sel_e, const float* s
         SQ_CHECK_LAUNCH(sq_launch(experts_down_kernel<false>, db, 256, 0, st, static_cast<const bf16*>(act), sel_e, (const int*)order, dn, pairs, y));
     }
     if (out) SQ_CHECK_LAUNCH(sq_launch(moe_combine_kernel, blocks_for((size_t)T * D, 256), 256, 0, st, (const float*)y, sel_w, T, out));
+    SQ_RETURN_LAUNCH();
+}
+
+// The LM head (FP8 block-128 weights [N, K], K <= 2560, a multiple of 128) for M rows: Y[m, n] = X[m] . W[n],
+// each row bitwise the shared GEMV's result; `blk` as lm_rows_kernel's.
+cudaError_t quench6k_ink_lm_rows(const void* x, int ldx, int M, int blk, const uint8_t* w, const float* scale, float* y, int ldy, int N,
+                                 int K, cudaStream_t st) {
+    if (M == 0) return cudaSuccess;
+    if (K > LM_CMAX * 512 || K % 128 != 0 || ldx % 4 != 0 || blk == 1) return cudaErrorInvalidValue;
+    const auto xb = static_cast<const bf16*>(x);
+    const unsigned grid = (N + 31) / 32;
+    // Micro bench (200058 x 2304, 600 W): 8 rows 299 us (GEMV 368), 16: 457 (546), 32: 788 (1087), 64: 1472 (2209).
+    if (M <= 8)
+        SQ_CHECK_LAUNCH(sq_launch(lm_rows_stream_kernel<4, 8>, grid, 256, 0, st, xb, ldx, M, blk, w, scale, y, ldy, N, K));
+    else
+        SQ_CHECK_LAUNCH(sq_launch(lm_rows_kernel<4, 8>, grid, 256, 0, st, xb, ldx, M, blk, w, scale, y, ldy, N, K));
     SQ_RETURN_LAUNCH();
 }
 
