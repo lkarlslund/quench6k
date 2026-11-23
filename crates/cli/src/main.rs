@@ -7,6 +7,7 @@ mod inkling;
 mod inkling_batch;
 mod gpumon;
 mod kbench;
+mod longctx;
 mod mtp;
 mod multi;
 mod overlay;
@@ -538,6 +539,25 @@ enum Command {
     /// Inkling 2 (inkling2_loop) commands.
     #[command(subcommand)]
     Inkling(inkling::InklingCmd),
+    /// Inkling 2, Hy4-flash or Flint at the far end of their context without prefilling it: sequences
+    /// placed at high positions (zeroed caches), decode steps alone and batched compared bitwise, step
+    /// time against position.
+    LongctxCheck {
+        #[arg(long)]
+        model: PathBuf,
+        /// Each sequence's capacity (default: the model's context).
+        #[arg(long)]
+        context: Option<usize>,
+        /// Layouts: n sequences at context / n each.
+        #[arg(long, num_args = 1.., default_values_t = [1usize, 2, 4, 8])]
+        seqs: Vec<usize>,
+        /// Steps per check.
+        #[arg(long, default_value_t = 6)]
+        steps: usize,
+        /// Positions of the step timing (default: 4096 and 1/8, 1/4, 1/2 and all of the context).
+        #[arg(long, num_args = 1..)]
+        positions: Vec<usize>,
+    },
     Gate {
         /// Fixture root containing one directory per fixture.
         #[arg(long, default_value = "oracle/fixtures")]
@@ -946,6 +966,7 @@ fn main() -> Result<()> {
         Command::Flint(cmd) => flint::run(cmd)?,
         Command::Hy4(cmd) => hy4::run(cmd)?,
         Command::Inkling(cmd) => inkling::run(cmd)?,
+        Command::LongctxCheck { model, context, seqs, steps, positions } => longctx::run(&model, context, &seqs, steps, &positions)?,
         Command::Gate {
             fixtures,
             candidates,
