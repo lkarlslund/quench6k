@@ -155,6 +155,7 @@ mod ffi {
             ldx: c_int,
             m: c_int,
             blk: c_int,
+            per: c_int,
             w: *const u8,
             scale: *const f32,
             y: *mut f32,
@@ -743,11 +744,14 @@ pub fn experts(
 
 /// Y F32 [m, n] (row stride ldy) = X BF16 [m, k] (row stride ldx) . W^T for FP8 weights with block-128
 /// scales (k <= 2560): every row bitwise the shared GEMV's, any number of rows in one pass over W. With
-/// `blk` above 1, rows in blocks of `blk` without their first rows (logical row m at (m / (blk - 1)) blk
-/// + 1 + m % (blk - 1) of X and Y); 0: all rows.
+/// `blk` above 1, rows in blocks of `blk` without their first rows, `per` (1 ..= blk - 1) of each
+/// (logical row m at (m / per) blk + 1 + m % per of X and Y); 0: all rows.
 #[allow(clippy::too_many_arguments)]
-pub fn lm_rows(s: &Stream, x: u64, ldx: usize, m: usize, blk: usize, w: u64, scale: u64, y: u64, ldy: usize, nn: usize, k: usize) -> Result<()> {
-    go!("ink_lm_rows", ffi::quench6k_ink_lm_rows(p(x), n(ldx), n(m), n(blk), u8p(w), f(scale), fm(y), n(ldy), n(nn), n(k), s.raw()))
+pub fn lm_rows(s: &Stream, x: u64, ldx: usize, m: usize, blk: usize, per: usize, w: u64, scale: u64, y: u64, ldy: usize, nn: usize, k: usize) -> Result<()> {
+    go!(
+        "ink_lm_rows",
+        ffi::quench6k_ink_lm_rows(p(x), n(ldx), n(m), n(blk), n(per), u8p(w), f(scale), fm(y), n(ldy), n(nn), n(k), s.raw())
+    )
 }
 
 pub fn softcap(s: &Stream, x: u64, rows: usize, nn: usize, ld: usize, cap: f32) -> Result<()> {

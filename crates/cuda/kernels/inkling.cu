@@ -1891,15 +1891,15 @@ __global__ void __launch_bounds__(256) experts_down_g_kernel(const bf16* __restr
 // 16 FMAs of (fp8 value * block scale) and the BF16 input in column order, then warp_sum. The GEMV takes
 // at most 16 rows a launch and reads the weights again per launch; here a warp keeps R weight rows and
 // walks the inputs in tiles of MT, decoding 4 weights of each row at a time (every input value read once
-// per R rows). `blk` > 0: logical row m is row (m / (blk - 1)) blk + 1 + m % (blk - 1) of X and Y (the
-// drafter's blocks without their first rows).
+// per R rows). `blk` > 0: logical row m is row (m / per) blk + 1 + m % per of X and Y (the drafter's blocks
+// without their first rows, `per` <= blk - 1 rows of each).
 constexpr int LM_CMAX = 5;
 
-SQ_DEVICE int lm_row(int m, int blk) { return blk > 0 ? m / (blk - 1) * blk + 1 + m % (blk - 1) : m; }
+SQ_DEVICE int lm_row(int m, int blk, int per) { return blk > 0 ? m / per * blk + 1 + m % per : m; }
 
 // A lane's chunks of its R rows load before the PDL wait.
 template <int R, int MT>
-__global__ void __launch_bounds__(256) lm_rows_kernel(const bf16* __restrict__ X, int ldx, int M, int blk, const uint8_t* __restrict__ W,
+__global__ void __launch_bounds__(256) lm_rows_kernel(const bf16* __restrict__ X, int ldx, int M, int blk, int per, const uint8_t* __restrict__ W,
                                                       const float* __restrict__ scale, float* Y, int ldy, int N, int K) {
     pdl_launch_dependents();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -1943,7 +1943,7 @@ __global__ void __launch_bounds__(256) lm_rows_kernel(const bf16* __restrict__ X
                 }
 #pragma unroll
                 for (int q = 0; q < MT; ++q) {
-                    const int m = lm_row(min(m0 + q, M - 1), blk);
+                    const int m = lm_row(min(m0 + q, M - 1), blk, per);
                     const uint2 xv = __ldg(reinterpret_cast<const uint2*>(X + (size_t)m * ldx + k + 4 * h));
                     const __nv_bfloat162* px = reinterpret_cast<const __nv_bfloat162*>(&xv);
                     const float2 xa = __bfloat1622float2(px[0]), xb = __bfloat1622float2(px[1]);
@@ -1964,14 +1964,14 @@ __global__ void __launch_bounds__(256) lm_rows_kernel(const bf16* __restrict__ X
                 for (int q = 0; q < MT; ++q) v[r * MT + q] = acc[r][q];
             const float sum = warp_sum_slots(v);
             const int slot = lane / (32 / NS), r = slot / MT, q = slot % MT;
-            if (lane % (32 / NS) == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk) * ldy + n0 + r] = sum;
+            if (lane % (32 / NS) == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk, per) * ldy + n0 + r] = sum;
         } else {
 #pragma unroll
             for (int r = 0; r < R; ++r)
 #pragma unroll
                 for (int q = 0; q < MT; ++q) {
                     const float v = warp_sum(acc[r][q]);
-                    if (lane == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk) * ldy + n0 + r] = v;
+                    if (lane == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk, per) * ldy + n0 + r] = v;
                 }
         }
     }
@@ -1980,7 +1980,7 @@ __global__ void __launch_bounds__(256) lm_rows_kernel(const bf16* __restrict__ X
 // lm_rows_kernel with each chunk's weights loaded while the one before computes (two chunks in registers
 // instead of all of a lane's; faster for one tile of inputs).
 template <int R, int MT>
-__global__ void __launch_bounds__(256) lm_rows_stream_kernel(const bf16* __restrict__ X, int ldx, int M, int blk, const uint8_t* __restrict__ W,
+__global__ void __launch_bounds__(256) lm_rows_stream_kernel(const bf16* __restrict__ X, int ldx, int M, int blk, int per, const uint8_t* __restrict__ W,
                                                              const float* __restrict__ scale, float* Y, int ldy, int N, int K) {
     pdl_launch_dependents();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -2028,7 +2028,7 @@ __global__ void __launch_bounds__(256) lm_rows_stream_kernel(const bf16* __restr
                 }
 #pragma unroll
                 for (int q = 0; q < MT; ++q) {
-                    const int m = lm_row(min(m0 + q, M - 1), blk);
+                    const int m = lm_row(min(m0 + q, M - 1), blk, per);
                     const uint2 xv = __ldg(reinterpret_cast<const uint2*>(X + (size_t)m * ldx + k + 4 * h));
                     const __nv_bfloat162* px = reinterpret_cast<const __nv_bfloat162*>(&xv);
                     const float2 xa = __bfloat1622float2(px[0]), xb = __bfloat1622float2(px[1]);
@@ -2058,14 +2058,14 @@ __global__ void __launch_bounds__(256) lm_rows_stream_kernel(const bf16* __restr
                 for (int q = 0; q < MT; ++q) v[r * MT + q] = acc[r][q];
             const float sum = warp_sum_slots(v);
             const int slot = lane / (32 / NS), r = slot / MT, q = slot % MT;
-            if (lane % (32 / NS) == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk) * ldy + n0 + r] = sum;
+            if (lane % (32 / NS) == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk, per) * ldy + n0 + r] = sum;
         } else {
 #pragma unroll
             for (int r = 0; r < R; ++r)
 #pragma unroll
                 for (int q = 0; q < MT; ++q) {
                     const float v = warp_sum(acc[r][q]);
-                    if (lane == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk) * ldy + n0 + r] = v;
+                    if (lane == 0 && n0 + r < N && m0 + q < M) Y[(size_t)lm_row(m0 + q, blk, per) * ldy + n0 + r] = v;
                 }
         }
     }
@@ -3277,18 +3277,18 @@ cudaError_t quench6k_ink_experts(const void* x, const int* sel_e, const float* s
 }
 
 // The LM head (FP8 block-128 weights [N, K], K <= 2560, a multiple of 128) for M rows: Y[m, n] = X[m] . W[n],
-// each row bitwise the shared GEMV's result; `blk` as lm_rows_kernel's.
-cudaError_t quench6k_ink_lm_rows(const void* x, int ldx, int M, int blk, const uint8_t* w, const float* scale, float* y, int ldy, int N,
-                                 int K, cudaStream_t st) {
+// each row bitwise the shared GEMV's result; `blk` and `per` as lm_rows_kernel's.
+cudaError_t quench6k_ink_lm_rows(const void* x, int ldx, int M, int blk, int per, const uint8_t* w, const float* scale, float* y, int ldy,
+                                 int N, int K, cudaStream_t st) {
     if (M == 0) return cudaSuccess;
-    if (K > LM_CMAX * 512 || K % 128 != 0 || ldx % 4 != 0 || blk == 1) return cudaErrorInvalidValue;
+    if (K > LM_CMAX * 512 || K % 128 != 0 || ldx % 4 != 0 || blk == 1 || (blk > 0 && (per < 1 || per > blk - 1))) return cudaErrorInvalidValue;
     const auto xb = static_cast<const bf16*>(x);
     const unsigned grid = (N + 31) / 32;
     // Micro bench (200058 x 2304, 600 W): 8 rows 299 us (GEMV 368), 16: 457 (546), 32: 788 (1087), 64: 1472 (2209).
     if (M <= 8)
-        SQ_CHECK_LAUNCH(sq_launch(lm_rows_stream_kernel<4, 8>, grid, 256, 0, st, xb, ldx, M, blk, w, scale, y, ldy, N, K));
+        SQ_CHECK_LAUNCH(sq_launch(lm_rows_stream_kernel<4, 8>, grid, 256, 0, st, xb, ldx, M, blk, per, w, scale, y, ldy, N, K));
     else
-        SQ_CHECK_LAUNCH(sq_launch(lm_rows_kernel<4, 8>, grid, 256, 0, st, xb, ldx, M, blk, w, scale, y, ldy, N, K));
+        SQ_CHECK_LAUNCH(sq_launch(lm_rows_kernel<4, 8>, grid, 256, 0, st, xb, ldx, M, blk, per, w, scale, y, ldy, N, K));
     SQ_RETURN_LAUNCH();
 }
 

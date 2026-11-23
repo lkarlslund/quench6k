@@ -228,7 +228,7 @@ fn inkling_lm_rows() {
             }
             Ok(())
         };
-        let lm = |s: &Stream| -> anyhow::Result<()> { ik::lm_rows(s, x.addr(), ldx, m, 0, w.addr(), sc.addr(), y1.addr(), n, n, kk) };
+        let lm = |s: &Stream| -> anyhow::Result<()> { ik::lm_rows(s, x.addr(), ldx, m, 0, 0, w.addr(), sc.addr(), y1.addr(), n, n, kk) };
         gemv(&s).unwrap();
         lm(&s).unwrap();
         let a: Vec<u32> = s.download::<f32>(y0.addr(), m * n).unwrap().iter().map(|f| f.to_bits()).collect();
@@ -242,12 +242,22 @@ fn inkling_lm_rows() {
             // The drafter's blocks of 8 rows without their first rows: m / 8 * 7 rows.
             let mb = m / 8 * 7;
             s.memset(y1.addr(), 0, m * n * 4).unwrap();
-            ik::lm_rows(&s, x.addr(), ldx, mb, 8, w.addr(), sc.addr(), y1.addr(), n, n, kk).unwrap();
+            ik::lm_rows(&s, x.addr(), ldx, mb, 8, 7, w.addr(), sc.addr(), y1.addr(), n, n, kk).unwrap();
             let b: Vec<u32> = s.download::<f32>(y1.addr(), m * n).unwrap().iter().map(|f| f.to_bits()).collect();
             let diff = (0..m).filter(|r| r % 8 != 0).map(|r| (0..n).filter(|&c| a[r * n + c] != b[r * n + c]).count()).sum::<usize>();
             let zero = (0..m).filter(|r| r % 8 == 0).all(|r| b[r * n..(r + 1) * n].iter().all(|&v| v == 0));
-            let gb = Graph::capture(&s, |s| ik::lm_rows(s, x.addr(), ldx, mb, 8, w.addr(), sc.addr(), y1.addr(), n, n, kk)).unwrap();
+            let gb = Graph::capture(&s, |s| ik::lm_rows(s, x.addr(), ldx, mb, 8, 7, w.addr(), sc.addr(), y1.addr(), n, n, kk)).unwrap();
             println!("  {mb} rows of blocks of 8 (first rows skipped): {:7.1} us, {}", time_graph(&s, &gb), if diff == 0 && zero { "bitwise same".to_string() } else { format!("{diff} DIFFER, skipped rows untouched {zero}") });
+            // Only the first 3 rows after each block's first (a drafter pass for 3 drafts).
+            let mp = m / 8 * 3;
+            s.memset(y1.addr(), 0, m * n * 4).unwrap();
+            ik::lm_rows(&s, x.addr(), ldx, mp, 8, 3, w.addr(), sc.addr(), y1.addr(), n, n, kk).unwrap();
+            let b: Vec<u32> = s.download::<f32>(y1.addr(), m * n).unwrap().iter().map(|f| f.to_bits()).collect();
+            let used = |r: usize| (1..=3).contains(&(r % 8));
+            let diff = (0..m).filter(|&r| used(r)).map(|r| (0..n).filter(|&c| a[r * n + c] != b[r * n + c]).count()).sum::<usize>();
+            let zero = (0..m).filter(|&r| !used(r)).all(|r| b[r * n..(r + 1) * n].iter().all(|&v| v == 0));
+            let gb = Graph::capture(&s, |s| ik::lm_rows(s, x.addr(), ldx, mp, 8, 3, w.addr(), sc.addr(), y1.addr(), n, n, kk)).unwrap();
+            println!("  {mp} rows of blocks of 8 (3 after the first): {:7.1} us, {}", time_graph(&s, &gb), if diff == 0 && zero { "bitwise same".to_string() } else { format!("{diff} DIFFER, other rows untouched {zero}") });
         }
     }
 }
