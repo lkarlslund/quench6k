@@ -11,8 +11,10 @@
 //! - Memory: a request starts when its plan (prompt + expected completion + a margin, in
 //!   [`SlotEngine::plan_bytes`]) fits next to the running requests' plans in free device memory and
 //!   what idle slots hold; idle slots give their memory up when the device is full (least recently used
-//!   first); a request that does not fit waits for running ones to finish, and one that does not fit
-//!   with nothing else on the device fails.
+//!   first, the whole state); a request that does not fit waits for running ones to finish, and one that
+//!   does not fit with nothing else on the device fails. Running requests that together outgrow the
+//!   device: the newest one beyond its plan ends (else the newest one), with an error that says so;
+//!   requests within their plans go on.
 //!
 //! A sequence's results never depend on which others share its steps: the engine's batched step is
 //! bit-identical to its steps alone, and every per-request decision (drafts, sampling, stopping) is the
@@ -274,6 +276,8 @@ enum Mode {
 struct Req {
     job: Job,
     slot: usize,
+    /// Admission order (the newest request gives way first when running requests outgrow the device).
+    order: u64,
     reused: usize,
     /// Prompt tokens computed or reused so far.
     at: usize,
@@ -453,6 +457,8 @@ struct Sched<'a, E: SlotEngine> {
     prefilling: VecDeque<usize>,
     waiting_for_memory: bool,
     cost: StepCost,
+    /// Requests admitted so far.
+    admitted: u64,
 }
 
 fn is_oom(e: &anyhow::Error) -> bool {
@@ -489,15 +495,22 @@ impl<E: SlotEngine> Sched<'_, E> {
         need + outstanding <= free + reclaimable
     }
 
-    /// Frees device memory for `keep`: mapped memory past the positions other slots hold (growable
-    /// states), else the state of the least recently used idle slot. False when nothing is left.
+    /// Frees device memory for `keep`: mapped memory past the positions other slots hold or (decoding
+    /// requests) their next step needs (growable states), else the whole state of the least recently
+    /// used idle slot (its caches and its fixed buffers: an emptied state keeps nothing worth its rings).
+    /// False when nothing is left.
     fn free_memory(&mut self, keep: usize) -> bool {
         if self.e.growable() {
             let before: usize = (0..self.cfg.slots).map(|i| self.device_bytes(i)).sum();
+            let next_step = 2 * self.e.max_step();
             for i in (0..self.cfg.slots).filter(|&i| i != keep) {
+                let decoding = self.reqs[i].as_ref().is_some_and(|r| r.decoding);
                 if let Some(st) = self.states[i].as_mut() {
+                    // A decoding request's next step was mapped already (decode maps every request's
+                    // before the step): keep it.
                     let pos = self.e.pos(st);
-                    self.e.trim(st, pos);
+                    let hold = if decoding { (pos + next_step).min(self.cfg.context) } else { pos };
+                    self.e.trim(st, hold);
                 }
             }
             if (0..self.cfg.slots).map(|i| self.device_bytes(i)).sum::<usize>() < before {
@@ -511,12 +524,11 @@ impl<E: SlotEngine> Sched<'_, E> {
             return false;
         };
         let held = self.states[i].as_ref().map_or(0, |st| self.e.history(st).len());
-        if self.e.growable() {
-            let st = self.states[i].as_mut().unwrap();
-            self.e.trim(st, 0);
-        } else {
-            self.states[i] = None;
+        // The device may still use the state's buffers.
+        if let Err(e) = self.e.sync() {
+            eprintln!("{} worker: {e:#}", self.e.name());
         }
+        self.states[i] = None;
         eprintln!("{} worker: slot {i}: context of {held} tokens dropped from device memory", self.e.name());
         self.metrics.kv_bytes[i].store(self.device_bytes(i) as u64, Ordering::Relaxed);
         true
@@ -536,7 +548,10 @@ impl<E: SlotEngine> Sched<'_, E> {
     fn memory_note(&self, slot: usize, positions: usize) -> String {
         let others = (0..self.cfg.slots).filter(|&i| i != slot && self.reqs[i].is_some()).count();
         if others > 0 {
-            format!("slot {slot}: device memory for {positions} positions is held by {others} running request(s)")
+            format!(
+                "slot {slot}: device memory for {positions} positions is held by {others} running request(s) (this request is the newest{})",
+                if self.beyond_plan(slot) { " beyond its plan" } else { "" }
+            )
         } else {
             format!(
                 "slot {slot}: device memory is full at {positions} positions: one sequence fits about {} positions on this device (--context {})",
@@ -546,20 +561,63 @@ impl<E: SlotEngine> Sched<'_, E> {
         }
     }
 
-    /// Runs `f` on `slot`'s state, freeing memory elsewhere while it fails for lack of it.
+    /// Whether running request `slot` has grown beyond the positions its admission planned for.
+    fn beyond_plan(&self, slot: usize) -> bool {
+        match (&self.reqs[slot], &self.states[slot]) {
+            (Some(r), Some(st)) => self.e.pos(st) + 2 * self.e.max_step() > r.planned,
+            _ => false,
+        }
+    }
+
+    /// The running request that gives way when running requests outgrow the device: the newest one
+    /// beyond its plan, else the newest one (`slot` among them).
+    fn gives_way(&self) -> Option<usize> {
+        let running = || (0..self.cfg.slots).filter(|&i| self.reqs[i].is_some());
+        let order = |i: &usize| self.reqs[*i].as_ref().map_or(0, |r| r.order);
+        running().filter(|&i| self.beyond_plan(i)).max_by_key(order).or_else(|| running().max_by_key(order))
+    }
+
+    /// Runs `f` on `slot`'s state, freeing memory elsewhere while it fails for lack of it: idle slots'
+    /// memory first, then the running request that gives way ([`Sched::gives_way`]; when that is `slot`'s
+    /// own, the error).
     fn with_memory<T>(&mut self, slot: usize, mut f: impl FnMut(&mut E, &mut E::State) -> Result<T>) -> Result<T> {
         loop {
             let st = self.states[slot].as_mut().expect("slot state");
             match f(&mut self.e, st) {
                 Err(e) if is_oom(&e) => {
-                    if !self.free_memory(slot) {
-                        let pos = self.states[slot].as_ref().map_or(0, |st| self.e.pos(st));
-                        return Err(e.context(self.memory_note(slot, pos)));
+                    if self.free_memory(slot) {
+                        continue;
+                    }
+                    let pos = self.states[slot].as_ref().map_or(0, |st| self.e.pos(st));
+                    match self.gives_way() {
+                        Some(v) if v != slot => {
+                            let note = self.give_way_note(v, slot, pos);
+                            self.fail(v, &anyhow::anyhow!("{note}"));
+                            // Its memory goes now (it is idle, but the most recently used).
+                            let _ = self.e.sync();
+                            self.states[v] = None;
+                            self.metrics.kv_bytes[v].store(0, Ordering::Relaxed);
+                        }
+                        _ => return Err(e.context(self.memory_note(slot, pos))),
                     }
                 }
                 r => return r,
             }
         }
+    }
+
+    /// Why running request `v` ended for `slot`'s memory at `pos` positions.
+    fn give_way_note(&self, v: usize, slot: usize, pos: usize) -> String {
+        let (r, at) = (self.reqs[v].as_ref().unwrap(), self.states[v].as_ref().map_or(0, |st| self.e.pos(st)));
+        format!(
+            "device memory is full: slot {v} stopped at {at} positions ({}) so that slot {slot} can go on at {pos} positions; {} requests were running",
+            if self.beyond_plan(v) {
+                format!("the newest request beyond its plan of {} positions", r.planned)
+            } else {
+                "the newest request".to_string()
+            },
+            self.reqs.iter().flatten().count()
+        )
     }
 
     /// Gives `slot` a state, freeing memory elsewhere while the device is full.
@@ -681,21 +739,6 @@ impl<E: SlotEngine> Sched<'_, E> {
             let Some(slot) = free else {
                 break;
             };
-            // A prompt whose caches cannot fit on the device even alone fails now (growable states:
-            // the per-request limit is memory, not only --context).
-            if self.e.growable() && !self.busy() && job.ids.len() + 1 > self.positions_alone() {
-                let job = queue.pop_front().unwrap();
-                self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
-                let msg = format!(
-                    "prompt of {} tokens does not fit in device memory: one sequence fits about {} positions on this device (--context {})",
-                    job.ids.len(),
-                    self.positions_alone(),
-                    self.cfg.context
-                );
-                eprintln!("{} worker: {msg}", self.e.name());
-                let _ = job.tx.send(Msg::Error(msg));
-                continue;
-            }
             let planned = self.plan_positions(job.ids.len(), job.params.max_tokens);
             if !self.admits(slot, planned) {
                 if !self.waiting_for_memory {
@@ -716,6 +759,22 @@ impl<E: SlotEngine> Sched<'_, E> {
                 self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
                 eprintln!("{} worker: slot {slot}, prompt {}: {e:#}", self.e.name(), job.ids.len());
                 let _ = job.tx.send(Msg::Error(format!("{e:#}")));
+                continue;
+            }
+            // A prompt whose caches cannot fit on the device even alone fails now (growable states:
+            // the per-request limit is memory, not only --context). After the slot has its state, so
+            // that the engine knows a state's fixed size.
+            if self.e.growable() && !self.busy() && job.ids.len() + 1 > self.positions_alone() {
+                let job = queue.pop_front().unwrap();
+                self.metrics.queued.fetch_sub(1, Ordering::Relaxed);
+                let msg = format!(
+                    "prompt of {} tokens does not fit in device memory: one sequence fits about {} positions on this device (--context {})",
+                    job.ids.len(),
+                    self.positions_alone(),
+                    self.cfg.context
+                );
+                eprintln!("{} worker: {msg}", self.e.name());
+                let _ = job.tx.send(Msg::Error(msg));
                 continue;
             }
             self.waiting_for_memory = false;
@@ -740,10 +799,12 @@ impl<E: SlotEngine> Sched<'_, E> {
                 }
             };
             let budget = job.params.max_tokens.min(self.cfg.context - job.ids.len()).max(1);
+            self.admitted += 1;
             let r = Req {
                 hist: job.ids.clone(),
                 job,
                 slot,
+                order: self.admitted,
                 reused: 0,
                 at: 0,
                 planned,
@@ -998,6 +1059,7 @@ pub(super) fn schedule<E: SlotEngine>(e: E, cfg: &Config, jobs: &mpsc::Receiver<
         prefilling: VecDeque::new(),
         waiting_for_memory: false,
         cost: StepCost::new(drafting_costs.0, drafting_costs.1),
+        admitted: 0,
     };
     let mut queue: VecDeque<Job> = VecDeque::new();
     // Unload requests wait until nothing runs or is queued.
