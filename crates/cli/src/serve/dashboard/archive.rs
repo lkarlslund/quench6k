@@ -8,8 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tsink::{
-    Aggregation, DataPoint, Label, QueryOptions, Row, Storage, StorageBuilder, TimestampPrecision,
-    WalSyncMode,
+    DataPoint, Label, Row, Storage, StorageBuilder, TimestampPrecision, Value, WalSyncMode,
 };
 
 macro_rules! totals {
@@ -390,30 +389,36 @@ impl Archive {
             .as_ref()
             .filter(|p| p.timestamp < end)
             .map_or(end, |p| p.timestamp);
-        for series in self.db.list_metrics()? {
+        let series_list = if from < persisted_end {
+            self.db.list_metrics()?
+        } else {
+            Vec::new()
+        };
+        for series in series_list {
             let slot = series
                 .labels
                 .iter()
                 .find(|l| l.name == "slot")
                 .and_then(|l| l.value.parse::<usize>().ok());
-            let aggregation = match series.name.as_str() {
-                "output_tps" | "prefill_tps" | "sample_seconds" => Aggregation::Sum,
-                n if n.starts_with("total_") => Aggregation::Sum,
-                _ => Aggregation::Max,
-            };
-            let options = QueryOptions::new(from as i64, persisted_end as i64)
-                .with_labels(series.labels)
-                .with_downsample(interval as i64, aggregation);
-            if from >= persisted_end {
-                continue;
-            }
-            for p in self.db.select_with_options(&series.name, options)? {
-                let t = p.timestamp as u64;
+            let sum = matches!(
+                series.name.as_str(),
+                "output_tps" | "prefill_tps" | "sample_seconds"
+            ) || series.name.starts_with("total_");
+            // Not tsink's downsampling: with an aggregation, select_with_options (0.10.2) holds
+            // its visibility read lock and takes it again to read the series. When a background
+            // retention pass queues for the write lock in between, both wait forever.
+            let points = self.db.select(
+                &series.name,
+                &series.labels,
+                from as i64,
+                persisted_end as i64,
+            )?;
+            for (t, value) in downsample(points, from, interval, sum) {
                 let s = buckets.entry(t).or_insert_with(|| Sample {
                     timestamp: t,
                     ..Default::default()
                 });
-                let v = p.value.as_f64().unwrap_or(0.0);
+                let v = value.as_f64().unwrap_or(0.0);
                 match (series.name.as_str(), slot) {
                     ("output_tps", Some(i)) => {
                         s.output_tps.resize(s.output_tps.len().max(i + 1), 0.0);
@@ -425,13 +430,13 @@ impl Archive {
                     }
                     ("kv_bytes", Some(i)) => {
                         s.kv_bytes.resize(s.kv_bytes.len().max(i + 1), 0);
-                        s.kv_bytes[i] = p.value.as_u64().unwrap_or(0);
+                        s.kv_bytes[i] = value.as_u64().unwrap_or(0);
                     }
                     ("sample_seconds", _) => s.seconds = v,
                     ("prefilling", _) => s.prefilling = v as usize,
                     ("decoding", _) => s.decoding = v as usize,
                     ("queued", _) => s.queued = v as u64,
-                    (name, _) => s.totals.set(name, p.value.as_u64().unwrap_or(0)),
+                    (name, _) => s.totals.set(name, value.as_u64().unwrap_or(0)),
                 }
             }
         }
@@ -450,6 +455,31 @@ impl Archive {
         }
         Ok(samples)
     }
+}
+
+/// Sums or maxima over buckets starting at `from + k * interval`, as tsink's downsampling.
+/// Integer values stay exact (sums saturate); NaN points are skipped.
+fn downsample(points: Vec<DataPoint>, from: u64, interval: u64, sum: bool) -> BTreeMap<u64, Value> {
+    let interval = interval.max(1);
+    let mut buckets = BTreeMap::<u64, Value>::new();
+    for p in points {
+        if matches!(p.value, Value::F64(v) if v.is_nan()) {
+            continue;
+        }
+        let t = from + (p.timestamp.max(0) as u64).saturating_sub(from) / interval * interval;
+        let merged = match (buckets.remove(&t), p.value) {
+            (None, v) => v,
+            (Some(Value::U64(a)), Value::U64(b)) => {
+                Value::U64(if sum { a.saturating_add(b) } else { a.max(b) })
+            }
+            (Some(a), b) => {
+                let (a, b) = (a.as_f64().unwrap_or(0.0), b.as_f64().unwrap_or(0.0));
+                Value::F64(if sum { a + b } else { a.max(b) })
+            }
+        };
+        buckets.insert(t, merged);
+    }
+    buckets
 }
 
 #[cfg(test)]
