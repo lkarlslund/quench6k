@@ -366,7 +366,7 @@ impl SlotEngine for Mock {
         // The last token's logits in row 0.
         Ok([rows[tokens.len().min(8) - 1]; 8])
     }
-    fn draft(&mut self, st: &mut MState, token: i32, row: usize) -> Result<Draft> {
+    fn draft(&mut self, st: &mut MState, token: i32, row: usize, room: usize) -> Result<Draft> {
         anyhow::ensure!(self.last == st.id, "draft after another sequence's step");
         anyhow::ensure!(row < st.last_t, "draft row {row} of a {}-token step", st.last_t);
         let mut x = fold(*st.pre.last().unwrap(), token);
@@ -377,7 +377,12 @@ impl SlotEngine for Mock {
             tokens.push(t);
         }
         tokens.push(tok_of(x) % 40 + 1);
-        Ok(Draft { tokens, conf: vec![0.95, 0.95, 0.2], secs: 0.0001 })
+        anyhow::ensure!(room >= 1, "a drafter pass for no drafts");
+        // A drafter computing only the drafts that can be used (the first ones are the same).
+        tokens.truncate(room);
+        let mut conf = vec![0.95, 0.95, 0.2];
+        conf.truncate(room);
+        Ok(Draft { tokens, conf, secs: 0.0001 })
     }
     fn step(&mut self, states: &mut [&mut MState], tokens: &[&[i32]], after: &mut After<'_, [i32; 8]>) -> Vec<Result<Option<Draft>>> {
         let ids: Vec<String> = states.iter().map(|s| s.id.to_string()).collect();
@@ -748,12 +753,12 @@ fn prefill_interleaves_with_decode() {
 /// The step-cost fit follows observed steps; a sequence's shares add up to the step.
 #[test]
 fn step_cost_shares() {
-    let mut c = StepCost::new(0.010, 0.0018);
+    let mut c = StepCost::new(0.010, 0.0018, 0.0024, 8, 8);
     for i in 0..400 {
-        let r = [1.0, 2.0, 4.0, 8.0, 12.0, 32.0][i % 6];
-        c.add(r, 0.0078 + 0.002 * r);
+        let r = [1, 2, 4, 8, 12, 32][i % 6];
+        c.add(r.min(8), r, 0.0078 + 0.002 * r as f64);
     }
-    let (a, b) = c.fit();
+    let (a, b) = c.rows.fit();
     assert!((a - 0.0078).abs() < 0.0003 && (b - 0.002).abs() < 0.0001, "{a} {b}");
     assert_eq!(c.share(1, 4, 4), 1.0);
     let widths = [1, 4, 2, 1];
@@ -762,6 +767,64 @@ fn step_cost_shares() {
     // Eight sequences: a plain row costs (a/8 + b), three more drafts 3b more.
     let plain = c.share(8, 1, 8) * (a + 8.0 * b);
     assert!((plain - (a / 8.0 + b)).abs() < 1e-9);
+}
+
+/// The batch's draft plan: drafts where their rows pay, none where the rows and the drafter pass cost
+/// more than they return; a step shape that costs more than its rows (learnt from steps run) is
+/// avoided; drafts without a drafter pass (prompt lookup) pay sooner.
+#[test]
+fn draft_plans() {
+    let want = |q, pass| Want { q: [q; MAX_DRAFTS], most: 7, pass, kept: None };
+    // Inkling-like: plain steps of 8 sequences 11.6 ms, 0.75 ms per row beyond, drafter passes
+    // 1 + 0.28 ms per sequence.
+    let mut c = StepCost::new(0.0045, 0.0008, 0.0006, 8, 8);
+    for _ in 0..50 {
+        for r in [8, 16, 24, 32] {
+            c.add(8, r, 0.0116 + 0.00075 * (r - 8) as f64);
+        }
+        for m in [1, 8] {
+            c.add_pass(m, 0.001 + 0.00028 * m as f64);
+        }
+    }
+    assert!((c.time(8, 20) - (0.0116 + 0.00075 * 12.0)).abs() < 2e-4, "{}", c.time(8, 20));
+    assert!((c.pass_time(4) - (0.001 + 0.00028 * 4.0)).abs() < 1e-4, "{}", c.pass_time(4));
+    let p = c.plan(&[want(0.9, true); 8]);
+    assert!(p.limits.iter().all(|&k| k >= 2), "{p:?}");
+    assert!(p.row_value > 0.3 && p.row_value < 0.9, "{p:?}");
+    assert_eq!(c.plan(&[want(0.3, true); 8]).limits, vec![0; 8]);
+    // Drafters that state probabilities: a pass that brings a likely draft pays, one whose kept drafts
+    // are rarely accepted does not; the plan says about how many rows a pass brings.
+    let kept = |k, a| Want { q: [0.6; MAX_DRAFTS], most: 7, pass: true, kept: Some((k, a)) };
+    let p = c.plan(&[kept(1.2, 1.15); 8]);
+    assert_eq!(p.limits, vec![1; 8], "{p:?}");
+    assert_eq!(c.plan(&[kept(0.4, 0.3); 8]).limits, vec![0; 8]);
+    // Sequences that cannot draft (plain requests) get none; the others still do.
+    let mut wants = vec![want(0.9, true); 8];
+    wants[3].most = 0;
+    let p = c.plan(&wants);
+    assert!(p.limits[3] == 0 && p.limits[0] >= 2, "{p:?}");
+    // Hy4-like: 2 sequences 11.7 ms plus 1.9 ms a row, 8 sequences 21.8 ms, drafter passes 2.3 ms.
+    let mut c = StepCost::new(0.010, 0.0018, 0.0024, 8, 8);
+    for _ in 0..50 {
+        for r in [2, 4, 6] {
+            c.add(2, r, 0.0117 + 0.0019 * (r - 2) as f64);
+        }
+        c.add(8, 8, 0.0218);
+        c.add_pass(1, 0.0023);
+        c.add_pass(2, 0.0024);
+    }
+    let p2 = c.plan(&[want(0.6, true); 2]);
+    assert!(p2.limits.iter().all(|&k| k >= 1), "{p2:?}");
+    // Likely drafts pay at 8 sequences too, until a step of 9 rows turns out to cost 8 ms more than
+    // the plain step (and the rows beyond it as much each as before).
+    let p8 = c.plan(&[want(0.9, true); 8]);
+    assert!(p8.limits.iter().all(|&k| k >= 1), "{p8:?}");
+    for _ in 0..5 {
+        c.add(8, 9, 0.030);
+    }
+    assert_eq!(c.plan(&[want(0.9, true); 8]).limits, vec![0; 8]);
+    // Prompt-lookup drafts (no pass) at the same chance still pay their rows.
+    assert!(c.plan(&[want(0.75, false); 2]).limits.iter().sum::<usize>() >= 2);
 }
 
 /// A new conversation sharing only a beginning (a system prompt) with an idle slot's takes a free

@@ -107,11 +107,16 @@ fn batched(model: &InklingModel, ws: &mut Workspace, s: &Stream, prompts: &[&[i3
         if drafted {
             // The source rows: the last prompt row first, then each sequence's last accepted row.
             let rows: Vec<usize> = rows.iter().zip(&states).map(|(&r, st)| if r == usize::MAX { st.last_t - 1 } else { r }).collect();
-            let d = model.draft_batch(&mut states, ws, s, &pend, &rows)?;
+            // Only the drafts the step verifies (as the server asks for), against the whole pass alone.
+            let block = model.drafter.as_ref().map_or(1, |d| d.block);
+            let most: Vec<usize> = (0..n).map(|i| recs[i][step].toks.len().max(2) - 1).collect();
+            let d = model.draft_batch_some(&mut states, ws, s, &pend, &rows, &most)?;
             let conf = model.draft_conf_batch(ws);
             for i in 0..n {
                 let c: Vec<u32> = conf[i].iter().map(|x| x.to_bits()).collect();
-                if d[i] != recs[i][step].drafts || c != recs[i][step].conf {
+                let (want, want_c) = (&recs[i][step].drafts, &recs[i][step].conf);
+                let k = most[i].min(block - 1).min(want.len());
+                if d[i][..] != want[..k] || c[..] != want_c[..k.min(want_c.len())] {
                     bad += 1;
                     println!("  step {step} sequence {i}: drafts {:?} / {:?} alone", d[i], recs[i][step].drafts);
                 }
@@ -230,14 +235,19 @@ pub fn run(dir: &Path, text: &Path, ctxs: &[usize], counts: &[usize], steps: usi
             // Verify steps of `block / 2` tokens (the corpus's next tokens as drafts) and drafter passes.
             let w = (block / 2).max(1);
             let mut t_verify = 0.0;
-            let mut t_draft = 0.0;
+            // Drafter passes for every draft, and for the first one or three only (in turn).
+            let mut t_draft = [0.0; 3];
+            let mut n_draft = [0usize; 3];
             let mut pend: Vec<i32> = seqs[..n].iter().map(|q| q.pending).collect();
             for step in 0..time_steps {
                 let mut states: Vec<&mut State> = seqs[..n].iter_mut().map(|q| &mut q.st).collect();
                 if model.drafter.is_some() && step > 0 {
+                    let kind = step % 3;
+                    let most = vec![[usize::MAX, 1, 3][kind]; n];
                     let t0 = Instant::now();
-                    model.draft_batch(&mut states, &mut ws, &s, &pend, &row)?;
-                    t_draft += t0.elapsed().as_secs_f64();
+                    model.draft_batch_some(&mut states, &mut ws, &s, &pend, &row, &most)?;
+                    t_draft[kind] += t0.elapsed().as_secs_f64();
+                    n_draft[kind] += 1;
                 }
                 let toks: Vec<Vec<i32>> = (0..n)
                     .map(|i| {
@@ -265,15 +275,17 @@ pub fn run(dir: &Path, text: &Path, ctxs: &[usize], counts: &[usize], steps: usi
                 q.st.truncate(b);
             }
             let verify = t_verify / time_steps as f64;
-            let draft = t_draft / (time_steps - 1).max(1) as f64;
+            let draft: Vec<f64> = (0..3).map(|k| 1e3 * t_draft[k] / n_draft[k].max(1) as f64).collect();
             println!(
-                "ctx {ctx} x{n}: plain step {:.2} ms, {:.0} tok/s in all ({:.1} per sequence); verify-{w} step {:.2} ms ({:.0} rows/s); draft pass {:.2} ms",
+                "ctx {ctx} x{n}: plain step {:.2} ms, {:.0} tok/s in all ({:.1} per sequence); verify-{w} step {:.2} ms ({:.0} rows/s); draft pass {:.2} ms (first draft only {:.2}, three {:.2})",
                 plain * 1e3,
                 n as f64 / plain,
                 1.0 / plain,
                 verify * 1e3,
                 (n * w) as f64 / verify,
-                draft * 1e3
+                draft[0],
+                draft[1],
+                draft[2]
             );
         }
         drop(seqs);

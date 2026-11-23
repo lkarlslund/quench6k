@@ -482,7 +482,8 @@ pub struct Workspace {
     /// CUDA graphs of small steps by (rows, logits kind); they read the sequences from `seqs`.
     graphs: HashMap<(usize, u8), quench6k_cuda::Graph>,
     /// The drafter's pass as CUDA graphs by sequence count.
-    dgraphs: HashMap<usize, quench6k_cuda::Graph>,
+    /// Drafter graphs by (sequences, drafts computed per sequence).
+    dgraphs: HashMap<(usize, usize), quench6k_cuda::Graph>,
     /// The side stream of the L2 prefetches (forked from and joined into the step's stream).
     side: Stream,
     fork: quench6k_cuda::Event,
@@ -946,8 +947,28 @@ impl InklingModel {
     /// last 16). Each sequence keeps its last step's features, so other sequences' steps in between do
     /// not matter. Sequences without room for a block (or before any step) get no drafts.
     pub fn draft_batch(&self, states: &mut [&mut State], ws: &mut Workspace, s: &Stream, pending: &[i32], rows: &[usize]) -> Result<Vec<Vec<i32>>> {
+        let all = vec![usize::MAX; states.len()];
+        self.draft_batch_some(states, ws, s, pending, rows, &all)
+    }
+
+    /// [`InklingModel::draft_batch`] for the first `most[i]` drafts of sequence i only (at least one):
+    /// the pass computes the drafter's head for the drafts up to the largest of them (every row of the
+    /// block still goes through the drafter's layers). Each draft and its probability are bit-identical
+    /// to the whole pass's.
+    pub fn draft_batch_some(
+        &self,
+        states: &mut [&mut State],
+        ws: &mut Workspace,
+        s: &Stream,
+        pending: &[i32],
+        rows: &[usize],
+        most: &[usize],
+    ) -> Result<Vec<Vec<i32>>> {
         let n = states.len();
-        ensure!(n <= MAX_SEQS && pending.len() == n && rows.len() == n, "a draft batch of {n} sequences (at most {MAX_SEQS})");
+        ensure!(
+            n <= MAX_SEQS && pending.len() == n && rows.len() == n && most.len() == n,
+            "a draft batch of {n} sequences (at most {MAX_SEQS})"
+        );
         let mut out = vec![Vec::new(); n];
         let (Some(d), Some(_)) = (&self.drafter, &ws.draft) else {
             return Ok(out);
@@ -972,6 +993,8 @@ impl InklingModel {
         }
         s.synchronize()?;
         let m = live.len();
+        // Drafts computed per sequence.
+        let nd = live.iter().map(|&i| most[i].clamp(1, b - 1)).max().unwrap();
         {
             let mut sq = Seqs {
                 nseq: m as i32,
@@ -991,23 +1014,24 @@ impl InklingModel {
         }
         let graphs = std::env::var("QUENCH6K_INK_GRAPHS").map_or(true, |v| v != "0");
         if graphs {
-            if !ws.dgraphs.contains_key(&m) {
-                let g = quench6k_cuda::Graph::capture(s, |s| self.draft_enqueue(ws, s, m))?;
-                ws.dgraphs.insert(m, g);
+            if !ws.dgraphs.contains_key(&(m, nd)) {
+                let g = quench6k_cuda::Graph::capture(s, |s| self.draft_enqueue(ws, s, m, nd))?;
+                ws.dgraphs.insert((m, nd), g);
             }
-            ws.dgraphs[&m].launch(s)?;
+            ws.dgraphs[&(m, nd)].launch(s)?;
         } else {
-            self.draft_enqueue(ws, s, m)?;
+            self.draft_enqueue(ws, s, m, nd)?;
         }
         s.synchronize()?;
         let dw = ws.draft.as_mut().unwrap();
-        let nd = b - 1;
+        let all = b - 1;
         let back = dw.stage_bytes.next_multiple_of(64);
         for (j, &i) in live.iter().enumerate() {
-            let words = &dw.pinned.as_slice()[back + j * 2 * nd * 4..back + (j + 1) * 2 * nd * 4];
+            let words = &dw.pinned.as_slice()[back + j * 2 * all * 4..back + (j + 1) * 2 * all * 4];
             let w = |x: usize| <[u8; 4]>::try_from(&words[x * 4..x * 4 + 4]).unwrap();
-            out[i] = (0..nd).map(|x| i32::from_le_bytes(w(x))).collect();
-            dw.confs[i] = (0..nd).map(|x| f32::from_le_bytes(w(nd + x))).collect();
+            let k = most[i].clamp(1, nd);
+            out[i] = (0..k).map(|x| i32::from_le_bytes(w(x))).collect();
+            dw.confs[i] = (0..k).map(|x| f32::from_le_bytes(w(all + x))).collect();
         }
         if let Some(dir) = std::env::var_os("QUENCH6K_INK_DUMP_DRAFT")
             && m == 1
@@ -1042,9 +1066,10 @@ impl InklingModel {
         ws.draft.as_ref().map(|dw| dw.confs.clone()).unwrap_or_default()
     }
 
-    /// The drafter's pass over `m` sequences' blocks (staged in dw.stage): block rows of sequence j are
-    /// rows j * block ...; every kernel's row results are independent of the other rows.
-    fn draft_enqueue(&self, ws: &Workspace, s: &Stream, m: usize) -> Result<()> {
+    /// The drafter's pass over `m` sequences' blocks (staged in dw.stage), computing the first `nd`
+    /// drafts of each: block rows of sequence j are rows j * block ...; every kernel's row results are
+    /// independent of the other rows.
+    fn draft_enqueue(&self, ws: &Workspace, s: &Stream, m: usize, nd: usize) -> Result<()> {
         let cfg = &self.cfg;
         let d = self.drafter.as_ref().unwrap();
         let dw = ws.draft.as_ref().unwrap();
@@ -1073,10 +1098,11 @@ impl InklingModel {
         let n = b - 1;
         ik::rms(s, &[RmsSet { x: dw.x, w: d.norm, out: dw.hf, ldo: 2 * D }], r)?;
         ik::mix(s, ws.feats, rows_from, sq, d.alpha + (d.layers.len() * 16) as u64, d.markov_norm, dw.hf + (D * 2) as u64, 2 * D, r)?;
-        // The block rows that predict drafts (1.. of each block; row 0's logits are not used).
+        // The block rows that predict the drafts computed (1 ..= nd of each block; row 0's logits are not
+        // used).
         if self.lm_head.fmt == WeightFormat::Fp8Block && lm_rows_on() {
             let l = &self.lm_head;
-            ik::lm_rows(s, dw.hf, 2 * D, m * (b - 1), b, l.w, l.scale, dw.base, cfg.vocab, l.n, l.k)?;
+            ik::lm_rows(s, dw.hf, 2 * D, m * nd, b, nd, l.w, l.scale, dw.base, cfg.vocab, l.n, l.k)?;
         } else {
             linear(s, dw.hf, 2 * D, r, &self.lm_head, dw.base, cfg.vocab, true)?;
         }
@@ -1096,7 +1122,7 @@ impl InklingModel {
             out: 2 * n,
             cand: b * per,
         };
-        for i in 0..n {
+        for i in 0..nd {
             let (sin, sout) = (dw.state + ((i % 2) * 512) as u64, dw.state + (((i + 1) % 2) * 512) as u64);
             ik::markov(
                 s,
@@ -1509,7 +1535,7 @@ impl InklingModel {
             let x = hidden + (first * 4 * D * 2) as u64;
             let l = &self.lm_head;
             if small && rows > LM_ROWS_GEMV && l.fmt == WeightFormat::Fp8Block && lm_rows_on() {
-                ik::lm_rows(s, x, 4 * D, rows, 0, l.w, l.scale, ws.out_logits, cfg.vocab, l.n, l.k)?;
+                ik::lm_rows(s, x, 4 * D, rows, 0, 0, l.w, l.scale, ws.out_logits, cfg.vocab, l.n, l.k)?;
             } else {
                 linear(s, x, 4 * D, rows, l, ws.out_logits, cfg.vocab, small)?;
             }
