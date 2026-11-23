@@ -87,7 +87,7 @@ impl Candidates {
         self.asked.push(pool);
         let Some((base, total, have)) = self.step else { return Ok(None) };
         let row_bytes = (fl::VOCAB * 4) as u64;
-        if have != pool || src < base || (src - base) % row_bytes != 0 || ((src - base) / row_bytes) as usize + rows > total {
+        if have != pool || src < base || !(src - base).is_multiple_of(row_bytes) || ((src - base) / row_bytes) as usize + rows > total {
             return Ok(None);
         }
         if !self.ready {
