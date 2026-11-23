@@ -903,7 +903,12 @@ impl<E: SlotEngine> Sched<'_, E> {
             let last = end == len;
             let ids = r.job.ids[at..end].to_vec();
             self.with_memory(slot, |e, st| e.reserve(st, end))?;
-            let src = self.with_memory(slot, |e, st| e.prefill(st, &ids, last))?;
+            // A chunk that ran out of memory after it advanced the sequence (an engine allocating at a
+            // boundary) is not fed again.
+            let src = self.with_memory(slot, |e, st| {
+                anyhow::ensure!(e.pos(st) == at, "prefill chunk at {at} failed after advancing the sequence to {}", e.pos(st));
+                e.prefill(st, &ids, last)
+            })?;
             computed += end - at;
             let r = self.reqs[slot].as_mut().unwrap();
             r.at = end;

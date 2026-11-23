@@ -102,6 +102,9 @@ struct Opts {
     fixed: usize,
     snap: usize,
     snap_at: usize,
+    /// The snapshot is allocated after the step that reaches `snap_at` has fed its tokens (an engine
+    /// that fails after advancing the sequence).
+    snap_late: bool,
     /// Positions mapped at once (growable states).
     grain: usize,
     growable: bool,
@@ -121,6 +124,7 @@ impl Default for Opts {
             fixed: 0,
             snap: 0,
             snap_at: 0,
+            snap_late: false,
             grain: 1,
             growable: false,
             drafter: Drafter::None,
@@ -222,7 +226,8 @@ impl Mock {
     fn feed(&mut self, st: &mut MState, toks: &[i32]) -> Result<[i32; 8]> {
         anyhow::ensure!(st.hist.len() + toks.len() <= st.cap, "context full");
         anyhow::ensure!(!self.o.growable || st.hist.len() + toks.len() <= st.mapped, "positions not reserved");
-        if self.o.snap > 0 && !st.snap && st.hist.len() + toks.len() >= self.o.snap_at {
+        let snap = self.o.snap > 0 && !st.snap && st.hist.len() + toks.len() >= self.o.snap_at;
+        if snap && !self.o.snap_late {
             self.take(self.o.snap, "snapshot")?;
             st.snap = true;
             st.bytes += self.o.snap;
@@ -235,6 +240,11 @@ impl Mock {
         st.hist.extend_from_slice(toks);
         st.last_t = toks.len();
         self.last = st.id;
+        if snap && self.o.snap_late {
+            self.take(self.o.snap, "snapshot")?;
+            st.snap = true;
+            st.bytes += self.o.snap;
+        }
         Ok(rows)
     }
 }
@@ -966,5 +976,22 @@ fn outgrowing_requests_plans_are_kept() {
     ga.extend(rest);
     assert!(ea.as_ref().is_err_and(|e| e.contains("beyond its plan")), "{ea:?}");
     assert!(ga.len() > 4196 && ga.len() < 16_000 && ga == expected(&a, ga.len(), &[]), "{}", ga.len());
+    srv.stop();
+}
+
+/// A prefill chunk that runs out of memory after it advanced the sequence is not fed a second time:
+/// the request fails with an error that says so, and the server goes on.
+#[test]
+fn prefill_failing_after_advancing_is_not_repeated() {
+    let o = Opts { total: 250, growable: true, snap: 150, snap_at: 64, snap_late: true, chunk: 32, ..Default::default() };
+    let srv = server(2, 1000, o);
+    // An idle conversation (below the snapshot's position) holds memory the snapshot needs.
+    let (_, e) = collect(srv.send(prompt(1, 40), 8, false));
+    assert_eq!(e, Ok((Finish::Length, 0)));
+    let (g, e) = collect(srv.send(prompt(2, 100), 8, false));
+    assert!(g.is_empty() && e.as_ref().is_err_and(|e| e.contains("after advancing")), "{e:?}");
+    let p = prompt(3, 20);
+    let (g, e) = collect(srv.send(p.clone(), 8, false));
+    assert_eq!((g, e), (expected(&p, 8, &[]), Ok((Finish::Length, 0))));
     srv.stop();
 }
