@@ -308,10 +308,16 @@ fn timed(
     let mut text = Vec::new();
     // Two warm-up steps (the first plain: the drafter needs a step's hidden states; graph captures),
     // then the timed ones.
+    // QUENCH6K_HY4_PROFILE=1: the timed steps inside a cudaProfilerStart/Stop region (nsys
+    // --capture-range=cudaProfilerApi --capture-range-end=repeat: one report per timed run).
+    let profile = std::env::var("QUENCH6K_HY4_PROFILE").is_ok_and(|v| v == "1");
     let mut t0 = Instant::now();
     for it in 0..steps + 2 {
         if it == 2 {
             s.synchronize()?;
+            if profile {
+                quench6k_cuda::profiler_start()?;
+            }
             t0 = Instant::now();
             produced = 0;
         }
@@ -345,6 +351,10 @@ fn timed(
         }
     }
     let secs = t0.elapsed().as_secs_f64();
+    if profile {
+        s.synchronize()?;
+        quench6k_cuda::profiler_stop()?;
+    }
     for (st, &c) in states.iter_mut().zip(&ctx) {
         st.truncate(c);
     }
@@ -376,15 +386,22 @@ fn throughput(model: &Hy4Model, s: &Stream, ws: &mut Workspace, text: &[i32], ct
             .ok()
             .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).filter(|&n| (1..=MAX_SEQS).contains(&n)).collect())
             .unwrap_or_else(|| vec![1, 2, 4, 8]);
-        // QUENCH6K_HY4_AB=1: each case four times, batched GEMV forms on, off, off, on (the same bits).
-        let ab = std::env::var("QUENCH6K_HY4_AB").is_ok_and(|v| v == "1");
+        // QUENCH6K_HY4_AB=1: each case four times, batched GEMV forms on, off, off, on (the same bits);
+        // QUENCH6K_HY4_AB=fuse: the fused small-step launches on, off, off, on.
+        let ab = std::env::var("QUENCH6K_HY4_AB").is_ok_and(|v| v == "1" || v == "fuse");
+        let fuse_ab = std::env::var("QUENCH6K_HY4_AB").is_ok_and(|v| v == "fuse");
         for &n in &counts {
             for &d in std::iter::once(&0).chain(drafts) {
                 let arms: &[Option<bool>] = if ab { &[Some(true), Some(false), Some(false), Some(true)] } else { &[None] };
                 let mut texts: Vec<Vec<i32>> = Vec::new();
                 for &arm in arms {
                     if let Some(on) = arm {
-                        quench6k_engine::hy4::forward::set_batched_gemv(on);
+                        // QUENCH6K_HY4_AB=fuse: the fused launches on and off instead.
+                        if fuse_ab {
+                            quench6k_engine::hy4::forward::set_fused(on);
+                        } else {
+                            quench6k_engine::hy4::forward::set_batched_gemv(on);
+                        }
                         ws.clear_graphs();
                     }
                     let (secs, produced, text) = timed(model, s, ws, &mut states, &firsts, n, d, steps)?;

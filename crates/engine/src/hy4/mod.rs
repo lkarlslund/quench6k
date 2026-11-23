@@ -233,6 +233,9 @@ pub struct Attn {
     pub post_norm: u64,
     pub sinks: u64,
     pub indexer: Option<Indexer>,
+    /// q_a and kv_a (and the indexer's token key and head weight projections) stacked, rows
+    /// [q_a | kv_a | tk | hw], when their formats agree: one GEMV for the small steps.
+    pub proj_in: Option<Linear>,
 }
 
 /// Routed experts of one layer plus the per-expert pointer tables of the grouped GEMM.
@@ -254,6 +257,9 @@ pub struct Moe {
     pub shared_up: Linear,
     pub shared_down: Linear,
     pub norm: u64,
+    /// down_lat, shared_gate and shared_up stacked, rows [down_lat | shared_gate | shared_up], when their
+    /// formats agree: one GEMV for the small steps.
+    pub mlp_in: Option<Linear>,
 }
 
 pub struct Dense {
@@ -261,6 +267,8 @@ pub struct Dense {
     pub up: Linear,
     pub down: Linear,
     pub norm: u64,
+    /// gate and up stacked ([gate | up]) when their formats agree.
+    pub gate_up: Option<Linear>,
 }
 
 pub enum Mlp {
@@ -378,6 +386,8 @@ pub struct DflyLayer {
     pub gate: Linear,
     pub up: Linear,
     pub down: Linear,
+    /// gate and up stacked ([gate | up]) when their formats agree.
+    pub gate_up: Option<Linear>,
 }
 
 /// The checkpoint's DFly drafter (`model.dfly_layers`). After a target step it drafts the tokens that follow
@@ -397,6 +407,8 @@ pub struct Dfly {
     pub c_gate: Linear,
     pub c_up: Linear,
     pub c_down: Linear,
+    /// c_gate and c_up stacked ([c_gate | c_up]) when their formats agree.
+    pub c_gate_up: Option<Linear>,
     /// The target's token embedding on the device (BF16 [vocab, 3072]).
     pub embed: u64,
     pub mask: i32,
@@ -481,30 +493,17 @@ impl Hy4Model {
             let post_attn_norm = l.raw(&n("post_attention_layernorm.weight"), DType::BF16, Some(&[D]))?;
             let sliding = cfg.sliding[i];
             let heads = if sliding { cfg.heads_sliding } else { cfg.heads_indexed };
-            let a = |x: &str| n(&format!("self_attn.{x}"));
-            let indexer = if sliding {
-                None
-            } else {
-                let x = |y: &str| a(&format!("compressed_indexer.{y}"));
-                Some(Indexer {
-                    q: l.linear(&x("query_projection.weight"), Some((IH * ID, Q_LORA)))?,
-                    hw: l.linear(&x("head_weight_projection.weight"), Some((IH, D)))?,
-                    tk: l.linear(&x("token_key_projection.weight"), Some((ID, D)))?,
-                    tk_norm: l.raw(&x("token_key_norm.weight"), DType::BF16, Some(&[ID]))?,
-                    wv: l.raw(&x("key_value_projection.weight"), DType::F32, Some(&[ID, ID]))?,
-                    wg: l.raw(&x("key_gate_projection.weight"), DType::F32, Some(&[ID, ID]))?,
-                    ape: l.raw(&x("intra_group_ape"), DType::F32, Some(&[GROUP, ID]))?,
-                    key_norm: l.raw(&x("key_norm.weight"), DType::F32, Some(&[ID]))?,
-                })
-            };
-            let attn = l.attn(&n("self_attn"), heads, sliding, indexer)?;
+            let attn = l.attn(&n("self_attn"), heads, sliding, !sliding)?;
             let m = |x: &str| n(&format!("mlp.{x}"));
             let mlp = if cfg.dense_mlp[i] {
+                let (gate_up, gu) = l.linears(&[(&m("gate_proj.weight"), None), (&m("up_proj.weight"), None)], false)?;
+                ensure!(gu[0].n == gu[1].n, "{}: gate and up widths differ", m("gate_proj.weight"));
                 Mlp::Dense(Dense {
-                    gate: l.linear(&m("gate_proj.weight"), None)?,
-                    up: l.linear(&m("up_proj.weight"), None)?,
+                    gate: gu[0],
+                    up: gu[1],
                     down: l.linear(&m("down_proj.weight"), None)?,
                     norm: l.raw(&m("post_fc2_norm.weight"), DType::BF16, Some(&[D]))?,
+                    gate_up,
                 })
             } else {
                 let ex = |l: &mut Loader, which: &str| -> Result<Experts> {
@@ -522,10 +521,18 @@ impl Hy4Model {
                     let sc: Vec<u64> = (0..EXPERTS).map(|x| e.scales + (x * LAT * LAT / 16) as u64).collect();
                     tables[slot] = (l.upload_slice(&c)?, l.upload_slice(&sc)?);
                 }
+                let (mlp_in, v) = l.linears(
+                    &[
+                        (&m("routed_expert_down_proj.weight"), Some((LAT, D))),
+                        (&m("shared_experts.gate_proj.weight"), Some((LAT, D))),
+                        (&m("shared_experts.up_proj.weight"), Some((LAT, D))),
+                    ],
+                    false,
+                )?;
                 Mlp::Moe(Moe {
                     router: l.linear(&m("gate.weight"), Some((EXPERTS, D)))?,
                     bias: l.raw(&m("gate.e_score_correction_bias"), DType::F32, Some(&[EXPERTS]))?,
-                    down_lat: l.linear(&m("routed_expert_down_proj.weight"), Some((LAT, D)))?,
+                    down_lat: v[0],
                     up_lat: l.linear(&m("routed_expert_up_proj.weight"), Some((D, LAT)))?,
                     experts: RoutedExperts {
                         gate,
@@ -533,10 +540,11 @@ impl Hy4Model {
                         down,
                         tables,
                     },
-                    shared_gate: l.linear(&m("shared_experts.gate_proj.weight"), Some((LAT, D)))?,
-                    shared_up: l.linear(&m("shared_experts.up_proj.weight"), Some((LAT, D)))?,
+                    shared_gate: v[1],
+                    shared_up: v[2],
                     shared_down: l.linear(&m("shared_experts.down_proj.weight"), Some((D, LAT)))?,
                     norm: l.raw(&m("combine_output_norm.weight"), DType::BF16, Some(&[D]))?,
+                    mlp_in,
                 })
             };
             let table = format!("model.layers.{i}.engram_layer.multi_head_embedding.embedding.weight");
@@ -645,6 +653,18 @@ fn fp8_at_load(name: &str) -> bool {
 
 const DIRECT_ALIGN: usize = 4096;
 
+/// Where a projection's device weights come from.
+#[derive(Clone, Copy)]
+enum Src {
+    Bf16,
+    /// BF16 quantized at load to block-128 FP8.
+    Fp8AtLoad,
+    /// FP8 with `<name>_scale_inv` block scales.
+    Fp8,
+    /// NVFP4 requantized to block-128 FP8.
+    Nvfp4,
+}
+
 struct Loader<'a> {
     ckpt: &'a Checkpoint,
     s: &'a Stream,
@@ -745,44 +765,145 @@ impl Loader<'_> {
         self.upload_tensor(name)
     }
 
-    /// A projection: BF16, or FP8 with `<name>_scale_inv` block scales.
-    fn linear(&mut self, name: &str, shape: Option<(usize, usize)>) -> Result<Linear> {
-        let info = self.ckpt.get(name)?.clone();
+    /// How projection `name` is kept on the device: (source kind, format, n, k).
+    fn plan(&self, name: &str, nvfp4: bool) -> Result<(Src, WeightFormat, usize, usize)> {
+        let info = self.ckpt.get(name)?;
         ensure!(info.shape.len() == 2, "{name}: not a matrix");
         let (n, k) = (info.shape[0], info.shape[1]);
-        if let Some((sn, sk)) = shape {
-            ensure!((n, k) == (sn, sk), "{name}: shape [{n}, {k}], expected [{sn}, {sk}]");
+        if nvfp4 {
+            return Ok((Src::Nvfp4, WeightFormat::Fp8Block, n, k * 2));
         }
-        if info.dtype == DType::BF16 && k % 128 == 0 && fp8_at_load(name) {
+        Ok(match info.dtype {
             // Quantized at load to block-128 FP8 (QUENCH6K_HY4_FP8).
-            let tmp = DeviceBuffer::new(n * k * 2)?;
-            self.copy_tensor(name, tmp.addr())?;
-            let w = self.alloc(n * k)?;
-            let scale = self.alloc(n.div_ceil(128) * (k / 128) * 4)?;
-            quench6k_cuda::hy4::quantize_fp8b(self.s, tmp.addr(), n, k, w, scale)?;
-            self.s.synchronize()?;
-            return Ok(Linear { w, scale, fmt: WeightFormat::Fp8Block, n, k });
-        }
-        let (fmt, scale) = match info.dtype {
-            DType::BF16 => (WeightFormat::Bf16, 0),
+            DType::BF16 if k % 128 == 0 && fp8_at_load(name) => (Src::Fp8AtLoad, WeightFormat::Fp8Block, n, k),
+            DType::BF16 => (Src::Bf16, WeightFormat::Bf16, n, k),
             DType::F8E4M3 => {
-                let sname = format!("{name}_scale_inv");
-                ensure!(
-                    k % 128 == 0,
-                    "{name}: block-FP8 needs K a multiple of 128"
-                );
-                let scale = self.raw(&sname, DType::F32, Some(&[n.div_ceil(128), k / 128]))?;
-                (WeightFormat::Fp8Block, scale)
+                ensure!(k % 128 == 0, "{name}: block-FP8 needs K a multiple of 128");
+                (Src::Fp8, WeightFormat::Fp8Block, n, k)
             }
             other => bail!("{name}: unsupported projection dtype {other:?}"),
-        };
-        let w = self.upload_tensor(name)?;
-        Ok(Linear { w, scale, fmt, n, k })
+        })
+    }
+
+    /// Writes projection `name` (planned as `src`) to device weights `w` and, for FP8, block scales `scale`
+    /// ([ceil(n / 128), k / 128] F32).
+    fn fill(&mut self, name: &str, src: Src, n: usize, k: usize, w: u64, scale: u64) -> Result<()> {
+        match src {
+            Src::Bf16 => {
+                self.copy_tensor(name, w)?;
+            }
+            Src::Fp8AtLoad => {
+                let tmp = DeviceBuffer::new(n * k * 2)?;
+                self.copy_tensor(name, tmp.addr())?;
+                quench6k_cuda::hy4::quantize_fp8b(self.s, tmp.addr(), n, k, w, scale)?;
+                self.s.synchronize()?;
+            }
+            Src::Fp8 => {
+                let sname = format!("{name}_scale_inv");
+                let info = self.ckpt.get(&sname)?;
+                let want = [n.div_ceil(128), k / 128];
+                ensure!(info.dtype == DType::F32 && info.shape == want, "{sname}: {:?} {:?}, expected F32 {want:?}", info.dtype, info.shape);
+                self.copy_tensor(name, w)?;
+                self.copy_tensor(&sname, scale)?;
+            }
+            Src::Nvfp4 => {
+                // NVFP4 (codes [n, k / 2], E4M3 scales per 16, scalar weight_scale_2) requantized to
+                // block-128 FP8 (the GEMV has no NVFP4 path).
+                let sname = format!("{name}_scale");
+                for (t, dtype, shape) in [(name, DType::U8, [n, k / 2]), (sname.as_str(), DType::F8E4M3, [n, k / 16])] {
+                    let info = self.ckpt.get(t)?;
+                    ensure!(info.dtype == dtype && info.shape == shape, "{t}: {:?} {:?}", info.dtype, info.shape);
+                }
+                let codes = DeviceBuffer::new(n * k / 2)?;
+                let scales = DeviceBuffer::new(n * k / 16)?;
+                self.copy_tensor(name, codes.addr())?;
+                self.copy_tensor(&sname, scales.addr())?;
+                let s2b = self.read(&format!("{name}_scale_2"))?;
+                ensure!(s2b.len() == 4, "{name}_scale_2: not a scalar");
+                let s2 = f32::from_le_bytes(s2b[..4].try_into().unwrap());
+                let tmp = DeviceBuffer::new(n * k * 2)?;
+                quench6k_cuda::hy4::nvfp4_to_bf16(self.s, codes.addr(), scales.addr(), s2, n, k, tmp.addr())?;
+                quench6k_cuda::hy4::quantize_fp8b(self.s, tmp.addr(), n, k, w, scale)?;
+                self.s.synchronize()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A projection: BF16, or FP8 with `<name>_scale_inv` block scales.
+    fn linear(&mut self, name: &str, shape: Option<(usize, usize)>) -> Result<Linear> {
+        Ok(self.linears(&[(name, shape)], false)?.1.pop().unwrap())
+    }
+
+    /// Projections of the same input stored as one matrix, rows in the given order, when their formats
+    /// and widths agree (FP8 parts but the last a multiple of 128 rows): (the stacked matrix, a view of
+    /// each part in it). A GEMV gives every row of the stacked matrix the bits of its part's own launch.
+    /// Otherwise (or for a single part) each part on its own and no stacked matrix. `nvfp4`: NVFP4
+    /// checkpoint projections requantized to block-128 FP8.
+    fn linears(&mut self, parts: &[(&str, Option<(usize, usize)>)], nvfp4: bool) -> Result<(Option<Linear>, Vec<Linear>)> {
+        let mut plans = Vec::with_capacity(parts.len());
+        for &(name, shape) in parts {
+            let p = self.plan(name, nvfp4)?;
+            if let Some((sn, sk)) = shape {
+                ensure!((p.2, p.3) == (sn, sk), "{name}: shape [{}, {}], expected [{sn}, {sk}]", p.2, p.3);
+            }
+            plans.push(p);
+        }
+        let (fmt, k) = (plans[0].1, plans[0].3);
+        let fp8 = fmt == WeightFormat::Fp8Block;
+        let stack = parts.len() > 1
+            && plans.iter().all(|p| p.1 == fmt && p.3 == k)
+            && (!fp8 || plans[..plans.len() - 1].iter().all(|p| p.2 % 128 == 0));
+        let elem = if fp8 { 1 } else { 2 };
+        let scale_bytes = |n: usize| if fp8 { n.div_ceil(128) * (k / 128) * 4 } else { 0 };
+        let mut views = Vec::with_capacity(parts.len());
+        if !stack {
+            for (&(name, _), &(src, fmt, n, k)) in parts.iter().zip(&plans) {
+                let w = self.alloc(n * k * elem)?;
+                let scale = if fp8 { self.alloc(scale_bytes(n))? } else { 0 };
+                self.fill(name, src, n, k, w, scale)?;
+                views.push(Linear { w, scale, fmt, n, k });
+            }
+            return Ok((None, views));
+        }
+        let total: usize = plans.iter().map(|p| p.2).sum();
+        let w = self.alloc(total * k * elem)?;
+        let scale = if fp8 { self.alloc(scale_bytes(total))? } else { 0 };
+        let mut row = 0;
+        for (&(name, _), &(src, _, n, _)) in parts.iter().zip(&plans) {
+            let (pw, ps) = (w + (row * k * elem) as u64, if fp8 { scale + scale_bytes(row) as u64 } else { 0 });
+            self.fill(name, src, n, k, pw, ps)?;
+            views.push(Linear { w: pw, scale: ps, fmt, n, k });
+            row += n;
+        }
+        Ok((Some(Linear { w, scale, fmt, n: total, k }), views))
     }
 
     /// An MLA attention sublayer under `prefix` (`...self_attn`).
-    fn attn(&mut self, prefix: &str, heads: usize, sliding: bool, indexer: Option<Indexer>) -> Result<Attn> {
+    fn attn(&mut self, prefix: &str, heads: usize, sliding: bool, indexed: bool) -> Result<Attn> {
         let a = |x: &str| format!("{prefix}.{x}");
+        let x = |y: &str| a(&format!("compressed_indexer.{y}"));
+        let mut parts = vec![(a("q_a_proj.weight"), Some((Q_LORA, D))), (a("kv_a_proj_with_mqa.weight"), Some((KROW, D)))];
+        if indexed {
+            parts.push((x("token_key_projection.weight"), Some((ID, D))));
+            parts.push((x("head_weight_projection.weight"), Some((IH, D))));
+        }
+        let parts: Vec<(&str, Option<(usize, usize)>)> = parts.iter().map(|(n, sh)| (n.as_str(), *sh)).collect();
+        let (proj_in, v) = self.linears(&parts, false)?;
+        let indexer = if indexed {
+            Some(Indexer {
+                q: self.linear(&x("query_projection.weight"), Some((IH * ID, Q_LORA)))?,
+                hw: v[3],
+                tk: v[2],
+                tk_norm: self.raw(&x("token_key_norm.weight"), DType::BF16, Some(&[ID]))?,
+                wv: self.raw(&x("key_value_projection.weight"), DType::F32, Some(&[ID, ID]))?,
+                wg: self.raw(&x("key_gate_projection.weight"), DType::F32, Some(&[ID, ID]))?,
+                ape: self.raw(&x("intra_group_ape"), DType::F32, Some(&[GROUP, ID]))?,
+                key_norm: self.raw(&x("key_norm.weight"), DType::F32, Some(&[ID]))?,
+            })
+        } else {
+            None
+        };
         let kv_b_bytes = self.expect(&a("kv_b_proj.weight"), DType::BF16, &[heads * (NOPE + VD), KV_LORA])?;
         let kv_b = self.upload_bytes(&kv_b_bytes)?;
         // Transposed key rows: wuk_t[h][j][i] = kv_b[h * 448 + i][j].
@@ -812,10 +933,10 @@ impl Loader<'_> {
         Ok(Attn {
             heads,
             sliding,
-            q_a: self.linear(&a("q_a_proj.weight"), Some((Q_LORA, D)))?,
+            q_a: v[0],
             q_a_norm: self.raw(&a("q_a_layernorm.weight"), DType::BF16, Some(&[Q_LORA]))?,
             q_b: self.linear(&a("q_b_proj.weight"), Some((heads * QK, Q_LORA)))?,
-            kv_a: self.linear(&a("kv_a_proj_with_mqa.weight"), Some((KROW, D)))?,
+            kv_a: v[1],
             kv_a_norm: self.raw(&a("kv_a_layernorm.weight"), DType::BF16, Some(&[KV_LORA]))?,
             kv_b,
             wuk_t,
@@ -824,31 +945,8 @@ impl Loader<'_> {
             post_norm: self.raw(&a("post_proj_norm.weight"), DType::BF16, Some(&[D]))?,
             sinks,
             indexer,
+            proj_in,
         })
-    }
-
-    /// An NVFP4 projection (codes `[n, k / 2]`, E4M3 scales per 16, scalar `weight_scale_2`) requantized to
-    /// block-128 FP8 (the GEMV has no NVFP4 path).
-    fn nvfp4_linear(&mut self, name: &str, n: usize, k: usize) -> Result<Linear> {
-        let sname = format!("{name}_scale");
-        for (t, dtype, shape) in [(name, DType::U8, [n, k / 2]), (sname.as_str(), DType::F8E4M3, [n, k / 16])] {
-            let info = self.ckpt.get(t)?;
-            ensure!(info.dtype == dtype && info.shape == shape, "{t}: {:?} {:?}", info.dtype, info.shape);
-        }
-        let codes = DeviceBuffer::new(n * k / 2)?;
-        let scales = DeviceBuffer::new(n * k / 16)?;
-        self.copy_tensor(name, codes.addr())?;
-        self.copy_tensor(&sname, scales.addr())?;
-        let s2b = self.read(&format!("{name}_scale_2"))?;
-        ensure!(s2b.len() == 4, "{name}_scale_2: not a scalar");
-        let s2 = f32::from_le_bytes(s2b[..4].try_into().unwrap());
-        let tmp = DeviceBuffer::new(n * k * 2)?;
-        quench6k_cuda::hy4::nvfp4_to_bf16(self.s, codes.addr(), scales.addr(), s2, n, k, tmp.addr())?;
-        let w = self.alloc(n * k)?;
-        let scale = self.alloc(n.div_ceil(128) * (k / 128) * 4)?;
-        quench6k_cuda::hy4::quantize_fp8b(self.s, tmp.addr(), n, k, w, scale)?;
-        self.s.synchronize()?;
-        Ok(Linear { w, scale, fmt: WeightFormat::Fp8Block, n, k })
     }
 
     /// The DFly drafter, if the checkpoint has one.
@@ -890,26 +988,29 @@ impl Loader<'_> {
             .and_then(|v| v.get("num_speculative_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(5) as usize;
-        let fp4 = |l: &mut Self, name: &str| -> Result<Linear> {
-            let info = l.ckpt.get(name)?;
-            ensure!(info.shape.len() == 2, "{name}: not a matrix");
-            let (n, k) = (info.shape[0], info.shape[1] * 2);
-            l.nvfp4_linear(name, n, k)
+        let fp4 = |l: &mut Self, names: &[&str]| -> Result<(Option<Linear>, Vec<Linear>)> {
+            let parts: Vec<(&str, Option<(usize, usize)>)> = names.iter().map(|&n| (n, None)).collect();
+            l.linears(&parts, true)
         };
         let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let n = |x: &str| format!("model.dfly_layers.{i}.{x}");
-            let attn = self.attn(&n("self_attn"), cfg.heads_indexed, false, None)?;
+            let attn = self.attn(&n("self_attn"), cfg.heads_indexed, false, false)?;
+            let (gate_up, gu) = fp4(self, &[&n("mlp.gate_proj.weight"), &n("mlp.up_proj.weight")])?;
+            ensure!(gu[0].n == gu[1].n, "drafter layer {i}: gate and up widths differ");
             layers.push(DflyLayer {
                 in_norm: self.raw(&n("input_layernorm.weight"), DType::BF16, Some(&[D]))?,
                 post_attn_norm: self.raw(&n("post_attention_layernorm.weight"), DType::BF16, Some(&[D]))?,
                 attn,
-                gate: fp4(self, &n("mlp.gate_proj.weight"))?,
-                up: fp4(self, &n("mlp.up_proj.weight"))?,
-                down: fp4(self, &n("mlp.down_proj.weight"))?,
+                gate: gu[0],
+                up: gu[1],
+                down: fp4(self, &[&n("mlp.down_proj.weight")])?.1[0],
+                gate_up,
             });
         }
         let x = |y: &str| format!("model.dfly_layers.{y}");
+        let (c_gate_up, cgu) = fp4(self, &[&x("hidden_correction.gate_proj.weight"), &x("hidden_correction.up_proj.weight")])?;
+        ensure!(cgu[0].n == cgu[1].n, "hidden_correction: gate and up widths differ");
         let dfly = Dfly {
             layers,
             norm: self.raw(&x("final_norm.weight"), DType::BF16, Some(&[D]))?,
@@ -919,9 +1020,10 @@ impl Loader<'_> {
             fuse_gate: self.raw(&x("mtp_fusion.gate"), DType::BF16, Some(&[D]))?,
             c_hidden_norm: self.raw(&x("hidden_correction.hidden_norm.weight"), DType::BF16, Some(&[D]))?,
             c_embed_norm: self.raw(&x("hidden_correction.embed_norm.weight"), DType::BF16, Some(&[D]))?,
-            c_gate: fp4(self, &x("hidden_correction.gate_proj.weight"))?,
-            c_up: fp4(self, &x("hidden_correction.up_proj.weight"))?,
-            c_down: fp4(self, &x("hidden_correction.down_proj.weight"))?,
+            c_gate: cgu[0],
+            c_up: cgu[1],
+            c_down: fp4(self, &[&x("hidden_correction.down_proj.weight")])?.1[0],
+            c_gate_up,
             embed: self.upload_bytes(embed)?,
             mask,
             index_layers,

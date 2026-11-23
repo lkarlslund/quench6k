@@ -88,6 +88,13 @@ impl Alloc {
         self.bytes += bytes;
         Ok(a)
     }
+    fn zeroed(&mut self, bytes: usize) -> Result<u64> {
+        let b = DeviceBuffer::zeroed(bytes.max(256))?;
+        let a = b.addr();
+        self.buffers.push(b);
+        self.bytes += bytes;
+        Ok(a)
+    }
 }
 
 /// Byte layout of a sequence's drafter buffer: per target layer the drafter reuses, the key lists
@@ -450,6 +457,10 @@ pub struct Workspace {
     x: u64,
     post: u64,
     hc_part: u64,
+    /// I32 [T] arrival counters of the fused sublayer boundaries (zero between launches).
+    hc_count: u64,
+    /// Floats each of f_a, f_b holds.
+    f_floats: usize,
     f_a: u64, // F32 scratch [T, max(16384, 13824 ...)]
     f_b: u64,
     f_c: u64,
@@ -647,6 +658,8 @@ impl Workspace {
             x: a.get(t * D * 2)?,
             post: a.get(t * HC * 4)?,
             hc_part: a.get(hk::hc_partial_floats(t) * 4)?,
+            hc_count: a.zeroed(t * 4)?,
+            f_floats: t * f_width,
             f_a: a.get(t * f_width * 4)?,
             f_b: a.get(t * f_width * 4)?,
             f_c: a.get(t * D * 4)?,
@@ -784,6 +797,9 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
     if m <= gm || small {
         let size = l.n * l.k;
         if m > 1 && matches!(l.fmt, k::WeightFormat::Bf16 | k::WeightFormat::Fp8Block) && wide_enabled() {
+            if let Some((mt, r)) = wide_form(l, m) {
+                return hk::gemv_wide(s, m, mt, r, x, ldx, l.fmt, l.w, l.scale, y, ldy, l.n, l.k);
+            }
             // The wide GEMV runs blocks of 16 rows: not for a last block of 8 rows or fewer.
             if size >= 12 << 20 && m > 8 && (m % 16 == 0 || m % 16 > 8) {
                 return hk::gemv_wide(s, m, 16, 4, x, ldx, l.fmt, l.w, l.scale, y, ldy, l.n, l.k);
@@ -799,6 +815,76 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
         Ok(())
     } else {
         k::gemm_f32(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, 1.0, false)
+    }
+}
+
+/// The wide GEMV's form (input rows, weight rows per warp) for 3 to 8 rows of `l`, where it beats the
+/// launches the rules in [`linear`] pick (hy4_micro at 600 W, per matrix shape; every form gives each row
+/// the bits of a one-row launch): None keeps those rules.
+fn wide_form(l: &Linear, m: usize) -> Option<(usize, usize)> {
+    if !fuse_enabled() {
+        return None;
+    }
+    let size = l.n * l.k;
+    let bf16 = l.fmt == k::WeightFormat::Bf16;
+    match m {
+        3..=4 if bf16 && size >= 12 << 20 => Some((4, 1)),
+        3..=4 if !bf16 && size >= 8 << 20 => Some((4, if l.k >= 8192 { 1 } else { 2 })),
+        5..=8 if bf16 && (3072..8192).contains(&l.k) => Some((8, if l.n >= 1024 { 1 } else { 2 })),
+        5..=8 if !bf16 && l.k < 8192 && size >= 12 << 20 => Some((8, 4)),
+        5..=8 if !bf16 && l.k < 8192 && size >= 8 << 20 => Some((8, 2)),
+        _ => None,
+    }
+}
+
+/// A sublayer's output before its norm: F32 rows [r, 3072] `a` (plus rows `b` added in BF16, when not 0),
+/// and the norm's weight.
+struct SubOut {
+    a: u64,
+    b: u64,
+    norm: u64,
+}
+
+/// The small steps' fused launches: sublayer boundaries in one launch, stacked projections, the wide GEMV
+/// forms of [`wide_form`] (the same bits either way). QUENCH6K_HY4_FUSE=0: separate launches.
+fn fuse_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match FUSE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var("QUENCH6K_HY4_FUSE").map_or(true, |v| v != "0") && std::env::var_os("QUENCH6K_HY4_DUMP").is_none();
+            FUSE.store(on as u8, Ordering::Relaxed);
+            hk::set_legacy(!on);
+            on
+        }
+    }
+}
+
+static FUSE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// Benchmarks: turns the small steps' fused launches on or off (the same bits either way). Steps captured
+/// as graphs keep the form they were captured with: clear them with [`Workspace::clear_graphs`].
+pub fn set_fused(on: bool) {
+    FUSE.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+    hk::set_legacy(!on);
+}
+
+/// act (BF16 [m, n]) = swiglu(gate(x), up(x)) without clamps: through the stacked [gate | up] matrix
+/// (`stacked`, one GEMV into f_a) when given and its rows fit, otherwise gate into f_a and up into f_b.
+#[allow(clippy::too_many_arguments)]
+fn gate_up(ws: &Workspace, s: &Stream, x: u64, ldx: usize, m: usize, g: &Linear, u: &Linear, stacked: Option<&Linear>, act: u64, small: bool) -> Result<()> {
+    let n = g.n;
+    match stacked.filter(|st| fuse_enabled() && m * st.n <= ws.f_floats) {
+        Some(st) => {
+            linear(s, x, ldx, m, st, ws.f_a, st.n, small)?;
+            hk::swiglu(s, ws.f_a, ws.f_a + (n * 4) as u64, st.n, n, 0.0, act, n, m)
+        }
+        None => {
+            linear(s, x, ldx, m, g, ws.f_a, n, small)?;
+            linear(s, x, ldx, m, u, ws.f_b, n, small)?;
+            hk::swiglu(s, ws.f_a, ws.f_b, n, n, 0.0, act, n, m)
+        }
     }
 }
 
@@ -1171,13 +1257,11 @@ impl Hy4Model {
             let slot = f.index_layers.iter().position(|&l| l == f.index_layers[li]).unwrap();
             let (ko, kno) = kl.ints(slot);
             hk::dfly_sel(s, at(lay.keep_tab), ko, kno, at(lay.anchor), at(lay.krow), n, w, d.sel, d.sel_n)?;
-            self.attn_output(ws, s, &layer.attn, AttnMode::Selected, cache, d.sel, d.sel_n, pos, seq, r, true)?;
+            self.attn_output(ws, s, &layer.attn, AttnMode::Selected, cache, d.sel, d.sel_n, pos, seq, r, true, true)?;
             hk::dfly_add(s, d.x, 1, ws.y, 0, 1, 0, 0, r)?;
             hk::rms_rows(s, d.x, D, layer.post_attn_norm, D, cfg.eps, ws.x, D, r)?;
             let nn = layer.gate.n;
-            linear(s, ws.x, D, r, &layer.gate, ws.f_a, nn, true)?;
-            linear(s, ws.x, D, r, &layer.up, ws.f_b, nn, true)?;
-            hk::swiglu(s, ws.f_a, ws.f_b, nn, nn, 0.0, ws.bf_a, nn, r)?;
+            gate_up(ws, s, ws.x, D, r, &layer.gate, &layer.up, layer.gate_up.as_ref(), ws.bf_a, true)?;
             linear(s, ws.bf_a, nn, r, &layer.down, ws.f_c, D, true)?;
             hk::dfly_add(s, d.x, 1, 0, ws.f_c, 1, 0, 0, r)?;
         }
@@ -1188,9 +1272,7 @@ impl Hy4Model {
             hk::dfly_norm(s, d.h, 0, D, at(lay.hidx + j * n * 4), f.c_hidden_norm, cfg.eps, d.cat, 2 * D, n)?;
             hk::dfly_norm(s, f.embed, 0, D, prev, f.c_embed_norm, cfg.eps, d.cat + (D * 2) as u64, 2 * D, n)?;
             let nn = f.c_gate.n;
-            linear(s, d.cat, 2 * D, n, &f.c_gate, ws.f_a, nn, true)?;
-            linear(s, d.cat, 2 * D, n, &f.c_up, ws.f_b, nn, true)?;
-            hk::swiglu(s, ws.f_a, ws.f_b, nn, nn, 0.0, ws.bf_a, nn, n)?;
+            gate_up(ws, s, d.cat, 2 * D, n, &f.c_gate, &f.c_up, f.c_gate_up.as_ref(), ws.bf_a, true)?;
             linear(s, ws.bf_a, nn, n, &f.c_down, ws.f_c, D, true)?;
             hk::dfly_add(s, ws.f_c, 1, d.h + ((j + 1) * D * 2) as u64, 0, w, 0, d.corr, n)?;
             linear(s, d.corr, D, n, &self.lm_head, d.logits, cfg.vocab, true)?;
@@ -1218,8 +1300,16 @@ impl Hy4Model {
         }
         hk::hc_expand(s, ws.emb, ws.lanes, r)?;
 
+        // Small steps fuse each sublayer boundary (the output's norm, the lanes' post update and the next
+        // pre-mix) into one launch (hc_next), the same bits; QUENCH6K_HY4_FUSE=0 runs them separately.
+        let fuse = plan.small && fuse_enabled();
+        // A sublayer's output not yet added to the lanes (fused steps).
+        let mut pending: Option<SubOut> = None;
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(eng) = &layer.engram {
+                if let Some(o) = pending.take() {
+                    self.sub_post(ws, s, &o, r)?;
+                }
                 let li = self.engram_layers.iter().position(|&x| x == i).unwrap();
                 hk::engram_embed(
                     s,
@@ -1245,48 +1335,31 @@ impl Hy4Model {
                 )?;
             }
             // Attention sublayer.
-            hk::hc_pre(
-                s,
-                ws.lanes,
-                layer.attn_hc.fn_,
-                layer.attn_hc.base,
-                layer.attn_hc.scale,
-                layer.in_norm,
-                cfg.hc_eps,
-                cfg.hc_mag,
-                cfg.eps,
-                false,
-                r,
-                ws.hc_part,
-                ws.x,
-                ws.post,
-            )?;
-            self.attention(ws, s, i, plan)?;
-            hk::hc_post(s, ws.lanes, ws.post, ws.y, D, r)?;
-            // MLP sublayer.
-            hk::hc_pre(
-                s,
-                ws.lanes,
-                layer.mlp_hc.fn_,
-                layer.mlp_hc.base,
-                layer.mlp_hc.scale,
-                layer.post_attn_norm,
-                cfg.hc_eps,
-                cfg.hc_mag,
-                cfg.eps,
-                false,
-                r,
-                ws.hc_part,
-                ws.x,
-                ws.post,
-            )?;
-            match &layer.mlp {
-                Mlp::Dense(m) => self.dense(ws, s, m, plan)?,
-                Mlp::Moe(m) => self.moe(ws, s, m, plan)?,
+            self.sub_pre(ws, s, pending.take(), &layer.attn_hc, layer.in_norm, false, r)?;
+            self.attention(ws, s, i, plan, !fuse)?;
+            pending = Some(SubOut { a: ws.f_a, b: 0, norm: layer.attn.post_norm });
+            if !fuse {
+                hk::hc_post(s, ws.lanes, ws.post, ws.y, D, r)?;
+                pending = None;
             }
-            hk::hc_post(s, ws.lanes, ws.post, ws.y, D, r)?;
+            // MLP sublayer.
+            self.sub_pre(ws, s, pending.take(), &layer.mlp_hc, layer.post_attn_norm, false, r)?;
+            pending = Some(match &layer.mlp {
+                Mlp::Dense(m) => {
+                    self.dense(ws, s, m, plan, !fuse)?;
+                    SubOut { a: ws.f_a, b: 0, norm: m.norm }
+                }
+                Mlp::Moe(m) => {
+                    self.moe(ws, s, m, plan, !fuse)?;
+                    SubOut { a: ws.f_c, b: ws.f_a, norm: m.norm }
+                }
+            });
+            if !fuse {
+                hk::hc_post(s, ws.lanes, ws.post, ws.y, D, r)?;
+                pending = None;
+            }
             if let Some(dir) = std::env::var_os("QUENCH6K_HY4_DUMP") {
-                // Debugging: the lanes after each layer, appended per chunk (F32 [r, 4, 3072]).
+                // Debugging (unfused steps): the lanes after each layer, appended per chunk (F32 [r, 4, 3072]).
                 use std::io::Write;
                 let v: Vec<f32> = s.download(ws.lanes, r * HC * D)?;
                 let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -1294,23 +1367,13 @@ impl Hy4Model {
                 std::fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(&bytes)?;
             }
         }
+        if plan.want == Logits::None {
+            if let Some(o) = pending.take() {
+                self.sub_post(ws, s, &o, r)?;
+            }
+        }
         if plan.want != Logits::None {
-            hk::hc_pre(
-                s,
-                ws.lanes,
-                self.hc_head.fn_,
-                self.hc_head.base,
-                self.hc_head.scale,
-                self.norm,
-                cfg.hc_eps,
-                1.0,
-                cfg.eps,
-                true,
-                r,
-                ws.hc_part,
-                ws.hidden,
-                ws.post,
-            )?;
+            self.sub_pre(ws, s, pending.take(), &self.hc_head, self.norm, true, r)?;
             if self.dfly.is_some() {
                 // The last rows' hidden states, for the drafter.
                 let (_, seq, kslot, tab) = ws.desc_addrs(r);
@@ -1332,7 +1395,51 @@ impl Hy4Model {
         Ok(())
     }
 
-    fn attention(&self, ws: &Workspace, s: &Stream, i: usize, plan: &Plan) -> Result<()> {
+    /// The next sublayer's pre-mix of the lanes into ws.x and ws.post (the head's into ws.hidden), after
+    /// adding `prev` (a fused step's pending sublayer output) to the lanes in the same launch.
+    #[allow(clippy::too_many_arguments)]
+    fn sub_pre(&self, ws: &Workspace, s: &Stream, prev: Option<SubOut>, hc: &Hc, norm_w: u64, head: bool, r: usize) -> Result<()> {
+        let cfg = &self.cfg;
+        let (out, mag) = if head { (ws.hidden, 1.0) } else { (ws.x, cfg.hc_mag) };
+        match prev {
+            Some(o) => hk::hc_next(
+                s,
+                o.a,
+                D,
+                o.b,
+                D,
+                o.norm,
+                cfg.eps,
+                ws.lanes,
+                ws.post,
+                (hc.fn_, hc.base, hc.scale),
+                norm_w,
+                cfg.hc_eps,
+                mag,
+                cfg.eps,
+                head,
+                r,
+                ws.hc_part,
+                ws.hc_count,
+                out,
+            ),
+            None => hk::hc_pre(s, ws.lanes, hc.fn_, hc.base, hc.scale, norm_w, cfg.hc_eps, mag, cfg.eps, head, r, ws.hc_part, out, ws.post),
+        }
+    }
+
+    /// Adds a pending sublayer output to the lanes: its norm into ws.y, then the post update.
+    fn sub_post(&self, ws: &Workspace, s: &Stream, o: &SubOut, r: usize) -> Result<()> {
+        let x = if o.b != 0 {
+            hk::add_rows(s, o.a, D, o.b, D, D, r, ws.f_b, D)?;
+            ws.f_b
+        } else {
+            o.a
+        };
+        hk::rms_rows(s, x, D, o.norm, D, self.cfg.eps, ws.y, D, r)?;
+        hk::hc_post(s, ws.lanes, ws.post, ws.y, D, r)
+    }
+
+    fn attention(&self, ws: &Workspace, s: &Stream, i: usize, plan: &Plan, norm: bool) -> Result<()> {
         let cfg = &self.cfg;
         let r = plan.r;
         let a = &self.layers[i].attn;
@@ -1350,19 +1457,26 @@ impl Hy4Model {
         if let Some(ix) = &a.indexer {
             let tk = SeqRows::new(tab_of(1), slot * ID, self.n_indexed * ID, 0);
             let pooled = SeqRows::new(tab_of(2), slot * ID, self.n_indexed * ID, 0);
-            linear(s, ws.x, D, r, &ix.tk, ws.f_c + (r * KROW * 4) as u64, ID, plan.small)?;
+            // Small steps: tk and hw came with q_a and kv_a (attn_project).
+            let (tk_y, hw_y, ld) = match a.proj_in.as_ref().filter(|pi| plan.small && fuse_enabled() && pi.n == Q_LORA + KROW + ID + IH) {
+                Some(pi) => (ws.f_c + ((Q_LORA + KROW) * 4) as u64, ws.f_c + ((Q_LORA + KROW + ID) * 4) as u64, pi.n),
+                None => {
+                    linear(s, ws.x, D, r, &ix.tk, ws.f_c + (r * KROW * 4) as u64, ID, plan.small)?;
+                    linear(s, ws.x, D, r, &ix.hw, ws.eu, IH, plan.small)?;
+                    (ws.f_c + (r * KROW * 4) as u64, ws.eu, 0)
+                }
+            };
             linear(s, ws.bf_a, Q_LORA, r, &ix.q, ws.eg, IH * ID, plan.small)?;
-            linear(s, ws.x, D, r, &ix.hw, ws.eu, IH, plan.small)?;
             hk::idx_prep(
                 s,
-                ws.f_c + (r * KROW * 4) as u64,
-                ID,
+                tk_y,
+                if ld > 0 { ld } else { ID },
                 ix.tk_norm,
                 cfg.eps,
                 ws.eg,
                 IH * ID,
-                ws.eu,
-                IH,
+                hw_y,
+                if ld > 0 { ld } else { IH },
                 cfg.theta_indexed,
                 pos,
                 seq,
@@ -1406,7 +1520,7 @@ impl Hy4Model {
                 }
             }
         }
-        self.attn_output(ws, s, a, mode, cache, ws.sel, ws.sel_n, pos, seq, r, plan.small)
+        self.attn_output(ws, s, a, mode, cache, ws.sel, ws.sel_n, pos, seq, r, plan.small, norm)
     }
 
     /// Projections of an attention sublayer for the `t` rows of ws.x (positions and sequences `pos`, `seq`):
@@ -1417,12 +1531,27 @@ impl Hy4Model {
         let h = a.heads;
         let theta = if a.sliding { cfg.theta_sliding } else { cfg.theta_indexed };
         // q_resid (BF16 [t, 1024]) in bf_a; q (F32 [t, h * 256]) in f_a; kv_a (F32 [t, 576]) in f_c; gate in f_b.
-        linear(s, ws.x, D, t, &a.q_a, ws.f_a, Q_LORA, small)?;
-        hk::rms_rows(s, ws.f_a, Q_LORA, a.q_a_norm, Q_LORA, cfg.eps, ws.bf_a, Q_LORA, t)?;
+        // Small steps run q_a and kv_a (and the indexer's tk and hw) as one stacked GEMV into f_c (rows of
+        // proj_in.n: [q_a | kv_a | tk | hw]).
+        let stacked = a.proj_in.as_ref().filter(|_| small && fuse_enabled());
+        let (qa_y, kv_y, ld) = match stacked {
+            Some(pi) => {
+                linear(s, ws.x, D, t, pi, ws.f_c, pi.n, small)?;
+                (ws.f_c, ws.f_c + (Q_LORA * 4) as u64, pi.n)
+            }
+            None => {
+                linear(s, ws.x, D, t, &a.q_a, ws.f_a, Q_LORA, small)?;
+                (ws.f_a, ws.f_c, 0)
+            }
+        };
+        hk::rms_rows(s, qa_y, if stacked.is_some() { ld } else { Q_LORA }, a.q_a_norm, Q_LORA, cfg.eps, ws.bf_a, Q_LORA, t)?;
         linear(s, ws.bf_a, Q_LORA, t, &a.q_b, ws.f_a, h * QK, small)?;
-        linear(s, ws.x, D, t, &a.kv_a, ws.f_c, KROW, small)?;
+        if stacked.is_none() {
+            linear(s, ws.x, D, t, &a.kv_a, ws.f_c, KROW, small)?;
+        }
         linear(s, ws.x, D, t, &a.gate, ws.f_b, h * VD, small)?;
-        hk::mla_prep(s, ws.f_a, h * QK, ws.f_c, KROW, a.kv_a_norm, cfg.eps, theta, h, pos, seq, cache, t, ws.qn, ws.qa)?;
+        let kv_ld = if stacked.is_some() { ld } else { KROW };
+        hk::mla_prep(s, ws.f_a, h * QK, kv_y, kv_ld, a.kv_a_norm, cfg.eps, theta, h, pos, seq, cache, t, ws.qn, ws.qa)?;
         // Absorb W_uk into the queries: qa[t, h, 0..512) = W_uk[h]^T q_nope.
         if small {
             // All rows in one launch (blocks of 16 rows; a row's arithmetic does not depend on the others).
@@ -1434,8 +1563,8 @@ impl Hy4Model {
         }
     }
 
-    /// Attention of the projected queries over the latent caches, then W_uv, the gate, o_proj and the post
-    /// norm: ws.y (BF16 [t, 3072]).
+    /// Attention of the projected queries over the latent caches, then W_uv, the gate, o_proj and (with
+    /// `norm`) the post norm: ws.y (BF16 [t, 3072]); without, o_proj's output in ws.f_a.
     #[allow(clippy::too_many_arguments)]
     fn attn_output(
         &self,
@@ -1450,6 +1579,7 @@ impl Hy4Model {
         seq: u64,
         t: usize,
         small: bool,
+        norm: bool,
     ) -> Result<()> {
         let cfg = &self.cfg;
         let h = a.heads;
@@ -1519,20 +1649,27 @@ impl Hy4Model {
             hk::gate_mul(s, ws.bf_b, ws.f_b, t * h * VD)?;
         }
         linear(s, ws.bf_b, h * VD, t, &a.o, ws.f_a, D, small)?;
-        hk::rms_rows(s, ws.f_a, D, a.post_norm, D, cfg.eps, ws.y, D, t)
+        if norm {
+            hk::rms_rows(s, ws.f_a, D, a.post_norm, D, cfg.eps, ws.y, D, t)?;
+        }
+        Ok(())
     }
 
-    fn dense(&self, ws: &Workspace, s: &Stream, m: &Dense, plan: &Plan) -> Result<()> {
+    /// The dense MLP of ws.x; with `norm` its normed output in ws.y, otherwise its output in ws.f_a.
+    fn dense(&self, ws: &Workspace, s: &Stream, m: &Dense, plan: &Plan, norm: bool) -> Result<()> {
         let (t, small) = (plan.r, plan.small);
         let n = m.gate.n;
-        linear(s, ws.x, D, t, &m.gate, ws.f_a, n, small)?;
-        linear(s, ws.x, D, t, &m.up, ws.f_b, n, small)?;
-        hk::swiglu(s, ws.f_a, ws.f_b, n, n, 0.0, ws.bf_a, n, t)?;
+        gate_up(ws, s, ws.x, D, t, &m.gate, &m.up, m.gate_up.as_ref().filter(|_| small), ws.bf_a, small)?;
         linear(s, ws.bf_a, n, t, &m.down, ws.f_a, D, small)?;
-        hk::rms_rows(s, ws.f_a, D, m.norm, D, self.cfg.eps, ws.y, D, t)
+        if norm {
+            hk::rms_rows(s, ws.f_a, D, m.norm, D, self.cfg.eps, ws.y, D, t)?;
+        }
+        Ok(())
     }
 
-    fn moe(&self, ws: &Workspace, s: &Stream, m: &Moe, plan: &Plan) -> Result<()> {
+    /// The MoE MLP of ws.x; with `norm` its normed output in ws.y, otherwise its two parts (routed in ws.f_c,
+    /// shared in ws.f_a) to be added in BF16 and normed.
+    fn moe(&self, ws: &Workspace, s: &Stream, m: &Moe, plan: &Plan, norm: bool) -> Result<()> {
         let cfg = &self.cfg;
         let (t, small) = (plan.r, plan.small);
         linear(s, ws.x, D, t, &m.router, ws.logits, EXPERTS, small)?;
@@ -1544,13 +1681,25 @@ impl Hy4Model {
             sel.iter().for_each(|&e| seen[e as usize] = true);
             eprintln!("hy4 experts: {t} rows, {} pairs, {} distinct experts", t * TOPK, seen.iter().filter(|&&x| x).count());
         }
-        linear(s, ws.x, D, t, &m.down_lat, ws.f_a, LAT, small)?;
-        k::f32_to_bf16(s, ws.f_a, ws.rin, t * LAT)?;
+        // Small steps: down_lat, shared_gate and shared_up as one stacked GEMV into f_b, then the routed input
+        // and the shared expert's activation in one launch.
+        let stacked = m.mlp_in.as_ref().filter(|mi| small && plan.ex_small && fuse_enabled() && t * mi.n <= ws.f_floats);
+        match stacked {
+            Some(mi) => {
+                linear(s, ws.x, D, t, mi, ws.f_b, mi.n, small)?;
+                hk::lat_prep(s, ws.f_b, mi.n, t, ws.rin, ws.bf_a, LAT)?;
+            }
+            None => {
+                linear(s, ws.x, D, t, &m.down_lat, ws.f_a, LAT, small)?;
+                k::f32_to_bf16(s, ws.f_a, ws.rin, t * LAT)?;
+            }
+        }
         let ex = &m.experts;
         if plan.ex_small {
             // ws.pair_row (unused by small steps) holds the pairs' expert order.
             hk::experts_small(s, ws.rin, ws.sel_e, ex.gate, ex.up, ex.down, cfg.swiglu_limit, t, ws.pair_row, ws.act, ws.ed)?;
             hk::experts_combine(s, ws.ed, 0, ws.sel_w, t, ws.fin)?;
+            return self.moe_tail(ws, s, m, plan, stacked.is_some(), norm);
         } else {
             let pairs = t * TOPK;
             let w4a4 = w4a4();
@@ -1596,7 +1745,7 @@ impl Hy4Model {
                 k::fp4_quant_rows(s, ws.act, pairs, LAT, ws.fp4_rows)?;
                 gemm4(ex.tables[2], ex.down.s2, ws.ed)?;
                 hk::experts_combine(s, ws.ed, ws.pair_row, ws.sel_w, t, ws.fin)?;
-                return self.moe_tail(ws, s, m, plan);
+                return self.moe_tail(ws, s, m, plan, false, norm);
             }
             let gemm = |x: u64, table: (u64, u64), s2: u64, y: u64| {
                 k::moe_nvfp4_gemm(
@@ -1621,19 +1770,25 @@ impl Hy4Model {
             gemm(ws.act, ex.tables[2], ex.down.s2, ws.ed)?;
             hk::experts_combine(s, ws.ed, ws.pair_row, ws.sel_w, t, ws.fin)?;
         }
-        self.moe_tail(ws, s, m, plan)
+        self.moe_tail(ws, s, m, plan, false, norm)
     }
 
-    /// Back to the model width, plus the shared expert, then the block's norm.
-    fn moe_tail(&self, ws: &Workspace, s: &Stream, m: &Moe, plan: &Plan) -> Result<()> {
+    /// Back to the model width, plus the shared expert (its activation already in bf_a with `shared_act`),
+    /// then (with `norm`) the block's norm.
+    fn moe_tail(&self, ws: &Workspace, s: &Stream, m: &Moe, plan: &Plan, shared_act: bool, norm: bool) -> Result<()> {
         let cfg = &self.cfg;
         let (t, small) = (plan.r, plan.small);
         linear(s, ws.fin, LAT, t, &m.up_lat, ws.f_c, D, small)?;
-        linear(s, ws.x, D, t, &m.shared_gate, ws.f_a, LAT, small)?;
-        linear(s, ws.x, D, t, &m.shared_up, ws.f_b, LAT, small)?;
-        hk::swiglu(s, ws.f_a, ws.f_b, LAT, LAT, 0.0, ws.bf_a, LAT, t)?;
+        if !shared_act {
+            linear(s, ws.x, D, t, &m.shared_gate, ws.f_a, LAT, small)?;
+            linear(s, ws.x, D, t, &m.shared_up, ws.f_b, LAT, small)?;
+            hk::swiglu(s, ws.f_a, ws.f_b, LAT, LAT, 0.0, ws.bf_a, LAT, t)?;
+        }
         linear(s, ws.bf_a, LAT, t, &m.shared_down, ws.f_a, D, small)?;
-        hk::add_rows(s, ws.f_c, D, ws.f_a, D, D, t, ws.f_b, D)?;
-        hk::rms_rows(s, ws.f_b, D, m.norm, D, cfg.eps, ws.y, D, t)
+        if norm {
+            hk::add_rows(s, ws.f_c, D, ws.f_a, D, D, t, ws.f_b, D)?;
+            hk::rms_rows(s, ws.f_b, D, m.norm, D, cfg.eps, ws.y, D, t)?;
+        }
+        Ok(())
     }
 }
