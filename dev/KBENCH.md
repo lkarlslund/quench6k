@@ -889,3 +889,72 @@ and after, drafts on and off), summed decode tok/s at 1 / 2 / 4 / 8 at once, 600
 once (two runs each): 524, 536 -> 632, 612. At 8 at once drafting still only breaks even: the scheduler's
 cap admits few drafts while a drafter pass for 8 sequences costs 3.2 ms and computes all 7 drafts per
 sequence.
+
+## 2026-11-23: several conversations at once, drafts planned for the whole step (served)
+
+Served workload (a scratch client; tools/loadgen.py's replies are short, so its levels are mostly
+prefill): L requests started together, each its own ~1K-token prompt asking for a long explanation, 320
+or 480 tokens each (all reach max_tokens), greedy, prompts 0..L-1 at every level (so prompt 0 alone and 8
+at once are compared by text). `QUENCH6K_SLOT_STATS=1` makes the server print, per number of sequences
+in a step: steps, rows per step, step and drafter times, drafts verified and accepted per sequence and
+step, and tok/s. Rates below are those of steps with exactly that many sequences, 600 W.
+
+Before (d731c05), where the time went:
+
+- Hy4-flash, 8 at once: drafts on 323-345 tok/s, off 362-368. Steps of 9.0 rows: the cap forced one
+  draft every 8th step on sequences capped at none, so with 8 sequences almost every step carried a lone
+  draft, and 40-60% of steps a drafter pass of 2.6-3.1 ms for 1.6-2.6 sequences; 1.09 tokens per
+  sequence and step. A 9-row step costs 24.1-24.4 ms against 21.7 for 8 rows. 2 at once: 172-180 (off
+  171), 4: 235-250 (off 251).
+- Inkling 2, 8 at once: on 643-659, off 666-669. 8.2-9.2 rows per step (0.05-0.15 drafts per sequence
+  and step), but a drafter pass in 55-80% of steps for 1.7-1.8 sequences (1.0-1.1 ms), most of which
+  kept no draft: the request's DraftPolicy truncated stated probabilities by its cost table, whose wider
+  steps were last measured alone (5 ms and more) while its one-token steps were measured as their share
+  of the batched step (about 1.2 ms).
+
+Changes (every check bit-identical, every text identical):
+
+- A batched step's drafts are planned for the whole step (serve/slots.rs StepCost::plan): drafts added
+  in order of their chance (per draft position and request), the prefix with the most expected tokens per
+  second kept, a drafter pass counted once (a fixed part plus a part per sequence), step time learnt per
+  number of sequences and rows (recent plain step, recent excess per row count, a line where neither was
+  seen; the first step of a shape, a CUDA graph capture, not learnt from). Stated probabilities
+  (Inkling): a request's passes are planned by what they recently kept and had accepted, and a pass's
+  drafts are kept while their calibrated chance is worth a row. Without drafts for 32 steps (then 64, ..
+  1024) all sequences try one in one pass; prompt lookup (no pass) tries one every 8th step.
+- Inkling's drafter computes only the drafts the requests can use (draft_batch_some; 8 sequences: 3.28 ms
+  for all 7, 2.46 for three, 2.04 for one).
+- Inkling and Hy4 sample from one top-k launch per 8 rows and one download per step (Flint's
+  StepCandidates, now shared): Inkling drafts off, 8 at once 666-669 -> 675-679.
+
+tok/s by sequences per step, drafts on (A B B A sessions; Hy4 one session each, Engram pages warmed):
+
+| model | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| Inkling 2, before | 395-402 | 585 | 596-615 | 643-659 |
+| Inkling 2, after | 392-404 | - | 617-618 | 749-772 |
+| Hy4-flash, before | 122 | 172 | 245 | 338 |
+| Hy4-flash, after | 126 | 170 | 252 | 366 |
+| Flint, before | 543-544 | 972-974 | 1241-1259 | 1586-1591 |
+| Flint, after | 543-545 | 964-974 | 1259-1260 | 1588-1589 |
+
+Drafts off (after): Inkling 246 / 371 / 516 / 675-679, Hy4 103 / 171 / 253 / 370, Flint 515 / 806 / 1183 /
+1596. The requests' summed decode tok/s (client side, Inkling, 480 tokens) at 1 / 2 / 4 / 8 at once:
+399-405 / 657-665 / 710-764 / 670-688 -> 395-407 / 726-744 / 715-724 / 879-897. 450 W, 8 at once
+(loadgen sweep, 1 turn towards 800 tokens, 400 max, A B B A, two seeds each): Inkling generated tok/s
+470, 449, 466, 458 -> 493, 467, 480, 456 (server 8-sequence steps 582-615 -> 622-672); Hy4 (the client
+above, 320 tokens) 332 -> 346 tok/s in 8-sequence steps, 325 -> 336 summed.
+
+Hy4's drafts at 2 and more at once still pay little: its drafter pass costs 2.3 ms alone and 3 ms for 8
+sequences, a verified row about 2 ms (more for uneven widths), and its drafts are accepted at about 0.57
+given the one before, so the plan drafts alone and rarely with others; at 8 it now matches plain steps
+instead of losing 6-11%. Inkling's drafts are kept where likely (0.95 of them accepted at 8 at once),
+0.5-0.7 per sequence and step.
+
+Checks: scheduler unit tests (draft_plans: plans against learnt costs, a step shape that costs more,
+stated-probability passes); Inkling batch-check with each step's drafts only, against the whole pass
+alone (600 and 3000 tokens, 1 / 4 / 8 sequences, PDL on and off: bit-identical, digests unchanged);
+inkling_lm_rows (micro test) with 3 of each block's rows: bitwise; served texts identical alone and 8 at
+once, drafts on and off, greedy and sampled (temperature 0.8, seeded), for all three models; loadgen
+`consistency --shared-system --between none` (4 conversations, 2 turns, greedy and sampled) 4/4 at
+--slots 1 and 4 for Inkling 2, Hy4-flash and Flint.
