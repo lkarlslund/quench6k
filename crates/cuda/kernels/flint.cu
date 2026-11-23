@@ -1919,6 +1919,7 @@ int gemvp_ctas() {
 template <int STEPS, int R, int G>
 cudaError_t gemvp_launch(const void* x, const Mats& mats, int total, float* y, int ldy, int M, int accumulate, cudaStream_t st, int ctas,
                          const float* rn = nullptr) {
+    if (M > G) return cudaErrorInvalidValue;
     constexpr size_t row_bytes = (size_t)STEPS * 1024 * 2;
     static bool configured = false;
     if (!configured) {
@@ -1986,6 +1987,8 @@ cudaError_t quench6k_flint_gemv_rows(const void* x, const float* norm_w, int M, 
     if (norm_w && xw && rn) {
         SQ_CHECK_LAUNCH(fl_launch(16, prenorm_kernel, M, 256, 0, st, static_cast<const float*>(x), norm_w, static_cast<__nv_bfloat16*>(xw), rn));
         if (c && M <= 8) return gemvp_launch<2, 2, 8>(xw, mats, total, y, ldy, M, accumulate, st, gemvp_ctas(), rn);
+        // The LM head with 10..16 rows: 16 rows staged once per CTA (64 KB, one CTA per SM).
+        if (c && M <= 16 && M >= 10 && total >= 65536) return gemvp_launch<2, 2, 16>(xw, mats, total, y, ldy, M, accumulate, st, gemvp_ctas() / 2, rn);
         if (c) return gemvc_launch<2, 2, 8, false>(xw, mats, total, y, ldy, M, accumulate, st, rn);
         return r == 1 ? gemvb_launch<2, 1, false, 8>(xw, nullptr, mats, total, y, ldy, M, accumulate, st, rn)
                       : gemvb_launch<2, 2, false, 8>(xw, nullptr, mats, total, y, ldy, M, accumulate, st, rn);
