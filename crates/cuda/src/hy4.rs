@@ -29,6 +29,31 @@ mod ffi {
             st: Stream,
         ) -> Error;
         pub fn quench6k_hy4_hc_partial_floats(t: c_int) -> usize;
+        pub fn quench6k_hy4_hc_next(
+            a: *const f32,
+            lda: c_int,
+            b: *const f32,
+            ldb: c_int,
+            norm_w: *const c_void,
+            eps: f32,
+            lanes: *mut c_void,
+            post: *mut f32,
+            fn_: *const f32,
+            base: *const f32,
+            scale: *const f32,
+            pre_w: *const c_void,
+            hc_eps: f32,
+            mag: f32,
+            pre_eps: f32,
+            head: c_int,
+            t: c_int,
+            partial: *mut f32,
+            count: *mut c_int,
+            out: *mut c_void,
+            st: Stream,
+        ) -> Error;
+        pub fn quench6k_hy4_set_legacy(on: c_int);
+        pub fn quench6k_hy4_lat_prep(f: *const f32, ld: c_int, rows: c_int, rin: *mut c_void, act: *mut c_void, lda: c_int, st: Stream) -> Error;
         pub fn quench6k_hy4_hc_post(
             lanes: *mut c_void,
             post: *const f32,
@@ -444,6 +469,76 @@ pub fn hc_post(s: &Stream, lanes: u64, post: u64, y: u64, ldy: usize, t: usize) 
     go!(
         "hy4_hc_post",
         ffi::quench6k_hy4_hc_post(pm(lanes), f(post), p(y), n(ldy), n(t), s.raw())
+    )
+}
+
+/// A small step's sublayer boundary in one launch: the sublayer's output (F32 rows `a` of stride `lda`, plus
+/// rows `b` added in BF16 as [`add_rows`] does when `b` is not 0) normalized with `norm_w` as [`rms_rows`]
+/// does, added to the lanes with the post weights as [`hc_post`] does, then the next sublayer's [`hc_pre`]
+/// (`fn_`, `base`, `scale`, `pre_w`, `hc_eps`, `mag`, `pre_eps`, `head`) into `out` and `post`: the same
+/// bits as those launches. `count`: `t` I32 counters, zero (left zero).
+#[allow(clippy::too_many_arguments)]
+pub fn hc_next(
+    s: &Stream,
+    a: u64,
+    lda: usize,
+    b: u64,
+    ldb: usize,
+    norm_w: u64,
+    eps: f32,
+    lanes: u64,
+    post: u64,
+    hc: (u64, u64, u64),
+    pre_w: u64,
+    hc_eps: f32,
+    mag: f32,
+    pre_eps: f32,
+    head: bool,
+    t: usize,
+    partial: u64,
+    count: u64,
+    out: u64,
+) -> Result<()> {
+    go!(
+        "hy4_hc_next",
+        ffi::quench6k_hy4_hc_next(
+            f(a),
+            n(lda),
+            f(b),
+            n(ldb),
+            p(norm_w),
+            eps,
+            pm(lanes),
+            fm(post),
+            f(hc.0),
+            f(hc.1),
+            f(hc.2),
+            p(pre_w),
+            hc_eps,
+            mag,
+            pre_eps,
+            head as c_int,
+            n(t),
+            fm(partial),
+            count as *mut c_int,
+            pm(out),
+            s.raw()
+        )
+    )
+}
+
+/// Benchmarks: the kernels' previous forms (the same bits): see `quench6k_hy4_set_legacy`.
+pub fn set_legacy(on: bool) {
+    unsafe { ffi::quench6k_hy4_set_legacy(on as c_int) }
+}
+
+/// The MoE inputs of a small step from the stacked [down_lat | shared_gate | shared_up] outputs `f` (F32
+/// rows of stride `ld`): `rin` BF16 [rows, 1536] = bf16 of the first 1536 columns, `act` (rows of stride
+/// `lda`) the shared expert's [`swiglu`] (no clamps) of the other two.
+pub fn lat_prep(s: &Stream, f_: u64, ld: usize, rows: usize, rin: u64, act: u64, lda: usize) -> Result<()> {
+    go!(
+        "hy4_lat_prep",
+        ffi::quench6k_hy4_lat_prep(f(f_), n(ld), n(rows), pm(rin), pm(act), n(lda), s.raw())
     )
 }
 

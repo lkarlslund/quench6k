@@ -164,6 +164,127 @@ __global__ void hc_post_kernel(float* lanes, const float* post, const bf16* __re
     lanes[i] = pw[c] * bf2f(y[(size_t)t * ldy + d]) + lanes[i];
 }
 
+// A small step's sublayer boundary in one kernel: the sublayer's output v (rows of a, or bf16(bf16(a) +
+// bf16(b)) as add_rows gives them) normalized with norm_w as rms_rows does (y), added to the lanes with the
+// post weights as hc_post does (lanes += post * y), then the next sublayer's pre-mix: hc_mix_partial's slice
+// sums over the new lanes and, in the last of a token's blocks to finish them, hc_pre's mix weights, mixed
+// and normalized input (out) and new post weights. Grid (HC_SLICES, T) of 256 threads; every value is
+// computed as those kernels compute it (each block takes the row's norm over 256 threads as rms_rows does;
+// hc_pre's 512-thread loops and block sum are run by two virtual threads per thread). count: per-token
+// arrival counters, zero before the launch (the last block of a token resets its counter).
+template <int NM>
+__global__ void __launch_bounds__(256) hc_next_kernel(const float* a, int lda, const float* b, int ldb, const bf16* __restrict__ norm_w,
+                                                      float eps, float* lanes, float* post, const float* __restrict__ fn,
+                                                      const float* __restrict__ base, const float* __restrict__ scale,
+                                                      const bf16* __restrict__ pre_w, float hc_eps, float mag, float pre_eps,
+                                                      float* partial, int* count, bf16* out) {
+    pdl_launch_dependents();
+    __shared__ float red[8][NM + 1];
+    __shared__ float scratch[32];
+    __shared__ float pw[HC];
+    __shared__ float coef[HC];
+    __shared__ float xs[D];
+    __shared__ bool last;
+    constexpr int PER = D / 256;  // values of a row per thread
+    const int slice = blockIdx.x, t = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    // Weights before the dependency wait: this block's mix rows and norm weights, and (for the last block)
+    // the pre-mix's.
+    const int i = slice * HC_SLICE + tid * 2, c = i / D, d = i % D;
+    float2 wf[NM];
+#pragma unroll
+    for (int j = 0; j < NM; ++j) wf[j] = *reinterpret_cast<const float2*>(fn + (size_t)j * HC * D + i);
+    const float nw0 = bf2f(norm_w[d]), nw1 = bf2f(norm_w[d + 1]);
+    float pre[PER];
+#pragma unroll
+    for (int j = 0; j < PER; ++j) pre[j] = bf2f(pre_w[tid + 256 * j]);
+    const float sc0 = scale[0], sc1 = NM == 2 * HC ? scale[1] : 0.0f, bs = tid <= NM ? base[min(tid, NM - 1)] : 0.0f;
+    pdl_wait();
+    const float* ar = a + (size_t)t * lda;
+    const float* br = b ? b + (size_t)t * ldb : nullptr;
+    auto val = [&](int e) { return br ? rb(rb(__ldcg(ar + e)) + rb(__ldcg(br + e))) : rb(__ldcg(ar + e)); };
+    if (tid < HC) pw[tid] = __ldcg(post + t * HC + tid);
+    // The row's norm (rms_rows: thread tid sums columns tid + 256 j in order).
+    float vr[PER];
+#pragma unroll
+    for (int j = 0; j < PER; ++j) vr[j] = val(tid + 256 * j);
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) ss += vr[j] * vr[j];
+    const float v0 = val(d), v1 = val(d + 1);
+    const float2 old = __ldcg(reinterpret_cast<const float2*>(lanes + (size_t)t * HC * D + i));
+    const float r = rsqrtf(block_sum(ss, scratch) / (float)D + eps);
+    // This block's 512 lane values: the post update (hc_post), then the slice sums (hc_mix_partial).
+    const float y0 = bf2f(f2bf(nw0 * rb(v0 * r)));
+    const float y1 = bf2f(f2bf(nw1 * rb(v1 * r)));
+    const float2 v = make_float2(fmaf(pw[c], y0, old.x), fmaf(pw[c], y1, old.y));
+    *reinterpret_cast<float2*>(lanes + (size_t)t * HC * D + i) = v;
+    float acc[NM + 1];
+#pragma unroll
+    for (int j = 0; j < NM; ++j) acc[j] = fmaf(wf[j].x, v.x, wf[j].y * v.y);
+    acc[NM] = fmaf(v.x, v.x, v.y * v.y);
+#pragma unroll
+    for (int j = 0; j <= NM; ++j) acc[j] = warp_sum(acc[j]);
+    if (lane == 0)
+#pragma unroll
+        for (int j = 0; j <= NM; ++j) red[warp][j] = acc[j];
+    __syncthreads();
+    if (tid <= NM) {
+        float s = 0.0f;
+        for (int w = 0; w < 8; ++w) s += red[w][tid];
+        partial[((size_t)t * HC_SLICES + slice) * (NM + 1) + tid] = s;
+    }
+    // The token's last block to finish runs its pre-mix (hc_pre).
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) last = atomicAdd(count + t, 1) == HC_SLICES - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (tid == 0) count[t] = 0;
+    const float* x = lanes + (size_t)t * HC * D;
+    // The token's lane values this thread mixes: columns tid + 256 h + 512 j (hc_pre's virtual thread
+    // tid + 256 h).
+    float lv[2][D / 512][HC];
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int j = 0; j < D / 512; ++j)
+#pragma unroll
+            for (int q = 0; q < HC; ++q) lv[h][j][q] = __ldcg(x + q * D + tid + 256 * h + 512 * j);
+    if (tid < 32) {
+        float m = 0.0f;
+        if (tid <= NM)
+            for (int sl = 0; sl < HC_SLICES; ++sl) m += __ldcg(partial + ((size_t)t * HC_SLICES + sl) * (NM + 1) + tid);
+        const float r = rsqrtf(__shfl_sync(0xffffffff, m, NM) / (float)(HC * D) + pre_eps);
+        if (tid < HC) coef[tid] = 1.0f / (1.0f + expf(-(m * r * sc0 + bs))) + hc_eps;
+        if (NM == 2 * HC && tid >= HC && tid < 2 * HC) post[t * HC + tid - HC] = mag / (1.0f + expf(-(m * r * sc1 + bs))) + hc_eps;
+    }
+    __syncthreads();
+    float ss2[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int j = 0; j < D / 512; ++j) {
+            float s = 0.0f;
+#pragma unroll
+            for (int q = 0; q < HC; ++q) s += coef[q] * lv[h][j][q];
+            s = rb(s);
+            xs[tid + 256 * h + 512 * j] = s;
+            ss2[h] += s * s;
+        }
+    // hc_pre's block sum: its warp w is this block's warp w (h = 0) for w < 8, warp w - 8 (h = 1) otherwise.
+    const float s0 = warp_sum(ss2[0]), s1 = warp_sum(ss2[1]);
+    __syncthreads();
+    if (lane == 0) {
+        scratch[warp] = s0;
+        scratch[warp + 8] = s1;
+    }
+    __syncthreads();
+    const float r2 = rsqrtf(warp_sum(lane < 16 ? scratch[lane] : 0.0f) / (float)D + pre_eps);
+#pragma unroll
+    for (int j = 0; j < PER; ++j) out[(size_t)t * D + tid + 256 * j] = f2bf(pre[j] * rb(xs[tid + 256 * j] * r2));
+}
+
 // lanes[t, c, :] = emb[t, :] for every lane.
 __global__ void hc_expand_kernel(const bf16* __restrict__ emb, float* lanes, int T) {
     pdl_launch_dependents();
@@ -220,6 +341,21 @@ __global__ void add_rows_kernel(const float* __restrict__ a, int lda, const floa
     if (i >= (size_t)rows * n) return;
     const size_t r = i / n, c = i % n;
     out[r * ldo + c] = rb(rb(a[r * lda + c]) + rb(b[r * ldb + c]));
+}
+
+// The MoE inputs of a small step from the stacked [down_lat | shared_gate | shared_up] outputs f (rows of
+// stride ld): rin[r, i] = bf16(f[r, i]) (the routed experts' latent input) and act[r, i] the shared expert's
+// swiglu of f[r, LAT + i] and f[r, 2 LAT + i] (swiglu_kernel without clamps), i < LAT.
+__global__ void lat_prep_kernel(const float* f, int ld, int rows, bf16* rin, bf16* act, int lda) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * LAT) return;
+    const int r = i / LAT, c = i % LAT;
+    const float* fr = f + (size_t)r * ld;
+    rin[(size_t)r * LAT + c] = f2bf(__ldcg(fr + c));
+    const float gv = rb(__ldcg(fr + LAT + c)), uv = rb(__ldcg(fr + 2 * LAT + c));
+    act[(size_t)r * lda + c] = f2bf(rb(silu(gv)) * uv);
 }
 
 // y = bf16(x); triggers its dependents only after its own dependency wait (see experts_gate_up_kernel).
@@ -578,24 +714,61 @@ __global__ void __launch_bounds__(128 * G) mla_attn_kernel(const bf16* __restric
     }
 }
 
-// out[t, h, :] = sum_s e^(m_s - m) O_s / (sum_s e^(m_s - m) l_s + e^(sink_h - m)). Block (t, h), 128 threads.
+// out[t, h, :] = sum_s e^(m_s - m) O_s / (sum_s e^(m_s - m) l_s + e^(sink_h - m)), summed in split order. Block (t, h),
+// 128 threads.
+int g_legacy = 0;
+
+// SPL > 0: exactly SPL splits, every split's loads issued at once (the partial outputs 16 splits at a
+// time); the same sums in the same order.
+template <int SPL>
 __global__ void __launch_bounds__(128) mla_merge_kernel(const float* __restrict__ part_o, const float* __restrict__ part_ml, int splits,
                                                        const float* __restrict__ sinks, int T, int H, bf16* out) {
     pdl_launch_dependents();
     pdl_wait();
     const int t = blockIdx.x / H, h = blockIdx.x % H;
     float m = -INFINITY;
-    for (int s = 0; s < splits; ++s) m = fmaxf(m, __ldcg(part_ml + (((size_t)s * T + t) * H + h) * 2));
     float l = 0.0f, acc[4] = {};
-    for (int s = 0; s < splits; ++s) {
-        const float* ml = part_ml + (((size_t)s * T + t) * H + h) * 2;
-        const float m_s = __ldcg(ml);
-        if (m_s == -INFINITY) continue;
-        const float w = __expf(m_s - m);
-        l += w * __ldcg(ml + 1);
-        const float* po = part_o + (((size_t)s * T + t) * H + h) * KVL;
+    if constexpr (SPL > 0) {
+        float ms[SPL], ls[SPL];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) acc[j] += w * __ldcg(po + threadIdx.x + 128 * j);
+        for (int s = 0; s < SPL; ++s) {
+            const float* ml = part_ml + (((size_t)s * T + t) * H + h) * 2;
+            ms[s] = __ldcg(ml);
+            ls[s] = __ldcg(ml + 1);
+        }
+#pragma unroll
+        for (int s = 0; s < SPL; ++s) m = fmaxf(m, ms[s]);
+        constexpr int B = SPL < 16 ? SPL : 16;
+#pragma unroll
+        for (int s0 = 0; s0 < SPL; s0 += B) {
+            // Every split writes its partial output (zeros without keys).
+            float po[B][4];
+#pragma unroll
+            for (int q = 0; q < B; ++q)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) po[q][j] = __ldcg(part_o + (((size_t)(s0 + q) * T + t) * H + h) * KVL + threadIdx.x + 128 * j);
+#pragma unroll
+            for (int q = 0; q < B; ++q) {
+                const int s = s0 + q;
+                if (ms[s] == -INFINITY) continue;
+                const float w = __expf(ms[s] - m);
+                l += w * ls[s];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[j] += w * po[q][j];
+            }
+        }
+    } else {
+        for (int s = 0; s < splits; ++s) m = fmaxf(m, __ldcg(part_ml + (((size_t)s * T + t) * H + h) * 2));
+        for (int s = 0; s < splits; ++s) {
+            const float* ml = part_ml + (((size_t)s * T + t) * H + h) * 2;
+            const float m_s = __ldcg(ml);
+            if (m_s == -INFINITY) continue;
+            const float w = __expf(m_s - m);
+            l += w * __ldcg(ml + 1);
+            const float* po = part_o + (((size_t)s * T + t) * H + h) * KVL;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) acc[j] += w * __ldcg(po + threadIdx.x + 128 * j);
+        }
     }
     const float inv = 1.0f / (l + (m == -INFINITY ? __expf(sinks[h]) : __expf(sinks[h] - m)));
 #pragma unroll
@@ -620,7 +793,9 @@ __global__ void __launch_bounds__(128) idx_prep_kernel(const float* __restrict__
     const float v = rb(tk[(size_t)t * ldk + i]);
     const float r = rsqrtf(block_sum(v * v, scratch) / (float)ID + eps);
     seq_row<bf16>(tk_cache, seq[t], p)[i] = f2bf(bf2f(tk_norm[i]) * rb(v * r));
-    for (int j = i; j < IH * ID; j += 128) {
+#pragma unroll
+    for (int q = 0; q < IH * ID / 128; ++q) {
+        const int j = i + 128 * q;
         const int h = j / ID, d = j % ID;
         const float* src = iq + (size_t)t * ldq + h * ID;
         float o;
@@ -643,28 +818,68 @@ __global__ void __launch_bounds__(128) idx_prep_kernel(const float* __restrict__
 // value_s = Wv[d] . k_s and gate_s = Wg[d] . k_s + ape[s, d] over the group's 4 keys k_s (FP32), pooled =
 // sum_s value_s softmax_s(gate_s), RMS-normalized with the FP32 key_norm weight, rounded to BF16 and its
 // last 64 dims rotated at the group's first position.
+// TILED: Wv and Wg pass through shared memory 32 columns at a time with coalesced loads (the first
+// before the dependency wait); the same sums in the same order.
+template <bool TILED>
 __global__ void __launch_bounds__(128) idx_pool_kernel(SeqRows tk_cache, const float* __restrict__ wv,
                                                       const float* __restrict__ wg, const float* __restrict__ ape,
                                                       const float* __restrict__ key_norm, float eps, float theta,
                                                       const int* pos, const int* seq, SeqRows pooled) {
     pdl_launch_dependents();
-    pdl_wait();
+    constexpr int IP_K = 32;
     __shared__ float ks[GRP][ID];
     __shared__ float ps[ID];
     __shared__ float scratch[32];
-    const int p = pos[blockIdx.x], sq = seq[blockIdx.x], d = threadIdx.x;
+    __shared__ float wts[TILED ? 2 : 1][TILED ? ID : 1][IP_K + 1];
+    const int d = threadIdx.x;
+    // This thread's elements of a [128 rows, 32 columns] tile: element d + 128 j is row 4 j + d / 32, column d % 32.
+    float rv[TILED ? IP_K : 1], rg[TILED ? IP_K : 1];
+    auto load = [&](int ch) {
+#pragma unroll
+        for (int j = 0; j < IP_K; ++j) {
+            const size_t at = (size_t)(4 * j + d / 32) * ID + ch * IP_K + d % 32;
+            rv[j] = wv[at];
+            rg[j] = wg[at];
+        }
+    };
+    if constexpr (TILED) load(0);
+    pdl_wait();
+    const int p = pos[blockIdx.x], sq = seq[blockIdx.x];
     if ((p + 1) % GRP != 0) return;
     const int g = p / GRP;
 #pragma unroll
     for (int s = 0; s < GRP; ++s) ks[s][d] = bf2f(__ldcg(seq_row<const bf16>(tk_cache, sq, g * GRP + s) + d));
     __syncthreads();
     float val[GRP] = {}, gate[GRP] = {};
-    for (int k = 0; k < ID; ++k) {
-        const float a = wv[d * ID + k], b = wg[d * ID + k];
+    if constexpr (TILED) {
+        for (int ch = 0; ch < ID / IP_K; ++ch) {
+            __syncthreads();
 #pragma unroll
-        for (int s = 0; s < GRP; ++s) {
-            val[s] = fmaf(a, ks[s][k], val[s]);
-            gate[s] = fmaf(b, ks[s][k], gate[s]);
+            for (int j = 0; j < IP_K; ++j) {
+                wts[0][4 * j + d / 32][d % 32] = rv[j];
+                wts[1][4 * j + d / 32][d % 32] = rg[j];
+            }
+            __syncthreads();
+            if (ch + 1 < ID / IP_K) load(ch + 1);
+#pragma unroll 8
+            for (int kk = 0; kk < IP_K; ++kk) {
+                const int k = ch * IP_K + kk;
+                const float a = wts[0][d][kk], b = wts[1][d][kk];
+#pragma unroll
+                for (int s = 0; s < GRP; ++s) {
+                    val[s] = fmaf(a, ks[s][k], val[s]);
+                    gate[s] = fmaf(b, ks[s][k], gate[s]);
+                }
+            }
+        }
+    } else {
+        for (int k = 0; k < ID; ++k) {
+            const float a = wv[d * ID + k], b = wg[d * ID + k];
+#pragma unroll
+            for (int s = 0; s < GRP; ++s) {
+                val[s] = fmaf(a, ks[s][k], val[s]);
+                gate[s] = fmaf(b, ks[s][k], gate[s]);
+            }
         }
     }
     float mx = -INFINITY;
@@ -817,6 +1032,77 @@ __global__ void __launch_bounds__(E) route_kernel(const float* __restrict__ logi
         for (int w = 0; w < warp; ++w) rank += wcount[w];
         es[rank] = e;
         ws[rank] = score;
+    }
+    __syncthreads();
+    if (e < TOPK) {
+        float s = 0.0f;
+        for (int k = 0; k < TOPK; ++k) s += ws[k];
+        sel_e[t * TOPK + e] = es[e];
+        sel_w[t * TOPK + e] = ws[e] / (s + 1e-20f) * scaling;
+    }
+}
+
+// route_kernel's choices by sorting instead of 16 rounds of block-wide argmax: the same 16 experts (the
+// first 16 in the order of score + bias descending, ties by lower index) and the same outputs. Each warp sorts
+// its 32 experts (bitonic, in registers), its first 16 go to shared memory, and 16-entry lists are merged
+// pairwise (bitonic merges in a warp) down to one.
+SQ_DEVICE bool route_before(float av, int ai, float bv, int bi) { return av > bv || (av == bv && ai < bi); }
+
+// One compare-exchange step of a bitonic network across lanes lane and lane ^ j: the lower lane of a block
+// sorted first-to-last (desc) keeps the earlier entry.
+SQ_DEVICE void route_cx(float& v, int& i, int j, bool desc) {
+    const float ov = __shfl_xor_sync(0xffffffff, v, j);
+    const int oi = __shfl_xor_sync(0xffffffff, i, j);
+    const bool lower = (threadIdx.x & j) == 0;
+    const bool other_first = route_before(ov, oi, v, i);
+    if ((lower == desc) == other_first) v = ov, i = oi;
+}
+
+__global__ void __launch_bounds__(E) route_sort_kernel(const float* __restrict__ logits, int ld, const float* __restrict__ bias,
+                                                       float scaling, int* sel_e, float* sel_w) {
+    pdl_launch_dependents();
+    const int t = blockIdx.x, e = threadIdx.x, lane = e & 31, warp = e >> 5;
+    const float b = bias[e];
+    pdl_wait();
+    __shared__ float sc[E];
+    __shared__ float lv[E / 32][TOPK];
+    __shared__ int li[E / 32][TOPK];
+    const float score = 1.0f / (1.0f + expf(-__ldcg(logits + (size_t)t * ld + e)));
+    sc[e] = score;
+    float v = score + b;
+    int idx = e;
+    // The warp's 32 entries in order.
+#pragma unroll
+    for (int k = 2; k <= 32; k <<= 1)
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) route_cx(v, idx, j, (lane & k) == 0 || k == 32);
+    if (lane < TOPK) lv[warp][lane] = v, li[warp][lane] = idx;
+    // Pairwise merges of the first-16 lists: lists 2 m and 2 m + 1 into list m.
+    for (int n = E / 32 / 2; n >= 1; n >>= 1) {
+        __syncthreads();
+        float mv = 0.0f;
+        int mi = 0;
+        if (warp < n) {
+            // The first list in order in lanes 0..15, the second reversed in 16..31: a bitonic sequence.
+            const int a = 2 * warp, c = 2 * warp + 1;
+            mv = lane < TOPK ? lv[a][lane] : lv[c][31 - lane];
+            mi = lane < TOPK ? li[a][lane] : li[c][31 - lane];
+#pragma unroll
+            for (int j = 16; j > 0; j >>= 1) route_cx(mv, mi, j, true);
+        }
+        __syncthreads();
+        if (warp < n && lane < TOPK) lv[warp][lane] = mv, li[warp][lane] = mi;
+    }
+    __syncthreads();
+    // The 16 picks in ascending expert order with their scores; weights as route_kernel computes them.
+    __shared__ float ws[TOPK];
+    __shared__ int es[TOPK];
+    if (e < TOPK) {
+        const int x = li[0][e];
+        int rank = 0;
+        for (int k = 0; k < TOPK; ++k) rank += li[0][k] < x;
+        es[rank] = x;
+        ws[rank] = sc[x];
     }
     __syncthreads();
     if (e < TOPK) {
@@ -1229,6 +1515,33 @@ cudaError_t quench6k_hy4_hc_post(void* lanes, const float* post, const void* y, 
     SQ_RETURN_LAUNCH();
 }
 
+// count: T ints, zero (hc_next_kernel leaves them zero).
+cudaError_t quench6k_hy4_hc_next(const float* a, int lda, const float* b, int ldb, const void* norm_w, float eps, void* lanes, float* post,
+                               const float* fn, const float* base, const float* scale, const void* pre_w, float hc_eps, float mag,
+                               float pre_eps, int head, int T, float* partial, int* count, void* out, cudaStream_t st) {
+    if (T == 0) return cudaSuccess;
+    const dim3 grid(HC_SLICES, T);
+    auto* l = static_cast<float*>(lanes);
+    const auto* nw = static_cast<const bf16*>(norm_w);
+    const auto* pw = static_cast<const bf16*>(pre_w);
+    auto* o = static_cast<bf16*>(out);
+    if (head)
+        SQ_CHECK_LAUNCH(sq_launch(hc_next_kernel<HC>, grid, 256, 0, st, a, lda, b, ldb, nw, eps, l, post, fn, base, scale, pw, hc_eps, mag,
+                                  pre_eps, partial, count, o));
+    else
+        SQ_CHECK_LAUNCH(sq_launch(hc_next_kernel<2 * HC>, grid, 256, 0, st, a, lda, b, ldb, nw, eps, l, post, fn, base, scale, pw, hc_eps,
+                                  mag, pre_eps, partial, count, o));
+    SQ_RETURN_LAUNCH();
+}
+
+cudaError_t quench6k_hy4_lat_prep(const float* f, int ld, int rows, void* rin, void* act, int lda, cudaStream_t st) {
+    const size_t n = (size_t)rows * LAT;
+    if (n == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(lat_prep_kernel, (unsigned)((n + 255) / 256), 256, 0, st, f, ld, rows, static_cast<bf16*>(rin),
+                              static_cast<bf16*>(act), lda));
+    SQ_RETURN_LAUNCH();
+}
+
 cudaError_t quench6k_hy4_hc_expand(const void* emb, void* lanes, int T, cudaStream_t st) {
     const size_t n = (size_t)T * HC * D;
     if (n == 0) return cudaSuccess;
@@ -1328,6 +1641,10 @@ cudaError_t launch_mla(int mode, dim3 grid, cudaStream_t st, const bf16* q, int 
 
 extern "C" {
 
+// Benchmarks: 1 runs the kernels' previous forms (the same bits): the attention split merge with one split's
+// loads at a time, the indexer's pooling reading its weights from global memory.
+void quench6k_hy4_set_legacy(int on) { g_legacy = on; }
+
 cudaError_t quench6k_hy4_mla_attention(int mode, const void* qa, int H, SeqRows cache, const int* sel, const int* sel_n,
                                      const float* sinks, const int* pos, const int* seq, int T, int splits, int heads_per_block, float* part,
                                      void* out, cudaStream_t st) {
@@ -1349,7 +1666,10 @@ cudaError_t quench6k_hy4_mla_attention(int mode, const void* qa, int H, SeqRows 
     }
     if (e != cudaSuccess) return e;
     if (splits > 1)
-        SQ_CHECK_LAUNCH(sq_launch(mla_merge_kernel, T * H, 128, 0, st, (const float*)part_o, (const float*)part_ml, splits, sinks, T, H, o));
+        SQ_CHECK_LAUNCH(sq_launch(!g_legacy && splits == 16   ? mla_merge_kernel<16>
+                                  : !g_legacy && splits == 32 ? mla_merge_kernel<32>
+                                                                  : mla_merge_kernel<0>,
+                                  T * H, 128, 0, st, (const float*)part_o, (const float*)part_ml, splits, sinks, T, H, o));
     SQ_RETURN_LAUNCH();
 }
 
@@ -1365,7 +1685,8 @@ cudaError_t quench6k_hy4_idx_prep(const float* tk, int ldk, const void* tk_norm,
 cudaError_t quench6k_hy4_idx_pool(SeqRows tk_cache, const float* wv, const float* wg, const float* ape, const float* key_norm, float eps,
                                 float theta, const int* pos, const int* seq, int T, SeqRows pooled, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(idx_pool_kernel, T, 128, 0, st, tk_cache, wv, wg, ape, key_norm, eps, theta, pos, seq, pooled));
+    SQ_CHECK_LAUNCH(sq_launch(g_legacy ? idx_pool_kernel<false> : idx_pool_kernel<true>, T, 128, 0, st, tk_cache, wv, wg, ape, key_norm, eps,
+                              theta, pos, seq, pooled));
     SQ_RETURN_LAUNCH();
 }
 
@@ -1387,7 +1708,7 @@ cudaError_t quench6k_hy4_idx_expand(const int* picked, int npick, const int* pos
 
 cudaError_t quench6k_hy4_route(const float* logits, int ld, const float* bias, float scaling, int T, int* sel_e, float* sel_w, cudaStream_t st) {
     if (T == 0) return cudaSuccess;
-    SQ_CHECK_LAUNCH(sq_launch(route_kernel, T, E, 0, st, logits, ld, bias, scaling, sel_e, sel_w));
+    SQ_CHECK_LAUNCH(sq_launch(g_legacy ? route_kernel : route_sort_kernel, T, E, 0, st, logits, ld, bias, scaling, sel_e, sel_w));
     SQ_RETURN_LAUNCH();
 }
 

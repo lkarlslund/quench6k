@@ -71,6 +71,16 @@ const SHAPES: &[Shape] = &[
     Shape { name: "q_a", n: 1024, k: 3072, fmt: WeightFormat::Bf16 },
     Shape { name: "kv_a", n: 576, k: 3072, fmt: WeightFormat::Bf16 },
     Shape { name: "router", n: 512, k: 3072, fmt: WeightFormat::Bf16 },
+    Shape { name: "attn_in sliding", n: 1600, k: 3072, fmt: WeightFormat::Bf16 },
+    Shape { name: "attn_in indexed", n: 1744, k: 3072, fmt: WeightFormat::Bf16 },
+    Shape { name: "mlp_in", n: 4608, k: 3072, fmt: WeightFormat::Fp8Block },
+    Shape { name: "o_proj indexed", n: 3072, k: 8192, fmt: WeightFormat::Fp8Block },
+    Shape { name: "q_b indexed", n: 8192, k: 1024, fmt: WeightFormat::Fp8Block },
+    Shape { name: "gate indexed", n: 8192, k: 3072, fmt: WeightFormat::Fp8Block },
+    Shape { name: "idx q", n: 2048, k: 1024, fmt: WeightFormat::Bf16 },
+    Shape { name: "dense gate", n: 13824, k: 3072, fmt: WeightFormat::Bf16 },
+    Shape { name: "dense down", n: 3072, k: 13824, fmt: WeightFormat::Bf16 },
+    Shape { name: "engram kv", n: 15360, k: 1536, fmt: WeightFormat::Bf16 },
     Shape { name: "lm_head", n: 120832, k: 3072, fmt: WeightFormat::Fp8Block },
 ];
 
@@ -123,8 +133,18 @@ fn hy4_gemv_grouped() {
         .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
         .unwrap_or_else(|| vec![1, 3, 8, 12, 16, 20, 32, 48, 64]);
     // Grouped launches of the shared GEMV (mg, r), then the wide kernel (mt, r) marked w.
-    let configs: &[(usize, usize, bool)] =
-        &[(8, 4, false), (16, 2, false), (8, 4, true), (16, 4, true)];
+    // HY4_MICRO_CFG: e.g. "g8x4,w8x2" (g: grouped shared GEMV, w: wide).
+    let configs: Vec<(usize, usize, bool)> = std::env::var("HY4_MICRO_CFG")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|c| {
+                    let (mg, r) = c[1..].split_once('x').unwrap();
+                    (mg.parse().unwrap(), r.parse().unwrap(), c.starts_with('w'))
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| vec![(8, 4, false), (16, 2, false), (8, 4, true), (16, 4, true)]);
     let mmax = 64;
     for sh in SHAPES {
         if only.as_deref().is_some_and(|o| !sh.name.contains(o)) {
@@ -171,7 +191,7 @@ fn hy4_gemv_grouped() {
             .unwrap();
             let old = time_graph(&s, &g, calls);
             let mut line = format!("  m {m:>2}: old {old:7.1} us |");
-            for &(mg, r, wide) in configs {
+            for &(mg, r, wide) in &configs {
                 let run = |s: &Stream, c: usize| {
                     if wide {
                         quench6k_cuda::hy4::gemv_wide(s, m, mg, r, x.addr(), sh.k, sh.fmt, wt.w[c].addr(), wt.sc[c].addr(), y.addr(), sh.n, sh.n, sh.k)
@@ -196,5 +216,40 @@ fn hy4_gemv_grouped() {
             }
             println!("{line}");
         }
+    }
+}
+
+/// The sorting router against the 16-round argmax router: random logits and biases, many of them tied
+/// (values on a coarse grid), every row's experts and weights bitwise.
+#[test]
+#[ignore]
+fn hy4_route_sort() {
+    let s = Stream::new().unwrap();
+    const E: usize = 512;
+    for (case, grid) in [(0u64, 0.0f32), (1, 0.25), (2, 1.0), (3, 4.0)] {
+        let t = 64;
+        let r = bytes(t * E * 2 + E * 2, 101 + case, |b| b);
+        let val = |i: usize| -> f32 {
+            let x = (u16::from_le_bytes([r[2 * i], r[2 * i + 1]]) as f32 / 65535.0 - 0.5) * 8.0;
+            if grid > 0.0 { (x * grid).round() / grid } else { x }
+        };
+        let logits: Vec<f32> = (0..t * E).map(val).collect();
+        let bias: Vec<f32> = (0..E).map(|i| val(t * E + i) * 0.01).collect();
+        let lb = DeviceBuffer::new(t * E * 4).unwrap();
+        let bb = DeviceBuffer::new(E * 4).unwrap();
+        s.upload(&lb, &logits).unwrap();
+        s.upload(&bb, &bias).unwrap();
+        let run = |legacy: bool| -> (Vec<i32>, Vec<u32>) {
+            let e = DeviceBuffer::new(t * 16 * 4).unwrap();
+            let w = DeviceBuffer::new(t * 16 * 4).unwrap();
+            quench6k_cuda::hy4::set_legacy(legacy);
+            quench6k_cuda::hy4::route(&s, lb.addr(), E, bb.addr(), 3.998, t, e.addr(), w.addr()).unwrap();
+            s.synchronize().unwrap();
+            quench6k_cuda::hy4::set_legacy(false);
+            (s.download(e.addr(), t * 16).unwrap(), s.download(w.addr(), t * 16).unwrap())
+        };
+        let (a, b) = (run(true), run(false));
+        println!("grid {grid}: experts {}, weights {}", if a.0 == b.0 { "same" } else { "DIFF" }, if a.1 == b.1 { "same" } else { "DIFF" });
+        assert!(a == b, "grid {grid}: the sorting router differs");
     }
 }

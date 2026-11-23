@@ -61,7 +61,7 @@ SQ_DEVICE void decode_half(const Chunk<F>& c, int h, float* w) {
 
 // Grid: (tiles of NW * R weight rows) x groups of MT input rows, the group index fastest. `mrows` input
 // rows in all (the last group may hold fewer). BF16 or FP8B weights; Y = the sums (alpha 1, no K split).
-template <WFmt F, int MT, int R>
+template <WFmt F, int MT, int R, int PRE = (MT >= 16 ? 1 : 8 / R)>
 __global__ void __launch_bounds__(NW * 32) gemv_wide_kernel(const __nv_bfloat16* __restrict__ X, int ldx, const uint8_t* __restrict__ W,
                                                             const float* __restrict__ bscale, float* Y, int ldy, int N, int K, int mrows) {
     pdl_launch_dependents();
@@ -82,19 +82,8 @@ __global__ void __launch_bounds__(NW * 32) gemv_wide_kernel(const __nv_bfloat16*
 #pragma unroll
         for (int m = 0; m < MT; ++m) acc[r][m] = 0.0f;
 
-    int k = lane * 16;
-    Chunk<F> cur[R];
-    if (k < K)
-#pragma unroll
-        for (int r = 0; r < R; ++r) cur[r] = load_chunk<F>(rows[r], k);
-    pdl_wait();
-    for (; k < K; k += 512) {
-        // The next chunk's weights load while this one is consumed.
-        Chunk<F> nxt[R];
-        const bool more = k + 512 < K;
-        if (more)
-#pragma unroll
-            for (int r = 0; r < R; ++r) nxt[r] = load_chunk<F>(rows[r], k + 512);
+    // One chunk (16 columns at k) of the R weight rows into the MT rows' sums.
+    auto consume = [&](const Chunk<F> (&c)[R], int k) {
         float gs[R];
         if constexpr (F == WFmt::FP8B)
 #pragma unroll
@@ -104,7 +93,7 @@ __global__ void __launch_bounds__(NW * 32) gemv_wide_kernel(const __nv_bfloat16*
             float w[R][8];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
-                decode_half<F>(cur[r], h, w[r]);
+                decode_half<F>(c[r], h, w[r]);
                 if constexpr (F == WFmt::FP8B)
 #pragma unroll
                     for (int i = 0; i < 8; ++i) w[r][i] *= gs[r];
@@ -119,22 +108,57 @@ __global__ void __launch_bounds__(NW * 32) gemv_wide_kernel(const __nv_bfloat16*
                     for (int i = 0; i < 8; ++i) acc[r][m] = fmaf(w[r][i], xf[i], acc[r][m]);
             }
         }
+    };
+    // The first PRE chunks load before the dependency wait (the weight stream overlaps the previous
+    // kernel), the rest one chunk ahead.
+    Chunk<F> pre[PRE][R];
+#pragma unroll
+    for (int c = 0; c < PRE; ++c)
+        if (lane * 16 + c * 512 < K)
+#pragma unroll
+            for (int r = 0; r < R; ++r) pre[c][r] = load_chunk<F>(rows[r], lane * 16 + c * 512);
+    pdl_wait();
+    int k = lane * 16 + PRE * 512;
+    Chunk<F> cur[R];
+    if (k < K)
+#pragma unroll
+        for (int r = 0; r < R; ++r) cur[r] = load_chunk<F>(rows[r], k);
+#pragma unroll
+    for (int c = 0; c < PRE; ++c)
+        if (lane * 16 + c * 512 < K) consume(pre[c], lane * 16 + c * 512);
+    for (; k < K; k += 512) {
+        // The next chunk's weights load while this one is consumed.
+        Chunk<F> nxt[R];
+        const bool more = k + 512 < K;
+        if (more)
+#pragma unroll
+            for (int r = 0; r < R; ++r) nxt[r] = load_chunk<F>(rows[r], k + 512);
+        consume(cur, k);
         if (more)
 #pragma unroll
             for (int r = 0; r < R; ++r) cur[r] = nxt[r];
     }
     // Sums 32 at a time (slot j of a batch: r = j / MT, m = j % MT within the batch), each bitwise as its
-    // own warp_sum.
+    // own warp_sum; fewer than 32 sums (a power of two) at once, slot j in lanes j * 32 / NS ...
     constexpr int NS = R * MT;
-    static_assert(NS % 32 == 0, "R * MT must be a multiple of 32");
+    static_assert(NS % 32 == 0 || (NS & (NS - 1)) == 0, "R * MT must be a power of two or a multiple of 32");
+    if constexpr (NS < 32) {
+        float v[NS];
 #pragma unroll
-    for (int b = 0; b < NS / 32; ++b) {
-        float v[32];
-#pragma unroll
-        for (int j = 0; j < 32; ++j) v[j] = acc[(b * 32 + j) / MT][(b * 32 + j) % MT];
+        for (int j = 0; j < NS; ++j) v[j] = acc[j / MT][j % MT];
         const float sum = warp_sum_slots(v);
-        const int j = b * 32 + lane, r = j / MT, m = j % MT;
-        if (n0 + r < N && m < mv) Y[(size_t)m * ldy + n0 + r] = sum;
+        const int j = lane / (32 / NS), r = j / MT, m = j % MT;
+        if (lane % (32 / NS) == 0 && n0 + r < N && m < mv) Y[(size_t)m * ldy + n0 + r] = sum;
+    } else {
+#pragma unroll
+        for (int b = 0; b < NS / 32; ++b) {
+            float v[32];
+#pragma unroll
+            for (int j = 0; j < 32; ++j) v[j] = acc[(b * 32 + j) / MT][(b * 32 + j) % MT];
+            const float sum = warp_sum_slots(v);
+            const int j = b * 32 + lane, r = j / MT, m = j % MT;
+            if (n0 + r < N && m < mv) Y[(size_t)m * ldy + n0 + r] = sum;
+        }
     }
 }
 
@@ -150,14 +174,17 @@ cudaError_t launch(int M, const void* X, int ldx, const void* W, const float* sc
 template <WFmt F>
 cudaError_t launch_f(int mt, int r, int M, const void* X, int ldx, const void* W, const float* scale, float* Y, int ldy, int N, int K,
                      cudaStream_t st) {
-    if (mt == 8 && r == 4) return launch<F, 8, 4>(M, X, ldx, W, scale, Y, ldy, N, K, st);
-    if (mt == 16 && r == 4) return launch<F, 16, 4>(M, X, ldx, W, scale, Y, ldy, N, K, st);
+#define SQ_W(mt_, r_) \
+    if (mt == mt_ && r == r_) return launch<F, mt_, r_>(M, X, ldx, W, scale, Y, ldy, N, K, st);
+    SQ_W(8, 4) SQ_W(16, 4) SQ_W(8, 2) SQ_W(8, 1) SQ_W(4, 4) SQ_W(4, 2) SQ_W(4, 1) SQ_W(2, 4) SQ_W(2, 2)
+#undef SQ_W
     return cudaErrorInvalidValue;
 }
 
 }  // namespace
 
-// fmt 0 BF16 [N, K], 5 FP8 E4M3 with an FP32 scale per 128 x 128 block; mt x r in {8 x 4, 16 x 4}. K a multiple of 16 (FP8B: of 128), ldx a multiple of 8.
+// fmt 0 BF16 [N, K], 5 FP8 E4M3 with an FP32 scale per 128 x 128 block; mt x r in {16 x 4, 8 x 4, 8 x 2, 8 x 1,
+// 4 x 4, 4 x 2, 4 x 1, 2 x 4, 2 x 2}. K a multiple of 16 (FP8B: of 128), ldx a multiple of 8.
 extern "C" cudaError_t quench6k_hy4_gemv_wide(int fmt, int M, int mt, int r, const void* X, int ldx, const void* W, const float* scale,
                                             float* Y, int ldy, int N, int K, cudaStream_t st) {
     if (M == 0) return cudaSuccess;
