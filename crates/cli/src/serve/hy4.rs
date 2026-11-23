@@ -2,15 +2,15 @@
 //! growable [`State`] (its full-length caches mapped as it grows), one shared [`Workspace`]; the decoding
 //! sequences step together through [`Hy4Model::forward_batch`] and draft together through
 //! [`Hy4Model::draft_batch`] (each sequence's bits as alone). Drafts come from the checkpoint's DFly
-//! drafter (as many as [`DraftPolicy`](quench6k_engine::hy4::policy::DraftPolicy) expects to pay off), or
-//! from prompt lookup without one.
+//! drafter (as many as pay off: see [`super::slots`]), or from prompt lookup without one. A batched
+//! step's sampling candidates come from the device together ([`StepCandidates`]).
 
 use anyhow::{Result, anyhow};
 use quench6k_cuda::Stream;
 use quench6k_engine::hy4::Hy4Model;
 use quench6k_engine::hy4::forward::{Logits, MAX_SEQS, MAX_STEP, State, Workspace};
 
-use super::slots::{After, Draft, Drafter, Drafting, Fed, GpuSampler, SlotEngine, SlotSampler};
+use super::slots::{After, Draft, Drafter, Drafting, Fed, GpuSampler, Shared, SlotEngine, SlotSampler, StepCandidates};
 
 /// Prefill chunk (tokens per forward step): the engine's canonical chunk, so the scheduler's aligned
 /// chunks advance the canonical frontier.
@@ -23,6 +23,8 @@ pub(super) struct Engine<'m> {
     /// Device bytes of a new state (its rings, drafter buffers and snapshot), before any position.
     fixed: usize,
     per_position: usize,
+    /// Sampling candidates of the last batched step (variant hy4.batch_topk, default on).
+    cand: Option<Shared>,
 }
 
 impl<'m> Engine<'m> {
@@ -36,7 +38,8 @@ impl<'m> Engine<'m> {
             ws.device_bytes as f64 / (1u64 << 30) as f64,
             fixed as f64 / (1u64 << 20) as f64
         );
-        Ok(Self { model, s, ws, fixed, per_position })
+        let cand = StepCandidates::shared("hy4", model.cfg.vocab, MAX_SEQS * MAX_STEP)?;
+        Ok(Self { model, s, ws, fixed, per_position, cand })
     }
 }
 
@@ -66,7 +69,7 @@ impl<'m> SlotEngine for Engine<'m> {
         }
     }
     fn new_sampler(&self) -> Result<Self::Sampler> {
-        GpuSampler::new(self.s, self.model.cfg.vocab)
+        GpuSampler::new(self.s, self.model.cfg.vocab, self.cand.clone())
     }
     fn new_state(&mut self, capacity: usize) -> Result<State> {
         State::new(self.model, capacity, self.s)
@@ -117,11 +120,15 @@ impl<'m> SlotEngine for Engine<'m> {
         self.s.synchronize()
     }
     fn prefill(&mut self, st: &mut State, tokens: &[i32], last: bool) -> Result<u64> {
+        if let Some(c) = &self.cand {
+            // The logits are about to be overwritten.
+            c.borrow_mut().invalidate();
+        }
         let want = if last { Logits::Last } else { Logits::None };
         self.model.forward(st, &mut self.ws, self.s, tokens, want)?;
         Ok(self.ws.out_logits)
     }
-    fn draft(&mut self, st: &mut State, token: i32, row: usize) -> Result<Draft> {
+    fn draft(&mut self, st: &mut State, token: i32, row: usize, _room: usize) -> Result<Draft> {
         let t = std::time::Instant::now();
         let tokens = self.model.draft(st, &mut self.ws, self.s, token, row)?;
         Ok(Draft { tokens, conf: Vec::new(), secs: t.elapsed().as_secs_f64() })
@@ -134,7 +141,15 @@ impl<'m> SlotEngine for Engine<'m> {
     ) -> Vec<Result<Option<Draft>>> {
         let started = std::time::Instant::now();
         let at: Vec<usize> = states.iter().map(|st| st.pos).collect();
-        if let Err(e) = self.model.forward_batch(states, &mut self.ws, self.s, tokens) {
+        if let Some(c) = &self.cand {
+            c.borrow_mut().invalidate();
+        }
+        let rows: usize = tokens.iter().map(|t| t.len()).sum();
+        let run = self.model.forward_batch(states, &mut self.ws, self.s, tokens).and_then(|()| match &self.cand {
+            Some(c) => c.borrow_mut().launch(self.s, self.ws.out_logits, rows),
+            None => Ok(()),
+        });
+        if let Err(e) = run {
             let msg = format!("{e:#}");
             return states.iter().map(|_| Err(anyhow!("{msg}"))).collect();
         }
@@ -149,7 +164,7 @@ impl<'m> SlotEngine for Engine<'m> {
             match after(i, src, Fed { at: at[i], started }) {
                 Ok(v) => {
                     st.truncate(at[i] + v.keep);
-                    if let Some((tok, r)) = v.draft {
+                    if let Some((tok, r, _room)) = v.draft {
                         wanted.push((i, tok, r));
                     }
                     out.push(Ok(None));
