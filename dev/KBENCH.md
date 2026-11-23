@@ -889,3 +889,50 @@ and after, drafts on and off), summed decode tok/s at 1 / 2 / 4 / 8 at once, 600
 once (two runs each): 524, 536 -> 632, 612. At 8 at once drafting still only breaks even: the scheduler's
 cap admits few drafts while a drafter pass for 8 sequences costs 3.2 ms and computes all 7 drafts per
 sequence.
+
+## 2026-11-23: Hy4-flash small steps, fewer launches (same bits)
+
+nsys (graph node tracing, `QUENCH6K_HY4_PROFILE=1` puts batch-check's timed steps in a profiler range;
+tools/census.py critical-path credits), one-token steps at ctx 1024: 1477 kernels per step at 1 and at 8
+sequences. GPU busy per step 9.69 ms (1 sequence) / 20.95 ms (8); the experts were 2.0 / 10.4 ms of it (at 8
+sequences about 113 distinct experts per layer, at their DRAM floor). The rest was mostly kernel boundaries:
+per sublayer boundary rms_rows (one block per row) -> hc_post -> hc_mix_partial -> hc_pre (one block per row)
+cost 9-15 us; the attention split merge 6-9 us (its 16 or 32 loads per thread one after another); the router
+5.6 us (16 rounds of a block-wide argmax); q_a and kv_a, and the three MLP input projections, separate GEMVs
+of 48-128 CTAs at 8 rows.
+
+Changes (every one against the launches it replaces, the same arithmetic per output in the same order):
+- One launch per sublayer boundary (hc_next): each of a token's 24 slice blocks takes the row norm as rms_rows
+  does, updates its 512 lane values as hc_post does and writes hc_mix_partial's slice sums; the token's last
+  block to finish (arrival counter) runs hc_pre, its 512-thread loops and block sum emulated by two virtual
+  threads per thread. The weights load before the dependency wait. 13 us at first (hc_pre's loop of six
+  dependent loads became twelve with 256 threads), 5.6 us (1 row) / 7.8 us (8 rows) with the loads unrolled.
+- Stacked projections loaded as one matrix (views keep the parts for prefill): [q_a | kv_a | tk | hw],
+  [down_lat | shared_gate | shared_up] (then the routed input and the shared activation in one launch), the
+  dense and drafter gate/up pairs.
+- Wide GEMV forms for 3 to 8 rows by matrix shape (hy4_micro, isolated, 600 W; e.g. o_proj at 4 rows 49.4 ->
+  34.2 us, the stacked MLP input at 8 rows 11.1 us against 3 x 7.4): 4 x 1 / 4 x 2 at 3-4 rows, 8 x 4 / 8 x 2
+  / 8 x 1 at 5-8 rows; 8 / R weight chunks before the dependency wait. The router keeps its 16-row launches
+  (faster in a step than the 8 x 2 form the micro preferred).
+- The split merge issues all its loads at once (templated on 16 / 32 splits), the indexer's pooling tiles its
+  weights through shared memory, its prep loop is unrolled; the router sorts (bitonic in warps, 16-entry
+  lists merged pairwise): hy4_route_sort checks it against the argmax rounds with tied values.
+- `QUENCH6K_HY4_FUSE=0` runs the previous launches; `QUENCH6K_HY4_AB=fuse` times both in one process.
+
+Kernels per one-token step 1477 -> 1009; GPU busy per step (nsys, same process) 9.69 -> 8.86 ms at 1
+sequence, 20.95 -> 19.46 ms at 8. Dropped on measurement: weight loads before the dependency wait in the
+per-head GEMV (W_uv 14 -> 18-21 us: the extra registers cost occupancy); the routed experts' first weights
+loaded during the stacked MLP GEMV (that GEMV triggering its dependents late, the pair order first): gate/up
+40 -> 74 us at 1 row, fewer resident blocks.
+
+batch-check bench, ctx 1024, 24 steps, `QUENCH6K_HY4_AB=fuse` (new old old new in one process), tok/s:
+
+| sequences | plain 600 W | 3 drafts 600 W |
+|---|---|---|
+| 1 | 102.9 / 102.9 -> 112.8 / 114.6 | 148.7 / 149.8 -> 162.5 / 166.1 |
+| 2 | 172.7 / 172.6 -> 191.2 / 194.5 | 212.7 / 213.2 -> 229.6 / 230.8 |
+| 4 | 257.2 / 256.6 -> 281.6 / 282.3 | 304.7 / 302.3 -> 296.3 / 318.6 |
+| 8 | 334.6 / 359.6 -> 361.2 / 379.2 | 362.9 / 372.0 -> 367.0 / 381.6 |
+
+450 W, 8 sequences: plain 367.8 / 368.4 -> 382.0 / 392.7, 3 drafts 327.2 / 327.2 -> 327.0 / 329.1 (power bound:
+the experts' DRAM traffic). The first arm of a case includes its graph captures.

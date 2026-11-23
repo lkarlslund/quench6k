@@ -830,7 +830,8 @@ fn wide_form(l: &Linear, m: usize) -> Option<(usize, usize)> {
     match m {
         3..=4 if bf16 && size >= 12 << 20 => Some((4, 1)),
         3..=4 if !bf16 && size >= 8 << 20 => Some((4, if l.k >= 8192 { 1 } else { 2 })),
-        5..=8 if bf16 && (3072..8192).contains(&l.k) => Some((8, if l.n >= 1024 { 1 } else { 2 })),
+        // (The router, 512 rows, measured faster alone than in a step: it keeps launches of 16 rows.)
+        5..=8 if bf16 && l.n >= 1024 && (3072..8192).contains(&l.k) => Some((8, 1)),
         5..=8 if !bf16 && l.k < 8192 && size >= 12 << 20 => Some((8, 4)),
         5..=8 if !bf16 && l.k < 8192 && size >= 8 << 20 => Some((8, 2)),
         _ => None,
