@@ -512,17 +512,21 @@ impl TextStream {
 mod tests {
     use super::*;
 
+    /// The model directory named by environment variable `var` when it has a tokenizer (the test is
+    /// skipped otherwise).
+    fn test_model(var: &str) -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(std::env::var_os(var)?);
+        dir.join("tokenizer.json").exists().then_some(dir)
+    }
+
     /// Streaming a generation token by token yields exactly its full decode (multi-byte characters
     /// split across tokens included).
     #[test]
     fn text_stream_matches_full_decode() {
-        let dir = std::path::Path::new(
-            "/storage/ai/huggingface/main/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4",
-        );
-        if !dir.join("tokenizer.json").exists() {
+        let Some(dir) = test_model("QUENCH6K_TEST_QWEN") else {
             return;
-        }
-        let chat = Chat::load(dir, None).unwrap();
+        };
+        let chat = Chat::load(&dir, None).unwrap();
         let text = "Hello, wörld! 你好，世界。 🦀🚀 emoji ZWJ 👩‍💻 and code:\n```rust\nfn main() { println!(\"ok\"); }\n```\n".repeat(20);
         let ids = chat.encode_plain(&text).unwrap();
         let mut stream = TextStream::default();
@@ -546,11 +550,10 @@ mod tests {
     /// Inkling's message tokens decode to the plain tags, and streaming yields the same text.
     #[test]
     fn inkling_output_maps_to_plain_tags() {
-        let dir = std::path::Path::new("/storage/ai/huggingface/main/thinkingmachines/Inkling-2-Mini");
-        if !dir.join("tokenizer.json").exists() {
+        let Some(dir) = test_model("QUENCH6K_TEST_INKLING") else {
             return;
-        }
-        let chat = Chat::load(dir, None).unwrap();
+        };
+        let chat = Chat::load(&dir, None).unwrap();
         assert!(chat.inkling);
         let text = "<|message_model|><|content_thinking|>Need weather.<|end_message|><|message_model|><|content_text|>Checking.<|end_message|>\
                     <|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Århus\"}}<|end_message|>\
