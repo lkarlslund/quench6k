@@ -1,13 +1,140 @@
 //! Flint checkpoints in the server's slot scheduler ([`super::slots`]): each slot's sequence its own
 //! growable [`fl::FlintState`] (full-attention caches mapped as it grows), one shared [`fl::Workspace`];
 //! the decoding sequences step together through [`fl::FlintModel::forward_batch`] (each sequence's bits
-//! as alone); prompt-lookup drafts (Flint has no drafter).
+//! as alone); prompt-lookup drafts (Flint has no drafter). A batched step's sampling candidates come
+//! from the device together ([`Candidates`]) rather than in a top-k launch and download per sequence.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use anyhow::{Result, anyhow};
-use quench6k_cuda::Stream;
+use quench6k_cuda::{DeviceBuffer, Event, PinnedBuffer, Stream};
 use quench6k_engine::flint as fl;
+use quench6k_engine::session::GenParams;
 
-use super::slots::{After, Draft, Drafter, Drafting, Fed, GpuSampler, SlotEngine, SlotSampler};
+use super::slots::{After, Draft, Drafter, Drafting, Fed, SlotEngine, SlotSampler};
+use crate::flint::{POOL, SAMPLE_ROWS, Sampler};
+
+/// A batched step's top candidates of every logits row, fetched right after the step is enqueued: one
+/// top-k launch per SAMPLE_ROWS rows (each row's candidates are those of a launch for its sequence's rows
+/// alone: top-k works row by row) and one download. A sequence whose parameters want another number of
+/// candidates fetches its own ([`Sampler::fetch`]); the next step then uses the pool most sequences
+/// asked for.
+struct Candidates {
+    /// Candidate ids [rows, pool] (i32), then values [rows, pool] (f32), per launch of SAMPLE_ROWS rows.
+    dev: DeviceBuffer,
+    host: PinnedBuffer,
+    done: Event,
+    /// The step's logits (address of row 0), rows and pool; None when the logits are not the step's.
+    step: Option<(u64, usize, usize)>,
+    /// Whether `done` has been waited on, and the candidates unpacked into `ids`/`vals` [rows, pool].
+    ready: bool,
+    ids: Vec<i32>,
+    vals: Vec<f32>,
+    /// Pools the sequences of the current step fetched with.
+    asked: Vec<usize>,
+}
+
+impl Candidates {
+    fn new() -> Result<Self> {
+        let bytes = fl::MAX_ROWS * POOL * 8;
+        Ok(Self {
+            dev: DeviceBuffer::new(bytes)?,
+            host: PinnedBuffer::new(bytes)?,
+            done: Event::new()?,
+            step: None,
+            ready: false,
+            ids: Vec::new(),
+            vals: Vec::new(),
+            asked: Vec::new(),
+        })
+    }
+
+    /// The pool most of the last step's fetches asked for (1 when none did).
+    fn pool(&self) -> usize {
+        let mut best = (0, 1);
+        for &p in &self.asked {
+            let n = self.asked.iter().filter(|&&q| q == p).count();
+            if n > best.0 || (n == best.0 && p < best.1) {
+                best = (n, p);
+            }
+        }
+        best.1
+    }
+
+    /// Enqueues the candidates of `rows` logits rows at `logits` (after the step that writes them).
+    fn launch(&mut self, s: &Stream, logits: u64, rows: usize) -> Result<()> {
+        let pool = self.pool();
+        self.asked.clear();
+        self.step = None;
+        self.ready = false;
+        let row_bytes = (fl::VOCAB * 4) as u64;
+        let mut r = 0;
+        while r < rows {
+            let n = (rows - r).min(SAMPLE_ROWS);
+            let at = self.dev.addr() + (r * pool * 8) as u64;
+            quench6k_cuda::kernels::topk(s, logits + r as u64 * row_bytes, n, fl::VOCAB, fl::VOCAB, pool, false, at, at + (n * pool * 4) as u64)?;
+            r += n;
+        }
+        unsafe { s.copy_d2h(self.host.as_ptr(), self.dev.addr(), rows * pool * 8)? };
+        self.done.record(s)?;
+        self.step = Some((logits, rows, pool));
+        Ok(())
+    }
+
+    /// The candidates of `rows` rows at `src` when this step's batch has them with `pool` per row.
+    fn take(&mut self, src: u64, rows: usize, pool: usize) -> Result<Option<(&[i32], &[f32])>> {
+        self.asked.push(pool);
+        let Some((base, total, have)) = self.step else { return Ok(None) };
+        let row_bytes = (fl::VOCAB * 4) as u64;
+        if have != pool || src < base || (src - base) % row_bytes != 0 || ((src - base) / row_bytes) as usize + rows > total {
+            return Ok(None);
+        }
+        if !self.ready {
+            self.done.synchronize()?;
+            let raw = self.host.as_slice();
+            let word = |i: usize| u32::from_le_bytes(raw[4 * i..4 * i + 4].try_into().unwrap());
+            self.ids.clear();
+            self.vals.clear();
+            let mut r = 0;
+            while r < total {
+                let n = (total - r).min(SAMPLE_ROWS);
+                let at = r * pool * 2;
+                self.ids.extend((0..n * pool).map(|i| word(at + i) as i32));
+                self.vals.extend((0..n * pool).map(|i| f32::from_bits(word(at + n * pool + i))));
+                r += n;
+            }
+            self.ready = true;
+        }
+        let first = ((src - base) / row_bytes) as usize;
+        Ok(Some((&self.ids[first * pool..(first + rows) * pool], &self.vals[first * pool..(first + rows) * pool])))
+    }
+}
+
+/// A slot's sampler: the batched step's candidates when they fit, else its own fetch.
+pub(super) struct FlintSampler<'s> {
+    s: &'s Stream,
+    shared: Rc<RefCell<Candidates>>,
+    inner: Sampler,
+}
+
+impl SlotSampler for FlintSampler<'_> {
+    /// F32 logits [rows, VOCAB] on the device.
+    type Src = u64;
+    fn fetch(&mut self, src: u64, rows: usize, p: &GenParams) -> Result<()> {
+        let pool = Sampler::pool(p);
+        let mut c = self.shared.borrow_mut();
+        if let Some((ids, vals)) = c.take(src, rows, pool)? {
+            self.inner.load(ids, vals, pool);
+            return Ok(());
+        }
+        drop(c);
+        self.inner.fetch(self.s, src, rows, fl::VOCAB, p)
+    }
+    fn pick(&mut self, row: usize, p: &GenParams, generated: &[i32]) -> i32 {
+        self.inner.pick(row, p, generated)
+    }
+}
 
 pub(super) struct Engine<'m> {
     model: &'m fl::FlintModel,
@@ -16,6 +143,8 @@ pub(super) struct Engine<'m> {
     per_position: usize,
     /// The sliding rings once a sequence reaches SWA_RING positions (they grow with it below that).
     rings: usize,
+    /// Sampling candidates of the last batched step (variant flint.batch_topk, default on).
+    cand: Option<Rc<RefCell<Candidates>>>,
 }
 
 impl<'m> Engine<'m> {
@@ -26,13 +155,18 @@ impl<'m> Engine<'m> {
             "flint worker: {per_position} bytes per position, rings up to {:.0} MiB per sequence",
             rings as f64 / (1u64 << 20) as f64
         );
-        Ok(Self { model, s, ws: fl::Workspace::new(fl::MAX_ROWS)?, per_position, rings })
+        let cand = if quench6k_cuda::variants::get("flint.batch_topk", 1) != 0 {
+            Some(Rc::new(RefCell::new(Candidates::new()?)))
+        } else {
+            None
+        };
+        Ok(Self { model, s, ws: fl::Workspace::new(fl::MAX_ROWS)?, per_position, rings, cand })
     }
 }
 
 impl<'m> SlotEngine for Engine<'m> {
     type State = fl::FlintState;
-    type Sampler = GpuSampler<'m>;
+    type Sampler = FlintSampler<'m>;
 
     fn name(&self) -> &'static str {
         "flint"
@@ -57,7 +191,12 @@ impl<'m> SlotEngine for Engine<'m> {
         }
     }
     fn new_sampler(&self) -> Result<Self::Sampler> {
-        GpuSampler::new(self.s, fl::VOCAB)
+        // Without batched candidates every sampler gets a store of its own that is never filled.
+        let shared = match &self.cand {
+            Some(c) => c.clone(),
+            None => Rc::new(RefCell::new(Candidates::new()?)),
+        };
+        Ok(FlintSampler { s: self.s, shared, inner: Sampler::new()? })
     }
     fn new_state(&mut self, capacity: usize) -> Result<fl::FlintState> {
         fl::FlintState::new(self.model, capacity, self.s)
@@ -116,6 +255,10 @@ impl<'m> SlotEngine for Engine<'m> {
         self.s.synchronize()
     }
     fn prefill(&mut self, st: &mut fl::FlintState, tokens: &[i32], _last: bool) -> Result<u64> {
+        if let Some(c) = &self.cand {
+            // The logits are about to be overwritten.
+            c.borrow_mut().step = None;
+        }
         fl::forward(self.model, &self.ws, st, tokens, false, self.s)?;
         Ok(self.ws.logits)
     }
@@ -130,7 +273,15 @@ impl<'m> SlotEngine for Engine<'m> {
     ) -> Vec<Result<Option<Draft>>> {
         let started = std::time::Instant::now();
         let at: Vec<usize> = states.iter().map(|st| st.pos()).collect();
-        if let Err(e) = self.model.forward_batch(states, &mut self.ws, self.s, tokens) {
+        let rows: usize = tokens.iter().map(|t| t.len()).sum();
+        if let Some(c) = &self.cand {
+            c.borrow_mut().step = None;
+        }
+        let run = self.model.forward_batch(states, &mut self.ws, self.s, tokens).and_then(|()| match &self.cand {
+            Some(c) => c.borrow_mut().launch(self.s, self.ws.logits, rows),
+            None => Ok(()),
+        });
+        if let Err(e) = run {
             let msg = format!("{e:#}");
             return states.iter().map(|_| Err(anyhow!("{msg}"))).collect();
         }
