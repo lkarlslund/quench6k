@@ -2,14 +2,24 @@
 use super::{Metrics, Sample, timestamp};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tsink::{
     DataPoint, Label, Row, Storage, StorageBuilder, TimestampPrecision, Value, WalSyncMode,
 };
+
+/// tsink persists every insert as a segment of its own within 250 ms, merges segments only up
+/// to its top level (16 inserts each) and keeps ~20 KB of index memory per segment for our 35
+/// series (8 slots). Inserting every minute grew that by ~1.9 MB a day without bound inside the
+/// retention; inserting each hour once it has ended keeps 31 days at ~50 segments.
+const BATCH_MS: u64 = 3_600_000;
+/// Finished minutes not yet in tsink, oldest first; rewritten once a minute, not every second.
+const UNWRITTEN: &str = "unwritten.json";
+/// While tsink refuses writes, keep retrying at most this many minutes (a day).
+const MAX_UNWRITTEN: usize = 1440;
 
 macro_rules! totals {
     ($($field:ident),+ $(,)?) => {
@@ -107,6 +117,14 @@ struct Checkpoint {
     pending: Option<Bucket>,
 }
 
+/// Minutes queries read from the writer rather than from tsink.
+#[derive(Clone, Default)]
+struct Recent {
+    /// Finished minutes, oldest first, all before `pending`.
+    unwritten: Vec<Sample>,
+    pending: Option<Sample>,
+}
+
 pub(in super::super) struct Archive {
     db: Arc<dyn Storage>,
     _lock: std::fs::File,
@@ -117,13 +135,17 @@ pub(in super::super) struct Archive {
     pub retention_seconds: u64,
     pub error: Mutex<Option<String>>,
     pub queries: Arc<tokio::sync::Semaphore>,
-    pending: Mutex<Option<Sample>>,
+    recent: Mutex<Recent>,
+    #[cfg(test)]
+    refuse_writes: std::sync::atomic::AtomicBool,
 }
 
 pub(super) struct Writer {
     archive: Arc<Archive>,
     dir: PathBuf,
     checkpoint: Checkpoint,
+    unwritten: Vec<Sample>,
+    unwritten_dirty: bool,
 }
 
 pub(super) fn default_dir() -> Result<PathBuf> {
@@ -132,6 +154,19 @@ pub(super) fn default_dir() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .context("set --stats-dir or HOME/XDG_STATE_HOME for durable statistics")?;
     Ok(root.join("quench6k/stats"))
+}
+
+/// Replaces `dir/name` with `data` so that a crash leaves the old or the new contents.
+fn store(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = dir.join(format!("{name}.tmp"));
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, dir.join(name))?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 impl Writer {
@@ -165,10 +200,19 @@ impl Writer {
             },
             Err(e) => return Err(e.into()),
         };
+        let mut unwritten: Vec<Sample> = match std::fs::read(dir.join(UNWRITTEN)) {
+            Ok(data) => serde_json::from_slice(&data).context("read unwritten statistics")?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
         let retention_seconds = u64::from(days) * 86400;
         // A dormant server can outlive its graph retention; lifetime totals still survive.
+        let cutoff = timestamp().saturating_sub(retention_seconds * 1000);
+        unwritten.retain(|s| s.timestamp >= cutoff);
         if checkpoint.pending.as_ref().is_some_and(|b| {
-            b.sample.timestamp < timestamp().saturating_sub(retention_seconds * 1000)
+            b.sample.timestamp < cutoff
+                // Saved as finished before the checkpoint that dropped it.
+                || unwritten.last().is_some_and(|u| u.timestamp >= b.sample.timestamp)
         }) {
             checkpoint.pending = None;
         }
@@ -176,7 +220,9 @@ impl Writer {
             .with_data_path(dir.join("series"))
             .with_timestamp_precision(TimestampPrecision::Milliseconds)
             .with_retention(Duration::from_secs(retention_seconds))
-            .with_memory_limit(32 << 20)
+            // No memory limit: tsink refuses every write beyond it and can evict only unflushed
+            // chunks, never the index of persisted segments, so a limit only discards history.
+            // Hourly inserts bound that index by the retention instead.
             .with_max_writers(1)
             .with_wal_size_limit(64 << 20)
             .with_wal_sync_mode(WalSyncMode::PerAppend)
@@ -194,12 +240,16 @@ impl Writer {
             .map(|i| i + 1)
             .max()
             .unwrap_or(0);
-        let known_slots = stored_slots.max(
-            checkpoint
-                .pending
-                .as_ref()
-                .map_or(0, |b| b.sample.output_tps.len()),
-        );
+        let known_slots = unwritten
+            .iter()
+            .map(|s| s.output_tps.len())
+            .chain(
+                checkpoint
+                    .pending
+                    .as_ref()
+                    .map(|b| b.sample.output_tps.len()),
+            )
+            .fold(stored_slots, usize::max);
         let archive = Arc::new(Archive {
             db,
             _lock: lock,
@@ -210,12 +260,19 @@ impl Writer {
             retention_seconds,
             error: Mutex::new(None),
             queries: Arc::new(tokio::sync::Semaphore::new(2)),
-            pending: Mutex::new(checkpoint.pending.as_ref().map(Bucket::sample)),
+            recent: Mutex::new(Recent {
+                unwritten: unwritten.clone(),
+                pending: checkpoint.pending.as_ref().map(Bucket::sample),
+            }),
+            #[cfg(test)]
+            refuse_writes: Default::default(),
         });
         let writer = Self {
             archive: archive.clone(),
             dir,
             checkpoint,
+            unwritten,
+            unwritten_dirty: false,
         };
         writer.save()?;
         Ok((archive, writer))
@@ -223,58 +280,140 @@ impl Writer {
 
     pub(super) fn record(&mut self, sample: &Sample, runtime: &Totals, seconds: f64) -> Result<()> {
         let minute = sample.timestamp / 60000 * 60000;
+        let mut result = Ok(());
         if self
             .checkpoint
             .pending
             .as_ref()
             .is_some_and(|b| b.sample.timestamp != minute)
         {
-            self.flush()?;
+            result = self.finish_minute(minute);
         }
+        // Even when tsink refuses finished minutes, the current one keeps accumulating.
         self.checkpoint
             .pending
             .get_or_insert_with(Bucket::default)
             .push(sample, seconds);
         self.checkpoint.totals = self.archive.base.add(runtime);
-        *self
-            .archive
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) =
-            self.checkpoint.pending.as_ref().map(Bucket::sample);
-        self.save()
+        self.archive.recent().pending = self.checkpoint.pending.as_ref().map(Bucket::sample);
+        self.save()?;
+        result
     }
 
-    fn flush(&mut self) -> Result<()> {
+    /// Moves the pending minute to the unwritten ones and writes every hour before `minute`.
+    fn finish_minute(&mut self, minute: u64) -> Result<()> {
         self.archive.log_background_errors();
-        if let Some(bucket) = &self.checkpoint.pending {
-            self.archive.write(&bucket.sample())?;
+        if let Some(bucket) = self.checkpoint.pending.take() {
+            let mut sample = bucket.sample();
+            self.archive.pad(&mut sample);
+            self.unwritten.push(sample);
+            self.unwritten_dirty = true;
         }
-        self.checkpoint.pending = None;
-        Ok(())
+        // tsink rejects a whole insert holding a point older than its retention.
+        let cutoff = timestamp().saturating_sub(self.archive.retention_seconds * 1000) + 60000;
+        let before = self.unwritten.len();
+        self.unwritten.retain(|s| s.timestamp >= cutoff);
+        let mut dropped = before - self.unwritten.len();
+        let mut result = Ok(());
+        while let Some(first) = self.unwritten.first() {
+            let batch = first.timestamp / BATCH_MS;
+            if batch >= minute / BATCH_MS {
+                break;
+            }
+            let n = self
+                .unwritten
+                .iter()
+                .take_while(|s| s.timestamp / BATCH_MS == batch)
+                .count();
+            if let Err(e) = self.archive.write(&self.unwritten[..n]) {
+                result = Err(e);
+                break;
+            }
+            self.unwritten.drain(..n);
+            self.unwritten_dirty = true;
+        }
+        if self.unwritten.len() > MAX_UNWRITTEN {
+            let excess = self.unwritten.len() - MAX_UNWRITTEN;
+            self.unwritten.drain(..excess);
+            dropped += excess;
+            let message = format!("dropped the {excess} oldest unwritten minutes");
+            result = Err(match result {
+                Ok(()) => anyhow::anyhow!(message),
+                Err(e) => e.context(message),
+            });
+        }
+        self.unwritten_dirty |= dropped > 0;
+        let saved = if self.unwritten_dirty {
+            serde_json::to_vec(&self.unwritten)
+                .map_err(anyhow::Error::from)
+                .and_then(|data| store(&self.dir, UNWRITTEN, &data))
+                .context("save unwritten statistics")
+        } else {
+            Ok(())
+        };
+        self.unwritten_dirty = saved.is_err();
+        self.archive.recent().unwritten = self.unwritten.clone();
+        saved.and(result)
     }
 
     fn save(&self) -> Result<()> {
-        use std::io::Write;
-        let mut file = std::fs::File::create(self.dir.join("checkpoint.tmp"))?;
-        file.write_all(&serde_json::to_vec(&self.checkpoint)?)?;
-        file.sync_all()?;
-        std::fs::rename(
-            self.dir.join("checkpoint.tmp"),
-            self.dir.join("checkpoint.json"),
-        )?;
-        #[cfg(unix)]
-        std::fs::File::open(&self.dir)?.sync_all()?;
-        Ok(())
+        store(
+            &self.dir,
+            "checkpoint.json",
+            &serde_json::to_vec(&self.checkpoint)?,
+        )
     }
 
     pub(super) fn finish(&mut self, runtime: &Totals) -> Result<()> {
-        // Partial minutes live in the durable checkpoint; only finalized minutes enter the TSDB.
+        // Unfinished minutes and hours live in the durable checkpoint and unwritten minutes;
+        // only finished hours enter the TSDB.
         self.checkpoint.totals = self.archive.base.add(runtime);
         self.save()?;
+        if self.unwritten_dirty {
+            store(&self.dir, UNWRITTEN, &serde_json::to_vec(&self.unwritten)?)?;
+            self.unwritten_dirty = false;
+        }
         self.archive.db.close()?;
         Ok(())
     }
+}
+
+/// tsink rows of one finished minute. Rates are stored as token sums so that downsampling sums
+/// work and time.
+fn rows(sample: &Sample) -> Vec<Row> {
+    let t = sample.timestamp as i64;
+    let mut rows = sample.totals.rows(t);
+    rows.push(Row::new(
+        "sample_seconds",
+        DataPoint::new(t, sample.seconds),
+    ));
+    for (name, values) in [
+        ("output_tps", &sample.output_tps),
+        ("prefill_tps", &sample.prefill_tps),
+    ] {
+        rows.extend(values.iter().enumerate().map(|(slot, v)| {
+            Row::with_labels(
+                name,
+                vec![Label::new("slot", slot.to_string())],
+                DataPoint::new(t, *v * sample.seconds),
+            )
+        }));
+    }
+    rows.extend(sample.kv_bytes.iter().enumerate().map(|(slot, v)| {
+        Row::with_labels(
+            "kv_bytes",
+            vec![Label::new("slot", slot.to_string())],
+            DataPoint::new(t, *v),
+        )
+    }));
+    for (name, v) in [
+        ("prefilling", sample.prefilling as u64),
+        ("decoding", sample.decoding as u64),
+        ("queued", sample.queued),
+    ] {
+        rows.push(Row::new(name, DataPoint::new(t, v)));
+    }
+    rows
 }
 
 impl Archive {
@@ -290,6 +429,10 @@ impl Archive {
             }
             Ok(()) => *error = None,
         }
+    }
+
+    fn recent(&self) -> std::sync::MutexGuard<'_, Recent> {
+        self.recent.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// tsink reports its flush and compaction failures only through `tracing`, which we don't
@@ -308,9 +451,8 @@ impl Archive {
         }
     }
 
-    fn write(&self, sample: &Sample) -> Result<()> {
-        // A removed slot contributes zero in later minutes, including downsampled averages.
-        let mut sample = sample.clone();
+    /// A removed slot contributes zero in later minutes, including downsampled averages.
+    fn pad(&self, sample: &mut Sample) {
         let count = sample
             .output_tps
             .len()
@@ -323,53 +465,43 @@ impl Archive {
         sample.output_tps.resize(count, 0.0);
         sample.prefill_tps.resize(count, 0.0);
         sample.kv_bytes.resize(count, 0);
-        let t = sample.timestamp as i64;
-        let mut rows = sample.totals.rows(t);
-        rows.push(Row::new(
-            "sample_seconds",
-            DataPoint::new(t, sample.seconds),
-        ));
-        for (name, values) in [
-            ("output_tps", &sample.output_tps),
-            ("prefill_tps", &sample.prefill_tps),
-        ] {
-            rows.extend(values.iter().enumerate().map(|(slot, v)| {
-                Row::with_labels(
-                    name,
-                    vec![Label::new("slot", slot.to_string())],
-                    DataPoint::new(t, *v * sample.seconds),
-                )
-            }));
-        }
-        rows.extend(sample.kv_bytes.iter().enumerate().map(|(slot, v)| {
-            Row::with_labels(
-                "kv_bytes",
-                vec![Label::new("slot", slot.to_string())],
-                DataPoint::new(t, *v),
-            )
-        }));
-        for (name, v) in [
-            ("prefilling", sample.prefilling as u64),
-            ("decoding", sample.decoding as u64),
-            ("queued", sample.queued),
-        ] {
-            rows.push(Row::new(name, DataPoint::new(t, v)));
-        }
-        // tsink preserves duplicate timestamps. Finalized minutes are immutable: on recovery
-        // after WAL commit but before checkpoint replacement, only insert missing metric rows.
-        // Also handles a failed batch that made only a prefix of its rows visible.
-        let mut missing = Vec::new();
-        for row in rows {
-            let existing = self.db.select(row.metric(), row.labels(), t, t + 1)?;
-            anyhow::ensure!(
-                existing.iter().all(|p| p == row.data_point()),
-                "conflicting persisted minute {} for {}",
-                t,
-                row.metric()
-            );
-            if existing.is_empty() {
-                missing.push(row);
+    }
+
+    /// Inserts finished minutes in one batch, so tsink persists them as one segment.
+    fn write(&self, samples: &[Sample]) -> Result<()> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.refuse_writes.load(Ordering::Relaxed),
+            "refused by test"
+        );
+        let mut series = HashMap::<(String, Vec<Label>), Vec<Row>>::new();
+        for sample in samples {
+            let mut sample = sample.clone();
+            self.pad(&mut sample);
+            for row in rows(&sample) {
+                series
+                    .entry((row.metric().to_string(), row.labels().to_vec()))
+                    .or_default()
+                    .push(row);
             }
+        }
+        // tsink preserves duplicate timestamps. Finished minutes are immutable: after a crash
+        // between the insert and saving the unwritten minutes, or after a failed insert that
+        // made only some rows visible, insert only the rows tsink lacks.
+        let mut missing = Vec::new();
+        for ((metric, labels), rows) in series {
+            let times = rows.iter().map(|r| r.data_point().timestamp);
+            let (first, last) = (times.clone().min().unwrap(), times.max().unwrap());
+            let stored = self
+                .db
+                .select(&metric, &labels, first, last + 1)?
+                .into_iter()
+                .map(|p| p.timestamp)
+                .collect::<HashSet<_>>();
+            missing.extend(
+                rows.into_iter()
+                    .filter(|r| !stored.contains(&r.data_point().timestamp)),
+            );
         }
         if !missing.is_empty() {
             self.db.insert_rows(&missing)?;
@@ -378,48 +510,55 @@ impl Archive {
     }
 
     pub(super) fn query(&self, from: u64, end: u64, interval: u64) -> Result<Vec<Sample>> {
+        let recent = self.recent().clone();
+        let unwritten = recent
+            .unwritten
+            .iter()
+            .filter(|s| s.timestamp >= from && s.timestamp < end)
+            .collect::<Vec<_>>();
+        // Minutes the writer still holds replace any copy tsink already has (a restart can
+        // leave one in both), so tsink is read only before the first of them.
+        let stored_end = recent
+            .unwritten
+            .first()
+            .or(recent.pending.as_ref())
+            .map_or(end, |s| s.timestamp.min(end));
+        let mut series = HashMap::<(String, Vec<Label>), Vec<DataPoint>>::new();
+        if from < stored_end {
+            for s in self.db.list_metrics()? {
+                // Not tsink's downsampling: with an aggregation, select_with_options (0.10.2)
+                // holds its visibility read lock and takes it again to read the series. When a
+                // background retention pass queues for the write lock in between, both wait
+                // forever.
+                let points = self
+                    .db
+                    .select(&s.name, &s.labels, from as i64, stored_end as i64)?;
+                series.entry((s.name, s.labels)).or_default().extend(points);
+            }
+        }
+        for row in unwritten.iter().flat_map(|s| rows(s)) {
+            series
+                .entry((row.metric().to_string(), row.labels().to_vec()))
+                .or_default()
+                .push(row.data_point().clone());
+        }
         let mut buckets = BTreeMap::<u64, Sample>::new();
-        let pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        // Pending replaces its persisted timestamp after restart, never double counting that minute.
-        let persisted_end = pending
-            .as_ref()
-            .filter(|p| p.timestamp < end)
-            .map_or(end, |p| p.timestamp);
-        let series_list = if from < persisted_end {
-            self.db.list_metrics()?
-        } else {
-            Vec::new()
-        };
-        for series in series_list {
-            let slot = series
-                .labels
+        for ((name, labels), points) in series {
+            let slot = labels
                 .iter()
                 .find(|l| l.name == "slot")
                 .and_then(|l| l.value.parse::<usize>().ok());
             let sum = matches!(
-                series.name.as_str(),
+                name.as_str(),
                 "output_tps" | "prefill_tps" | "sample_seconds"
-            ) || series.name.starts_with("total_");
-            // Not tsink's downsampling: with an aggregation, select_with_options (0.10.2) holds
-            // its visibility read lock and takes it again to read the series. When a background
-            // retention pass queues for the write lock in between, both wait forever.
-            let points = self.db.select(
-                &series.name,
-                &series.labels,
-                from as i64,
-                persisted_end as i64,
-            )?;
+            ) || name.starts_with("total_");
             for (t, value) in downsample(points, from, interval, sum) {
                 let s = buckets.entry(t).or_insert_with(|| Sample {
                     timestamp: t,
                     ..Default::default()
                 });
                 let v = value.as_f64().unwrap_or(0.0);
-                match (series.name.as_str(), slot) {
+                match (name.as_str(), slot) {
                     ("output_tps", Some(i)) => {
                         s.output_tps.resize(s.output_tps.len().max(i + 1), 0.0);
                         s.output_tps[i] = v;
@@ -450,7 +589,10 @@ impl Archive {
                 }
             }
         }
-        if let Some(pending) = pending.filter(|p| p.timestamp >= from && p.timestamp < end) {
+        if let Some(pending) = recent
+            .pending
+            .filter(|p| p.timestamp >= from && p.timestamp < end)
+        {
             samples.push(pending);
         }
         Ok(samples)
@@ -567,9 +709,9 @@ mod tests {
         let (archive, mut writer) = Writer::open(dir.0.clone(), 31).unwrap();
         let t = (timestamp() / 600000 - 2) * 600000;
         let huge = (1u64 << 53) + 1;
-        archive.write(&sample(t, 1, 2, huge)).unwrap();
-        archive.write(&sample(t + 60000, 12, 3, 5)).unwrap();
-        archive.write(&sample(t, 1, 2, huge)).unwrap();
+        archive.write(&[sample(t, 1, 2, huge)]).unwrap();
+        archive.write(&[sample(t + 60000, 12, 3, 5)]).unwrap();
+        archive.write(&[sample(t, 1, 2, huge)]).unwrap();
         let result = archive.query(t, t + 120000, 600000).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].totals.generated_tokens, huge + 5);
@@ -589,5 +731,190 @@ mod tests {
         drop(archive);
         std::fs::write(dir.0.join("checkpoint.json"), b"broken").unwrap();
         assert!(Writer::open(dir.0.clone(), 31).is_err());
+    }
+
+    const H: u64 = BATCH_MS;
+    /// Waits until tsink has persisted every point inserted so far, as its 250 ms background
+    /// flush does between two minutes of the production sampler.
+    fn settle(archive: &Archive) {
+        let start = std::time::Instant::now();
+        loop {
+            let o = archive.db.observability_snapshot();
+            if o.flush.persisted_points_total >= o.wal.append_points_total {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "tsink did not flush"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn record_minute(writer: &mut Writer, runtime: &mut Totals, t: u64) -> Result<()> {
+        let s = sample(t, 8, 1, 10);
+        *runtime = runtime.add(&s.totals);
+        writer.record(&s, runtime, 1.0)
+    }
+    #[test]
+    fn eight_slot_minutes_reach_tsink_once_per_hour() {
+        // tsink persists every insert as a segment of its own and never merges its top level
+        // (16 inserts per segment); each segment holds ~20 KB of index memory for these 35
+        // series. Inserting every minute outgrew the former 32 MiB budget after ~16 days.
+        let dir = Temp::new();
+        let hours = 4;
+        let t0 = (timestamp() / H - hours - 2) * H;
+        let end = t0 + (hours * 60 + 1) * 60000;
+        let (archive, mut writer) = Writer::open(dir.0.clone(), 31).unwrap();
+        let mut runtime = Totals::default();
+        for m in 0..=hours * 60 {
+            record_minute(&mut writer, &mut runtime, t0 + m * 60000 + 1000).unwrap();
+            settle(&archive);
+        }
+        let segments = archive
+            .db
+            .observability_snapshot()
+            .flush
+            .persisted_segments_total;
+        assert!(
+            segments <= hours,
+            "{segments} tsink segments for {hours} hours"
+        );
+        let check = |archive: &Archive| {
+            let result = archive.query(t0, end, 60000).unwrap();
+            assert_eq!(result.len() as u64, hours * 60 + 1);
+            for (m, s) in result.iter().enumerate() {
+                assert_eq!(s.timestamp, t0 + m as u64 * 60000);
+                assert_eq!(s.totals.requests, 1);
+                assert_eq!(s.kv_bytes, vec![1234; 8]);
+                assert_eq!(s.output_tps, vec![10.0; 8]);
+            }
+            let hourly = archive.query(t0, end, H).unwrap();
+            assert_eq!(
+                hourly.iter().map(|s| s.totals.requests).sum::<u64>(),
+                hours * 60 + 1
+            );
+        };
+        check(&archive);
+        writer.finish(&runtime).unwrap();
+        drop(writer);
+        drop(archive);
+        let (archive, mut writer) = Writer::open(dir.0.clone(), 31).unwrap();
+        check(&archive);
+        writer.finish(&runtime).unwrap();
+    }
+    #[test]
+    fn refused_writes_keep_every_minute_and_retry() {
+        let dir = Temp::new();
+        let t0 = (timestamp() / H - 5) * H;
+        let (archive, mut writer) = Writer::open(dir.0.clone(), 31).unwrap();
+        let mut runtime = Totals::default();
+        for m in 0..60 {
+            record_minute(&mut writer, &mut runtime, t0 + m * 60000).unwrap();
+        }
+        archive.refuse_writes.store(true, Ordering::Relaxed);
+        let failures = (60..150)
+            .filter(|m| record_minute(&mut writer, &mut runtime, t0 + m * 60000).is_err())
+            .count();
+        assert!(failures > 0);
+        let result = archive.query(t0, t0 + 150 * 60000, 60000).unwrap();
+        assert_eq!(result.len(), 150);
+        // The backlog survives a restart while storage still refuses it.
+        writer.finish(&runtime).unwrap();
+        drop(writer);
+        drop(archive);
+        let (archive, mut writer) = Writer::open(dir.0.clone(), 31).unwrap();
+        for m in 150..=180 {
+            record_minute(&mut writer, &mut runtime, t0 + m * 60000).unwrap();
+        }
+        let result = archive.query(t0, t0 + 181 * 60000, 60000).unwrap();
+        assert_eq!(result.len(), 181);
+        assert!(result.iter().all(|s| s.totals.requests == 1));
+        assert_eq!(
+            result
+                .iter()
+                .map(|s| s.totals.generated_tokens)
+                .sum::<u64>(),
+            1810
+        );
+        let stored = archive
+            .db
+            .select("total_requests", &[], t0 as i64, (t0 + 180 * 60000) as i64)
+            .unwrap();
+        assert_eq!(stored.len(), 180);
+        writer.finish(&runtime).unwrap();
+    }
+    /// The production failure: ~18 days of minutes inserted one at a time (one tsink segment
+    /// each, as tsink's 250 ms flush makes them) left the former 32 MiB budget unable to admit
+    /// the next minute. Slow (each reopen loads every segment so far; about half an hour):
+    /// `cargo test --release -p quench6k-cli -- --ignored`.
+    #[test]
+    #[ignore]
+    fn extends_history_stored_one_segment_per_minute() {
+        let dir = Temp::new();
+        let minutes = 26000u64;
+        let t0 = (timestamp() / 60000 - minutes - 120) * 60000;
+        let numbers = [
+            "total_requests",
+            "total_generations",
+            "total_prompt_tokens",
+            "total_cached_tokens",
+            "total_generated_tokens",
+            "total_prefilled_tokens",
+            "total_errors",
+            "prefilling",
+            "decoding",
+            "queued",
+        ];
+        for m in 0..minutes {
+            let t = (t0 + m * 60000) as i64;
+            let mut rows: Vec<Row> = numbers
+                .iter()
+                .map(|n| Row::new(*n, DataPoint::new(t, m % 7)))
+                .collect();
+            rows.push(Row::new("sample_seconds", DataPoint::new(t, 60.0)));
+            for slot in 0..8 {
+                let labels = vec![Label::new("slot", slot.to_string())];
+                rows.push(Row::with_labels(
+                    "output_tps",
+                    labels.clone(),
+                    DataPoint::new(t, 600.0),
+                ));
+                rows.push(Row::with_labels(
+                    "prefill_tps",
+                    labels.clone(),
+                    DataPoint::new(t, 0.0),
+                ));
+                rows.push(Row::with_labels(
+                    "kv_bytes",
+                    labels,
+                    DataPoint::new(t, 163577856u64),
+                ));
+            }
+            let db = StorageBuilder::new()
+                .with_data_path(dir.0.join("series"))
+                .with_timestamp_precision(TimestampPrecision::Milliseconds)
+                .with_retention(Duration::from_secs(31 * 86400))
+                .with_max_writers(1)
+                .build()
+                .unwrap();
+            db.insert_rows(&rows).unwrap();
+            db.close().unwrap();
+        }
+        let (archive, mut writer) = Writer::open(dir.0.clone(), 31).unwrap();
+        eprintln!(
+            "tsink memory after {minutes} one-minute inserts: {:?}",
+            archive.db.observability_snapshot().memory
+        );
+        // The second minute starts an hour, so the first one is written to tsink.
+        let t = timestamp() / H * H - 60000;
+        let mut runtime = Totals::default();
+        record_minute(&mut writer, &mut runtime, t).unwrap();
+        record_minute(&mut writer, &mut runtime, t + 60000).unwrap();
+        let stored = archive
+            .db
+            .select("total_requests", &[], t as i64, t as i64 + 1)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        writer.finish(&runtime).unwrap();
     }
 }
