@@ -317,6 +317,48 @@ pub fn gemm_bf16_batched(
     check(err, "gemm_bf16_batched")
 }
 
+/// [`gemv`] (no K split) of any number of rows `m`, in CTAs of `mg` rows with `r` weight rows per warp
+/// ((mg, r) in {(8, 4), (16, 2)}); the CTAs of one weight tile run together, so the weights
+/// stream from DRAM about once. Each row's result is bitwise the one [`gemv`] gives it. Formats BF16 and
+/// Fp8Block.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_grouped(
+    s: &Stream,
+    m: usize,
+    mg: usize,
+    r: usize,
+    x: u64,
+    ldx: usize,
+    fmt: WeightFormat,
+    w: u64,
+    scale: u64,
+    y: u64,
+    ldy: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let err = unsafe {
+        ffi::quench6k_gemv_grouped(
+            fmt as i32,
+            m as i32,
+            mg as i32,
+            r as i32,
+            p(x),
+            ldx as i32,
+            p(w),
+            opt_f(scale),
+            y as *mut f32,
+            ldy as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            0,
+            s.raw(),
+        )
+    };
+    check(err, "gemv_grouped")
+}
+
 pub fn gemv_max_m() -> usize {
     unsafe { ffi::quench6k_gemv_max_m() as usize }
 }

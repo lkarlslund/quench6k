@@ -736,6 +736,12 @@ impl Workspace {
         })
     }
 
+    /// Drops the captured graphs (they are captured again as steps need them).
+    pub fn clear_graphs(&mut self) {
+        self.graphs.clear();
+        self.dgraphs.clear();
+    }
+
     /// Device addresses of a step's descriptors for `r` rows: (pos, seq, keep slot, tables).
     fn desc_addrs(&self, r: usize) -> (u64, u64, u64, u64) {
         let lay = StepLayout::new(r, 0);
@@ -744,12 +750,48 @@ impl Workspace {
     }
 }
 
+/// Several rows of a small step through the GEMV's batched forms (QUENCH6K_HY4_WIDE=0: launches of 16
+/// rows only).
+fn wide_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match WIDE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var("QUENCH6K_HY4_WIDE").map_or(true, |v| v != "0");
+            WIDE.store(on as u8, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+static WIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// Benchmarks: turns the batched GEMV forms on or off (the same bits either way). Steps captured as
+/// graphs keep the form they were captured with: clear them with [`Workspace::clear_graphs`].
+pub fn set_batched_gemv(on: bool) {
+    WIDE.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Y [m, l.n] F32 = X [m, l.k] BF16 . W^T: the GEMV (per-row arithmetic independent of m) for small steps
-/// and any m <= 16, in launches of 16 rows; the tensor-core GEMM otherwise.
+/// and any m <= 16; the tensor-core GEMM otherwise. Several rows go through the GEMV's batched forms, every
+/// row bitwise as alone: 5 to 8 rows four weight rows per warp with the weights read once (larger
+/// matrices), more rows the wide GEMV (16 rows per warp; the largest matrices) or groups of 8 rows; small
+/// matrices and single rows in launches of up to 16 rows.
 #[allow(clippy::too_many_arguments)]
 fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usize, small: bool) -> Result<()> {
     let gm = k::gemv_max_m();
     if m <= gm || small {
+        let size = l.n * l.k;
+        if m > 1 && matches!(l.fmt, k::WeightFormat::Bf16 | k::WeightFormat::Fp8Block) && wide_enabled() {
+            // The wide GEMV runs blocks of 16 rows: not for a last block of 8 rows or fewer.
+            if size >= 12 << 20 && m > 8 && (m % 16 == 0 || m % 16 > 8) {
+                return hk::gemv_wide(s, m, 16, 4, x, ldx, l.fmt, l.w, l.scale, y, ldy, l.n, l.k);
+            }
+            if (size >= 4 << 20 && m > 4) || m > 16 {
+                return k::gemv_grouped(s, m, 8, 4, x, ldx, l.fmt, l.w, l.scale, y, ldy, l.n, l.k);
+            }
+        }
         for r0 in (0..m).step_by(gm) {
             let rows = gm.min(m - r0);
             k::gemv(s, rows, x + (r0 * ldx * 2) as u64, ldx, l.fmt, l.w, l.scale, y + (r0 * ldy * 4) as u64, ldy, 0, l.n, l.k, 1, 1.0, false)?;
@@ -793,16 +835,11 @@ impl Hy4Model {
                 }
             }
         }
-        // Small steps (decode): read-ahead hints for every row, so cold rows load concurrently. Larger
-        // chunks fault rows in from the copy threads instead (a hint per row costs a system call).
-        if r <= MAX_SEQS * MAX_STEP {
-            for (li, &layer) in self.engram_layers.iter().enumerate() {
-                let eng = self.layers[layer].engram.as_ref().unwrap();
-                for &row in &rows[li * r * ENGRAM_HEADS..(li + 1) * r * ENGRAM_HEADS] {
-                    eng.prefetch(row as usize);
-                }
-            }
-        }
+        // Small steps (decode): read-ahead hints for the rows (pages hinted before get none), so cold rows
+        // load concurrently; larger chunks fault rows in from the copy threads instead (a hint per row
+        // costs a system call).
+        let hint = r <= MAX_SEQS * MAX_STEP;
+        let t0 = std::time::Instant::now();
         let buf = ws.pinned.as_mut_slice();
         let (head, rest) = buf.split_at_mut(lay.sc);
         let q8 = &mut head[lay.q8..];
@@ -810,14 +847,20 @@ impl Hy4Model {
         let per_layer = r * ENGRAM_HEADS;
         let copy = |li: usize, idx: std::ops::Range<usize>, q8: &mut [u8], sc: &mut [u8]| {
             let eng = self.layers[self.engram_layers[li]].engram.as_ref().unwrap();
+            if hint {
+                for i in idx.clone() {
+                    eng.prefetch(rows[li * per_layer + i] as usize);
+                }
+            }
             for (k, i) in idx.enumerate() {
                 let (q, s) = eng.row(rows[li * per_layer + i] as usize);
                 q8[k * ENGRAM_DIM..(k + 1) * ENGRAM_DIM].copy_from_slice(q);
                 sc[k * 4..k * 4 + 4].copy_from_slice(&s.to_le_bytes());
             }
         };
-        // Up to 16 threads over contiguous ranges of each layer's rows: cold rows fault in parallel.
-        let threads = per_layer.div_ceil(512).clamp(1, 16 / n_layers.max(1)).max(1);
+        // Up to 16 threads over contiguous ranges of each layer's rows (hints and faults in parallel): one
+        // per 64 rows of a small step, per 512 rows of a larger one.
+        let threads = per_layer.div_ceil(if hint { 64 } else { 512 }).clamp(1, 16 / n_layers.max(1)).max(1);
         let span = per_layer.div_ceil(threads).max(1);
         std::thread::scope(|scope| {
             let mut q8_rest = q8;
@@ -837,6 +880,9 @@ impl Hy4Model {
                 }
             }
         });
+        if std::env::var_os("QUENCH6K_HY4_TIMING").is_some() {
+            eprintln!("hy4 engram r={r}: rows {:.2} ms ({threads} threads per layer)", t0.elapsed().as_secs_f64() * 1e3);
+        }
         let mut j = 0;
         for (_, tokens) in seqs {
             for &tok in tokens.iter() {
@@ -1379,27 +1425,8 @@ impl Hy4Model {
         hk::mla_prep(s, ws.f_a, h * QK, ws.f_c, KROW, a.kv_a_norm, cfg.eps, theta, h, pos, seq, cache, t, ws.qn, ws.qa)?;
         // Absorb W_uk into the queries: qa[t, h, 0..512) = W_uk[h]^T q_nope.
         if small {
-            for r0 in (0..t).step_by(SMALL_ROWS) {
-                let rows = SMALL_ROWS.min(t - r0);
-                hk::heads_gemv(
-                    s,
-                    ws.qn + (r0 * h * NOPE * 2) as u64,
-                    h * NOPE,
-                    NOPE,
-                    a.wuk_t,
-                    KV_LORA * NOPE,
-                    KV_LORA,
-                    NOPE,
-                    h,
-                    rows,
-                    0,
-                    0,
-                    ws.qa + (r0 * h * KROW * 2) as u64,
-                    h * KROW,
-                    KROW,
-                )?;
-            }
-            Ok(())
+            // All rows in one launch (blocks of 16 rows; a row's arithmetic does not depend on the others).
+            hk::heads_gemv(s, ws.qn, h * NOPE, NOPE, a.wuk_t, KV_LORA * NOPE, KV_LORA, NOPE, h, t, 0, 0, ws.qa, h * KROW, KROW)
         } else {
             k::gemm_bf16_batched(
                 s, ws.qn, h * NOPE, NOPE, a.wuk_t, NOPE, KV_LORA * NOPE, ws.qa, h * KROW, KROW, t, KV_LORA, NOPE, h,
@@ -1450,25 +1477,25 @@ impl Hy4Model {
                     ws.part,
                     ws.olat + (r0 * h * KV_LORA * 2) as u64,
                 )?;
-                // Expand the output latents (W_uv) and gate them: bf_b [t, h * 256].
-                hk::heads_gemv(
-                    s,
-                    ws.olat + (r0 * h * KV_LORA * 2) as u64,
-                    h * KV_LORA,
-                    KV_LORA,
-                    wuv,
-                    (NOPE + VD) * KV_LORA,
-                    VD,
-                    KV_LORA,
-                    h,
-                    rows,
-                    ws.f_b + (r0 * h * VD * 4) as u64,
-                    h * VD,
-                    ws.bf_b + (r0 * h * VD * 2) as u64,
-                    h * VD,
-                    VD,
-                )?;
             }
+            // Expand the output latents (W_uv) and gate them: bf_b [t, h * 256], all rows in one launch.
+            hk::heads_gemv(
+                s,
+                ws.olat,
+                h * KV_LORA,
+                KV_LORA,
+                wuv,
+                (NOPE + VD) * KV_LORA,
+                VD,
+                KV_LORA,
+                h,
+                t,
+                ws.f_b,
+                h * VD,
+                ws.bf_b,
+                h * VD,
+                VD,
+            )?;
         } else {
             // Prefill: all of a token's heads (up to 64) share each key tile (variant hy4.attn_heads).
             let hpb = quench6k_cuda::variants::get("hy4.attn_heads", 16) as usize;
@@ -1510,6 +1537,13 @@ impl Hy4Model {
         let (t, small) = (plan.r, plan.small);
         linear(s, ws.x, D, t, &m.router, ws.logits, EXPERTS, small)?;
         hk::route(s, ws.logits, EXPERTS, m.bias, cfg.scaling, t, ws.sel_e, ws.sel_w)?;
+        if std::env::var_os("QUENCH6K_HY4_EXPERT_STATS").is_some() && !graphs_enabled() {
+            // Debugging (eager steps only): distinct experts of the step's rows.
+            let sel: Vec<i32> = s.download(ws.sel_e, t * TOPK)?;
+            let mut seen = [false; EXPERTS];
+            sel.iter().for_each(|&e| seen[e as usize] = true);
+            eprintln!("hy4 experts: {t} rows, {} pairs, {} distinct experts", t * TOPK, seen.iter().filter(|&&x| x).count());
+        }
         linear(s, ws.x, D, t, &m.down_lat, ws.f_a, LAT, small)?;
         k::f32_to_bf16(s, ws.f_a, ws.rin, t * LAT)?;
         let ex = &m.experts;

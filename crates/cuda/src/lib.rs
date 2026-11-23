@@ -194,6 +194,23 @@ pub mod ffi {
             stream: Stream,
         ) -> Error;
         pub fn quench6k_gemv_max_m() -> c_int;
+        pub fn quench6k_gemv_grouped(
+            fmt: c_int,
+            m: c_int,
+            mg: c_int,
+            r: c_int,
+            x: *const c_void,
+            ldx: c_int,
+            w: *const c_void,
+            scale: *const f32,
+            y: *mut f32,
+            ldy: c_int,
+            n: c_int,
+            k: c_int,
+            alpha: f32,
+            accumulate: c_int,
+            stream: Stream,
+        ) -> Error;
         pub fn quench6k_gemv_seg(
             fmt: c_int,
             m: c_int,

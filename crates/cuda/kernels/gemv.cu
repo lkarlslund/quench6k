@@ -33,16 +33,27 @@ struct GSeg {
 // of every row (all of them for K <= 2560 per split) are loaded raw before the PDL wait, so the weight
 // stream overlaps the previous kernel; activations are read only after it. NW warps per CTA. Neither
 // R, PRE nor NW changes any output's arithmetic.
-template <WFmt F, int M, typename XT, int R, int PRE = 5, int NW = WARPS>
+// GRP: the `mrows` rows of X in groups of M (the last may be smaller), group g = blockIdx.x % groups, so
+// the CTAs of one weight tile are adjacent and read it from DRAM about once (no K split). A row's
+// arithmetic is the same as in any other launch.
+template <WFmt F, int M, typename XT, int R, int PRE = 5, int NW = WARPS, bool GRP = false>
 __global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X, int ldx,
                                                        const uint8_t* __restrict__ W, const float* __restrict__ row_scale,
                                                        float* Y, int ldy, float* partial, int ldp, int N,
-                                                       int K, int k_per_split, float alpha, int accumulate, GSeg seg) {
+                                                       int K, int k_per_split, float alpha, int accumulate, GSeg seg, int mrows) {
     pdl_launch_dependents();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int k_begin = blockIdx.y * k_per_split, k_end = min(K, k_begin + k_per_split);
     const size_t row_bytes = (size_t)K * elem_bytes<F>();
-    const int n0 = (blockIdx.x * NW + warp) * R;
+    int bx = blockIdx.x, mv = M;
+    if constexpr (GRP) {
+        const int groups = (mrows + M - 1) / M, g = bx % groups;
+        bx /= groups;
+        mv = min(M, mrows - g * M);
+        X += (size_t)g * M * ldx;
+        Y += (size_t)g * M * ldy;
+    }
+    const int n0 = (bx * NW + warp) * R;
     int nb = 0;
     if (seg.n > 1) {
         const int sg = n0 < seg.end[0] ? 0 : (seg.n > 2 && n0 >= seg.end[1] ? 2 : 1);
@@ -81,8 +92,9 @@ __global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X,
 #pragma unroll
         for (int m = 0; m < M; ++m) {
             float xf[16];
-            load_x8(X + (size_t)m * ldx + k, xf);
-            load_x8(X + (size_t)m * ldx + k + 8, xf + 8);
+            const size_t xm = GRP ? min(m, mv - 1) : m;
+            load_x8(X + xm * ldx + k, xf);
+            load_x8(X + xm * ldx + k + 8, xf + 8);
 #pragma unroll
             for (int r = 0; r < R; ++r)
 #pragma unroll
@@ -146,7 +158,7 @@ __global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X,
             for (int m = 0; m < M; ++m) v[r * M + m] = acc[r][m];
         const float sum = warp_sum_slots(v);
         const int slot = lane / (32 / NS), r = slot / M, m = slot % M;
-        if (lane % (32 / NS) == 0 && (r == 0 ? row_live[0] : row_live[R - 1])) store(r, m, sum);
+        if (lane % (32 / NS) == 0 && (r == 0 ? row_live[0] : row_live[R - 1]) && (!GRP || m < mv)) store(r, m, sum);
     } else {
 #pragma unroll
         for (int r = 0; r < R; ++r) {
@@ -154,7 +166,8 @@ __global__ void __launch_bounds__(NW * 32) gemv_kernel(const XT* __restrict__ X,
             for (int m = 0; m < M; ++m) acc[r][m] = warp_sum(acc[r][m]);
             if (lane == 0 && row_live[r])
 #pragma unroll
-                for (int m = 0; m < M; ++m) store(r, m, acc[r][m]);
+                for (int m = 0; m < M; ++m)
+                    if (!GRP || m < mv) store(r, m, acc[r][m]);
         }
     }
 }
@@ -178,7 +191,7 @@ cudaError_t launch_one(const __nv_bfloat16* X, int ldx, const uint8_t* W, const 
                        int N, int K, int splits, int k_per_split, float alpha, int accumulate, cudaStream_t st, GSeg seg) {
     const dim3 grid((N + NW * R - 1) / (NW * R), splits);
     SQ_CHECK_LAUNCH(sq_launch(gemv_kernel<F, M, __nv_bfloat16, R, PRE, NW>, grid, NW * 32, 0, st, X, ldx, W, scale, Y, ldy, partial, N,
-                              N, K, k_per_split, alpha, accumulate, seg));
+                              N, K, k_per_split, alpha, accumulate, seg, M));
     return cudaSuccess;
 }
 
@@ -261,6 +274,48 @@ cudaError_t launch(int M, const void* Xv, int ldx, const void* Wv, const float* 
 }  // namespace
 
 extern "C" int quench6k_gemv_max_m() { return 16; }
+
+namespace {
+
+// Grouped launch: `mrows` rows in groups of MG, R weight rows per warp, PRE prefetched chunks.
+template <WFmt F, int MG, int R, int PRE>
+cudaError_t launch_grouped(int mrows, const __nv_bfloat16* X, int ldx, const uint8_t* W, const float* scale, float* Y, int ldy, int N,
+                           int K, float alpha, int accumulate, cudaStream_t st) {
+    const int groups = (mrows + MG - 1) / MG;
+    const int k_per_split = (K + 511) / 512 * 512;
+    const dim3 grid((N + WARPS * R - 1) / (WARPS * R) * groups, 1);
+    SQ_CHECK_LAUNCH(sq_launch(gemv_kernel<F, MG, __nv_bfloat16, R, PRE, WARPS, true>, grid, WARPS * 32, 0, st, X, ldx, W, scale, Y, ldy,
+                              nullptr, N, N, K, k_per_split, alpha, accumulate, GSeg{}, mrows));
+    return cudaSuccess;
+}
+
+template <WFmt F>
+cudaError_t launch_grouped_f(int mg, int r, int mrows, const void* X, int ldx, const void* W, const float* scale, float* Y, int ldy, int N,
+                             int K, float alpha, int accumulate, cudaStream_t st) {
+    const auto* x = static_cast<const __nv_bfloat16*>(X);
+    const auto* w = static_cast<const uint8_t*>(W);
+#define SQ_G(mg_, r_, pre_) \
+    if (mg == mg_ && r == r_) return launch_grouped<F, mg_, r_, pre_>(mrows, x, ldx, w, scale, Y, ldy, N, K, alpha, accumulate, st);
+    SQ_G(8, 4, 3) SQ_G(16, 2, 5)
+#undef SQ_G
+    return cudaErrorInvalidValue;
+}
+
+}  // namespace
+
+// Y[m, n] for M rows (any number) as rows of `mg` per CTA with `r` weight rows per warp ((mg, r) in
+// {(8, 4), (16, 2)}): each row's result is bitwise the one quench6k_gemv gives it (no K split),
+// while the CTAs sharing a weight tile run together. fmt 0 BF16 or 5 FP8 block-128.
+extern "C" cudaError_t quench6k_gemv_grouped(int fmt, int M, int mg, int r, const void* X, int ldx, const void* W, const float* scale,
+                                           float* Y, int ldy, int N, int K, float alpha, int accumulate, cudaStream_t st) {
+    if (M == 0) return cudaSuccess;
+    if (K % 16 != 0 || ldx % 8 != 0) return cudaErrorInvalidValue;
+    cudaError_t e = cudaErrorInvalidValue;
+    if (fmt == 0) e = launch_grouped_f<WFmt::BF16>(mg, r, M, X, ldx, W, scale, Y, ldy, N, K, alpha, accumulate, st);
+    else if (fmt == 5 && K % 128 == 0) e = launch_grouped_f<WFmt::FP8B>(mg, r, M, X, ldx, W, scale, Y, ldy, N, K, alpha, accumulate, st);
+    if (e != cudaSuccess) return e;
+    return cudaGetLastError();
+}
 
 // One weight matrix [N, K] in up to three row segments with their own inputs (x[i], shared ldx) and
 // outputs (y[i], ldy[i]): rows [0, end0) -> x0 / y0, [end0, end1) -> x1 / y1, [end1, N) -> x2 / y2

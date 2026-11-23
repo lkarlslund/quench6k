@@ -275,14 +275,85 @@ fn greedy(model: &Hy4Model, s: &Stream, ws: &mut Workspace, seqs: &[Seq], n: usi
         );
         bad += (!same_tokens || !same_drafts || !same_logits || !plain_same) as usize;
     }
-    println!("  ({steps} batched steps)");
+    // A digest of every sequence's tokens, drafts and logits rows (to compare builds).
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    for tr in &traces {
+        for v in tr.tokens.iter().map(|&t| t as u64).chain(tr.drafts.iter().flatten().map(|&t| t as u64 | 1 << 40)).chain(tr.logits.iter().copied()) {
+            digest = (digest ^ v).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    println!("  ({steps} batched steps; digest {digest:016x})");
     Ok(bad)
+}
+
+/// One timed throughput run of `n` sequences (truncated back to their prompts) with `d` drafts per step:
+/// (seconds, tokens produced, every sequence's tokens).
+#[allow(clippy::too_many_arguments)]
+fn timed(
+    model: &Hy4Model,
+    s: &Stream,
+    ws: &mut Workspace,
+    states: &mut [State],
+    firsts: &[i32],
+    n: usize,
+    d: usize,
+    steps: usize,
+) -> Result<(f64, usize, Vec<i32>)> {
+    let vocab = model.cfg.vocab;
+    let ctx: Vec<usize> = states.iter().map(|st| st.pos).collect();
+    let mut pending: Vec<i32> = firsts[..n].to_vec();
+    // The prefill's last row; after a truncation the drafter has no source until a step ran.
+    let mut row = vec![0usize; n];
+    let mut produced = 0usize;
+    let mut text = Vec::new();
+    // Two warm-up steps (the first plain: the drafter needs a step's hidden states; graph captures),
+    // then the timed ones.
+    let mut t0 = Instant::now();
+    for it in 0..steps + 2 {
+        if it == 2 {
+            s.synchronize()?;
+            t0 = Instant::now();
+            produced = 0;
+        }
+        let mut refs: Vec<&mut State> = states[..n].iter_mut().collect();
+        let dr = if d > 0 && it > 0 { model.draft_batch(&mut refs, ws, s, &pending, &row)? } else { vec![Vec::new(); n] };
+        let toks: Vec<Vec<i32>> = (0..n)
+            .map(|j| {
+                let mut t = vec![pending[j]];
+                t.extend(dr[j].iter().take(d));
+                t
+            })
+            .collect();
+        let before: Vec<usize> = refs.iter().map(|st| st.pos).collect();
+        let tok_refs: Vec<&[i32]> = toks.iter().map(|t| t.as_slice()).collect();
+        model.forward_batch(&mut refs, ws, s, &tok_refs)?;
+        let rows: usize = toks.iter().map(|t| t.len()).sum();
+        k::argmax(s, ws.out_logits, rows, vocab, vocab, ws.argmax_scratch, ws.argmax)?;
+        let picks = s.download::<i32>(ws.argmax, rows)?;
+        let mut at = 0;
+        for j in 0..n {
+            let mut a = 0;
+            while a < toks[j].len() - 1 && picks[at + a] == toks[j][a + 1] {
+                a += 1;
+            }
+            produced += a + 1;
+            text.extend_from_slice(&toks[j][..a + 1]);
+            pending[j] = picks[at + a];
+            refs[j].truncate(before[j] + 1 + a);
+            row[j] = a;
+            at += toks[j].len();
+        }
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    for (st, &c) in states.iter_mut().zip(&ctx) {
+        st.truncate(c);
+    }
+    Ok((secs, produced, text))
 }
 
 /// Aggregate decode throughput of batched steps for 1, 2, 4, 8 sequences at each context: plain (one token
 /// per sequence per step) and with a fixed number of drafts per sequence.
 fn throughput(model: &Hy4Model, s: &Stream, ws: &mut Workspace, text: &[i32], ctxs: &[usize], steps: usize, drafts: &[usize]) -> Result<()> {
-    let vocab = model.cfg.vocab;
     for &ctx in ctxs {
         let mut states = Vec::new();
         let mut firsts = Vec::new();
@@ -300,60 +371,38 @@ fn throughput(model: &Hy4Model, s: &Stream, ws: &mut Workspace, text: &[i32], ct
             mem as f64 / (1u64 << 30) as f64,
             mem as f64 / MAX_SEQS as f64 / (1u64 << 20) as f64
         );
-        for n in [1usize, 2, 4, 8] {
+        // QUENCH6K_HY4_BENCH_SEQS: the sequence counts to time (comma-separated; default 1,2,4,8).
+        let counts: Vec<usize> = std::env::var("QUENCH6K_HY4_BENCH_SEQS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).filter(|&n| (1..=MAX_SEQS).contains(&n)).collect())
+            .unwrap_or_else(|| vec![1, 2, 4, 8]);
+        // QUENCH6K_HY4_AB=1: each case four times, batched GEMV forms on, off, off, on (the same bits).
+        let ab = std::env::var("QUENCH6K_HY4_AB").is_ok_and(|v| v == "1");
+        for &n in &counts {
             for &d in std::iter::once(&0).chain(drafts) {
-                for st in states.iter_mut() {
-                    st.truncate(ctx);
-                }
-                let mut pending: Vec<i32> = firsts[..n].to_vec();
-                // The prefill's last row; after a truncation the drafter has no source until a step ran.
-                let mut row = vec![0usize; n];
-                let mut produced = 0usize;
-                // Two warm-up steps (the first plain: the drafter needs a step's hidden states; graph
-                // captures), then the timed ones.
-                let mut t0 = Instant::now();
-                for it in 0..steps + 2 {
-                    if it == 2 {
-                        s.synchronize()?;
-                        t0 = Instant::now();
-                        produced = 0;
+                let arms: &[Option<bool>] = if ab { &[Some(true), Some(false), Some(false), Some(true)] } else { &[None] };
+                let mut texts: Vec<Vec<i32>> = Vec::new();
+                for &arm in arms {
+                    if let Some(on) = arm {
+                        quench6k_engine::hy4::forward::set_batched_gemv(on);
+                        ws.clear_graphs();
                     }
-                    let mut refs: Vec<&mut State> = states[..n].iter_mut().collect();
-                    let dr = if d > 0 && it > 0 { model.draft_batch(&mut refs, ws, s, &pending, &row)? } else { vec![Vec::new(); n] };
-                    let toks: Vec<Vec<i32>> = (0..n)
-                        .map(|j| {
-                            let mut t = vec![pending[j]];
-                            t.extend(dr[j].iter().take(d));
-                            t
-                        })
-                        .collect();
-                    let before: Vec<usize> = refs.iter().map(|st| st.pos).collect();
-                    let tok_refs: Vec<&[i32]> = toks.iter().map(|t| t.as_slice()).collect();
-                    model.forward_batch(&mut refs, ws, s, &tok_refs)?;
-                    let rows: usize = toks.iter().map(|t| t.len()).sum();
-                    k::argmax(s, ws.out_logits, rows, vocab, vocab, ws.argmax_scratch, ws.argmax)?;
-                    let picks = s.download::<i32>(ws.argmax, rows)?;
-                    let mut at = 0;
-                    for j in 0..n {
-                        let mut a = 0;
-                        while a < toks[j].len() - 1 && picks[at + a] == toks[j][a + 1] {
-                            a += 1;
-                        }
-                        produced += a + 1;
-                        pending[j] = picks[at + a];
-                        refs[j].truncate(before[j] + 1 + a);
-                        row[j] = a;
-                        at += toks[j].len();
-                    }
+                    let (secs, produced, text) = timed(model, s, ws, &mut states, &firsts, n, d, steps)?;
+                    texts.push(text);
+                    println!(
+                        "  {n} seq, {}{}: {:>6.1} ms per step, {:>6.1} tok/s aggregate ({:.2} tokens per sequence per step)",
+                        if d == 0 { "plain    ".to_string() } else { format!("{d} drafts ") },
+                        match arm {
+                            Some(true) => " [new]",
+                            Some(false) => " [old]",
+                            None => "",
+                        },
+                        secs * 1e3 / steps as f64,
+                        produced as f64 / secs,
+                        produced as f64 / (steps * n) as f64
+                    );
                 }
-                let secs = t0.elapsed().as_secs_f64();
-                println!(
-                    "  {n} seq, {}: {:>6.1} ms per step, {:>6.1} tok/s aggregate ({:.2} tokens per sequence per step)",
-                    if d == 0 { "plain    ".to_string() } else { format!("{d} drafts ") },
-                    secs * 1e3 / steps as f64,
-                    produced as f64 / secs,
-                    produced as f64 / (steps * n) as f64
-                );
+                ensure!(texts.iter().all(|t| *t == texts[0]), "{n} seq, {d} drafts: the arms produced different tokens");
             }
         }
     }
