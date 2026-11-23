@@ -821,3 +821,35 @@ Snapshot costs: Hy4 copies 30 sliding layers x 512 rows x 1152 bytes (17.7 MB) p
 35 x 2 x 513 x 1 KiB (35 MiB) per 4096-token chunk, both as device copies on the prefill's stream (tens of
 microseconds of copy per chunk of hundreds of milliseconds); the prompt-end snapshots they replace copied
 17.7 MB (Hy4) and up to 560 MiB (Flint) per prompt.
+
+## 2026-11-23: Recursive Flint, several conversations at once
+
+Where a batched step of 8 sequences at 2K went (nsys, PDL off, 6.1 ms): expert gate/up 1.67 ms and down
+0.97 ms (both at about the DRAM read ceiling for the experts the 8 tokens pick), the three row GEMVs 1.91
+ms (QKV 0.79, O 0.82, LM head 0.30: 2.5-2.8x their one-row time for the same weights), attention 0.80 +
+0.12 merge, router 0.34. The server added 0.27 ms per step: a top-k launch, download and synchronization
+per sequence after the step. All changes below are bit-identical (batch-check digests at 2K and 16K and
+rows vs alone, canon-check, served texts greedy and sampled):
+
+- **Row GEMVs** (`fp4_gemvc_kernel`): each staged input value is read from shared memory and converted
+  once per warp, not once per weight row; the R x G sums reduce together (`warp_sum_slots`). Every GEMV
+  kernel also picked its matrix by indexing the `Mats` parameter with a run-time index, which copied the
+  struct to local memory (88 bytes of stack per thread); selects instead (QKV at one row 6.4 -> 4.8 us).
+- **Fixed-grid GEMV** (`fp4_gemvp_kernel`, K = 2048, up to 8 rows; the LM head also 10..16): two CTAs per
+  SM stage the rows once and walk the column blocks, prefetching the next block's weights. The per-block
+  kernels staged the rows once per block: 9384 times for the LM head. Micro bench (cold weights, 8 rows):
+  QKV 12.8 -> 8.1 us, LM head 291 -> 151 us; O (K = 4096) 12.8 -> 11.6 us (gemvc; nothing tried beat it:
+  register-capped, M-split and L1-direct variants were slower).
+- **Decode attention, 4 or more rows**: one K/V tile buffer and the 16 query rows it reads (39 instead of
+  87 KB of shared memory, two CTAs per SM). +3% at 8 rows; -4% at one row, so one row keeps the old one
+  (`flint.attn_sb` = smallest row count). Tried: stopping the grid of sliding layers at the window's 9
+  splits (the others exit at once): one row 504 -> 470 tok/s, reverted.
+- **Server sampling** (`serve/flint.rs`): a batched step's top-k candidates in one launch per 8 rows and one
+  download, enqueued right after the step (each row's candidates are those of a launch for its sequence
+  alone); a sequence wanting another pool fetches its own. Gap between steps 270 -> 176 us.
+
+Batched decode (batch-check, 2K, 600 W), 1 / 2 / 4 / 8 sequences: 484 / 731 / 1039 / 1341 -> 501 / 777 /
+1145 / 1539 tok/s. Served (loadgen sweep, 1 turn towards 2K, 1024 tokens, 8 slots, 600 W, two sessions
+each): generated tok/s 391 / 688 / 825 / 1085 -> 402 / 744 / 884 / 1202; at 450 W, 8 at once 958 -> 1064.
+Prompt-lookup drafts under load (same workload, on vs off): +2% at 1, +5-10% at 2 and 4, +1-2% at 8 (the
+step-cost cap already keeps drafts to about 1.05 tokens per step at 8): kept on at every load.

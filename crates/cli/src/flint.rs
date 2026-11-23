@@ -663,7 +663,7 @@ fn generate(dir: &Path, prompt: &str, raw: bool, n: usize, context: usize) -> Re
     Ok(())
 }
 
-/// Host-side sampling: the top candidates of up to MAX_ROWS logits rows come from the device in one
+/// Host-side sampling: the top candidates of up to SAMPLE_ROWS logits rows come from the device in one
 /// kernel and one download ([`Sampler::fetch`]); penalties, temperature, top-k, min-p and top-p apply to
 /// them per row ([`Sampler::pick`]).
 pub struct Sampler {
@@ -676,13 +676,15 @@ pub struct Sampler {
     seed: Option<u64>,
 }
 
-const POOL: usize = 256;
-const MAX_ROWS: usize = 8;
+/// Most candidates per row.
+pub const POOL: usize = 256;
+/// Most rows per fetch (and per top-k launch of a batched step's rows).
+pub const SAMPLE_ROWS: usize = 8;
 
 impl Sampler {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            buf: quench6k_cuda::DeviceBuffer::new(MAX_ROWS * POOL * 8)?,
+            buf: quench6k_cuda::DeviceBuffer::new(SAMPLE_ROWS * POOL * 8)?,
             ids: Vec::new(),
             vals: Vec::new(),
             pool: 1,
@@ -700,6 +702,28 @@ impl Sampler {
         (z >> 11) as f64 / (1u64 << 53) as f64
     }
 
+    /// Candidates per row (`pool`) for these sampling parameters.
+    pub fn pool(p: &quench6k_engine::session::GenParams) -> usize {
+        let penalized = p.presence_penalty != 0.0 || p.repetition_penalty != 1.0;
+        let greedy = p.temperature <= 0.0 || p.top_k == 1;
+        if greedy && !penalized {
+            1
+        } else if p.top_k == 0 {
+            POOL
+        } else {
+            p.top_k.max(if penalized { 64 } else { 1 }).min(POOL)
+        }
+    }
+
+    /// Takes candidates fetched elsewhere: `ids` and `vals` [rows, pool], as [`Sampler::fetch`] gets them.
+    pub fn load(&mut self, ids: &[i32], vals: &[f32], pool: usize) {
+        self.ids.clear();
+        self.ids.extend_from_slice(ids);
+        self.vals.clear();
+        self.vals.extend_from_slice(vals);
+        self.pool = pool;
+    }
+
     /// The candidates of `rows` consecutive logits rows at `logits` (n columns each).
     pub fn fetch(
         &mut self,
@@ -709,16 +733,8 @@ impl Sampler {
         n: usize,
         p: &quench6k_engine::session::GenParams,
     ) -> Result<()> {
-        anyhow::ensure!(rows <= MAX_ROWS, "{rows} rows to sample");
-        let penalized = p.presence_penalty != 0.0 || p.repetition_penalty != 1.0;
-        let greedy = p.temperature <= 0.0 || p.top_k == 1;
-        let pool = if greedy && !penalized {
-            1
-        } else if p.top_k == 0 {
-            POOL
-        } else {
-            p.top_k.max(if penalized { 64 } else { 1 }).min(POOL)
-        };
+        anyhow::ensure!(rows <= SAMPLE_ROWS, "{rows} rows to sample");
+        let pool = Self::pool(p);
         let (idx, val) = (self.buf.addr(), self.buf.addr() + (rows * pool * 4) as u64);
         quench6k_cuda::kernels::topk(s, logits, rows, n, n, pool, false, idx, val)?;
         let raw = s.download::<u32>(idx, 2 * rows * pool)?;

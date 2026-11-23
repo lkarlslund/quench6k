@@ -213,6 +213,15 @@ struct __align__(16) AttnSmem8T {
 };
 using AttnSmem = AttnSmemT<AT_ROWS, AT_KEYS>;
 using AttnSmem8 = AttnSmem8T<AT_ROWS, AT_KEYS>;
+// Decode mode (BF16 caches) with one K/V tile buffer and the 16 query rows it uses: 39 KB instead of
+// 87 KB, so two CTAs fit on an SM. Tiles of a split load one after another (the other CTA overlaps).
+// Batched steps of at least flint.attn_sb rows (default 4) use it: +3% at 8 rows, -4% at one.
+struct __align__(16) AttnSmemSB {
+    __nv_bfloat16 q[16 * AT_LD];
+    __nv_bfloat16 k[1][AT_KEYS * AT_LD];
+    __nv_bfloat16 v[1][AT_KEYS * AT_LD];
+};
+static_assert(sizeof(AttnSmemSB) >= (4 * 16 * HD + 4 * 16 * 2) * sizeof(float), "the decode combine fits");
 // Wide tiles for steps of many tokens: 8 warps, 128 rows (16 tokens), 32-key tiles.
 constexpr int AT_WIDE_ROWS = 128, AT_WIDE_KEYS = 32;
 
@@ -225,7 +234,9 @@ constexpr int AT_MIN_TILES_DEFAULT = 1;
 // BATCH (with DEC): CTA x computes row x of a batched step alone, exactly as a one-token step of its
 // sequence: position row_pos[x], caches kvtab[4 * row_seq[x]] = (k, v, k scales, v scales), q row x,
 // partials at rows x * HQ ...
-template <bool F8, bool DEC, int W = 4, bool BATCH = false>
+// SB (DEC, BF16): AttnSmemSB, tiles loaded one at a time; the same arithmetic as the double-buffered
+// kernel (only the shared-memory layout and the load schedule differ).
+template <bool F8, bool DEC, int W = 4, bool BATCH = false, bool SB = false>
 __global__ void __launch_bounds__(W * 32) attn_kernel(const __nv_bfloat16* q, const __nv_bfloat16* kc,
                                                    const __nv_bfloat16* vc, const float* ksc_in, const float* vsc_in, int T,
                                                    const int* start_p, int window, int mask, int splits, float* part_o,
@@ -257,7 +268,10 @@ __global__ void __launch_bounds__(W * 32) attn_kernel(const __nv_bfloat16* q, co
     extern __shared__ __align__(16) uint8_t at_smem[];
     constexpr int ROWS = W * 16, KEYS = W == 8 ? AT_WIDE_KEYS : AT_KEYS, NT = W * 32;
     static_assert(!DEC || W == 4, "decode mode uses 4 warps");
-    using Smem = std::conditional_t<F8, AttnSmem8T<ROWS, KEYS>, AttnSmemT<ROWS, KEYS>>;
+    static_assert(!SB || (DEC && !F8), "one tile buffer in the BF16 decode mode");
+    using Smem = std::conditional_t<SB, AttnSmemSB, std::conditional_t<F8, AttnSmem8T<ROWS, KEYS>, AttnSmemT<ROWS, KEYS>>>;
+    // Query rows staged (the decode mode reads rows 0..15).
+    constexpr int QROWS = SB ? 16 : ROWS;
     Smem& sm = *reinterpret_cast<Smem*>(at_smem);
     const int kh = blockIdx.y, split = blockIdx.z;
     const int tok0 = bx * (ROWS / GROUP);
@@ -276,7 +290,7 @@ __global__ void __launch_bounds__(W * 32) attn_kernel(const __nv_bfloat16* q, co
     const int t_begin = split * per, t_end = min(tiles_all, t_begin + per);
 
     // Q rows -> shared.
-    for (int i = tid; i < ROWS * (HD / 8); i += NT) {
+    for (int i = tid; i < QROWS * (HD / 8); i += NT) {
         const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
         const int tt = r / GROUP, hh = r % GROUP;
         uint4 val = make_uint4(0, 0, 0, 0);
@@ -369,10 +383,14 @@ __global__ void __launch_bounds__(W * 32) attn_kernel(const __nv_bfloat16* q, co
         ldmatrix_x4(qa[ks], &sm.q[(rbase + (lane & 15)) * AT_LD + ks * 16 + (lane >> 4) * 8]);
 
     for (int tile = t_begin; tile < t_end; ++tile) {
-        const int sbuf = (tile - t_begin) & 1;
-        if (tile + 1 < t_end) load_kv(sbuf ^ 1, tile + 1);
-        cp_async_commit();
-        cp_async_wait<1>();
+        const int sbuf = SB ? 0 : (tile - t_begin) & 1;
+        if constexpr (SB) {
+            cp_async_wait<0>();
+        } else {
+            if (tile + 1 < t_end) load_kv(sbuf ^ 1, tile + 1);
+            cp_async_commit();
+            cp_async_wait<1>();
+        }
         __syncthreads();
         const int j0 = k_begin_all + tile * KEYS;
         if constexpr (F8) {
@@ -469,6 +487,11 @@ __global__ void __launch_bounds__(W * 32) attn_kernel(const __nv_bfloat16* q, co
             }
         }
         __syncthreads();
+        if constexpr (SB) {
+            // The buffer is free: the next tile.
+            if (tile + 1 < t_end) load_kv(0, tile + 1);
+            cp_async_commit();
+        }
     }
     cp_async_wait<0>();
     if constexpr (DEC) {
@@ -608,6 +631,13 @@ struct Mats {
     int end[3];  // cumulative output columns
 };
 
+// The matrix of concatenated output column `row`.
+SQ_DEVICE int mat_of(const Mats& mats, int row) { return row < mats.end[0] ? 0 : (row < mats.end[1] ? 1 : 2); }
+
+// a[i] for i < 3 by selects (indexing a kernel parameter array with a run-time index copies it to local memory).
+template <typename T>
+SQ_DEVICE T pick3(const T (&a)[3], int i) { return i == 0 ? a[0] : (i == 1 ? a[1] : a[2]); }
+
 SQ_DEVICE void fp4x8(uint32_t c, float sc, float* w) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -640,9 +670,9 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv_kernel(const void* xin
     for (int r = 0; r < R; ++r) {
         const int row = min(row0 + r, n_total - 1);
         mat[r] = row < mats.end[0] ? 0 : (row < mats.end[1] ? 1 : 2);
-        const int n = row - (mat[r] == 0 ? 0 : mats.end[mat[r] - 1]);
-        const uint8_t* wc = mats.codes[mat[r]] + (size_t)n * (K / 2);
-        const uint8_t* ws = mats.scales[mat[r]] + (size_t)n * (K / 16);
+        const int n = row - (mat[r] == 0 ? 0 : (mat[r] == 1 ? mats.end[0] : mats.end[1]));
+        const uint8_t* wc = pick3(mats.codes, mat[r]) + (size_t)n * (K / 2);
+        const uint8_t* ws = pick3(mats.scales, mat[r]) + (size_t)n * (K / 16);
 #pragma unroll
         for (int u = 0; u < GV_KMAX / 256; ++u) {
             if (u < steps) {
@@ -689,7 +719,7 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv_kernel(const void* xin
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         const int row = row0 + r;
-        const float s2 = *mats.s2[mat[r]];
+        const float s2 = *pick3(mats.s2, mat[r]);
 #pragma unroll
         for (int mm = 0; mm < M; ++mm) {
             const float v = warp_sum(acc[r][mm]) * s2;
@@ -718,9 +748,9 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv1_kernel(const void* xi
     for (int r = 0; r < R; ++r) {
         const int row = min(row0 + r, n_total - 1);
         mat[r] = row < mats.end[0] ? 0 : (row < mats.end[1] ? 1 : 2);
-        const int n = row - (mat[r] == 0 ? 0 : mats.end[mat[r] - 1]);
-        const uint8_t* wc = mats.codes[mat[r]] + (size_t)n * (K / 2);
-        const uint8_t* ws = mats.scales[mat[r]] + (size_t)n * (K / 16);
+        const int n = row - (mat[r] == 0 ? 0 : (mat[r] == 1 ? mats.end[0] : mats.end[1]));
+        const uint8_t* wc = pick3(mats.codes, mat[r]) + (size_t)n * (K / 2);
+        const uint8_t* ws = pick3(mats.scales, mat[r]) + (size_t)n * (K / 16);
 #pragma unroll
         for (int u = 0; u < GV_KMAX / 256; ++u)
             if (u < steps) {
@@ -776,7 +806,7 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv1_kernel(const void* xi
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         const int row = row0 + r;
-        const float v = warp_sum(acc[r]) * *mats.s2[mat[r]];
+        const float v = warp_sum(acc[r]) * *pick3(mats.s2, mat[r]);
         if (lane == 0 && row < n_total) y[row] = accumulate ? y[row] + v : v;
     }
 }
@@ -805,9 +835,9 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv2_kernel(const void* xi
     for (int r = 0; r < R; ++r) {
         const int row = min(row0 + r, n_total - 1);
         mat[r] = row < mats.end[0] ? 0 : (row < mats.end[1] ? 1 : 2);
-        const int n = row - (mat[r] == 0 ? 0 : mats.end[mat[r] - 1]);
-        const uint8_t* wc = mats.codes[mat[r]] + (size_t)n * (K / 2);
-        const uint8_t* ws = mats.scales[mat[r]] + (size_t)n * (K / 16);
+        const int n = row - (mat[r] == 0 ? 0 : (mat[r] == 1 ? mats.end[0] : mats.end[1]));
+        const uint8_t* wc = pick3(mats.codes, mat[r]) + (size_t)n * (K / 2);
+        const uint8_t* ws = pick3(mats.scales, mat[r]) + (size_t)n * (K / 16);
 #pragma unroll
         for (int u = 0; u < STEPS; ++u) {
             const int k = u * 1024 + lane * 32;
@@ -855,7 +885,7 @@ __global__ void __launch_bounds__(GV_WARPS * 32) fp4_gemv2_kernel(const void* xi
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         const int row = row0 + r;
-        const float v = warp_sum(acc[r]) * *mats.s2[mat[r]] * rn;
+        const float v = warp_sum(acc[r]) * *pick3(mats.s2, mat[r]) * rn;
         if (lane == 0 && row < n_total) y[row] = accumulate ? y[row] + v : v;
     }
 }
@@ -882,9 +912,9 @@ __global__ void __launch_bounds__(GV_WARPS * 32, 2) fp4_gemvb_kernel(const void*
     for (int r = 0; r < R; ++r) {
         const int row = min(row0 + r, n_total - 1);
         mat[r] = row < mats.end[0] ? 0 : (row < mats.end[1] ? 1 : 2);
-        const int n = row - (mat[r] == 0 ? 0 : mats.end[mat[r] - 1]);
-        const uint8_t* wc = mats.codes[mat[r]] + (size_t)n * (K / 2);
-        const uint8_t* ws = mats.scales[mat[r]] + (size_t)n * (K / 16);
+        const int n = row - (mat[r] == 0 ? 0 : (mat[r] == 1 ? mats.end[0] : mats.end[1]));
+        const uint8_t* wc = pick3(mats.codes, mat[r]) + (size_t)n * (K / 2);
+        const uint8_t* ws = pick3(mats.scales, mat[r]) + (size_t)n * (K / 16);
 #pragma unroll
         for (int u = 0; u < STEPS; ++u) {
             const int k = u * 1024 + lane * 32;
@@ -963,7 +993,7 @@ __global__ void __launch_bounds__(GV_WARPS * 32, 2) fp4_gemvb_kernel(const void*
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const int row = row0 + r;
-                const float s2 = *mats.s2[mat[r]];
+                const float s2 = *pick3(mats.s2, mat[r]);
 #pragma unroll
                 for (int g = 0; g < G; ++g) {
                     if (g < gn) {
@@ -978,6 +1008,228 @@ __global__ void __launch_bounds__(GV_WARPS * 32, 2) fp4_gemvb_kernel(const void*
             }
         }
         __syncthreads();
+    }
+}
+
+// fp4_gemvb_kernel without NORM, rearranged so that each staged input value is read from shared memory
+// and converted once per warp rather than once per weight row (the old loop read it R times), with the
+// R x G dot products reduced together (warp_sum_slots). Per row the same products are added in the same
+// order (u, then q, then i) and reduced over the same pairing: bitwise fp4_gemv2_kernel's results.
+// F32: the group's rows are staged as FP32 (converted once per CTA; twice the shared memory).
+template <int STEPS, int R, int G, bool F32, int MINB>
+__global__ void __launch_bounds__(GV_WARPS * 32, MINB) fp4_gemvc_kernel(const void* xin, Mats mats, float* y, int ldy, int M, int accumulate,
+                                                                  const float* rn_in) {
+    pdl_launch_dependents();
+    constexpr int K = STEPS * 1024;
+    // [G][K / 8] (BF16) or [G][K / 4] (FP32) 16-byte chunks, swizzled per row.
+    extern __shared__ __align__(16) uint4 gc_x[];
+    constexpr int CH = F32 ? K / 4 : K / 8;
+    __shared__ float rns[G];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n_total = mats.end[2];
+    const int row0 = (blockIdx.x * GV_WARPS + warp) * R;
+    uint4 c[R][STEPS];
+    uint16_t sb[R][STEPS];
+    int mat[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = min(row0 + r, n_total - 1);
+        mat[r] = row < mats.end[0] ? 0 : (row < mats.end[1] ? 1 : 2);
+        const int n = row - (mat[r] == 0 ? 0 : (mat[r] == 1 ? mats.end[0] : mats.end[1]));
+        const uint8_t* wc = pick3(mats.codes, mat[r]) + (size_t)n * (K / 2);
+        const uint8_t* ws = pick3(mats.scales, mat[r]) + (size_t)n * (K / 16);
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) {
+            const int k = u * 1024 + lane * 32;
+            c[r][u] = ld_stream(wc + k / 2);
+            sb[r][u] = *reinterpret_cast<const uint16_t*>(ws + k / 16);
+        }
+    }
+    pdl_wait();
+    for (int m0 = 0; m0 < M; m0 += G) {
+        const int gn = min(G, M - m0);
+        {
+            constexpr int PER = G * (K / 8) / (GV_WARPS * 32);
+            static_assert(PER * GV_WARPS * 32 == G * (K / 8), "staging covers the group");
+            const uint4* x = static_cast<const uint4*>(xin) + (size_t)m0 * (K / 8);
+            constexpr int BATCH_LD = PER < 4 ? PER : 4;
+#pragma unroll
+            for (int i0 = 0; i0 < PER; i0 += BATCH_LD) {
+                uint4 v[BATCH_LD];
+#pragma unroll
+                for (int i = 0; i < BATCH_LD; ++i) {
+                    const int idx = threadIdx.x + (i0 + i) * GV_WARPS * 32;
+                    if (idx / (K / 8) < gn) v[i] = x[idx];
+                }
+#pragma unroll
+                for (int i = 0; i < BATCH_LD; ++i) {
+                    const int idx = threadIdx.x + (i0 + i) * GV_WARPS * 32, g = idx / (K / 8), j = idx % (K / 8);
+                    if (g < gn) {
+                        if constexpr (F32) {
+                            float f[8];
+                            load_bf16x8(reinterpret_cast<const __nv_bfloat16*>(&v[i]), f);
+                            gc_x[(size_t)g * CH + swz16(2 * j)] = make_uint4(__float_as_uint(f[0]), __float_as_uint(f[1]), __float_as_uint(f[2]),
+                                                                             __float_as_uint(f[3]));
+                            gc_x[(size_t)g * CH + swz16(2 * j + 1)] = make_uint4(__float_as_uint(f[4]), __float_as_uint(f[5]), __float_as_uint(f[6]),
+                                                                                 __float_as_uint(f[7]));
+                        } else {
+                            gc_x[(size_t)g * CH + swz16(j)] = v[i];
+                        }
+                    }
+                }
+            }
+            if (threadIdx.x < gn) rns[threadIdx.x] = rn_in ? rn_in[m0 + threadIdx.x] : 1.0f;
+        }
+        __syncthreads();
+        if (row0 < n_total) {
+            float acc[R * G] = {};
+#pragma unroll
+            for (int u = 0; u < STEPS; ++u) {
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    float w[R][8];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        const uint32_t cq = q == 0 ? c[r][u].x : q == 1 ? c[r][u].y : q == 2 ? c[r][u].z : c[r][u].w;
+                        fp4x8(cq, e4m3f(q < 2 ? (sb[r][u] & 0xff) : (sb[r][u] >> 8)), w[r]);
+                    }
+#pragma unroll
+                    for (int g = 0; g < G; ++g) {
+                        if (g < gn) {
+                            float xv[8];
+                            if constexpr (F32) {
+                                const uint4 a = gc_x[(size_t)g * CH + swz16(2 * (u * 128 + lane * 4 + q))];
+                                const uint4 b = gc_x[(size_t)g * CH + swz16(2 * (u * 128 + lane * 4 + q) + 1)];
+                                xv[0] = __uint_as_float(a.x), xv[1] = __uint_as_float(a.y), xv[2] = __uint_as_float(a.z), xv[3] = __uint_as_float(a.w);
+                                xv[4] = __uint_as_float(b.x), xv[5] = __uint_as_float(b.y), xv[6] = __uint_as_float(b.z), xv[7] = __uint_as_float(b.w);
+                            } else {
+                                load_bf16x8(reinterpret_cast<const __nv_bfloat16*>(&gc_x[(size_t)g * CH + swz16(u * 128 + lane * 4 + q)]), xv);
+                            }
+#pragma unroll
+                            for (int r = 0; r < R; ++r)
+#pragma unroll
+                                for (int i = 0; i < 8; ++i) acc[r * G + g] = fmaf(w[r][i], xv[i], acc[r * G + g]);
+                        }
+                    }
+                }
+            }
+            // Slot r * G + g of the warp's sums lands in lanes (r * G + g) * 32 / (R * G) ...
+            constexpr int N = R * G, PER_SLOT = 32 / N;
+            const float sum = warp_sum_slots(acc);
+            const int slot = lane / PER_SLOT, r = slot / G, g = slot % G;
+            if (lane % PER_SLOT == 0 && g < gn) {
+                const int row = row0 + r;
+                if (row < n_total) {
+                    // As fp4_gemv2_kernel: (sum * s2) * rn; rn = 1 without NORM.
+                    const float v = sum * *pick3(mats.s2, mat_of(mats, row)) * rns[g];
+                    float* dst = y + (size_t)(m0 + g) * ldy + row;
+                    *dst = accumulate ? *dst + v : v;
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// fp4_gemvc_kernel for at most G rows on a fixed grid: each CTA stages the rows once and walks blocks of
+// GV_WARPS * R output columns (block b, b + gridDim.x, ..), loading the next block's weights while it
+// computes the current one. Per column the same products in the same order and the same reduction: the
+// same bits. (The per-block CTAs of fp4_gemvc_kernel stage the rows again for every block: for the LM
+// head that is 9384 copies of them.)
+template <int STEPS, int R, int G>
+__global__ void __launch_bounds__(GV_WARPS * 32, 2) fp4_gemvp_kernel(const void* xin, Mats mats, float* y, int ldy, int M, int accumulate,
+                                                                  const float* rn_in) {
+    pdl_launch_dependents();
+    constexpr int K = STEPS * 1024, CH = K / 8;
+    extern __shared__ __align__(16) uint4 gp_x[];
+    __shared__ float rns[G];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n_total = mats.end[2];
+    const int blocks = (n_total + GV_WARPS * R - 1) / (GV_WARPS * R);
+    uint4 c[R][STEPS], cn[R][STEPS];
+    uint16_t sb[R][STEPS], sbn[R][STEPS];
+    auto load = [&](int b, uint4 (&cc)[R][STEPS], uint16_t (&ss)[R][STEPS]) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = min((b * GV_WARPS + warp) * R + r, n_total - 1);
+            const int mt = mat_of(mats, row);
+            const int n = row - (mt == 0 ? 0 : (mt == 1 ? mats.end[0] : mats.end[1]));
+            const uint8_t* wc = pick3(mats.codes, mt) + (size_t)n * (K / 2);
+            const uint8_t* ws = pick3(mats.scales, mt) + (size_t)n * (K / 16);
+#pragma unroll
+            for (int u = 0; u < STEPS; ++u) {
+                const int k = u * 1024 + lane * 32;
+                cc[r][u] = ld_stream(wc + k / 2);
+                ss[r][u] = *reinterpret_cast<const uint16_t*>(ws + k / 16);
+            }
+        }
+    };
+    load(blockIdx.x, c, sb);
+    pdl_wait();
+    {
+        constexpr int PER = G * CH / (GV_WARPS * 32);
+        static_assert(PER * GV_WARPS * 32 == G * CH, "staging covers the rows");
+        const uint4* x = static_cast<const uint4*>(xin);
+        constexpr int BATCH_LD = PER < 4 ? PER : 4;
+#pragma unroll
+        for (int i0 = 0; i0 < PER; i0 += BATCH_LD) {
+            uint4 v[BATCH_LD];
+#pragma unroll
+            for (int i = 0; i < BATCH_LD; ++i) {
+                const int idx = threadIdx.x + (i0 + i) * GV_WARPS * 32;
+                if (idx / CH < M) v[i] = x[idx];
+            }
+#pragma unroll
+            for (int i = 0; i < BATCH_LD; ++i) {
+                const int idx = threadIdx.x + (i0 + i) * GV_WARPS * 32, g = idx / CH, j = idx % CH;
+                if (g < M) gp_x[(size_t)g * CH + swz16(j)] = v[i];
+            }
+        }
+        if (threadIdx.x < M) rns[threadIdx.x] = rn_in ? rn_in[threadIdx.x] : 1.0f;
+    }
+    __syncthreads();
+    for (int b = blockIdx.x; b < blocks; b += gridDim.x) {
+        if (b + gridDim.x < blocks) load(b + gridDim.x, cn, sbn);
+        const int row0 = (b * GV_WARPS + warp) * R;
+        float acc[R * G] = {};
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                float w[R][8];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const uint32_t cq = q == 0 ? c[r][u].x : q == 1 ? c[r][u].y : q == 2 ? c[r][u].z : c[r][u].w;
+                    fp4x8(cq, e4m3f(q < 2 ? (sb[r][u] & 0xff) : (sb[r][u] >> 8)), w[r]);
+                }
+#pragma unroll
+                for (int g = 0; g < G; ++g) {
+                    if (g < M) {
+                        float xv[8];
+                        load_bf16x8(reinterpret_cast<const __nv_bfloat16*>(&gp_x[(size_t)g * CH + swz16(u * 128 + lane * 4 + q)]), xv);
+#pragma unroll
+                        for (int r = 0; r < R; ++r)
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) acc[r * G + g] = fmaf(w[r][i], xv[i], acc[r * G + g]);
+                    }
+                }
+            }
+        }
+        constexpr int N = R * G, PER_SLOT = 32 / N;
+        const float sum = warp_sum_slots(acc);
+        const int slot = lane / PER_SLOT, r = slot / G, g = slot % G;
+        if (lane % PER_SLOT == 0 && g < M) {
+            const int row = row0 + r;
+            if (row < n_total) {
+                const float v = sum * *pick3(mats.s2, mat_of(mats, row)) * rns[g];
+                float* dst = y + (size_t)g * ldy + row;
+                *dst = accumulate ? *dst + v : v;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int u = 0; u < STEPS; ++u) c[r][u] = cn[r][u], sb[r][u] = sbn[r][u];
     }
 }
 
@@ -1539,6 +1791,8 @@ cudaError_t quench6k_flint_attention_rows(const void* q, int rows, const int* ro
     if (!configured) {
         cudaError_t err = cudaFuncSetAttribute(attn_kernel<false, true, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(AttnSmem));
         if (err == cudaSuccess) err = cudaFuncSetAttribute(attn_kernel<true, true, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(AttnSmem8));
+        if (err == cudaSuccess)
+            err = cudaFuncSetAttribute(attn_kernel<false, true, 4, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(AttnSmemSB));
         if (err != cudaSuccess) return err;
         configured = true;
     }
@@ -1550,6 +1804,8 @@ cudaError_t quench6k_flint_attention_rows(const void* q, int rows, const int* ro
     __nv_bfloat16* ob = static_cast<__nv_bfloat16*>(out);
     if (f8)
         SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<true, true, 4, true>, grid, 128, sizeof(AttnSmem8), st, qb, nb, nb, nf, nf, 1, row_pos, window, mask, splits, part_o, part_ml, sinks, (int*)nullptr, ob, min_tiles, row_pos, row_seq, kvtab));
+    else if (rows >= sq_variant("flint.attn_sb", 4))
+        SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, true, 4, true, true>, grid, 128, sizeof(AttnSmemSB), st, qb, nb, nb, nf, nf, 1, row_pos, window, mask, splits, part_o, part_ml, sinks, (int*)nullptr, ob, min_tiles, row_pos, row_seq, kvtab));
     else
         SQ_CHECK_LAUNCH(fl_launch(8, attn_kernel<false, true, 4, true>, grid, 128, sizeof(AttnSmem), st, qb, nb, nb, nf, nf, 1, row_pos, window, mask, splits, part_o, part_ml, sinks, (int*)nullptr, ob, min_tiles, row_pos, row_seq, kvtab));
     SQ_CHECK_LAUNCH(fl_launch(8, attn_merge_kernel, rows * HQ, 128, 0, st, (const float*)part_o, (const float*)part_ml, splits, sinks, rows, row_pos,
@@ -1635,6 +1891,47 @@ cudaError_t gemvb_launch(const void* x, const float* norm_w, const Mats& mats, i
     SQ_RETURN_LAUNCH();
 }
 
+template <int STEPS, int R, int G, bool F32, int MINB = 2>
+cudaError_t gemvc_launch(const void* x, const Mats& mats, int total, float* y, int ldy, int M, int accumulate, cudaStream_t st,
+                         const float* rn = nullptr) {
+    constexpr size_t row_bytes = (size_t)STEPS * 1024 * (F32 ? 4 : 2);
+    static bool configured = false;
+    if (!configured) {
+        const cudaError_t err = cudaFuncSetAttribute(fp4_gemvc_kernel<STEPS, R, G, F32, MINB>, cudaFuncAttributeMaxDynamicSharedMemorySize, G * row_bytes);
+        if (err != cudaSuccess) return err;
+        configured = true;
+    }
+    const unsigned grid = (total + GV_WARPS * R - 1) / (GV_WARPS * R);
+    SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemvc_kernel<STEPS, R, G, F32, MINB>, grid, GV_WARPS * 32, min(G, M) * row_bytes, st, x, mats, y, ldy, M, accumulate, rn));
+    SQ_RETURN_LAUNCH();
+}
+
+// CTAs of fp4_gemvp_kernel: two per SM (flint.gemvp_ctas overrides).
+int gemvp_ctas() {
+    static const int n = [] {
+        int dev = 0, sms = 188;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) sms = 188;
+        return sms * 2;
+    }();
+    return max(1, sq_variant("flint.gemvp_ctas", n));
+}
+
+template <int STEPS, int R, int G>
+cudaError_t gemvp_launch(const void* x, const Mats& mats, int total, float* y, int ldy, int M, int accumulate, cudaStream_t st, int ctas,
+                         const float* rn = nullptr) {
+    if (M > G) return cudaErrorInvalidValue;
+    constexpr size_t row_bytes = (size_t)STEPS * 1024 * 2;
+    static bool configured = false;
+    if (!configured) {
+        const cudaError_t err = cudaFuncSetAttribute(fp4_gemvp_kernel<STEPS, R, G>, cudaFuncAttributeMaxDynamicSharedMemorySize, G * row_bytes);
+        if (err != cudaSuccess) return err;
+        configured = true;
+    }
+    const int blocks = (total + GV_WARPS * R - 1) / (GV_WARPS * R);
+    SQ_CHECK_LAUNCH(fl_launch(16, fp4_gemvp_kernel<STEPS, R, G>, min(blocks, ctas), GV_WARPS * 32, M * row_bytes, st, x, mats, y, ldy, M, accumulate, rn));
+    SQ_RETURN_LAUNCH();
+}
+
 }  // namespace
 
 extern "C" {
@@ -1685,11 +1982,20 @@ cudaError_t quench6k_flint_gemv_rows(const void* x, const float* norm_w, int M, 
         mats.end[i] = total;
     }
     const int r = sq_variant("flint.gemvb_r", 0);
+    // flint.gemvc (default 1): fp4_gemvc_kernel for BF16 rows (the same bits as fp4_gemvb_kernel).
+    const bool c = sq_variant("flint.gemvc", 1) != 0;
     if (norm_w && xw && rn) {
         SQ_CHECK_LAUNCH(fl_launch(16, prenorm_kernel, M, 256, 0, st, static_cast<const float*>(x), norm_w, static_cast<__nv_bfloat16*>(xw), rn));
+        if (c && M <= 8) return gemvp_launch<2, 2, 8>(xw, mats, total, y, ldy, M, accumulate, st, gemvp_ctas(), rn);
+        // The LM head with 10..16 rows: 16 rows staged once per CTA (64 KB, one CTA per SM).
+        if (c && M <= 16 && M >= 10 && total >= 65536) return gemvp_launch<2, 2, 16>(xw, mats, total, y, ldy, M, accumulate, st, gemvp_ctas() / 2, rn);
+        if (c) return gemvc_launch<2, 2, 8, false>(xw, mats, total, y, ldy, M, accumulate, st, rn);
         return r == 1 ? gemvb_launch<2, 1, false, 8>(xw, nullptr, mats, total, y, ldy, M, accumulate, st, rn)
                       : gemvb_launch<2, 2, false, 8>(xw, nullptr, mats, total, y, ldy, M, accumulate, st, rn);
     }
+    if (c && !norm_w && K == 2048 && M <= 8) return gemvp_launch<2, 2, 8>(x, mats, total, y, ldy, M, accumulate, st, gemvp_ctas());
+    if (c && !norm_w) return K == 4096 ? gemvc_launch<4, 1, 4, false>(x, mats, total, y, ldy, M, accumulate, st)
+                                       : gemvc_launch<2, 2, 8, false>(x, mats, total, y, ldy, M, accumulate, st);
     if (K == 4096) return r == 2 ? gemvb_launch<4, 2, false, 4>(x, norm_w, mats, total, y, ldy, M, accumulate, st)
                                  : gemvb_launch<4, 1, false, 4>(x, norm_w, mats, total, y, ldy, M, accumulate, st);
     if (norm_w) return r == 1 ? gemvb_launch<2, 1, true, 8>(x, norm_w, mats, total, y, ldy, M, accumulate, st)
