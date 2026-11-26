@@ -15,6 +15,13 @@
 - `inkling.jsonl`: quench6k on Inkling 2 Mini, written by `quench6k inkling bench --json` (`mode`
   `plain` or `dspark`), 600 W; the corpus is the text of `context.ids` tokenized with Inkling's
   tokenizer (323,064 tokens). `gpu` was sampled with nvidia-smi during the run (same fields as below).
+- `nemotron.jsonl`: quench6k on Munin 2.0 (Nemotron 3 Super's architecture; `model` is the checkpoint
+  directory's name), written by `quench6k nemotron bench --json`, 600 W, BF16 caches; the corpus is the
+  text of `context.ids` tokenized with Nemotron's tokenizer (330,969 tokens). One record per context,
+  sequence count and draft count: `seqs` sequences (corpus windows 37 tokens apart, each a prompt of
+  `ctx` tokens) decoded in batched steps, `decode_tok_s` summed over them; `mode` `plain` (`drafts` 0)
+  or `mtp` (that many MTP drafts per step), `tokens_per_step` the generated tokens per step of one
+  sequence, `copied` as for Flint (first sequence), `gpu` from NVML (fields below).
 - `flint-llamacpp.jsonl`: llama.cpp (c7fc50941, `llama-bench -fa 1 -ub 2048`, F16 KV) on the same
   file and machine: `pp<ctx>` for prefill and `tg128 @ d<ctx>` for decode.
 - `kbench.jsonl`: the experiment ledger, one record per kernel configuration measured by `quench6k
