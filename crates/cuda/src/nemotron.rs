@@ -71,11 +71,15 @@ pub const SHARED_INTER: usize = 5376;
 /// Most rows of [`moe_experts_small`].
 pub const SMALL_ROWS: usize = 16;
 
-/// Attention: query heads, KV heads, head dim; bytes of one layer's FP8 K+V cache row of a position.
+/// Attention: query heads, KV heads, head dim.
 pub const QH: usize = 32;
 pub const KVH: usize = 2;
 pub const HD: usize = 128;
-pub const KV_ROW_BYTES: usize = 2 * KVH * HD;
+/// Bytes of one layer's cache row of a position: BF16 K [2][128] then V [2][128].
+pub const KV_ROW_BYTES_BF16: usize = 2 * KVH * HD * 2;
+/// Bytes of one layer's FP8 cache row of a position: E4M3 K [2][128], E4M3 V [2][128], then FP32 scales
+/// k [2], v [2] (amax / 448 of the head's 128 BF16-rounded values; 1 when all are zero).
+pub const KV_ROW_BYTES_FP8: usize = 2 * KVH * HD + 2 * KVH * 4;
 /// Attention key tile (positions) and decode split group (positions); both absolute-aligned.
 pub const ATTN_TILE: usize = 64;
 pub const ATTN_GROUP: usize = 1024;
@@ -130,11 +134,13 @@ pub struct MambaW {
 }
 
 /// One attention layer's rows in the per-sequence cache: position p of sequence s at byte
-/// `Seqs.kv[s] + p * ld + off`; the row is K [2][128] then V [2][128], FP8 E4M3 ([`KV_ROW_BYTES`]).
+/// `Seqs.kv[s] + p * ld + off` (16-byte aligned); the row is [`KV_ROW_BYTES_BF16`] or, with `fp8`,
+/// [`KV_ROW_BYTES_FP8`] bytes. E.g. ld = 9 rows (8 layers + MTP), off = layer * row bytes.
 #[derive(Clone, Copy, Debug)]
 pub struct KvRows {
     pub off: usize,
     pub ld: usize,
+    pub fp8: bool,
 }
 
 /// One projection kind of a layer's routed experts, contiguous over the 512 experts: codes U8
@@ -295,8 +301,7 @@ mod ffi {
             seqs: *const c_void,
             kv_off: i64,
             kv_ld: i64,
-            k_scale: f32,
-            v_scale: f32,
+            fp8: c_int,
             q: *mut c_void,
             st: Stream,
         ) -> Error;
@@ -307,8 +312,7 @@ mod ffi {
             seqs: *const c_void,
             kv_off: i64,
             kv_ld: i64,
-            k_scale: f32,
-            v_scale: f32,
+            fp8: c_int,
             max_groups: c_int,
             part: *mut f32,
             out: *mut c_void,
@@ -320,8 +324,7 @@ mod ffi {
             seqs: *const c_void,
             kv_off: i64,
             kv_ld: i64,
-            k_scale: f32,
-            v_scale: f32,
+            fp8: c_int,
             out: *mut c_void,
             st: Stream,
         ) -> Error;
@@ -632,24 +635,12 @@ pub fn moe_combine(s: &Stream, y: u64, pair_row: u64, sel_w: u64, rows: usize, o
 // ---- Attention -------------------------------------------------------------------------------------
 
 /// Attention inputs of the step's rows: q = bf16(qkv[r, q_col ..]) BF16 [rows, 4096]; k and v
-/// (BF16-rounded, [2][128] each at k_col / v_col) to the cache as E4M3(value / scale) (saturating) at
-/// the row's position (start + row offset of its sequence). No rotary embedding, no q/k norm.
-/// `k_scale` / `v_scale`: the layer's k_proj.k_scale / v_proj.v_scale.
+/// ([2][128] each at k_col / v_col, rounded to BF16) into the cache row of the row's position (start + row
+/// offset in its sequence): BF16, or with `kv.fp8` E4M3(x / scale), scale = amax / 448 per (position, KV
+/// head) (1 if all zero), as Qwen's and Flint's FP8 caches. No rotary embedding, no q/k norm. The
+/// checkpoint's static k_scale / v_scale (1.0) are not used.
 #[allow(clippy::too_many_arguments)]
-pub fn attn_prep(
-    s: &Stream,
-    qkv: u64,
-    ld: usize,
-    q_col: usize,
-    k_col: usize,
-    v_col: usize,
-    rows: usize,
-    seqs: u64,
-    kv: KvRows,
-    k_scale: f32,
-    v_scale: f32,
-    q: u64,
-) -> Result<()> {
+pub fn attn_prep(s: &Stream, qkv: u64, ld: usize, q_col: usize, k_col: usize, v_col: usize, rows: usize, seqs: u64, kv: KvRows, q: u64) -> Result<()> {
     go!(
         "nem_attn_prep",
         ffi::quench6k_nem_attn_prep(
@@ -662,8 +653,7 @@ pub fn attn_prep(
             p(seqs),
             kv.off as i64,
             kv.ld as i64,
-            k_scale,
-            v_scale,
+            kv.fp8 as c_int,
             pm(q),
             s.raw()
         )
@@ -680,21 +670,10 @@ pub fn attn_part_floats(rows: usize, max_groups: usize) -> usize {
 /// rows over their sequences' caches (row at position p sees positions 0 ..= p, after [`attn_prep`]).
 /// `q` BF16 [rows, 4096]; `out` BF16 [rows, 4096] (o_proj's input). Every row's result is the canonical
 /// one: online softmax over 64-position key tiles within absolute 1024-position groups, groups folded in
-/// order; P rounded to BF16 for P·V as flash attention does. `max_groups` bounds ceil((p + 1) / 1024) over
-/// the rows (it sizes the grid and `part`, [`attn_part_floats`]).
+/// order; P (times the value's FP8 scale) rounded to BF16 for P·V as flash attention does. `max_groups`
+/// bounds ceil((p + 1) / 1024) over the rows (it sizes the grid and `part`, [`attn_part_floats`]).
 #[allow(clippy::too_many_arguments)]
-pub fn attention_small(
-    s: &Stream,
-    q: u64,
-    rows: usize,
-    seqs: u64,
-    kv: KvRows,
-    k_scale: f32,
-    v_scale: f32,
-    max_groups: usize,
-    part: u64,
-    out: u64,
-) -> Result<()> {
+pub fn attention_small(s: &Stream, q: u64, rows: usize, seqs: u64, kv: KvRows, max_groups: usize, part: u64, out: u64) -> Result<()> {
     go!(
         "nem_attention_small",
         ffi::quench6k_nem_attention_small(
@@ -703,8 +682,7 @@ pub fn attention_small(
             p(seqs),
             kv.off as i64,
             kv.ld as i64,
-            k_scale,
-            v_scale,
+            kv.fp8 as c_int,
             n(max_groups),
             fm(part),
             pm(out),
@@ -713,12 +691,11 @@ pub fn attention_small(
     )
 }
 
-/// As [`attention_small`] for prefill rows (any count, any sequences; no scratch): bit-identical per
-/// row to [`attention_small`].
-#[allow(clippy::too_many_arguments)]
-pub fn attention_prefill(s: &Stream, q: u64, rows: usize, seqs: u64, kv: KvRows, k_scale: f32, v_scale: f32, out: u64) -> Result<()> {
+/// As [`attention_small`] for prefill rows (any count; rows of one sequence share key tiles; no scratch):
+/// bit-identical per row to [`attention_small`].
+pub fn attention_prefill(s: &Stream, q: u64, rows: usize, seqs: u64, kv: KvRows, out: u64) -> Result<()> {
     go!(
         "nem_attention_prefill",
-        ffi::quench6k_nem_attention_prefill(p(q), n(rows), p(seqs), kv.off as i64, kv.ld as i64, k_scale, v_scale, pm(out), s.raw())
+        ffi::quench6k_nem_attention_prefill(p(q), n(rows), p(seqs), kv.off as i64, kv.ld as i64, kv.fp8 as c_int, pm(out), s.raw())
     )
 }
