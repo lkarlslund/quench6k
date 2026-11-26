@@ -380,6 +380,42 @@ impl State {
             quench6k_cuda::device_checksum(self.mamba.addr(), self.mamba.bytes(), s)?,
         ])
     }
+
+    /// A copy of the sequence's position, history and recurrent state (for benches that decode several
+    /// times from one prefill: [`State::restore`]; the caches below `pos` are not copied, decoding does not
+    /// rewrite them).
+    pub fn save(&self, s: &Stream) -> Result<Saved> {
+        ensure!(self.uncommitted.is_none(), "save with a verification step pending");
+        let mb = self.mamba.bytes();
+        let buf = DeviceBuffer::new(mb + D * 4)?;
+        s.copy_d2d(buf.addr(), self.mamba.addr(), mb)?;
+        s.copy_d2d(buf.addr() + mb as u64, self.h_last.addr(), D * 4)?;
+        Ok(Saved { pos: self.pos, history: self.history.clone(), last_t: self.last_t, canon: self.canon, mtp_pos: self.mtp_pos, buf })
+    }
+
+    /// Back to a [`State::save`] of this sequence.
+    pub fn restore(&mut self, v: &Saved, s: &Stream) -> Result<()> {
+        let mb = self.mamba.bytes();
+        s.copy_d2d(self.mamba.addr(), v.buf.addr(), mb)?;
+        s.copy_d2d(self.h_last.addr(), v.buf.addr() + mb as u64, D * 4)?;
+        self.pos = v.pos;
+        self.history.clone_from(&v.history);
+        self.last_t = v.last_t;
+        self.canon = v.canon;
+        self.mtp_pos = v.mtp_pos;
+        self.uncommitted = None;
+        Ok(())
+    }
+}
+
+/// See [`State::save`].
+pub struct Saved {
+    pos: usize,
+    history: Vec<i32>,
+    last_t: usize,
+    canon: usize,
+    mtp_pos: usize,
+    buf: DeviceBuffer,
 }
 
 struct Alloc {

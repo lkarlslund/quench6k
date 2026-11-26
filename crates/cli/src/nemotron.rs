@@ -473,17 +473,20 @@ fn bench(
     ensure!(drafts <= MAX_DRAFTS, "--drafts 0 to {MAX_DRAFTS}");
     ensure!(drafts == 0 || model.mtp.is_some(), "--drafts needs the MTP layer");
     // QUENCH6K_NEM_AB=A,B[,..]: feature masks (forward::set_features, decimal or 0x hex) timed interleaved
-    // in this process, A B B A per round (QUENCH6K_NEM_AB_ROUNDS rounds, default 2; a variant's first run
-    // includes its graph captures: compare medians); every variant's tokens must equal the first's.
+    // in this process, A B B A per round (QUENCH6K_NEM_AB_ROUNDS rounds, default 2) after a warm-up run of each
+    // (its graph captures); a variant listed twice is a null arm; every variant's tokens must equal the first's.
     let parse = |v: &str| if let Some(h) = v.strip_prefix("0x") { u32::from_str_radix(h, 16) } else { v.parse::<u32>() };
     let ab: Vec<u32> = match std::env::var("QUENCH6K_NEM_AB") {
         Ok(v) => v.split(',').map(|x| parse(x.trim())).collect::<Result<_, _>>().context("QUENCH6K_NEM_AB")?,
         Err(_) => Vec::new(),
     };
     let rounds: usize = std::env::var("QUENCH6K_NEM_AB_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    // With QUENCH6K_NEM_AB, an untimed warm-up run of every variant comes first (graph captures; marked by
+    // WARM + variant).
+    const WARM: usize = 1 << 20;
     let order: Vec<usize> = if ab.len() > 1 {
         let fwd: Vec<usize> = (0..ab.len()).collect();
-        (0..rounds).flat_map(|_| fwd.iter().copied().chain(fwd.iter().rev().copied())).collect()
+        fwd.iter().map(|v| WARM + v).chain((0..rounds).flat_map(|_| fwd.iter().copied().chain(fwd.iter().rev().copied()))).collect()
     } else {
         vec![0]
     };
@@ -493,31 +496,47 @@ fn bench(
         ensure!(ctx + generate + 37 * seqs <= ids.len(), "corpus has {} tokens, {} needed", ids.len(), ctx + generate + 37 * seqs);
         let mut reference: Option<Vec<Vec<i32>>> = None;
         let mut rates: Vec<Vec<f64>> = vec![Vec::new(); ab.len().max(1)];
-        for &vi in &order {
+        let mut kept: Option<(Vec<State>, Vec<quench6k_engine::nemotron::forward::Saved>, Vec<i32>, f64)> = None;
+        for &oi in &order {
+            let warm = oi >= WARM;
+            let vi = oi % WARM;
             if ab.len() > 1 {
                 quench6k_engine::nemotron::forward::set_features(ab[vi]);
             }
-            let mut states = Vec::with_capacity(seqs);
-            let mut firsts = Vec::with_capacity(seqs);
             // QUENCH6K_NEM_PROFILE=1: the prefills inside a cudaProfilerStart/Stop range (nsys
             // --capture-range=cudaProfilerApi); =decode: the plain decode steps after the first 8.
             let profile = std::env::var("QUENCH6K_NEM_PROFILE").is_ok_and(|v| v == "1");
             let profile_decode = std::env::var("QUENCH6K_NEM_PROFILE").is_ok_and(|v| v == "decode");
-            s.synchronize()?;
-            if profile {
-                quench6k_cuda::profiler_start()?;
+            // A/B runs (QUENCH6K_NEM_AB) decode from one prefill: the states are saved after it and restored
+            // before every later run (the prefill rate is that of the first run).
+            if kept.is_none() || ab.len() <= 1 {
+                let mut states = Vec::with_capacity(seqs);
+                let mut firsts = Vec::with_capacity(seqs);
+                s.synchronize()?;
+                if profile {
+                    quench6k_cuda::profiler_start()?;
+                }
+                let t0 = Instant::now();
+                for j in 0..seqs {
+                    let mut st = State::new(model, ctx + generate + 16, kv, s)?;
+                    model.prefill(&mut st, ws, s, &ids[37 * j..37 * j + ctx])?;
+                    firsts.push(argmax(ws, model, s, 1)?[0]);
+                    states.push(st);
+                }
+                let prefill_s = t0.elapsed().as_secs_f64();
+                if profile {
+                    quench6k_cuda::profiler_stop()?;
+                }
+                let saved = if ab.len() > 1 { states.iter().map(|st| st.save(s)).collect::<Result<Vec<_>>>()? } else { Vec::new() };
+                kept = Some((states, saved, firsts, prefill_s));
+            } else if let Some((states, saved, _, _)) = kept.as_mut() {
+                for (st, v) in states.iter_mut().zip(saved.iter()) {
+                    st.restore(v, s)?;
+                }
+                s.synchronize()?;
             }
-            let t0 = Instant::now();
-            for j in 0..seqs {
-                let mut st = State::new(model, ctx + generate + 16, kv, s)?;
-                model.prefill(&mut st, ws, s, &ids[37 * j..37 * j + ctx])?;
-                firsts.push(argmax(ws, model, s, 1)?[0]);
-                states.push(st);
-            }
-            let prefill_s = t0.elapsed().as_secs_f64();
-            if profile {
-                quench6k_cuda::profiler_stop()?;
-            }
+            let (states, _, firsts, prefill_s) = kept.as_mut().unwrap();
+            let (firsts, prefill_s) = (firsts.clone(), *prefill_s);
             let mut outs: Vec<Vec<i32>> = firsts.iter().map(|&t| vec![t]).collect();
             let t1 = Instant::now();
             let mut steps = generate - 1;
@@ -554,12 +573,14 @@ fn bench(
             let pf = (ctx * seqs) as f64 / prefill_s;
             let tg = ((generate - 1) * seqs) as f64 / decode_s;
             let per_step = (generate - 1) as f64 / steps.max(1) as f64;
-            let label = if ab.len() > 1 { format!(" [{:#x}]", ab[vi]) } else { String::new() };
+            let label = if warm { format!(" [warm-up {vi}]") } else if ab.len() > 1 { format!(" [{vi}: {:#x}]", ab[vi]) } else { String::new() };
             println!(
                 "ctx {ctx:>6} x {seqs}{label}: prefill {pf:>7.0} tok/s ({prefill_s:.2}s), decode {tg:>6.1} tok/s ({per_step:.2} tokens/step); corpus continuation {copied}/{generate}; {:?}",
                 chat.decode(&outs[0][..outs[0].len().min(24)], false)?
             );
-            rates[vi].push(tg);
+            if !warm {
+                rates[vi].push(tg);
+            }
             match &reference {
                 None => reference = Some(outs.clone()),
                 Some(r) if *r != outs => {
@@ -568,7 +589,7 @@ fn bench(
                 }
                 _ => {}
             }
-            if let Some(path) = json {
+            if let (Some(path), false) = (json, warm) {
                 use std::io::Write;
                 let rec = serde_json::json!({"engine": "quench6k", "model": "nemotron-h", "kv": format!("{kv:?}").to_lowercase(), "drafts": drafts, "tokens_per_step": (per_step * 100.0).round() / 100.0, "seqs": seqs, "ctx": ctx,
                     "generate": generate, "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0,
@@ -580,7 +601,17 @@ fn bench(
             for (vi, r) in rates.iter().enumerate() {
                 let mut v = r.clone();
                 v.sort_by(f64::total_cmp);
-                println!("ctx {ctx:>6} x {seqs} [{:#x}]: decode median {:.1} tok/s, range {:.1}-{:.1}", ab[vi], v[v.len() / 2], v[0], v[v.len() - 1]);
+                println!("ctx {ctx:>6} x {seqs} [{vi}: {:#x}]: decode median {:.1} tok/s, range {:.1}-{:.1}", ab[vi], v[v.len() / 2], v[0], v[v.len() - 1]);
+            }
+            // Per round (A B .. B A), each variant's mean of its two runs over the first variant's.
+            for (vi, r) in rates.iter().enumerate().skip(1) {
+                let mut q: Vec<f64> = (0..rounds).map(|k| (r[2 * k] + r[2 * k + 1]) / (rates[0][2 * k] + rates[0][2 * k + 1])).collect();
+                q.sort_by(f64::total_cmp);
+                let med = if q.len() % 2 == 1 { q[q.len() / 2] } else { (q[q.len() / 2 - 1] + q[q.len() / 2]) / 2.0 };
+                println!(
+                    "ctx {ctx:>6} x {seqs} [{vi}: {:#x}] / [0: {:#x}]: median ratio {med:.4} over {rounds} rounds, range {:.4}-{:.4}",
+                    ab[vi], ab[0], q[0], q[q.len() - 1]
+                );
             }
         }
     }
