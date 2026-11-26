@@ -286,6 +286,21 @@ mod ffi {
             pair_row: *mut i32,
             st: Stream,
         ) -> Error;
+        pub fn quench6k_nem_moe_prefill_tile_rows() -> c_int;
+        pub fn quench6k_nem_moe_experts_prefill(
+            xs: *const c_void,
+            up: NvExperts,
+            down: NvExperts,
+            offsets: *const i32,
+            tile_expert: *const i32,
+            tile_row: *const i32,
+            num_tiles: *const i32,
+            max_tiles: c_int,
+            act: *mut c_void,
+            y: *mut c_void,
+            st: Stream,
+        ) -> Error;
+        pub fn quench6k_nem_moe_combine_bf16(y: *const c_void, pair_row: *const i32, sel_w: *const f32, rows: c_int, out: *mut c_void, st: Stream) -> Error;
         pub fn quench6k_nem_moe_gather(x: *const c_void, pair_row: *const i32, rows: c_int, xs: *mut c_void, st: Stream) -> Error;
         pub fn quench6k_nem_relu2(
             x: *const f32,
@@ -634,6 +649,56 @@ pub fn moe_plan(
             im(pair_row),
             s.raw()
         )
+    )
+}
+
+/// Tile rows of [`moe_experts_prefill`] (pass to [`moe_plan`] as `tile_rows` for that path).
+pub fn moe_prefill_tile_rows() -> usize {
+    unsafe { ffi::quench6k_nem_moe_prefill_tile_rows() as usize }
+}
+
+/// Routed experts of a prefill step (replaces the two `kernels::moe_nvfp4_gemm` calls and [`relu2`]):
+/// after [`moe_plan`] with `tile_rows` = [`moe_prefill_tile_rows`] and [`moe_gather`] into `xs` (BF16
+/// [pairs, 1024]), `act` = relu²(up) BF16 [pairs, 2688] (fused epilogue) and `y` = bf16(down) BF16
+/// [pairs, 1024]; combine with [`moe_combine_bf16`]. Uses the contiguous expert arrays (no pointer tables).
+/// Bit-identical to the unfused path. `max_tiles` as for the GEMM (pairs / tile_rows + 512).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_prefill(
+    s: &Stream,
+    xs: u64,
+    up: &NvExperts,
+    down: &NvExperts,
+    offsets: u64,
+    tile_expert: u64,
+    tile_row: u64,
+    num_tiles: u64,
+    max_tiles: usize,
+    act: u64,
+    y: u64,
+) -> Result<()> {
+    go!(
+        "nem_moe_experts_prefill",
+        ffi::quench6k_nem_moe_experts_prefill(
+            p(xs),
+            *up,
+            *down,
+            i(offsets),
+            i(tile_expert),
+            i(tile_row),
+            i(num_tiles),
+            n(max_tiles),
+            pm(act),
+            pm(y),
+            s.raw()
+        )
+    )
+}
+
+/// [`moe_combine`] reading BF16 expert outputs `y` [pairs, 1024] (as [`moe_experts_prefill`] writes them).
+pub fn moe_combine_bf16(s: &Stream, y: u64, pair_row: u64, sel_w: u64, rows: usize, out: u64) -> Result<()> {
+    go!(
+        "nem_moe_combine_bf16",
+        ffi::quench6k_nem_moe_combine_bf16(p(y), i(pair_row), f(sel_w), n(rows), pm(out), s.raw())
     )
 }
 

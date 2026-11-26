@@ -803,6 +803,25 @@ fn time_experts() {
     let t_down = time_graph(&s, |st| kernels::moe_nvfp4_gemm(st, act.addr(), downc, downs, downn.s2, offsets.addr(), te.addr(), tr.addr(), nt.addr(), max_tiles, yd.addr(), LATENT, MOE_INTER), 1);
     let t_comb = time_graph(&s, |st| moe_combine(st, yd.addr(), pr.addr(), sw.addr(), rows, out.addr()), 1);
     let flops = 2.0 * 2.0 * (pairs * MOE_INTER * LATENT) as f64;
+    // The fused path (its own tile rows).
+    let tile2 = moe_prefill_tile_rows();
+    let max2 = pairs / tile2 + EXPERTS;
+    let (te2, tr2) = (ib(max2), ib(max2));
+    let yb = DeviceBuffer::new(pairs * LATENT * 2).unwrap();
+    let plan2 = |st: &Stream| -> anyhow::Result<()> {
+        moe_plan(st, sel.addr(), rows, tile2, counts.addr(), offsets.addr(), cursor.addr(), te2.addr(), tr2.addr(), nt.addr(), pr.addr())?;
+        moe_gather(st, xb.addr(), pr.addr(), rows, xs.addr())
+    };
+    let t_plan2 = time_graph(&s, plan2, 1);
+    let t_gemms = time_graph(&s, |st| moe_experts_prefill(st, xs.addr(), &upn, &downn, offsets.addr(), te2.addr(), tr2.addr(), nt.addr(), max2, act.addr(), yb.addr()), 1);
+    let t_comb2 = time_graph(&s, |st| moe_combine_bf16(st, yb.addr(), pr.addr(), sw.addr(), rows, out.addr()), 1);
+    eprintln!(
+        "TIME experts prefill fused {rows} tokens (tile {tile2}): plan+gather {t_plan2:.0} gemms {t_gemms:.0} combine {t_comb2:.0} = {:.0} us/layer ({:.0} TFLOPS in the GEMMs)",
+        t_plan2 + t_gemms + t_comb2,
+        flops / t_gemms / 1e6
+    );
+    // The unfused path with the shared GEMM (re-plan with its tile rows).
+    let _ = time_graph(&s, plan, 1);
     let total = t_plan + t_up + t_relu + t_down + t_comb;
     eprintln!(
         "TIME experts prefill {rows} tokens: plan+gather {t_plan:.0} up {t_up:.0} relu2 {t_relu:.0} down {t_down:.0} combine {t_comb:.0} = {total:.0} us/layer ({:.0} TFLOPS in the GEMMs)",
@@ -926,6 +945,16 @@ fn digest() {
     kernels::moe_nvfp4_gemm(&s, act_p.addr(), ex.down_tabs.0.addr(), ex.down_tabs.1.addr(), ex.down.s2, offsets.addr(), te.addr(), tr.addr(), nt.addr(), max_tiles, yd.addr(), LATENT, MOE_INTER).unwrap();
     moe_combine(&s, yd.addr(), pr.addr(), wb.addr(), rows_p, outp.addr()).unwrap();
     eprintln!("digest experts prefill out {:016x}", digest_of(&bf16s(&s, outp.addr(), rows_p * LATENT)));
+    // The fused prefill path: the same output bits.
+    let tile2 = moe_prefill_tile_rows();
+    let max2 = pairs / tile2 + EXPERTS;
+    let (te2, tr2) = (ib(max2), ib(max2));
+    let yb = DeviceBuffer::new(pairs * LATENT * 2).unwrap();
+    moe_plan(&s, eb.addr(), rows_p, tile2, counts.addr(), offsets.addr(), cursor.addr(), te2.addr(), tr2.addr(), nt.addr(), pr.addr()).unwrap();
+    moe_gather(&s, xb.addr(), pr.addr(), rows_p, xs.addr()).unwrap();
+    moe_experts_prefill(&s, xs.addr(), &ex.up, &ex.down, offsets.addr(), te2.addr(), tr2.addr(), nt.addr(), max2, act_p.addr(), yb.addr()).unwrap();
+    moe_combine_bf16(&s, yb.addr(), pr.addr(), wb.addr(), rows_p, outp.addr()).unwrap();
+    eprintln!("digest experts prefill (fused) out {:016x}", digest_of(&bf16s(&s, outp.addr(), rows_p * LATENT)));
 
     // Attention, both formats: prefill of 2100 rows and decode rows.
     for fp8 in [false, true] {
