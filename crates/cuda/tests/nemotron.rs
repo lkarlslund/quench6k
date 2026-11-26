@@ -633,14 +633,51 @@ fn time_graph(s: &Stream, body: impl FnOnce(&Stream) -> anyhow::Result<()>, call
     v[2]
 }
 
+/// Fast random bytes (8 per generator step).
+fn rand_bytes(rng: &mut Rng, n: usize, f: impl Fn(u8) -> u8) -> Vec<u8> {
+    let mut v = Vec::with_capacity(n + 8);
+    while v.len() < n {
+        v.extend(rng.next_u64().to_le_bytes().map(&f));
+    }
+    v.truncate(n);
+    v
+}
+
+fn experts_dev(s: &Stream, rng: &mut Rng, e: usize, n: usize, k: usize, keep: &mut Vec<DeviceBuffer>) -> (NvExperts, u64, u64) {
+    let codes = up(s, &rand_bytes(rng, e * n * k / 2, |b| b));
+    let scales = up(s, &rand_bytes(rng, e * n * k / 16, |b| 0x28 + (b & 15)));
+    let s2 = up(s, &rng.vec(e, 0.005, 0.02));
+    let ct: Vec<u64> = (0..EXPERTS).map(|i| codes.addr() + (i.min(e - 1) * n * k / 2) as u64).collect();
+    let st: Vec<u64> = (0..EXPERTS).map(|i| scales.addr() + (i.min(e - 1) * n * k / 16) as u64).collect();
+    let (ctb, stb) = (up(s, &ct), up(s, &st));
+    let nv = NvExperts { codes: codes.addr(), scales: scales.addr(), s2: s2.addr() };
+    let r = (nv, ctb.addr(), stb.addr());
+    keep.extend([codes, scales, s2, ctb, stb]);
+    r
+}
+
+fn rand_sel(rng: &mut Rng, rows: usize, experts: usize) -> Vec<i32> {
+    let mut v = Vec::new();
+    for _ in 0..rows {
+        let mut pick: Vec<i32> = (0..experts as i32).collect();
+        for i in (1..pick.len()).rev() {
+            pick.swap(i, (rng.next_u64() % (i as u64 + 1)) as usize);
+        }
+        let mut sel = pick[..TOPK].to_vec();
+        sel.sort();
+        v.extend(sel);
+    }
+    v
+}
+
 #[test]
 #[ignore]
-fn timing() {
+fn time_mamba() {
     let s = Stream::new().unwrap();
     let mut rng = Rng::new(41);
-    // Mamba mixer, one row per sequence, 16 layers' states per sequence.
     let p = MambaParams::random(&mut rng);
     let w = mamba_weights(&s, &p);
+    // Decode: one row per sequence, 16 layers' states per sequence.
     const TL: usize = 16;
     for nseq in [1usize, 8] {
         let blocks: Vec<DeviceBuffer> = (0..nseq).map(|_| DeviceBuffer::zeroed(mamba_seq_bytes(TL, REC)).unwrap()).collect();
@@ -670,34 +707,48 @@ fn timing() {
             TL,
         );
         let bytes = (2 * SSM_BYTES * nseq) as f64;
-        eprintln!("mamba mixer, {nseq} seq x 1 row: {us:.1} us per layer ({:.0} GB/s of SSM state r+w)", bytes / us / 1e3);
+        eprintln!("TIME mamba decode {nseq} seq: {us:.1} us/layer ({:.0} GB/s of state r+w)", bytes / us / 1e3);
     }
-    // Routed experts of small steps: 128 experts, 16 routings cycled.
-    const TE: usize = 128;
-    let h_up = NvExpertsHost::random(&mut rng, TE, MOE_INTER, LATENT);
-    let h_down = NvExpertsHost::random(&mut rng, TE, LATENT, MOE_INTER);
-    let (cu, su, s2u) = (up(&s, &h_up.codes), up(&s, &h_up.scales), up(&s, &h_up.s2));
-    let (cd, sd, s2d) = (up(&s, &h_down.codes), up(&s, &h_down.scales), up(&s, &h_down.s2));
-    let upn = NvExperts { codes: cu.addr(), scales: su.addr(), s2: s2u.addr() };
-    let downn = NvExperts { codes: cd.addr(), scales: sd.addr(), s2: s2d.addr() };
-    for rows in [1usize, 8, 16] {
+    // Prefill: 4096 rows of one sequence (each kernel separately and the mixer).
+    let rows = 4096;
+    let block = new_block();
+    let mut q = Seqs::default();
+    q.mamba[0] = block.addr();
+    q.row0[1] = rows as i32;
+    q.nseq = 1;
+    let qb = seqs_buf(&s, &q);
+    let proj = up(&s, &random_proj(&mut rng, rows));
+    let (xbc, dt, y, out) = (
+        DeviceBuffer::new(rows * CONV_DIM * 2).unwrap(),
+        DeviceBuffer::new(rows * HEADS * 4).unwrap(),
+        DeviceBuffer::new(rows * INNER * 2).unwrap(),
+        DeviceBuffer::new(rows * INNER * 2).unwrap(),
+    );
+    let sc = MambaScratch { xbc: xbc.addr(), dt: dt.addr(), y: y.addr() };
+    let t_conv = time_graph(&s, |st| mamba_conv(st, proj.addr(), PROJ, rows, qb.addr(), 1, LAYER, REC, &w.w, xbc.addr(), dt.addr()), 1);
+    let t_commit = time_graph(&s, |st| mamba_conv_commit(st, proj.addr(), PROJ, rows, qb.addr(), 1, LAYER, REC, xbc.addr(), dt.addr(), false), 1);
+    let t_scan = time_graph(&s, |st| mamba_scan(st, xbc.addr(), dt.addr(), rows, qb.addr(), 1, LAYER, REC, &w.w, false, y.addr()), 1);
+    let t_norm = time_graph(&s, |st| mamba_gated_norm(st, y.addr(), proj.addr(), PROJ, rows, w.w.norm_w, 1e-5, out.addr()), 1);
+    let t_all = time_graph(&s, |st| mamba_mixer(st, proj.addr(), PROJ, rows, qb.addr(), 1, LAYER, REC, &w.w, false, &sc, out.addr()), 1);
+    eprintln!(
+        "TIME mamba prefill {rows} rows: conv {t_conv:.0} commit {t_commit:.0} scan {t_scan:.0} norm {t_norm:.0} mixer {t_all:.0} us ({:.0} tok/s per layer)",
+        rows as f64 / t_all * 1e6
+    );
+}
+
+#[test]
+#[ignore]
+fn time_experts() {
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(42);
+    let mut keep = Vec::new();
+    // All 512 experts (3.2 GB of up + down weights), 16 routings cycled per graph.
+    let (upn, upc, ups) = experts_dev(&s, &mut rng, EXPERTS, MOE_INTER, LATENT, &mut keep);
+    let (downn, downc, downs) = experts_dev(&s, &mut rng, EXPERTS, LATENT, MOE_INTER, &mut keep);
+    for rows in [1usize, 2, 4, 8, 16] {
         let x: Vec<u16> = rng.vec(rows * LATENT, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
         let xb = up(&s, &x);
-        let sels: Vec<DeviceBuffer> = (0..16)
-            .map(|_| {
-                let mut v = Vec::new();
-                for _ in 0..rows {
-                    let mut pick: Vec<i32> = (0..TE as i32).collect();
-                    for i in (1..pick.len()).rev() {
-                        pick.swap(i, (rng.next_u64() % (i as u64 + 1)) as usize);
-                    }
-                    let mut sel = pick[..TOPK].to_vec();
-                    sel.sort();
-                    v.extend(sel);
-                }
-                up(&s, &v)
-            })
-            .collect();
+        let sels: Vec<DeviceBuffer> = (0..16).map(|_| up(&s, &rand_sel(&mut rng, rows, EXPERTS))).collect();
         let pairs = rows * TOPK;
         let (order, act, y) = (
             DeviceBuffer::new(pairs * 4).unwrap(),
@@ -714,9 +765,75 @@ fn timing() {
             },
             16,
         );
-        eprintln!("routed experts small, {rows} rows: {us:.1} us per layer");
+        // Distinct experts' bytes (codes + scales of up and down).
+        let mut distinct = 0usize;
+        for sel in &sels {
+            let v: Vec<i32> = s.download(sel.addr(), pairs).unwrap();
+            let mut u = v.clone();
+            u.sort();
+            u.dedup();
+            distinct += u.len();
+        }
+        let bytes = distinct as f64 / 16.0 * 2.0 * (MOE_INTER * LATENT) as f64 * (0.5 + 1.0 / 16.0);
+        eprintln!("TIME experts small {rows} rows: {us:.1} us/layer ({:.0} GB/s of distinct expert weights)", bytes / us / 1e3);
     }
-    // Attention decode: 8 sequences at 32K positions, BF16 and FP8 caches.
+    // Prefill path at 2048 tokens.
+    let rows = 2048;
+    let pairs = rows * TOPK;
+    let x: Vec<u16> = rng.vec(rows * LATENT, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
+    let xb = up(&s, &x);
+    let sel = up(&s, &rand_sel(&mut rng, rows, EXPERTS));
+    let sw = up(&s, &rng.vec(pairs, 0.05, 0.5));
+    let tile = kernels::moe_tile_rows();
+    let max_tiles = pairs / tile + EXPERTS;
+    let ib = |n: usize| DeviceBuffer::new(n * 4).unwrap();
+    let (counts, offsets, cursor, te, tr, nt, pr) = (ib(EXPERTS), ib(EXPERTS + 1), ib(EXPERTS), ib(max_tiles), ib(max_tiles), ib(1), ib(pairs));
+    let xs = DeviceBuffer::new(pairs * LATENT * 2).unwrap();
+    let yu = DeviceBuffer::new(pairs * MOE_INTER * 4).unwrap();
+    let act = DeviceBuffer::new(pairs * MOE_INTER * 2).unwrap();
+    let yd = DeviceBuffer::new(pairs * LATENT * 4).unwrap();
+    let out = DeviceBuffer::new(rows * LATENT * 2).unwrap();
+    let plan = |st: &Stream| -> anyhow::Result<()> {
+        moe_plan(st, sel.addr(), rows, tile, counts.addr(), offsets.addr(), cursor.addr(), te.addr(), tr.addr(), nt.addr(), pr.addr())?;
+        moe_gather(st, xb.addr(), pr.addr(), rows, xs.addr())
+    };
+    let t_plan = time_graph(&s, plan, 1);
+    let t_up = time_graph(&s, |st| kernels::moe_nvfp4_gemm(st, xs.addr(), upc, ups, upn.s2, offsets.addr(), te.addr(), tr.addr(), nt.addr(), max_tiles, yu.addr(), MOE_INTER, LATENT), 1);
+    let t_relu = time_graph(&s, |st| relu2(st, yu.addr(), MOE_INTER, MOE_INTER, pairs, act.addr(), MOE_INTER), 1);
+    let t_down = time_graph(&s, |st| kernels::moe_nvfp4_gemm(st, act.addr(), downc, downs, downn.s2, offsets.addr(), te.addr(), tr.addr(), nt.addr(), max_tiles, yd.addr(), LATENT, MOE_INTER), 1);
+    let t_comb = time_graph(&s, |st| moe_combine(st, yd.addr(), pr.addr(), sw.addr(), rows, out.addr()), 1);
+    let flops = 2.0 * 2.0 * (pairs * MOE_INTER * LATENT) as f64;
+    // The fused path (its own tile rows).
+    let tile2 = moe_prefill_tile_rows();
+    let max2 = pairs / tile2 + EXPERTS;
+    let (te2, tr2) = (ib(max2), ib(max2));
+    let yb = DeviceBuffer::new(pairs * LATENT * 2).unwrap();
+    let plan2 = |st: &Stream| -> anyhow::Result<()> {
+        moe_plan(st, sel.addr(), rows, tile2, counts.addr(), offsets.addr(), cursor.addr(), te2.addr(), tr2.addr(), nt.addr(), pr.addr())?;
+        moe_gather(st, xb.addr(), pr.addr(), rows, xs.addr())
+    };
+    let t_plan2 = time_graph(&s, plan2, 1);
+    let t_gemms = time_graph(&s, |st| moe_experts_prefill(st, xs.addr(), &upn, &downn, offsets.addr(), te2.addr(), tr2.addr(), nt.addr(), max2, act.addr(), yb.addr()), 1);
+    let t_comb2 = time_graph(&s, |st| moe_combine_bf16(st, yb.addr(), pr.addr(), sw.addr(), rows, out.addr()), 1);
+    eprintln!(
+        "TIME experts prefill fused {rows} tokens (tile {tile2}): plan+gather {t_plan2:.0} gemms {t_gemms:.0} combine {t_comb2:.0} = {:.0} us/layer ({:.0} TFLOPS in the GEMMs)",
+        t_plan2 + t_gemms + t_comb2,
+        flops / t_gemms / 1e6
+    );
+    // The unfused path with the shared GEMM (re-plan with its tile rows).
+    let _ = time_graph(&s, plan, 1);
+    let total = t_plan + t_up + t_relu + t_down + t_comb;
+    eprintln!(
+        "TIME experts prefill {rows} tokens: plan+gather {t_plan:.0} up {t_up:.0} relu2 {t_relu:.0} down {t_down:.0} combine {t_comb:.0} = {total:.0} us/layer ({:.0} TFLOPS in the GEMMs)",
+        flops / (t_up + t_down) / 1e6
+    );
+}
+
+#[test]
+#[ignore]
+fn time_attention() {
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(43);
     let ctx = 32768usize;
     for fp8 in [false, true] {
         let row = if fp8 { KV_ROW_BYTES_FP8 } else { KV_ROW_BYTES_BF16 };
@@ -736,6 +853,117 @@ fn timing() {
         let part = DeviceBuffer::new(attn_part_floats(8, groups) * 4).unwrap();
         let out = DeviceBuffer::new(8 * QH * HD * 2).unwrap();
         let us = time_graph(&s, |st| attention_small(st, qd.addr(), 8, qb.addr(), kv, groups, part.addr(), out.addr()), 1);
-        eprintln!("attention decode fp8 {fp8}, 8 seq at {ctx}: {us:.1} us ({:.0} GB/s of cache)", (8 * ctx * row) as f64 / us / 1e3);
+        eprintln!("TIME attention decode fp8 {fp8}, 8 seq at {ctx}: {us:.1} us ({:.0} GB/s of cache)", (8 * ctx * row) as f64 / us / 1e3);
+        // Prefill: 4096 rows of the first cache.
+        let rows = 4096;
+        let mut q1 = Seqs::default();
+        q1.kv[0] = caches[0].addr();
+        q1.row0[1] = rows as i32;
+        q1.nseq = 1;
+        let qb1 = seqs_buf(&s, &q1);
+        let qp: Vec<u16> = rng.vec(rows * QH * HD, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
+        let qpd = up(&s, &qp);
+        let outp = DeviceBuffer::new(rows * QH * HD * 2).unwrap();
+        let us = time_graph(&s, |st| attention_prefill(st, qpd.addr(), rows, qb1.addr(), kv, outp.addr()), 1);
+        let flops = 4.0 * (rows * rows / 2 * QH * HD) as f64;
+        eprintln!("TIME attention prefill fp8 {fp8}, {rows} rows: {us:.0} us ({:.0} TFLOPS)", flops / us / 1e6);
+    }
+}
+
+// ---- Output digest (bit-identity of optimizations) ---------------------------------------------------
+
+fn fnv(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(0x100_0000_01b3);
+    }
+}
+
+fn digest_of<T: Copy>(v: &[T]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let b = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) };
+    fnv(&mut h, b);
+    h
+}
+
+/// Prints one hash per kernel family over fixed inputs; compare before / after a speed change.
+#[test]
+#[ignore]
+fn digest() {
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(61);
+    // Mamba: prefill of 700 rows (several staging chunks), decode steps, a deferred step, a replay.
+    let p = MambaParams::random(&mut rng);
+    let w = mamba_weights(&s, &p);
+    let (a, b) = (new_block(), new_block());
+    let mut outs = Vec::new();
+    let pa = random_proj(&mut rng, 700);
+    let pb = random_proj(&mut rng, 3);
+    outs.extend(mamba_step(&s, &w, &[&a, &b], &[&pa, &pb], false).concat());
+    for _ in 0..3 {
+        let (x, y) = (random_proj(&mut rng, 1), random_proj(&mut rng, 2));
+        outs.extend(mamba_step(&s, &w, &[&a, &b], &[&x, &y], false).concat());
+    }
+    let (x, y) = (random_proj(&mut rng, 4), random_proj(&mut rng, 5));
+    outs.extend(mamba_step(&s, &w, &[&a, &b], &[&x, &y], true).concat());
+    set_ctl(&s, &[&a, &b], &[4, 5], &[2, 5], true);
+    let (x, y) = (random_proj(&mut rng, 1), random_proj(&mut rng, 1));
+    outs.extend(mamba_step(&s, &w, &[&a, &b], &[&x, &y], false).concat());
+    let mut st = ssm_of(&s, &a);
+    st.extend(ssm_of(&s, &b));
+    st.extend(conv_of(&s, &a));
+    eprintln!("digest mamba out {:016x} state {:016x}", digest_of(&outs), digest_of(&st));
+
+    // Routed experts, small path at 1, 8, 16 rows, and the prefill path at 300 rows (over 40 experts).
+    let h_up = NvExpertsHost::random(&mut rng, TEST_EXPERTS, MOE_INTER, LATENT);
+    let h_down = NvExpertsHost::random(&mut rng, TEST_EXPERTS, LATENT, MOE_INTER);
+    let ex = experts_gpu(&s, &h_up, &h_down);
+    for rows in [1usize, 8, 16] {
+        let x: Vec<u16> = rng.vec(rows * LATENT, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
+        let (sel, _) = routing(&mut rng, rows);
+        let (act, y) = experts_small_run(&s, &ex, &x, &sel, rows);
+        eprintln!("digest experts small {rows} rows: act {:016x} y {:016x}", digest_of(&act), digest_of(&y));
+    }
+    let rows_p = 300;
+    let xp: Vec<u16> = rng.vec(rows_p * LATENT, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
+    let (selp, swp) = routing(&mut rng, rows_p);
+    let pairs = rows_p * TOPK;
+    let tile = kernels::moe_tile_rows();
+    let max_tiles = pairs / tile + EXPERTS;
+    let ib = |n: usize| DeviceBuffer::new(n * 4).unwrap();
+    let (counts, offsets, cursor, te, tr, nt, pr) = (ib(EXPERTS), ib(EXPERTS + 1), ib(EXPERTS), ib(max_tiles), ib(max_tiles), ib(1), ib(pairs));
+    let (xb, eb, wb) = (up(&s, &xp), up(&s, &selp), up(&s, &swp));
+    let xs = DeviceBuffer::new(pairs * LATENT * 2).unwrap();
+    let yu = DeviceBuffer::new(pairs * MOE_INTER * 4).unwrap();
+    let act_p = DeviceBuffer::new(pairs * MOE_INTER * 2).unwrap();
+    let yd = DeviceBuffer::new(pairs * LATENT * 4).unwrap();
+    let outp = DeviceBuffer::new(rows_p * LATENT * 2).unwrap();
+    moe_plan(&s, eb.addr(), rows_p, tile, counts.addr(), offsets.addr(), cursor.addr(), te.addr(), tr.addr(), nt.addr(), pr.addr()).unwrap();
+    moe_gather(&s, xb.addr(), pr.addr(), rows_p, xs.addr()).unwrap();
+    kernels::moe_nvfp4_gemm(&s, xs.addr(), ex.up_tabs.0.addr(), ex.up_tabs.1.addr(), ex.up.s2, offsets.addr(), te.addr(), tr.addr(), nt.addr(), max_tiles, yu.addr(), MOE_INTER, LATENT).unwrap();
+    relu2(&s, yu.addr(), MOE_INTER, MOE_INTER, pairs, act_p.addr(), MOE_INTER).unwrap();
+    kernels::moe_nvfp4_gemm(&s, act_p.addr(), ex.down_tabs.0.addr(), ex.down_tabs.1.addr(), ex.down.s2, offsets.addr(), te.addr(), tr.addr(), nt.addr(), max_tiles, yd.addr(), LATENT, MOE_INTER).unwrap();
+    moe_combine(&s, yd.addr(), pr.addr(), wb.addr(), rows_p, outp.addr()).unwrap();
+    eprintln!("digest experts prefill out {:016x}", digest_of(&bf16s(&s, outp.addr(), rows_p * LATENT)));
+    // The fused prefill path: the same output bits.
+    let tile2 = moe_prefill_tile_rows();
+    let max2 = pairs / tile2 + EXPERTS;
+    let (te2, tr2) = (ib(max2), ib(max2));
+    let yb = DeviceBuffer::new(pairs * LATENT * 2).unwrap();
+    moe_plan(&s, eb.addr(), rows_p, tile2, counts.addr(), offsets.addr(), cursor.addr(), te2.addr(), tr2.addr(), nt.addr(), pr.addr()).unwrap();
+    moe_gather(&s, xb.addr(), pr.addr(), rows_p, xs.addr()).unwrap();
+    moe_experts_prefill(&s, xs.addr(), &ex.up, &ex.down, offsets.addr(), te2.addr(), tr2.addr(), nt.addr(), max2, act_p.addr(), yb.addr()).unwrap();
+    moe_combine_bf16(&s, yb.addr(), pr.addr(), wb.addr(), rows_p, outp.addr()).unwrap();
+    eprintln!("digest experts prefill (fused) out {:016x}", digest_of(&bf16s(&s, outp.addr(), rows_p * LATENT)));
+
+    // Attention, both formats: prefill of 2100 rows and decode rows.
+    for fp8 in [false, true] {
+        let mut qkv = Vec::new();
+        let (cache, kv, qout) = attn_fill(&s, &mut rng, 2100, fp8, &mut qkv);
+        let q_all: Vec<u16> = s.download(qout.addr(), 2100 * QH * HD).unwrap();
+        let full = attn_prefill(&s, &cache, kv, &q_all, 0, 2100);
+        let dec = attn_decode(&s, &cache, kv, &q_all, &[5, 1024, 2099]);
+        let bytes: Vec<u8> = s.download(cache.addr(), 2100 * kv.ld).unwrap();
+        eprintln!("digest attention fp8 {fp8}: cache {:016x} prefill {:016x} decode {:016x}", digest_of(&bytes), digest_of(&full), digest_of(&dec));
     }
 }

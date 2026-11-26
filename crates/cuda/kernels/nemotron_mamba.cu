@@ -8,7 +8,9 @@
 // Speculative steps (defer) keep the state at the start of the step and record the step's rows; the next
 // launch of the layer replays the accepted ones (count and record parity in the sequence's header) first.
 
+#include "mma.cuh"
 #include "nemotron.cuh"
+#include "variants.cuh"
 
 using namespace nem;
 
@@ -119,62 +121,63 @@ __global__ void __launch_bounds__(CONV_THREADS) mamba_conv_commit_kernel(const f
     }
 }
 
-// Selective scan. Block = (head h, 16 channels p of it) x sequence; 2 warps of 8 channels; lane holds state
-// entries n = 4 lane .. 4 lane + 3 of its warp's 8 channels. Tokens are staged in shared memory TT at a
-// time: replayed records first, then the sequence's rows of this step.
-constexpr int PB = 16, SCAN_THREADS = 64, TT = 32, PCH = HEAD_DIM / PB;
+// Selective scan: block = (head h, PB channels) x sequence, warps of SLOTS channels x 128 state entries (lane:
+// n = 4 lane .. 4 lane + 3). Per token and channel: dA = exp(dt A), S = fmaf(S, dA, (B dt) x); y = the
+// warp_sum tree over lanes of the lane partial S0 C0 + S1 C1 + S2 C2 + S3 C3 (fma order), + x D. The same
+// operations for every row count and every SLOTS / PB (warp_sum_slots is bitwise warp_sum), so prefill
+// equals decode. Replayed records first, then the step's rows; tokens' raw BF16 x / B / C and dt are staged
+// with cp.async, the next chunk of TT2 tokens loading while the current one is computed.
+constexpr int TT2 = 32;
 
-struct ScanStage {
-    float x[TT][PB];
-    float4 B[TT][STATE / 4];
-    float4 C[TT][STATE / 4];
-    float dt[TT];
-};
-
-// One token's state update (identical for replayed and new tokens).
-SQ_DEVICE void scan_update(float (&S)[8][4], const float* xs, float4 B4, float d, float A) {
-    const float dA = expf(d * A);
-    const float db[4] = {B4.x * d, B4.y * d, B4.z * d, B4.w * d};
-#pragma unroll
-    for (int j = 0; j < 8; ++j)
-#pragma unroll
-        for (int k = 0; k < 4; ++k) S[j][k] = fmaf(S[j][k], dA, __fmul_rn(db[k], xs[j]));
+SQ_DEVICE void cp_async4(void* smem, const void* gmem) {
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(s), "l"(gmem));
 }
 
-__global__ void __launch_bounds__(SCAN_THREADS) mamba_scan_kernel(const bf16* xbc, const float* dt, const Seqs* sq, int layer, int rec_rows,
-                                                                  MambaW w, int defer, int flush, bf16* y) {
+template <int PB>
+struct ScanStage2 {
+    __align__(16) bf16 x[2][TT2][PB];
+    __align__(16) bf16 B[2][TT2][STATE];
+    __align__(16) bf16 C[2][TT2][STATE];
+    float dt[2][TT2];
+};
+
+template <int SLOTS, int PB>
+__global__ void __launch_bounds__(PB / SLOTS * 32) mamba_scan2_kernel(const bf16* xbc, const float* dt, const Seqs* sq, int layer, int rec_rows,
+                                                                      MambaW w, int defer, int flush, bf16* y) {
+    constexpr int THREADS = PB / SLOTS * 32, PCH2 = HEAD_DIM / PB;
+    constexpr int XP = PB / 8, PIECES = XP + 2 * (STATE / 8);  // 16-byte pieces per token
     pdl_launch_dependents();
     pdl_wait();
     __shared__ Seqs q;
-    __shared__ ScanStage stg;
+    __shared__ ScanStage2<PB> stg;
     __shared__ int ctl[MAX_SEQ][2];
     load_seqs(q, sq, ctl);
     const int s = blockIdx.y;
     if (s >= q.nseq) return;
-    const int h = blockIdx.x / PCH, pc = blockIdx.x % PCH, g = h / HPG;
+    const int h = blockIdx.x / PCH2, pc = blockIdx.x % PCH2, g = h / HPG;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int p0 = pc * PB + warp * 8;  // first channel of this warp within the head
-    float* st = ssm_state(q, s, layer, rec_rows) + ((size_t)h * HEAD_DIM + p0) * STATE + lane * 4;
-    float S[8][4];
+    const int pw = warp * SLOTS;  // first channel of this warp within the block
+    float* st = ssm_state(q, s, layer, rec_rows) + ((size_t)h * HEAD_DIM + pc * PB + pw) * STATE + lane * 4;
+    float S[SLOTS][4];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
+    for (int j = 0; j < SLOTS; ++j) {
         const float4 v = __ldcg(reinterpret_cast<const float4*>(st + (size_t)j * STATE));
         S[j][0] = v.x, S[j][1] = v.y, S[j][2] = v.z, S[j][3] = v.w;
     }
     auto store = [&] {
 #pragma unroll
-        for (int j = 0; j < 8; ++j) *reinterpret_cast<float4*>(st + (size_t)j * STATE) = make_float4(S[j][0], S[j][1], S[j][2], S[j][3]);
+        for (int j = 0; j < SLOTS; ++j) *reinterpret_cast<float4*>(st + (size_t)j * STATE) = make_float4(S[j][0], S[j][1], S[j][2], S[j][3]);
     };
     const float A = -expf(w.a_log[h]), Dh = w.d[h];
     const int replay = ctl[s][0], parity = ctl[s][1];
     const int nrows = flush ? 0 : q.row0[s + 1] - q.row0[s], rbase = q.row0[s];
     const int total = replay + nrows;
-    constexpr int PER = PB + 2 * STATE + 1;
-    for (int t0 = 0; t0 < total; t0 += TT) {
-        const int nt = min(TT, total - t0);
-        __syncthreads();
-        for (int e = tid; e < nt * PER; e += SCAN_THREADS) {
-            const int tt = e / PER, k = e % PER, i = t0 + tt;
+    const int chunks = (total + TT2 - 1) / TT2;
+    auto issue = [&](int c) {
+        const int b = c & 1, t0 = c * TT2, nt = min(TT2, total - t0);
+        for (int e = tid; e < nt * (PIECES + 1); e += THREADS) {
+            const int tt = e / (PIECES + 1), k = e % (PIECES + 1), i = t0 + tt;
             const bf16* conv;
             const float* dtp;
             if (i < replay) {
@@ -186,36 +189,63 @@ __global__ void __launch_bounds__(SCAN_THREADS) mamba_scan_kernel(const bf16* xb
                 conv = xbc + (size_t)r * CONV_DIM;
                 dtp = dt + (size_t)r * HEADS;
             }
-            if (k < PB) stg.x[tt][k] = bf2f(__ldcg(conv + h * HEAD_DIM + pc * PB + k));
-            else if (k < PB + STATE) reinterpret_cast<float*>(stg.B[tt])[k - PB] = bf2f(__ldcg(conv + INNER + g * STATE + k - PB));
-            else if (k < PB + 2 * STATE)
-                reinterpret_cast<float*>(stg.C[tt])[k - PB - STATE] = bf2f(__ldcg(conv + INNER + GROUPS * STATE + g * STATE + k - PB - STATE));
-            else stg.dt[tt] = __ldcg(dtp + h);
+            if (k < XP) cp_async16(&stg.x[b][tt][k * 8], conv + h * HEAD_DIM + pc * PB + k * 8, true);
+            else if (k < XP + STATE / 8) cp_async16(&stg.B[b][tt][(k - XP) * 8], conv + INNER + g * STATE + (k - XP) * 8, true);
+            else if (k < PIECES) cp_async16(&stg.C[b][tt][(k - XP - STATE / 8) * 8], conv + INNER + GROUPS * STATE + g * STATE + (k - XP - STATE / 8) * 8, true);
+            else cp_async4(&stg.dt[b][tt], dtp + h);
+        }
+        cp_async_commit();
+    };
+    if (chunks > 0) issue(0);
+    for (int c = 0; c < chunks; ++c) {
+        const int b = c & 1, t0 = c * TT2, nt = min(TT2, total - t0);
+        if (c + 1 < chunks) {
+            issue(c + 1);
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
         }
         __syncthreads();
         for (int tt = 0; tt < nt; ++tt) {
             const int i = t0 + tt;
-            const float* xs = &stg.x[tt][warp * 8];
-            scan_update(S, xs, stg.B[tt][lane], stg.dt[tt], A);
+            const float d = stg.dt[b][tt];
+            const float dA = expf(d * A);
+            const uint2 braw = *reinterpret_cast<const uint2*>(&stg.B[b][tt][lane * 4]);
+            const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&braw.x));
+            const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&braw.y));
+            const float db[4] = {b01.x * d, b01.y * d, b23.x * d, b23.y * d};
+            float xs[SLOTS];
+#pragma unroll
+            for (int j = 0; j < SLOTS; ++j) xs[j] = bf2f(stg.x[b][tt][pw + j]);
+#pragma unroll
+            for (int j = 0; j < SLOTS; ++j)
+#pragma unroll
+                for (int k = 0; k < 4; ++k) S[j][k] = fmaf(S[j][k], dA, __fmul_rn(db[k], xs[j]));
             if (i == replay - 1 && (defer || flush)) store();
             if (i >= replay) {
-                const float4 C4 = stg.C[tt][lane];
-                float part[8];
+                const uint2 craw = *reinterpret_cast<const uint2*>(&stg.C[b][tt][lane * 4]);
+                const float2 c01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&craw.x));
+                const float2 c23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&craw.y));
+                float part[SLOTS];
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    float a = __fmul_rn(S[j][0], C4.x);
-                    a = fmaf(S[j][1], C4.y, a);
-                    a = fmaf(S[j][2], C4.z, a);
-                    part[j] = fmaf(S[j][3], C4.w, a);
+                for (int j = 0; j < SLOTS; ++j) {
+                    float a = __fmul_rn(S[j][0], c01.x);
+                    a = fmaf(S[j][1], c01.y, a);
+                    a = fmaf(S[j][2], c23.x, a);
+                    part[j] = fmaf(S[j][3], c23.y, a);
                 }
-                const float v = warp_sum_slots<8>(part);
-                if ((lane & 3) == 0) {
-                    const int j = lane >> 2;
-                    const float out = __fadd_rn(v, __fmul_rn(xs[j], Dh));
-                    y[(size_t)(rbase + i - replay) * INNER + h * HEAD_DIM + p0 + j] = f2bf(out);
+                float v;
+                if constexpr (SLOTS == 1) v = warp_sum(part[0]);
+                else v = warp_sum_slots<SLOTS>(part);
+                constexpr int SH = SLOTS == 8 ? 2 : SLOTS == 4 ? 3 : SLOTS == 2 ? 4 : 5;
+                if ((lane & ((1 << SH) - 1)) == 0) {
+                    const int j = lane >> SH;
+                    const float out = __fadd_rn(v, __fmul_rn(bf2f(stg.x[b][tt][pw + j]), Dh));
+                    y[(size_t)(rbase + i - replay) * INNER + h * HEAD_DIM + pc * PB + pw + j] = f2bf(out);
                 }
             }
         }
+        __syncthreads();
     }
     if (!defer && !flush && total > 0) store();
 }
@@ -297,9 +327,18 @@ extern "C" cudaError_t quench6k_nem_mamba_scan(const void* xbc, const float* dt,
     (void)rows;
     if (nseq <= 0) return cudaSuccess;
     if (nseq > MAX_SEQ) return cudaErrorInvalidValue;
-    const dim3 grid(HEADS * PCH, nseq);
-    SQ_CHECK_LAUNCH(sq_launch(mamba_scan_kernel, grid, SCAN_THREADS, 0, st, static_cast<const bf16*>(xbc), dt, static_cast<const Seqs*>(seqs), layer,
-                              rec_rows, w, defer, flush, static_cast<bf16*>(y)));
+    const bf16* x = static_cast<const bf16*>(xbc);
+    const Seqs* q = static_cast<const Seqs*>(seqs);
+    bf16* yo = static_cast<bf16*>(y);
+    const int v = sq_variant("nem.scan", 432);
+#define SQ_SCAN2(SL, PBV)                                                                                                          \
+    if (v == SL * 100 + PBV)                                                                                                       \
+        SQ_CHECK_LAUNCH(sq_launch(mamba_scan2_kernel<SL, PBV>, dim3(HEADS * (HEAD_DIM / PBV), nseq), PBV / SL * 32, 0, st, x, dt, q, layer, \
+                                  rec_rows, w, defer, flush, yo));
+    SQ_SCAN2(4, 32)
+    SQ_SCAN2(8, 64)
+    SQ_SCAN2(2, 16)
+#undef SQ_SCAN2
     SQ_RETURN_LAUNCH();
 }
 
