@@ -503,8 +503,14 @@ local port, one at a time; requests (streams included) pass through to it.
   loaded, or with `?model=` naming another model than the loaded one, they get HTTP 404 (what clients
   probing for endpoints such as llama.cpp's `/props` expect from a server without them). Other requests
   without a model go to the loaded model; with none loaded they get HTTP 400 `no_model_loaded`.
-  `POST /v1/unload` stops the loaded model when no request is running.
-- A failed load is reported to the waiting requests; the next request tries again.
+  `/` with no model loaded shows a model picker instead.
+- By hand: `POST /v1/load` with `{"model": NAME}` loads that model without waiting for the settle
+  period and answers at once (HTTP 202 while it loads, 200 when it is already loaded); `POST /v1/unload`
+  stops the loaded model. Both refuse with HTTP 409 `model_busy` while a request runs or a model loads.
+  `GET /health` gives the loaded model, its `state` (`unloaded`, `loading`, `loaded` or `failed`, with
+  `error`), the running requests and the catalog's `models`. The loaded model's dashboard (`/`) has a
+  model drop-down with Load and Unload buttons that use these.
+- A failed load is reported to the waiting requests and on `/health`; the next request tries again.
 
 A prompt of as many tokens as the served context (`--context`, or the capped one) or more is rejected
 with HTTP 400 and code `context_length_exceeded`.

@@ -53,7 +53,7 @@ prefills 1.4-2.1x faster ([below](#recursive-flint-against-llamacpp)).
 - Up to eight concurrent requests for every model: batched decoding, prefill interleaved with
   running requests, memory-aware admission.
 - Several models behind one endpoint (`serve-models`): each loads on first request and the server
-  switches once the loaded one has been idle.
+  switches once the loaded one has been idle, or pick one by hand from the dashboard.
 - Images and video for Qwen, with image content included in prefix-cache identity.
 - Context cache: prefix reuse per slot, and for Qwen GPU snapshots plus a disk tier that survives
   restarts.
