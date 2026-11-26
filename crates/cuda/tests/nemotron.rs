@@ -871,6 +871,13 @@ fn time_experts() {
     let t_plan2 = time_graph(&s, plan2, 1);
     let t_gemms = time_graph(&s, |st| moe_experts_prefill(st, xs.addr(), &upn, &downn, offsets.addr(), te2.addr(), tr2.addr(), nt.addr(), max2, act.addr(), yb.addr()), 1);
     let t_comb2 = time_graph(&s, |st| moe_combine_bf16(st, yb.addr(), pr.addr(), sw.addr(), rows, out.addr()), 1);
+    // Thin 32-row tiles.
+    let max3 = pairs / 32 + EXPERTS;
+    let (te3, tr3) = (ib(max3), ib(max3));
+    moe_plan(&s, sel.addr(), rows, 32, counts.addr(), offsets.addr(), cursor.addr(), te3.addr(), tr3.addr(), nt.addr(), pr.addr()).unwrap();
+    let t_thin = time_graph(&s, |st| moe_experts_prefill_tiles(st, xs.addr(), &upn, &downn, offsets.addr(), te3.addr(), tr3.addr(), nt.addr(), max3, 32, act.addr(), yb.addr()), 1);
+    eprintln!("TIME experts prefill thin {rows} tokens (tile 32): gemms {t_thin:.0} us/layer ({:.0} TFLOPS)", flops / t_thin / 1e6);
+    let _ = time_graph(&s, plan2, 1);
     eprintln!(
         "TIME experts prefill fused {rows} tokens (tile {tile2}): plan+gather {t_plan2:.0} gemms {t_gemms:.0} combine {t_comb2:.0} = {:.0} us/layer ({:.0} TFLOPS in the GEMMs)",
         t_plan2 + t_gemms + t_comb2,
@@ -1011,6 +1018,14 @@ fn digest() {
     moe_experts_prefill(&s, xs.addr(), &ex.up, &ex.down, offsets.addr(), te2.addr(), tr2.addr(), nt.addr(), max2, act_p.addr(), yb.addr()).unwrap();
     moe_combine_bf16(&s, yb.addr(), pr.addr(), wb.addr(), rows_p, outp.addr()).unwrap();
     eprintln!("digest experts prefill (fused) out {:016x}", digest_of(&bf16s(&s, outp.addr(), rows_p * LATENT)));
+    // Thin 32-row tiles (small steps): the same bits.
+    let max3 = pairs / 32 + EXPERTS;
+    let (te3, tr3) = (ib(max3), ib(max3));
+    moe_plan(&s, eb.addr(), rows_p, 32, counts.addr(), offsets.addr(), cursor.addr(), te3.addr(), tr3.addr(), nt.addr(), pr.addr()).unwrap();
+    moe_gather(&s, xb.addr(), pr.addr(), rows_p, xs.addr()).unwrap();
+    moe_experts_prefill_tiles(&s, xs.addr(), &ex.up, &ex.down, offsets.addr(), te3.addr(), tr3.addr(), nt.addr(), max3, 32, act_p.addr(), yb.addr()).unwrap();
+    moe_combine_bf16(&s, yb.addr(), pr.addr(), wb.addr(), rows_p, outp.addr()).unwrap();
+    eprintln!("digest experts prefill (thin) out {:016x}", digest_of(&bf16s(&s, outp.addr(), rows_p * LATENT)));
 
     // Attention, both formats: prefill of 2100 rows and decode rows.
     for fp8 in [false, true] {

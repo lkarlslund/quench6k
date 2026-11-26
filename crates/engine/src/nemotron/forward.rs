@@ -432,7 +432,7 @@ impl Workspace {
         // The grouped expert GEMM takes a whole step in one pass (passes of 512 rows left about 22 rows
         // per expert and took twice as long as one of 2048).
         let pairs = cap.max(nk::SMALL_ROWS) * TOPK;
-        let max_tiles = pairs / nk::moe_prefill_tile_rows().max(1) + EXPERTS;
+        let max_tiles = (pairs / nk::moe_prefill_tile_rows().max(1)).max(nk::THIN_MAX_ROWS * TOPK / 32) + EXPERTS;
         (
             max_tiles,
             [
@@ -932,16 +932,18 @@ impl NemotronModel {
                 nk::moe_combine(s, ws.ey, 0, at(ws.sel_w, r0, TOPK * 4), n, at(ws.ex_bf, r0, LAT * 2))?;
             }
         } else {
-            // Pairs grouped by expert into the prefill expert kernel's tiles, the whole step at once.
-            let tile = nk::moe_prefill_tile_rows();
+            // Pairs grouped by expert into the prefill expert kernel's tiles (thin 32-row tiles for small
+            // steps), the whole step at once.
             for r0 in (0..r).step_by(ws.rows_cap) {
                 let n = ws.rows_cap.min(r - r0);
+                let tile = nk::moe_prefill_tile_rows_for(n);
+                let tiles = (n * TOPK / tile + EXPERTS).min(ws.max_tiles);
                 let sel_e = at(ws.sel_e, r0, TOPK * 4);
                 s.memset(ws.counts, 0, EXPERTS * 4)?;
                 nk::moe_plan(s, sel_e, n, tile, ws.counts, ws.offsets, ws.cursor, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
                 nk::moe_gather(s, at(ws.lat_bf, r0, LAT * 2), ws.pair_row, n, ws.xs)?;
                 // relu²(up) BF16 in ws.eact, bf16(down) BF16 in ws.ey.
-                nk::moe_experts_prefill(s, ws.xs, &ex.up, &ex.down, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.max_tiles, ws.eact, ws.ey)?;
+                nk::moe_experts_prefill_tiles(s, ws.xs, &ex.up, &ex.down, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, tile, ws.eact, ws.ey)?;
                 nk::moe_combine_bf16(s, ws.ey, ws.pair_row, at(ws.sel_w, r0, TOPK * 4), n, at(ws.ex_bf, r0, LAT * 2))?;
             }
         }

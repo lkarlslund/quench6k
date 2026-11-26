@@ -725,6 +725,175 @@ cudaError_t launch_w4v3(const void* x, NvExperts w, const int* offsets, const in
     return cudaSuccess;
 }
 
+// Thin tiles for small prefill steps (few rows per expert): 32-row tiles, 128 output columns per CTA, 128-wide
+// k-tiles. Each warp owns 16 columns over all the tile's rows; its lanes read their weight rows' codes and
+// scales straight into registers (one k-tile ahead) and decode them into the MMA's B fragments (lane quad
+// q of a column takes code bytes q and q + 4 of each 8: the fragment's k, k + 1 and k + 8, k + 9), so the
+// weights need no shared memory and no barrier; only A is staged (cp.async, 3 stages, 16-byte chunk c of
+// row r at c ^ (r & 7)). Same decoded values and m16n8k16 sequence per output as the other versions.
+constexpr int TH_BM = 32, TH_BK = 128, TH_ST = 3;
+constexpr size_t TH_SMEM = (size_t)TH_ST * TH_BM * TH_BK * 2;
+
+template <int EPI>
+__global__ void __launch_bounds__(WG_THREADS, 2) w4thin_kernel(const bf16* X, NvExperts W, const int* offsets, const int* tile_expert,
+                                                               const int* tile_row, const int* num_tiles, void* Y, int N, int K) {
+    constexpr int TILE_A = TH_BM * TH_BK * 2;  // 8 KiB per stage
+    pdl_launch_dependents();
+    pdl_wait();
+    extern __shared__ __align__(128) unsigned char th_raw[];
+    const uint32_t sA = static_cast<uint32_t>(__cvta_generic_to_shared(th_raw));
+    if ((int)blockIdx.y >= __ldcg(num_tiles)) return;
+    const int e = __ldcg(tile_expert + blockIdx.y), r0 = __ldcg(tile_row + blockIdx.y);
+    const int nrows = min(TH_BM, __ldcg(offsets + e + 1) - r0), nr16 = (nrows + 15) & ~15;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int n0 = blockIdx.x * WG_BN;
+    const int k_tiles = K / TH_BK, SR = K / 16;
+    {
+        const int rows = min(WG_BN, N - n0);
+        l2_prefetch(W.codes + ((size_t)e * N + n0) * (K / 2), (size_t)rows * (K / 2), tid, WG_THREADS);
+        l2_prefetch(W.scales + ((size_t)e * N + n0) * SR, (size_t)rows * SR, tid, WG_THREADS);
+    }
+    // A copies: 32 rows x 16 chunks per stage, two per thread (rows ra and ra + 16, chunk ca).
+    const int ra = tid >> 4, ca = tid & 15;
+    auto a_off = [](int r, int c) { return (uint32_t)(r * 256 + ((c ^ (r & 7)) << 4)); };
+    const uint32_t a_dst0 = sA + a_off(ra, ca), a_dst1 = sA + a_off(ra + 16, ca);
+    const bool go0 = ra < nr16, ok0 = ra < nrows, go1 = ra + 16 < nr16, ok1 = ra + 16 < nrows;
+    const bf16* src0 = X + (size_t)(r0 + (ok0 ? ra : 0)) * K + ca * 8;
+    const bf16* src1 = X + (size_t)(r0 + (ok1 ? ra + 16 : 0)) * K + ca * 8;
+    auto issue_a = [&](int kt) {
+        if (kt < k_tiles) {
+            const uint32_t st = (kt % TH_ST) * TILE_A;
+            const int k = kt * TH_BK;
+            if (go0) cp16s(a_dst0 + st, src0 + k, ok0);
+            if (go1) cp16s(a_dst1 + st, src1 + k, ok1);
+        }
+        cp_async_commit();
+    };
+    // This lane's weight rows: column n0 + warp * 16 + j * 8 + lane / 4 for n8 tile j; quad lane q.
+    const int q = lane & 3;
+    const uint8_t* wc[2];
+    const uint8_t* wsc[2];
+    bool bok[2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int n = n0 + warp * 16 + j * 8 + (lane >> 2);
+        bok[j] = n < N;
+        wc[j] = W.codes + ((size_t)e * N + (bok[j] ? n : 0)) * (K / 2);
+        wsc[j] = W.scales + ((size_t)e * N + (bok[j] ? n : 0)) * SR;
+    }
+    struct Slab {
+        uint4 c[2][4];  // 64 code bytes (128 values) per n8 tile
+        uint2 s[2];     // 8 scales per n8 tile
+    };
+    auto fetch = [&](int kt, Slab& b) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            if (kt < k_tiles && bok[j]) {
+                const uint4* cp = reinterpret_cast<const uint4*>(wc[j] + (size_t)kt * (TH_BK / 2));
+#pragma unroll
+                for (int u = 0; u < 4; ++u) b.c[j][u] = __ldg(cp + u);
+                b.s[j] = __ldg(reinterpret_cast<const uint2*>(wsc[j] + kt * (TH_BK / 16)));
+            } else {
+#pragma unroll
+                for (int u = 0; u < 4; ++u) b.c[j][u] = make_uint4(0, 0, 0, 0);
+                b.s[j] = make_uint2(0, 0);
+            }
+        }
+    };
+    // Code byte (low nibble: the even k) -> BF16 pair times the block scale, as the other versions decode.
+    auto dec = [](uint32_t byte, __half2 sc) {
+        const __half2_raw hr = __nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)byte, __NV_E2M1);
+        const float2 f = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&hr), sc));
+        const __nv_bfloat162 v = __floats2bfloat162_rn(f.x, f.y);
+        return *reinterpret_cast<const uint32_t*>(&v);
+    };
+    const bool live1 = nrows > 16;
+    const int ar = lane & 15;
+    float acc[2][2][4] = {};
+    auto compute = [&](int kt, const Slab& b) {
+        const uint32_t at = sA + (kt % TH_ST) * TILE_A;
+#pragma unroll
+        for (int kb = 0; kb < TH_BK / 16; ++kb) {
+            uint32_t bf[2][2];
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                // Words 2 kb, 2 kb + 1 of the 16: uint4 kb / 2, components (kb % 2) * 2, + 1.
+                const uint4 cw = b.c[j][kb >> 1];
+                const uint32_t wlo = kb & 1 ? cw.z : cw.x, whi = kb & 1 ? cw.w : cw.y;
+                const uint32_t sw = kb < 4 ? b.s[j].x : b.s[j].y;
+                const __half_raw hs = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)__byte_perm(sw, 0, kb & 3), __NV_E4M3);
+                const __half h = hs;
+                const __half2 sc = __halves2half2(h, h);
+                bf[j][0] = dec(__byte_perm(wlo, 0, q), sc);
+                bf[j][1] = dec(__byte_perm(whi, 0, q), sc);
+            }
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                if (i == 1 && !live1) continue;
+                uint32_t a[4];
+                const int r = i * 16 + ar, c = kb * 2 + (lane >> 4);
+                ldsm4(a, at + a_off(r, c));
+#pragma unroll
+                for (int j = 0; j < 2; ++j) mma_bf16(acc[i][j], a, bf[j]);
+            }
+        }
+    };
+
+    Slab b0, b1;
+    fetch(0, b0);
+#pragma unroll
+    for (int st = 0; st < TH_ST - 1; ++st) issue_a(st);
+    auto step = [&](int kt, const Slab& cur, Slab& nxt) {
+        cp_async_wait<TH_ST - 2>();
+        __syncthreads();
+        issue_a(kt + TH_ST - 1);
+        fetch(kt + 1, nxt);
+        compute(kt, cur);
+    };
+    int kt = 0;
+    for (; kt + 1 < k_tiles; kt += 2) {
+        step(kt, b0, b1);
+        step(kt + 1, b1, b0);
+    }
+    if (kt < k_tiles) step(kt, b0, b1);
+    cp_async_wait<0>();
+
+    const float alpha = W.s2[e];
+    const int g = lane >> 2, t4 = lane & 3;
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int rl = i * 16 + g + h * 8;
+                const int n = n0 + warp * 16 + j * 8 + t4 * 2;
+                if (rl >= nrows || n >= N) continue;
+                const int r = r0 + rl;
+                const float v0 = alpha * acc[i][j][h * 2], v1 = alpha * acc[i][j][h * 2 + 1];
+                if constexpr (EPI == 1) {
+                    const float a0 = fmaxf(rb(v0), 0.0f), a1 = fmaxf(rb(v1), 0.0f);
+                    *reinterpret_cast<__nv_bfloat162*>(static_cast<bf16*>(Y) + (size_t)r * N + n) = __floats2bfloat162_rn(a0 * a0, a1 * a1);
+                } else {
+                    *reinterpret_cast<__nv_bfloat162*>(static_cast<bf16*>(Y) + (size_t)r * N + n) = __floats2bfloat162_rn(v0, v1);
+                }
+            }
+}
+
+template <int EPI>
+cudaError_t launch_w4thin(const void* x, NvExperts w, const int* offsets, const int* te, const int* tr, const int* nt, int max_tiles, void* y, int N,
+                          int K, cudaStream_t st) {
+    if (K % TH_BK != 0) return cudaErrorInvalidValue;
+    static bool configured = false;
+    if (!configured) {
+        SQ_CHECK_LAUNCH(cudaFuncSetAttribute(w4thin_kernel<EPI>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TH_SMEM));
+        configured = true;
+    }
+    SQ_CHECK_LAUNCH(sq_launch(w4thin_kernel<EPI>, dim3((N + WG_BN - 1) / WG_BN, max_tiles), WG_THREADS, TH_SMEM, st, static_cast<const bf16*>(x), w,
+                              offsets, te, tr, nt, y, N, K));
+    return cudaSuccess;
+}
+
 // moe_combine from BF16 expert outputs (bf16(y) stored by the down GEMM: the same values combine_kernel rounds).
 __global__ void combine_bf16_kernel(const bf16* y, const int* pair_row, const float* sel_w, bf16* out) {
     pdl_launch_dependents();
@@ -844,5 +1013,24 @@ extern "C" cudaError_t quench6k_nem_moe_combine_bf16(const void* y, const int* p
     if (rows == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(combine_bf16_kernel, dim3(rows, LATENT / 256), 256, 0, st, static_cast<const bf16*>(y), pair_row, sel_w,
                               static_cast<bf16*>(out)));
+    SQ_RETURN_LAUNCH();
+}
+
+// Tile rows of the prefill expert kernels for a step of `rows` rows (nem.thin: the most rows that take
+// the thin 32-row tiles, default 1024; 0: never): 32 or quench6k_nem_moe_prefill_tile_rows().
+extern "C" int quench6k_nem_moe_prefill_tile_rows_for(int rows) {
+    // (The engine sizes its tile lists for thin steps of at most 1024 rows.)
+    return rows <= std::min(sq_variant("nem.thin", 1024), 1024) ? TH_BM : quench6k_nem_moe_prefill_tile_rows();
+}
+
+// quench6k_nem_moe_experts_prefill after moe_plan with `tile_rows` from quench6k_nem_moe_prefill_tile_rows_for.
+extern "C" cudaError_t quench6k_nem_moe_experts_prefill_tiles(const void* xs, NvExperts up, NvExperts down, const int* offsets, const int* tile_expert,
+                                                              const int* tile_row, const int* num_tiles, int max_tiles, int tile_rows, void* act,
+                                                              void* y, cudaStream_t st) {
+    if (tile_rows != TH_BM)
+        return quench6k_nem_moe_experts_prefill(xs, up, down, offsets, tile_expert, tile_row, num_tiles, max_tiles, act, y, st);
+    if (max_tiles == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH((launch_w4thin<1>(xs, up, offsets, tile_expert, tile_row, num_tiles, max_tiles, act, MOE_INTER, LATENT, st)));
+    SQ_CHECK_LAUNCH((launch_w4thin<2>(act, down, offsets, tile_expert, tile_row, num_tiles, max_tiles, y, LATENT, MOE_INTER, st)));
     SQ_RETURN_LAUNCH();
 }

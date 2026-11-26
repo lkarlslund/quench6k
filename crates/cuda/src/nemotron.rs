@@ -898,3 +898,75 @@ pub fn expand_bf16(s: &Stream, fmt: crate::kernels::WeightFormat, w: u64, scale:
         "nem_expand_bf16",
     )
 }
+
+mod thin_ffi {
+    use super::NvExperts;
+    use crate::ffi::{Error, Stream};
+    use std::ffi::{c_int, c_void};
+
+    unsafe extern "C" {
+        pub fn quench6k_nem_moe_prefill_tile_rows_for(rows: c_int) -> c_int;
+        pub fn quench6k_nem_moe_experts_prefill_tiles(
+            xs: *const c_void,
+            up: NvExperts,
+            down: NvExperts,
+            offsets: *const i32,
+            tile_expert: *const i32,
+            tile_row: *const i32,
+            num_tiles: *const i32,
+            max_tiles: c_int,
+            tile_rows: c_int,
+            act: *mut c_void,
+            y: *mut c_void,
+            st: Stream,
+        ) -> Error;
+    }
+}
+
+/// Tile rows of the prefill expert kernels for a step of `rows` rows: 32 (thin tiles, small steps; at
+/// most [`THIN_MAX_ROWS`] rows) or [`moe_prefill_tile_rows`].
+pub fn moe_prefill_tile_rows_for(rows: usize) -> usize {
+    unsafe { thin_ffi::quench6k_nem_moe_prefill_tile_rows_for(rows.min(i32::MAX as usize) as c_int) as usize }
+}
+
+/// Most step rows that take the thin 32-row tiles (variant nem.thin lowers it): size tile lists for
+/// `THIN_MAX_ROWS * 22 / 32 + 512` tiles.
+pub const THIN_MAX_ROWS: usize = 1024;
+
+/// [`moe_experts_prefill`] after [`moe_plan`] with `tile_rows` = [`moe_prefill_tile_rows_for`] (the same
+/// outputs whatever the tiles).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_prefill_tiles(
+    s: &Stream,
+    xs: u64,
+    up: &NvExperts,
+    down: &NvExperts,
+    offsets: u64,
+    tile_expert: u64,
+    tile_row: u64,
+    num_tiles: u64,
+    max_tiles: usize,
+    tile_rows: usize,
+    act: u64,
+    y: u64,
+) -> Result<()> {
+    check(
+        unsafe {
+            thin_ffi::quench6k_nem_moe_experts_prefill_tiles(
+                xs as *const c_void,
+                *up,
+                *down,
+                offsets as *const i32,
+                tile_expert as *const i32,
+                tile_row as *const i32,
+                num_tiles as *const i32,
+                max_tiles as c_int,
+                tile_rows as c_int,
+                act as *mut c_void,
+                y as *mut c_void,
+                s.raw(),
+            )
+        },
+        "nem_moe_experts_prefill_tiles",
+    )
+}
