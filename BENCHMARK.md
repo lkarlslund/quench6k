@@ -61,6 +61,44 @@ Past 512 the corpus repeats, so the 128 tokens continue it exactly in every run.
 1,042,346 tokens prefills at 1.7K tokens/s and decodes at 34 tokens/s with 38.9 GiB of caches (450 W).
 Data: `bench/inkling.jsonl` (with the GPU's temperature, clocks and power during each run).
 
+## Nemotron 3 Super / Munin 2.0
+
+One request, 600 W, greedy, 128 tokens generated after the first N tokens of the Qwen corpus
+(`bench/context.ids`) tokenized with Nemotron's tokenizer (`quench6k nemotron bench --generate 128
+--drafts 0 3`, BF16 caches), on Munin 2.0 (NVIDIA's checkpoint has the same layers, formats and
+tokenizer). Plain decoding, and decoding with three drafts of the checkpoint's MTP layer per step
+(tokens per step in parentheses). Prefill is the same work in both runs, in steps of up to 2048 tokens.
+
+| Context | Prefill | Decode, plain | Decode, 3 MTP drafts |
+|---:|---:|---:|---:|
+| 512 | TBD | TBD | TBD (TBD) |
+| 8K | TBD | TBD | TBD (TBD) |
+| 32K | TBD | TBD | TBD (TBD) |
+
+Long contexts, one request (each context in a run of its own):
+
+| Context | Prefill | Decode, plain | Decode, 3 MTP drafts |
+|---:|---:|---:|---:|
+| 128K | TBD | TBD | TBD (TBD) |
+| 260,000 | TBD | TBD | TBD (TBD) |
+
+Several sequences decoded together (`--seqs N`: N windows of the corpus, each its own prompt of the same
+length, in batched steps; each sequence's tokens are the same as alone). Decode tokens per second summed
+over the sequences; with drafts, tokens per sequence step in parentheses:
+
+| Context | Drafts | 1 | 2 | 4 | 8 |
+|---:|---|---:|---:|---:|---:|
+| 8K | none | TBD | TBD | TBD | TBD |
+| 8K | 3 | TBD (TBD) | TBD (TBD) | TBD (TBD) | TBD (TBD) |
+
+The server prefills several whole 2048-token chunks in one step (up to 8192 tokens) while no other
+request decodes; measured with such steps (`QUENCH6K_NEM_MAXT=8192`), prefill is TBD / TBD / TBD tokens/s
+at 512 / 8K / 32K.
+
+Past the corpus' first repetition the greedy tokens continue it, so drafts are accepted more often than
+on real prompts. Data: `bench/nemotron.jsonl` (with the GPU's temperature, clocks and power during each
+run).
+
 ## Several requests at once
 
 Served requests started together, each its own ~1K-token prompt asking for a long answer (320 or 480
@@ -75,6 +113,15 @@ that many sequences, summed over the requests:
 
 A request's tokens do not depend on which others share its steps: the same prompts give the same text
 alone and eight at once. Details and the before/after of each change: [dev/KBENCH.md](dev/KBENCH.md).
+
+Munin 2.0 served (`--slots 8 --context 65536`, MTP drafts on, BF16 caches), multi-turn conversations
+from `tools/loadgen.py consistency --shared-system --between none` (each conversation alone, then all at
+once on the same server): 4 conversations of 8 turns growing to 24.8K tokens, greedy and sampled
+(temperature 0.8, seeded), and 8 conversations of 5 turns growing to 16.7K, greedy. Every conversation's
+text was identical alone and together (4/4, 4/4, 8/8; no errors). Prompt tokens served from cache: 71% /
+72% / 58% alone, 65% / 66% / 60% together (a turn recomputes back to the last 2048-token boundary).
+Decode tokens per second per request (median): 162 / 154 / 166 alone, 115 / 74 / 149 together, with
+other requests' prefills sharing the GPU.
 
 Recursive Flint against llama.cpp, one request by context: [README](README.md#recursive-flint-against-llamacpp).
 

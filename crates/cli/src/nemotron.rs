@@ -126,6 +126,8 @@ pub enum NemotronCmd {
         /// Drafted greedy decoding with this many MTP drafts per step (0: plain; several values: each in turn).
         #[arg(long, num_args = 1.., default_values_t = [0usize])]
         drafts: Vec<usize>,
+        /// Append one JSON record per (ctx, seqs, drafts) to this file (bench/README.md), with the GPU's
+        /// temperature, SM clock and power sampled during the run.
         #[arg(long)]
         json: Option<PathBuf>,
     },
@@ -230,9 +232,10 @@ pub fn run(cmd: NemotronCmd) -> Result<()> {
             let max_t = std::env::var("QUENCH6K_NEM_MAXT").ok().and_then(|v| v.parse().ok()).unwrap_or(CANON_CHUNK);
             let mut ws = Workspace::new(&m, max_t, seqs.iter().max().copied().unwrap_or(1) * MAX_VERIFY)?;
             println!("workspace: steps of {max_t} tokens, {:.2} GiB", ws.device_bytes as f64 / (1u64 << 30) as f64);
+            let mon = crate::gpumon::Monitor::start();
             for &n in &seqs {
                 for &d in &drafts {
-                    bench(&m, &s, &mut ws, &model, &text, &ctx, generate, n, kv, d, json.as_deref())?;
+                    bench(&m, &s, &mut ws, &model, &text, &ctx, generate, n, kv, d, json.as_deref(), mon.as_ref())?;
                 }
             }
             Ok(())
@@ -468,8 +471,11 @@ fn bench(
     kv: Kv,
     drafts: usize,
     json: Option<&Path>,
+    mon: Option<&crate::gpumon::Monitor>,
 ) -> Result<()> {
     ensure!((1..=MAX_SEQS).contains(&seqs), "--seqs 1 to {MAX_SEQS}");
+    // The record's model name: the checkpoint directory's name (several checkpoints share this architecture).
+    let model_name = dir.canonicalize().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).unwrap_or_else(|| "nemotron-h".into());
     ensure!(generate >= 2, "--generate at least 2");
     let chat = Chat::load(dir, None)?;
     let ids = chat.encode(&std::fs::read_to_string(text)?)?;
@@ -514,6 +520,10 @@ fn bench(
             // --capture-range=cudaProfilerApi); =decode: the plain decode steps after the first 8.
             let profile = std::env::var("QUENCH6K_NEM_PROFILE").is_ok_and(|v| v == "1");
             let profile_decode = std::env::var("QUENCH6K_NEM_PROFILE").is_ok_and(|v| v == "decode");
+            // The GPU window covers this run's prefill (when it has one) and decode.
+            if let Some(m) = mon {
+                m.begin();
+            }
             // A/B runs (QUENCH6K_NEM_AB) decode from one prefill: the states are saved after it and restored
             // before every later run (the prefill rate is that of the first run).
             if kept.is_none() || ab.len() <= 1 {
@@ -546,12 +556,13 @@ fn bench(
             let (firsts, prefill_s) = (firsts.clone(), *prefill_s);
             let mut outs: Vec<Vec<i32>> = firsts.iter().map(|&t| vec![t]).collect();
             let t1 = Instant::now();
-            let mut steps = generate - 1;
+            // Steps each sequence took part in, summed (lockstep batched steps count once per sequence).
+            let mut seq_steps = (generate - 1) * seqs;
             if drafts > 0 {
                 let mut refs: Vec<&mut State> = states.iter_mut().collect();
                 let r = decode_drafted(model, &mut refs, ws, s, &firsts, generate, drafts, &|_| false)?;
                 outs = r.tokens;
-                steps = r.steps;
+                seq_steps = r.seq_steps;
             }
             for i in 1..if drafts > 0 { 0 } else { generate } {
                 if profile_decode && i == 9 {
@@ -579,12 +590,17 @@ fn bench(
             let copied = outs[0].iter().zip(&ids[ctx..]).filter(|(a, b)| a == b).count();
             let pf = (ctx * seqs) as f64 / prefill_s;
             let tg = ((generate - 1) * seqs) as f64 / decode_s;
-            let per_step = (generate - 1) as f64 / steps.max(1) as f64;
+            let tokens: usize = outs.iter().map(|o| o.len() - 1).sum();
+            let per_step = tokens as f64 / seq_steps.max(1) as f64;
             let label = if warm { format!(" [warm-up {vi}]") } else if ab.len() > 1 { format!(" [{vi}: {}]", ab[vi].label) } else { String::new() };
             println!(
-                "ctx {ctx:>6} x {seqs}{label}: prefill {pf:>7.0} tok/s ({prefill_s:.2}s), decode {tg:>6.1} tok/s ({per_step:.2} tokens/step); corpus continuation {copied}/{generate}; {:?}",
+                "ctx {ctx:>6} x {seqs}{label}: prefill {pf:>7.0} tok/s ({prefill_s:.2}s), decode {tg:>6.1} tok/s ({per_step:.2} tokens per sequence step); corpus continuation {copied}/{generate}; {:?}",
                 chat.decode(&outs[0][..outs[0].len().min(24)], false)?
             );
+            let gpu = if warm { None } else { mon.map(|m| m.end()) };
+            if let Some(w) = &gpu {
+                println!("         {}{}", w.summary(), if w.slowed() { format!("; WARNING: the GPU slowed down ({})", w.reason_names().join(", ")) } else { String::new() });
+            }
             if !warm {
                 rates[vi].push(tg);
             }
@@ -598,9 +614,15 @@ fn bench(
             }
             if let (Some(path), false) = (json, warm) {
                 use std::io::Write;
-                let rec = serde_json::json!({"engine": "quench6k", "model": "nemotron-h", "kv": format!("{kv:?}").to_lowercase(), "drafts": drafts, "tokens_per_step": (per_step * 100.0).round() / 100.0, "seqs": seqs, "ctx": ctx,
-                    "generate": generate, "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0,
-                    "copied": copied, "variant": ab.get(vi).map(|a| a.label.clone())});
+                let mut rec = serde_json::json!({"engine": "quench6k", "model": model_name, "mode": if drafts > 0 { "mtp" } else { "plain" }, "kv": format!("{kv:?}").to_lowercase(),
+                    "ctx": ctx, "seqs": seqs, "drafts": drafts, "generate": generate, "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0,
+                    "tokens_per_step": (per_step * 100.0).round() / 100.0, "copied": copied, "date": crate::bench::utc_date()});
+                if ab.len() > 1 {
+                    rec["variant"] = ab[vi].label.clone().into();
+                }
+                if let Some(w) = &gpu {
+                    rec["gpu"] = w.json();
+                }
                 writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path)?, "{rec}")?;
             }
         }
@@ -801,6 +823,8 @@ pub(crate) struct Drafted {
     pub tokens: Vec<Vec<i32>>,
     /// Verification steps (the most any sequence took).
     pub steps: usize,
+    /// Verification steps summed over the sequences (each counts the steps it took part in).
+    pub seq_steps: usize,
     /// Drafts verified and accepted, over all sequences.
     pub drafted: usize,
     pub accepted: usize,
@@ -827,7 +851,7 @@ pub(crate) fn decode_drafted(
     let want: Vec<usize> = (0..m).map(|i| if done[i] { 0 } else { room(&out[i]) }).collect();
     let next: Vec<Option<i32>> = (0..m).map(|i| (!done[i]).then_some(first[i])).collect();
     let mut cur = model.commit(states, ws, s, &vec![0; m], &next, &want)?;
-    let (mut steps, mut drafted, mut accepted) = (0, 0, 0);
+    let (mut steps, mut seq_steps, mut drafted, mut accepted) = (0, 0, 0, 0);
     while done.iter().any(|d| !d) {
         let active: Vec<usize> = (0..m).filter(|&i| !done[i]).collect();
         let toks: Vec<Vec<i32>> = active
@@ -843,6 +867,7 @@ pub(crate) fn decode_drafted(
         let mut sub: Vec<&mut State> = states.iter_mut().enumerate().filter(|(i, _)| !done[*i]).map(|(_, st)| &mut **st).collect();
         model.verify(&mut sub, ws, s, &refs)?;
         steps += 1;
+        seq_steps += active.len();
         let rows: usize = toks.iter().map(|t| t.len()).sum();
         k::argmax(s, ws.out_logits, rows, vocab, vocab, ws.argmax_scratch, ws.argmax)?;
         let picks = s.download::<i32>(ws.argmax, rows)?;
@@ -875,7 +900,7 @@ pub(crate) fn decode_drafted(
             cur[i] = d[a].clone();
         }
     }
-    Ok(Drafted { tokens: out, steps, drafted, accepted })
+    Ok(Drafted { tokens: out, steps, seq_steps, drafted, accepted })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -928,7 +953,7 @@ fn spec_check(dir: &Path, text: &Path, ctx: usize, seqs: usize, n: usize, drafts
     // Drafted: each sequence alone, then all in batched verification steps.
     for batched in [false, true] {
         let groups: Vec<Vec<usize>> = if batched { vec![(0..seqs).collect()] } else { (0..seqs).map(|i| vec![i]).collect() };
-        let (mut secs, mut steps, mut drafted, mut accepted, mut tokens) = (0.0, 0, 0, 0, 0);
+        let (mut secs, mut steps, mut seq_steps, mut drafted, mut accepted, mut tokens) = (0.0, 0, 0, 0, 0, 0);
         for g in &groups {
             let mut sts = Vec::new();
             let mut firsts = Vec::new();
@@ -943,6 +968,7 @@ fn spec_check(dir: &Path, text: &Path, ctx: usize, seqs: usize, n: usize, drafts
             let r = decode_drafted(&model, &mut refs, &mut ws, &s, &firsts, n, drafts, &stop)?;
             secs += t0.elapsed().as_secs_f64();
             steps += r.steps;
+            seq_steps += r.seq_steps;
             drafted += r.drafted;
             accepted += r.accepted;
             for (k2, &i) in g.iter().enumerate() {
@@ -958,7 +984,7 @@ fn spec_check(dir: &Path, text: &Path, ctx: usize, seqs: usize, n: usize, drafts
             "drafted {}: {:.1} tok/s, {:.2} tokens per sequence step, acceptance {:.1}% ({accepted} of {drafted} drafts), {} steps",
             if batched { format!("{seqs} batched") } else { "alone".into() },
             tokens as f64 / secs,
-            tokens as f64 / (steps as f64 * if batched { seqs as f64 } else { 1.0 }).max(1.0),
+            tokens as f64 / seq_steps.max(1) as f64,
             100.0 * accepted as f64 / drafted.max(1) as f64,
             steps
         );
