@@ -23,6 +23,10 @@
 //! may serve less context than its `--context` (what one sequence fits in device memory): once it has
 //! loaded, its `/v1/models` context is listed instead, and remembered across restarts in a state file
 //! (`$XDG_STATE_HOME/quench6k/serve-models-contexts.json`), keyed by the entry's args and env.
+//!
+//! By hand: `POST /v1/load {"model": name}` loads a model without waiting for the settle period (only
+//! while no request is running), `POST /v1/unload` stops the loaded one; the loaded model's dashboard
+//! has a model picker for both, and `/` shows the picker alone while no model is loaded.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -137,6 +141,7 @@ pub fn run(opts: Options, identity: impl Fn(&[String]) -> Result<(Vec<String>, u
         .route("/v1/models", get(models))
         .route("/v1/models/{*id}", get(model))
         .route("/v1/unload", axum::routing::post(unload))
+        .route("/v1/load", axum::routing::post(load))
         .fallback(pass)
         .layer(axum::extract::DefaultBodyLimit::max(512 << 20))
         .with_state(app.clone());
@@ -275,32 +280,76 @@ async fn model(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response 
     }
 }
 
+/// GET /health: the loaded (or loading) model and its state, the running requests, and the catalog's
+/// models (each entry's first name: what the dashboard's model picker offers).
 async fn health(State(app): State<Arc<App>>) -> Json<Value> {
     let sh = app.shared.lock().await;
-    let (model, state) = match &sh.backend {
-        None => (Value::Null, "unloaded"),
-        Some(b) => (
-            json!(app.entries[b.entry].names[0]),
-            match *b.status.borrow() {
-                None => "loading",
-                Some(Ok(_)) => "loaded",
-                Some(Err(_)) => "failed",
-            },
-        ),
+    let (model, state, failure) = match &sh.backend {
+        None => (Value::Null, "unloaded", Value::Null),
+        Some(b) => {
+            let (state, failure) = match &*b.status.borrow() {
+                None => ("loading", Value::Null),
+                Some(Ok(_)) => ("loaded", Value::Null),
+                Some(Err(e)) => ("failed", json!(e)),
+            };
+            (json!(app.entries[b.entry].names[0]), state, failure)
+        }
     };
-    Json(json!({"status": "ok", "model": model, "state": state, "running": sh.running}))
+    let models: Vec<&str> = app.entries.iter().map(|e| e.names[0].as_str()).collect();
+    Json(json!({"status": "ok", "model": model, "state": state, "error": failure, "running": sh.running,
+                "models": models}))
 }
 
-/// POST /v1/unload: stops the loaded model once no request is running.
+/// POST /v1/unload: stops the loaded model once no request is running (not while one is loading).
 async fn unload(State(app): State<Arc<App>>) -> Response {
     let mut sh = app.shared.lock().await;
-    if sh.running > 0 {
-        return error(StatusCode::CONFLICT, Some("model_busy"), "requests are running".into(), false);
+    if let Some(r) = busy(&app, &sh) {
+        return with_anthropic(r, false);
     }
     if let Some(b) = sh.backend.take() {
         stop(b).await;
     }
     Json(json!({"status": "unloaded"})).into_response()
+}
+
+/// POST /v1/load {"model": name}: loads a model by hand, switching from the loaded one without the
+/// settle period, once no request is running. Answers at once (202 while loading); `/health` follows it.
+async fn load(State(app): State<Arc<App>>, body: axum::body::Bytes) -> Response {
+    let Some(name) = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["model"].as_str().map(str::to_string)) else {
+        return error(StatusCode::BAD_REQUEST, None, "the body must be {\"model\": name}".into(), false);
+    };
+    let Some(want) = find(&app, &name) else {
+        return error(StatusCode::NOT_FOUND, Some("model_not_found"), format!("model '{name}' not found"), false);
+    };
+    let mut sh = app.shared.lock().await;
+    if let Some(b) = &sh.backend
+        && b.entry == want
+    {
+        match &*b.status.borrow() {
+            Some(Ok(_)) => return Json(json!({"status": "loaded", "model": name})).into_response(),
+            None => return (StatusCode::ACCEPTED, Json(json!({"status": "loading", "model": name}))).into_response(),
+            Some(Err(_)) => {} // a failed load: try again
+        }
+    }
+    if let Some(r) = busy(&app, &sh) {
+        return with_anthropic(r, false);
+    }
+    begin_load(&app, &mut sh, want);
+    (StatusCode::ACCEPTED, Json(json!({"status": "loading", "model": name}))).into_response()
+}
+
+/// Why the loaded model cannot be stopped by hand now: requests are running, or a model is loading.
+fn busy(app: &App, sh: &Shared) -> Option<Rejection> {
+    let b = sh.backend.as_ref()?;
+    let current = &app.entries[b.entry].names[0];
+    let message = if b.status.borrow().is_none() {
+        format!("model {current} is loading; wait until it has loaded")
+    } else if sh.running > 0 {
+        format!("model {current} is serving {} request(s); retry when they have finished", sh.running)
+    } else {
+        return None;
+    };
+    Some(Rejection { status: StatusCode::CONFLICT, code: "model_busy", message, retry_after: None })
 }
 
 fn find(app: &App, name: &str) -> Option<usize> {
@@ -347,6 +396,9 @@ async fn pass(State(app): State<Arc<App>>, req: Request) -> Response {
             (Some(name), Some(l)) => find(&app, name) == Some(l),
         };
         if !serves {
+            if asked.is_none() && parts.uri.path() == "/" && parts.method == Method::GET {
+                return picker_page();
+            }
             let what = asked.map_or_else(|| "no model is loaded".to_string(), |n| format!("'{n}' is not loaded"));
             let msg = format!("{} is answered by a loaded model only, and {what}; model details are at /v1/models", parts.uri.path());
             return error(StatusCode::NOT_FOUND, Some("not_found"), msg, anthropic);
@@ -506,36 +558,49 @@ async fn acquire(app: &Arc<App>, entry: Option<usize>) -> std::result::Result<u1
             }
         }
         // Load `want` (after stopping the loaded model) in the background; this request waits for it.
-        let old = sh.backend.take();
-        let (tx, rx) = watch::channel(None);
-        sh.backend = Some(Backend { entry: want, child: None, status: rx });
-        drop(sh);
-        let app2 = app.clone();
-        tokio::spawn(async move {
-            if let Some(b) = old {
-                stop(b).await;
-            }
-            let result = start(&app2, want).await;
-            if let Ok((_, port)) = &result {
-                learn_context(&app2, want, *port).await;
-            }
-            let mut sh = app2.shared.lock().await;
-            let status = match result {
-                Ok((child, port)) => {
-                    if let Some(b) = sh.backend.as_mut().filter(|b| b.entry == want) {
-                        b.child = Some(child);
-                    }
-                    Ok(port)
-                }
-                Err(e) => {
-                    eprintln!("loading {}: {e:#}", app2.entries[want].names[0]);
-                    Err(format!("loading {}: {e:#}", app2.entries[want].names[0]))
-                }
-            };
-            sh.active = Instant::now();
-            let _ = tx.send(Some(status));
-        });
+        begin_load(app, &mut sh, want);
     }
+}
+
+/// Makes `want` the backend, loading it in the background after stopping the current one.
+fn begin_load(app: &Arc<App>, sh: &mut Shared, want: usize) {
+    let old = sh.backend.take();
+    let (tx, rx) = watch::channel(None);
+    sh.backend = Some(Backend { entry: want, child: None, status: rx });
+    let app = app.clone();
+    tokio::spawn(async move {
+        if let Some(b) = old {
+            stop(b).await;
+        }
+        let result = start(&app, want).await;
+        if let Ok((_, port)) = &result {
+            learn_context(&app, want, *port).await;
+        }
+        let mut sh = app.shared.lock().await;
+        let status = match result {
+            Ok((child, port)) => {
+                if let Some(b) = sh.backend.as_mut().filter(|b| b.entry == want) {
+                    b.child = Some(child);
+                }
+                Ok(port)
+            }
+            Err(e) => {
+                eprintln!("loading {}: {e:#}", app.entries[want].names[0]);
+                Err(format!("loading {}: {e:#}", app.entries[want].names[0]))
+            }
+        };
+        sh.active = Instant::now();
+        let _ = tx.send(Some(status));
+    });
+}
+
+/// The model picker shown at `/` while no model serves (the loaded model's dashboard has its own).
+fn picker_page() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
+        include_str!("multi.html"),
+    )
+        .into_response()
 }
 
 /// Starts a model's server and waits until it answers.
@@ -652,6 +717,98 @@ mod tests {
         write_learned(&path, &hy4.key, 202_752).unwrap();
         assert_eq!(read_learned(&path)[&hy4.key], 202_752);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn named(name: &str) -> Entry {
+        let mut e = entry(&["--model", &format!("/{name}")], 4096);
+        e.names = vec![name.into(), format!("{name}-alias")];
+        e
+    }
+
+    fn test_app(entries: Vec<Entry>) -> Arc<App> {
+        Arc::new(App {
+            entries,
+            state: None,
+            settle: Duration::from_secs(60),
+            // No executable: every load fails at once (what the hand-load path does with a failure).
+            exe: PathBuf::new(),
+            started: 0,
+            shared: Mutex::new(Shared { backend: None, running: 0, active: Instant::now() }),
+            client: hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(hyper_util::client::legacy::connect::HttpConnector::new()),
+        })
+    }
+
+    async fn call(app: &Arc<App>, path: &str, body: &str) -> (StatusCode, Value) {
+        let resp = if path == "/health" {
+            health(State(app.clone())).await.into_response()
+        } else if path == "/v1/unload" {
+            unload(State(app.clone())).await
+        } else {
+            load(State(app.clone()), axum::body::Bytes::from(body.to_string())).await
+        };
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// A backend in a given state (Some(Ok(port)): loaded), without a child process.
+    fn backend(entry: usize, status: Option<std::result::Result<u16, String>>) -> Backend {
+        let (_tx, rx) = watch::channel(status);
+        Backend { entry, child: None, status: rx }
+    }
+
+    #[test]
+    fn hand_load_and_unload() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let app = test_app(vec![named("a"), named("b")]);
+            let (s, h) = call(&app, "/health", "").await;
+            assert_eq!(s, StatusCode::OK);
+            assert_eq!(h["models"], json!(["a", "b"]));
+            assert_eq!(h["state"], "unloaded");
+            assert_eq!(call(&app, "/v1/load", "{}").await.0, StatusCode::BAD_REQUEST);
+            assert_eq!(call(&app, "/v1/load", r#"{"model": "c"}"#).await.0, StatusCode::NOT_FOUND);
+
+            // Loaded: the same model (any of its names) is a no-op; another one switches at once (no settle).
+            app.shared.lock().await.backend = Some(backend(0, Some(Ok(1))));
+            app.shared.lock().await.active = Instant::now();
+            let (s, v) = call(&app, "/v1/load", r#"{"model": "a-alias"}"#).await;
+            assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("loaded")));
+            // ...but not while requests run, and neither does unload.
+            app.shared.lock().await.running = 2;
+            let (s, v) = call(&app, "/v1/load", r#"{"model": "b"}"#).await;
+            assert_eq!(s, StatusCode::CONFLICT);
+            assert!(v["error"]["message"].as_str().unwrap().contains("serving 2 request(s)"), "{v}");
+            assert_eq!(call(&app, "/v1/unload", "").await.0, StatusCode::CONFLICT);
+            app.shared.lock().await.running = 0;
+            // Loading: unload and other loads wait; the same model reports loading.
+            app.shared.lock().await.backend = Some(backend(0, None));
+            assert_eq!(call(&app, "/v1/unload", "").await.0, StatusCode::CONFLICT);
+            assert_eq!(call(&app, "/v1/load", r#"{"model": "b"}"#).await.0, StatusCode::CONFLICT);
+            assert_eq!(call(&app, "/v1/load", r#"{"model": "a"}"#).await.0, StatusCode::ACCEPTED);
+            // Unload of a loaded model.
+            app.shared.lock().await.backend = Some(backend(0, Some(Ok(1))));
+            let (s, _) = call(&app, "/v1/unload", "").await;
+            assert_eq!(s, StatusCode::OK);
+            assert!(app.shared.lock().await.backend.is_none());
+
+            // A hand load runs in the background; its failure shows on /health, and loading again retries.
+            let (s, v) = call(&app, "/v1/load", r#"{"model": "b-alias"}"#).await;
+            assert_eq!((s, v["status"].as_str()), (StatusCode::ACCEPTED, Some("loading")));
+            let mut h = Value::Null;
+            for _ in 0..100 {
+                h = call(&app, "/health", "").await.1;
+                if h["state"] != "loading" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(h["state"], "failed");
+            assert_eq!(h["model"], "b");
+            assert!(h["error"].as_str().unwrap().starts_with("loading b:"), "{h}");
+            assert_eq!(call(&app, "/v1/load", r#"{"model": "b"}"#).await.0, StatusCode::ACCEPTED);
+        });
     }
 
     #[test]

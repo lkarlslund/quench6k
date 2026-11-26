@@ -126,6 +126,36 @@ button {
 .text-link:hover {
   color: #fff;
 }
+.model-switch {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+.model-switch select {
+  min-width: 0;
+  max-width: 100%;
+  background: #22272c;
+  color: var(--text);
+  border: 1px solid #394048;
+  border-radius: 4px;
+  padding: 7px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+.model-switch select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.model-switch .button:disabled {
+  opacity: .5;
+  cursor: default;
+}
+.switch-status {
+  font-size: 12px;
+  color: var(--muted);
+}
 main {
   max-width: 1440px;
   padding: 36px 32px 25px;

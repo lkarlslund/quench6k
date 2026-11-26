@@ -21,6 +21,7 @@ document.addEventListener('alpine:init', () => {
     return {
       server: {}, totals: {}, periodTotals: {}, slots: [], queued: 0, paused: false, error: '',
       lastUpdated: 0, range: 900, zoomed: false, outputRate: 0, prefillRate: 0, hasTraffic: false,
+      models: [], loadedModel: '', pick: '', switching: false, switchError: '',
       hiddenSlots: [], colors: ['#ff966b', '#79adff', '#65d5ab', '#c3a1ff', '#ffc579', '#6ed8de', '#ef9bc1', '#b6d887'],
       ranges: [{ label: '5m', seconds: 300 }, { label: '15m', seconds: 900 }, { label: '1h', seconds: 3600 }, { label: '1d', seconds: 86400 }, { label: '7d', seconds: 604800 }, { label: '31d', seconds: 2678400 }],
       get chartSlots() {
@@ -65,8 +66,38 @@ document.addEventListener('alpine:init', () => {
           [this.$refs.outputChart, this.$refs.prefillChart, this.$refs.activityChart].forEach(el => resizeObserver.observe(el));
           this.render();
           this.poll();
+          this.detectModels();
         });
       },
+      /* Under serve-models, /health lists the catalog: offer loading another model or unloading this one. */
+      async detectModels() {
+        try {
+          const health = await (await fetch('/health', { cache: 'no-store' })).json();
+          if (Array.isArray(health.models)) {
+            this.loadedModel = health.model || '';
+            this.pick = this.loadedModel;
+            this.models = health.models;
+          }
+        } catch (e) { /* a single-model server: no picker */ }
+      },
+      async switchModel(path, body) {
+        this.switching = true;
+        this.switchError = '';
+        clearTimeout(timer);
+        controller?.abort();
+        try {
+          const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+          if (response.ok) { location.href = '/'; return; }
+          const data = await response.json().catch(() => ({}));
+          this.switchError = data.error?.message || 'HTTP ' + response.status;
+        } catch (e) {
+          this.switchError = 'The server does not answer';
+        }
+        this.switching = false;
+        this.retry();
+      },
+      loadModel() { this.switchModel('/v1/load', { model: this.pick }); },
+      unloadModel() { this.switchModel('/v1/unload'); },
       destroy() {
         disposed = true;
         clearTimeout(timer);

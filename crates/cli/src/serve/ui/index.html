@@ -30,7 +30,8 @@
   <main>
     <section class="heading" aria-labelledby="page-title">
       <div><p class="eyebrow">INFERENCE / TELEMETRY</p><h1 id="page-title">Engine overview<span class="heading-dot">.</span></h1>
-        <p class="model-name" x-text="server.name || 'Connecting to the engine…'"></p></div>
+        <p class="model-name" x-text="server.name || 'Connecting to the engine…'"></p>
+        <div class="model-switch" x-show="models.length" x-cloak><select x-model="pick" :disabled="switching" aria-label="Model to load"><template x-for="m in models" :key="m"><option :value="m" x-text="m" :selected="m === pick"></option></template></select><button class="button" @click="loadModel()" :disabled="switching || pick === loadedModel">Load</button><button class="button" @click="unloadModel()" :disabled="switching">Unload</button><span class="switch-status" :class="{ 'error-text': switchError }" role="status" x-text="switchError || (switching ? 'Stopping ' + loadedModel + '…' : '')"></span></div></div>
       <div class="server-meta"><span class="tag" x-text="server.kv_format ? server.kv_format + ' KV' : '—'"></span><span class="tag" x-text="server.context ? compact(server.context) + ' context' : '—'"></span><span class="uptime" x-text="'Uptime ' + uptime"></span></div>
     </section>
 
