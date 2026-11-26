@@ -1042,7 +1042,22 @@ CTA order for the dense GEMMs (-0.4%); the in_proj expanded in L2-sized column s
 Result (`nemotron bench`, 600 W, ~2.8 GHz start): workspace of 2048-token steps 3.49K / 7.03K / 6.51K tok/s
 at 512 / 8K / 32K; of 8192-token steps (QUENCH6K_NEM_MAXT=8192) 3.41K / 7.68K / 7.40K.
 
+Second round:
+- Thin expert tiles for steps of up to 1024 rows (`nem.thin`): 32 rows x 128 columns per CTA, 128-wide
+  k-tiles, each warp's lanes decode their weight rows straight into the MMA's B fragments (no weight
+  staging, one barrier per 128 k). time_experts: 256 tokens 1954 -> 1163 us/layer, 512 2047 -> 1236, 1024
+  2239 -> 1852 (2048 stays on 128-row tiles: 2668 vs 2990). Engine 512 +23.1%, 1000 +11.5%.
+- Served: while no request decodes, a prefill call takes several whole chunks (up to 8192 tokens, not a
+  sequence's first), ending at the same multiples; with others decoding one chunk per call as before.
+  Consistency (`--shared-system --between none`, 4 x 3 turns to 12K) 4/4; the alone phase's per-request
+  reuse equals a server without merging.
+- Dropped: the residual add folded into the next norm (-0.1..+0.3%, as levers.md predicts for
+  launch-eliminating fusions under PDL).
+
+After both rounds (`nemotron bench`, 600 W, 2.6-2.8 GHz, 46-55 C): workspace of 2048-token steps 4.11K /
+7.22K / 7.09K / 6.57K tok/s at 512 / 2K / 8K / 32K; of 8192-token steps (as served while nothing else
+decodes) 4.31K / - / 7.73K / 7.43K (from 2.9K / 6.2K / 6.2K / 5.8K). The first prefill of a process can
+read low (one run: 512 tokens at 1.3K).
+
 Left: the expert GEMM at 2048 rows streams its weights at ~0.8 TB/s (half of DRAM) and runs at 189
-TFLOPS; at 512 rows it is a latency-bound loop of 32/84 k-tiles per CTA (a thin-tile, wider-k variant for
-small steps is the next lever). The server prefills in CANON_CHUNK steps (slot scheduler); taking
-several chunks per step there trades longer pauses for the other slots' decode.
+TFLOPS; the thin kernel at 256 rows is within ~15% of the weight-streaming floor.
