@@ -117,14 +117,15 @@ pub enum NemotronCmd {
         ctx: Vec<usize>,
         #[arg(long, default_value_t = 64)]
         generate: usize,
-        #[arg(long, default_value_t = 1)]
-        seqs: usize,
+        /// Sequences decoded together (several values: each in turn).
+        #[arg(long, num_args = 1.., default_values_t = [1usize])]
+        seqs: Vec<usize>,
         /// Attention cache: bf16, or fp8 (a scale per position and KV head).
         #[arg(long, default_value = "bf16")]
         kv: String,
-        /// Drafted greedy decoding with this many MTP drafts per step (0: plain).
-        #[arg(long, default_value_t = 0)]
-        drafts: usize,
+        /// Drafted greedy decoding with this many MTP drafts per step (0: plain; several values: each in turn).
+        #[arg(long, num_args = 1.., default_values_t = [0usize])]
+        drafts: Vec<usize>,
         #[arg(long)]
         json: Option<PathBuf>,
     },
@@ -222,7 +223,17 @@ pub fn run(cmd: NemotronCmd) -> Result<()> {
             kv,
             drafts,
             json,
-        } => bench(&model, &text, &ctx, generate, seqs, Kv::parse(&kv)?, drafts, json.as_deref()),
+        } => {
+            let kv = Kv::parse(&kv)?;
+            let (m, s) = load(&model)?;
+            let mut ws = Workspace::new(&m, CANON_CHUNK, seqs.iter().max().copied().unwrap_or(1) * MAX_VERIFY)?;
+            for &n in &seqs {
+                for &d in &drafts {
+                    bench(&m, &s, &mut ws, &model, &text, &ctx, generate, n, kv, d, json.as_deref())?;
+                }
+            }
+            Ok(())
+        }
         NemotronCmd::SpecCheck {
             model,
             text,
@@ -442,78 +453,138 @@ fn score(model: &NemotronModel, s: &quench6k_cuda::Stream, fixture: &Path, out: 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, kv: Kv, drafts: usize, json: Option<&Path>) -> Result<()> {
+fn bench(
+    model: &NemotronModel,
+    s: &quench6k_cuda::Stream,
+    ws: &mut Workspace,
+    dir: &Path,
+    text: &Path,
+    ctxs: &[usize],
+    generate: usize,
+    seqs: usize,
+    kv: Kv,
+    drafts: usize,
+    json: Option<&Path>,
+) -> Result<()> {
     ensure!((1..=MAX_SEQS).contains(&seqs), "--seqs 1 to {MAX_SEQS}");
     ensure!(generate >= 2, "--generate at least 2");
     let chat = Chat::load(dir, None)?;
     let ids = chat.encode(&std::fs::read_to_string(text)?)?;
-    let (model, s) = load(dir)?;
     ensure!(drafts <= MAX_DRAFTS, "--drafts 0 to {MAX_DRAFTS}");
     ensure!(drafts == 0 || model.mtp.is_some(), "--drafts needs the MTP layer");
-    let mut ws = Workspace::new(&model, CANON_CHUNK, seqs * MAX_VERIFY)?;
+    // QUENCH6K_NEM_AB=A,B[,..]: feature masks (forward::set_features, decimal or 0x hex) timed interleaved
+    // in this process, A B B A per round (QUENCH6K_NEM_AB_ROUNDS rounds, default 2; a variant's first run
+    // includes its graph captures: compare medians); every variant's tokens must equal the first's.
+    let parse = |v: &str| if let Some(h) = v.strip_prefix("0x") { u32::from_str_radix(h, 16) } else { v.parse::<u32>() };
+    let ab: Vec<u32> = match std::env::var("QUENCH6K_NEM_AB") {
+        Ok(v) => v.split(',').map(|x| parse(x.trim())).collect::<Result<_, _>>().context("QUENCH6K_NEM_AB")?,
+        Err(_) => Vec::new(),
+    };
+    let rounds: usize = std::env::var("QUENCH6K_NEM_AB_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let order: Vec<usize> = if ab.len() > 1 {
+        let fwd: Vec<usize> = (0..ab.len()).collect();
+        (0..rounds).flat_map(|_| fwd.iter().copied().chain(fwd.iter().rev().copied())).collect()
+    } else {
+        vec![0]
+    };
+    let mut differ = 0;
     for &ctx in ctxs {
         // Sequence j reads the corpus from token 37 j on (different prompts of the same length).
         ensure!(ctx + generate + 37 * seqs <= ids.len(), "corpus has {} tokens, {} needed", ids.len(), ctx + generate + 37 * seqs);
-        let mut states = Vec::with_capacity(seqs);
-        let mut firsts = Vec::with_capacity(seqs);
-        // QUENCH6K_NEM_PROFILE=1: the prefills inside a cudaProfilerStart/Stop range (nsys
-        // --capture-range=cudaProfilerApi).
-        let profile = std::env::var("QUENCH6K_NEM_PROFILE").is_ok_and(|v| v == "1");
-        s.synchronize()?;
-        if profile {
-            quench6k_cuda::profiler_start()?;
-        }
-        let t0 = Instant::now();
-        for j in 0..seqs {
-            let mut st = State::new(&model, ctx + generate + 16, kv, &s)?;
-            model.prefill(&mut st, &mut ws, &s, &ids[37 * j..37 * j + ctx])?;
-            firsts.push(argmax(&ws, &model, &s, 1)?[0]);
-            states.push(st);
-        }
-        let prefill_s = t0.elapsed().as_secs_f64();
-        if profile {
-            quench6k_cuda::profiler_stop()?;
-        }
-        let mut outs: Vec<Vec<i32>> = firsts.iter().map(|&t| vec![t]).collect();
-        let t1 = Instant::now();
-        let mut steps = generate - 1;
-        if drafts > 0 {
-            let mut refs: Vec<&mut State> = states.iter_mut().collect();
-            let r = decode_drafted(&model, &mut refs, &mut ws, &s, &firsts, generate, drafts, &|_| false)?;
-            outs = r.tokens;
-            steps = r.steps;
-        }
-        for _ in 1..if drafts > 0 { 0 } else { generate } {
-            let toks: Vec<[i32; 1]> = outs.iter().map(|o| [*o.last().unwrap()]).collect();
-            let tok_refs: Vec<&[i32]> = toks.iter().map(|t| t.as_slice()).collect();
-            let mut refs: Vec<&mut State> = states.iter_mut().collect();
-            if seqs == 1 {
-                model.forward(refs[0], &mut ws, &s, tok_refs[0], Logits::Last)?;
-            } else {
-                model.forward_batch(&mut refs, &mut ws, &s, &tok_refs)?;
+        let mut reference: Option<Vec<Vec<i32>>> = None;
+        let mut rates: Vec<Vec<f64>> = vec![Vec::new(); ab.len().max(1)];
+        for &vi in &order {
+            if ab.len() > 1 {
+                quench6k_engine::nemotron::forward::set_features(ab[vi]);
             }
-            let picks = argmax(&ws, &model, &s, seqs)?;
-            for (o, p) in outs.iter_mut().zip(picks) {
-                o.push(p);
+            let mut states = Vec::with_capacity(seqs);
+            let mut firsts = Vec::with_capacity(seqs);
+            // QUENCH6K_NEM_PROFILE=1: the prefills inside a cudaProfilerStart/Stop range (nsys
+            // --capture-range=cudaProfilerApi); =decode: the plain decode steps after the first 8.
+            let profile = std::env::var("QUENCH6K_NEM_PROFILE").is_ok_and(|v| v == "1");
+            let profile_decode = std::env::var("QUENCH6K_NEM_PROFILE").is_ok_and(|v| v == "decode");
+            s.synchronize()?;
+            if profile {
+                quench6k_cuda::profiler_start()?;
+            }
+            let t0 = Instant::now();
+            for j in 0..seqs {
+                let mut st = State::new(model, ctx + generate + 16, kv, s)?;
+                model.prefill(&mut st, ws, s, &ids[37 * j..37 * j + ctx])?;
+                firsts.push(argmax(ws, model, s, 1)?[0]);
+                states.push(st);
+            }
+            let prefill_s = t0.elapsed().as_secs_f64();
+            if profile {
+                quench6k_cuda::profiler_stop()?;
+            }
+            let mut outs: Vec<Vec<i32>> = firsts.iter().map(|&t| vec![t]).collect();
+            let t1 = Instant::now();
+            let mut steps = generate - 1;
+            if drafts > 0 {
+                let mut refs: Vec<&mut State> = states.iter_mut().collect();
+                let r = decode_drafted(model, &mut refs, ws, s, &firsts, generate, drafts, &|_| false)?;
+                outs = r.tokens;
+                steps = r.steps;
+            }
+            for i in 1..if drafts > 0 { 0 } else { generate } {
+                if profile_decode && i == 9 {
+                    s.synchronize()?;
+                    quench6k_cuda::profiler_start()?;
+                    eprintln!("profiling decode steps 9 to {}: {} steps", generate - 1, generate - 9);
+                }
+                let toks: Vec<[i32; 1]> = outs.iter().map(|o| [*o.last().unwrap()]).collect();
+                let tok_refs: Vec<&[i32]> = toks.iter().map(|t| t.as_slice()).collect();
+                let mut refs: Vec<&mut State> = states.iter_mut().collect();
+                if seqs == 1 {
+                    model.forward(refs[0], ws, s, tok_refs[0], Logits::Last)?;
+                } else {
+                    model.forward_batch(&mut refs, ws, s, &tok_refs)?;
+                }
+                let picks = argmax(ws, model, s, seqs)?;
+                for (o, p) in outs.iter_mut().zip(picks) {
+                    o.push(p);
+                }
+            }
+            let decode_s = t1.elapsed().as_secs_f64();
+            if profile_decode && drafts == 0 && generate > 9 {
+                quench6k_cuda::profiler_stop()?;
+            }
+            let copied = outs[0].iter().zip(&ids[ctx..]).filter(|(a, b)| a == b).count();
+            let pf = (ctx * seqs) as f64 / prefill_s;
+            let tg = ((generate - 1) * seqs) as f64 / decode_s;
+            let per_step = (generate - 1) as f64 / steps.max(1) as f64;
+            let label = if ab.len() > 1 { format!(" [{:#x}]", ab[vi]) } else { String::new() };
+            println!(
+                "ctx {ctx:>6} x {seqs}{label}: prefill {pf:>7.0} tok/s ({prefill_s:.2}s), decode {tg:>6.1} tok/s ({per_step:.2} tokens/step); corpus continuation {copied}/{generate}; {:?}",
+                chat.decode(&outs[0][..outs[0].len().min(24)], false)?
+            );
+            rates[vi].push(tg);
+            match &reference {
+                None => reference = Some(outs.clone()),
+                Some(r) if *r != outs => {
+                    differ += 1;
+                    eprintln!("ctx {ctx}{label}: tokens differ from the first variant's");
+                }
+                _ => {}
+            }
+            if let Some(path) = json {
+                use std::io::Write;
+                let rec = serde_json::json!({"engine": "quench6k", "model": "nemotron-h", "kv": format!("{kv:?}").to_lowercase(), "drafts": drafts, "tokens_per_step": (per_step * 100.0).round() / 100.0, "seqs": seqs, "ctx": ctx,
+                    "generate": generate, "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0,
+                    "copied": copied, "variant": ab.get(vi)});
+                writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path)?, "{rec}")?;
             }
         }
-        let decode_s = t1.elapsed().as_secs_f64();
-        let copied = outs[0].iter().zip(&ids[ctx..]).filter(|(a, b)| a == b).count();
-        let pf = (ctx * seqs) as f64 / prefill_s;
-        let tg = ((generate - 1) * seqs) as f64 / decode_s;
-        let per_step = (generate - 1) as f64 / steps.max(1) as f64;
-        println!(
-            "ctx {ctx:>6} x {seqs}: prefill {pf:>7.0} tok/s ({prefill_s:.2}s), decode {tg:>6.1} tok/s ({per_step:.2} tokens/step); corpus continuation {copied}/{generate}; {:?}",
-            chat.decode(&outs[0][..outs[0].len().min(24)], false)?
-        );
-        if let Some(path) = json {
-            use std::io::Write;
-            let rec = serde_json::json!({"engine": "quench6k", "model": "nemotron-h", "kv": format!("{kv:?}").to_lowercase(), "drafts": drafts, "tokens_per_step": (per_step * 100.0).round() / 100.0, "seqs": seqs, "ctx": ctx,
-                "generate": generate, "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0,
-                "copied": copied});
-            writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path)?, "{rec}")?;
+        if ab.len() > 1 {
+            for (vi, r) in rates.iter().enumerate() {
+                let mut v = r.clone();
+                v.sort_by(f64::total_cmp);
+                println!("ctx {ctx:>6} x {seqs} [{:#x}]: decode median {:.1} tok/s, range {:.1}-{:.1}", ab[vi], v[v.len() / 2], v[0], v[v.len() - 1]);
+            }
         }
     }
+    ensure!(differ == 0, "{differ} runs' tokens differ from the first variant's");
     Ok(())
 }
 
