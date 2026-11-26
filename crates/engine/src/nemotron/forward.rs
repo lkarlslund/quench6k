@@ -601,6 +601,22 @@ fn append_f32(dir: &std::path::Path, name: &str, v: &[f32]) -> Result<()> {
     Ok(())
 }
 
+static DEBUG_SYNC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Debugging races: waits for the device before the launches selected by `mask` (1 Mamba mixer, 2 small
+/// experts, 4 expert combine, 8 router, 16 attention prep, 32 attention, 64 relu², 128 block norms, 256
+/// residual adds, 512 to_bf16).
+pub fn set_debug_sync(mask: u32) {
+    DEBUG_SYNC.store(mask, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn dsync(s: &Stream, bit: u32) -> Result<()> {
+    if DEBUG_SYNC.load(std::sync::atomic::Ordering::Relaxed) & bit != 0 {
+        s.synchronize()?;
+    }
+    Ok(())
+}
+
 /// What the enqueued work of a step depends on besides device data.
 #[derive(Clone, Copy)]
 struct Plan {
@@ -777,12 +793,14 @@ impl NemotronModel {
         let (r, small, want) = (plan.r, plan.small, plan.want);
         let eps = self.cfg.eps;
         for (i, layer) in self.layers.iter().enumerate() {
+            dsync(s, 128)?;
             nk::rms(s, ws.h, D, layer.norm, eps, r, ws.xn, D, false)?;
             match &layer.mixer {
                 Mixer::Mamba(m) => self.mamba(ws, s, m, self.slot[i], plan)?,
                 Mixer::Attn(a) => self.attention(ws, s, a, kv[self.slot[i]], plan)?,
                 Mixer::Moe(m) => self.moe(ws, s, m, r, small)?,
             }
+            dsync(s, 256)?;
             k::add_f32(s, ws.h, ws.mix, r * D)?;
             if let Some(dir) = &ws.dump {
                 append_f32(dir, &format!("lanes-{i:02}.bin"), &s.download::<f32>(ws.h, r * D)?)?;
@@ -820,6 +838,7 @@ impl NemotronModel {
     fn mamba(&self, ws: &Workspace, s: &Stream, m: &Mamba, slot: usize, plan: &Plan) -> Result<()> {
         let r = plan.r;
         linear(s, ws.xn, D, r, &m.in_proj, ws.big, INP, plan.small, false)?;
+        dsync(s, 1)?;
         nk::mamba_mixer(s, ws.big, INP, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, &ws.mamba, ws.act)?;
         linear(s, ws.act, DI, r, &m.out_proj, ws.mix, D, plan.small, false)
     }
@@ -829,7 +848,9 @@ impl NemotronModel {
         let r = plan.r;
         debug_assert_eq!(kv.fp8, plan.kv_fp8);
         linear(s, ws.xn, D, r, &a.qkv, ws.big, QKV, plan.small, false)?;
+        dsync(s, 16)?;
         nk::attn_prep(s, ws.big, QKV, 0, H * HD, (H + KVH) * HD, r, plan.seqs, kv, ws.q)?;
+        dsync(s, 32)?;
         if plan.small {
             nk::attention_small(s, ws.q, r, plan.seqs, kv, plan.groups, plan.part, ws.act)?;
         } else {
@@ -842,8 +863,10 @@ impl NemotronModel {
     /// shared expert on the full width, added into ws.mix.
     fn moe(&self, ws: &Workspace, s: &Stream, m: &Moe, r: usize, small: bool) -> Result<()> {
         linear(s, ws.xn, D, r, &m.gate, ws.logits, EXPERTS, small, false)?;
+        dsync(s, 8)?;
         nk::moe_route(s, ws.logits, EXPERTS, m.bias, self.cfg.routed_scaling, r, ws.sel_e, ws.sel_w)?;
         linear(s, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false)?;
+        dsync(s, 512)?;
         quench6k_cuda::hy4::to_bf16(s, ws.lat, ws.lat_bf, r * LAT)?;
         let ex = &m.experts;
         let at = |base: u64, row: usize, width: usize| base + (row * width) as u64;
@@ -852,7 +875,9 @@ impl NemotronModel {
             for r0 in (0..r).step_by(nk::SMALL_ROWS) {
                 let n = nk::SMALL_ROWS.min(r - r0);
                 let sel_e = at(ws.sel_e, r0, TOPK * 4);
+                dsync(s, 2)?;
                 nk::moe_experts_small(s, at(ws.lat_bf, r0, LAT * 2), sel_e, &ex.up, &ex.down, n, ws.pair_row, ws.eact, ws.ey)?;
+                dsync(s, 4)?;
                 nk::moe_combine(s, ws.ey, 0, at(ws.sel_w, r0, TOPK * 4), n, at(ws.ex_bf, r0, LAT * 2))?;
             }
         } else {
@@ -871,6 +896,7 @@ impl NemotronModel {
         }
         linear(s, ws.ex_bf, LAT, r, &m.fc2, ws.mix, D, small, false)?;
         linear(s, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false)?;
+        dsync(s, 64)?;
         nk::relu2(s, ws.big, SH, SH, r, ws.act, SH)?;
         linear(s, ws.act, SH, r, &m.shared_down, ws.mix, D, small, true)
     }

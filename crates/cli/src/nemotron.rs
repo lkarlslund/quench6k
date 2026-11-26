@@ -101,6 +101,10 @@ pub enum NemotronCmd {
         steps: usize,
         #[arg(long, default_value = "bf16")]
         kv: String,
+        /// Verification steps instead of plain ones: sequence j feeds its token and 1 + (j + step) % W
+        /// corpus tokens as drafts and keeps a varying number of them (also checks the Mamba states).
+        #[arg(long, default_value_t = 0)]
+        verify: usize,
     },
     /// Prefill and greedy decode throughput at each context length, on a text corpus (its first `ctx`
     /// tokens); with --seqs N, N sequences (corpus windows) decoded in lockstep batched steps.
@@ -201,7 +205,14 @@ pub fn run(cmd: NemotronCmd) -> Result<()> {
             seqs,
             steps,
             kv,
-        } => batch_check(&model, &text, ctx, seqs, steps, Kv::parse(&kv)?),
+            verify,
+        } => {
+            if verify > 0 {
+                verify_check(&model, &text, ctx, seqs, steps, verify, Kv::parse(&kv)?)
+            } else {
+                batch_check(&model, &text, ctx, seqs, steps, Kv::parse(&kv)?)
+            }
+        }
         NemotronCmd::Bench {
             model,
             text,
@@ -733,5 +744,125 @@ fn spec_check(dir: &Path, text: &Path, ctx: usize, seqs: usize, n: usize, drafts
     }
     ensure!(failures == 0, "{failures} drafted outputs differ from plain greedy");
     println!("spec-check: drafted greedy output equals plain greedy for {seqs} sequences, alone and batched");
+    Ok(())
+}
+
+/// Batch invariance of verification steps: each sequence alone, then all batched, with the same fed
+/// tokens and kept counts; every row's logits and the states' checksums after each commit compared.
+fn verify_check(dir: &Path, text: &Path, ctx: usize, seqs: usize, steps: usize, w: usize, kv: Kv) -> Result<()> {
+    ensure!((2..=MAX_SEQS).contains(&seqs) && w < MAX_VERIFY, "--seqs 2 to {MAX_SEQS}, --verify below {MAX_VERIFY}");
+    let chat = Chat::load(dir, None)?;
+    let ids = chat.encode(&std::fs::read_to_string(text)?)?;
+    let (model, s) = load(dir)?;
+    let v = model.cfg.vocab;
+    let mut ws = Workspace::new(&model, CANON_CHUNK, seqs * MAX_VERIFY)?;
+    let prompt = |j: usize| &ids[64 * j..64 * j + ctx - 37 * j];
+    // Alone: the fed tokens, kept counts, logits rows and checksums of every step.
+    type Rec = (Vec<i32>, usize, Vec<u32>, [u64; 2]);
+    let mut recs: Vec<Vec<Rec>> = Vec::new();
+    for j in 0..seqs {
+        let mut st = State::new(&model, ctx + steps * MAX_VERIFY + 64, kv, &s)?;
+        model.prefill(&mut st, &mut ws, &s, prompt(j))?;
+        let mut next = argmax(&ws, &model, &s, 1)?[0];
+        model.commit(&mut [&mut st], &mut ws, &s, &[0], &[Some(next)], &[0])?;
+        let mut r = Vec::new();
+        for step in 0..steps {
+            let extra = 1 + (j + step) % w;
+            let at = 64 * j + st.pos;
+            let mut toks = vec![next];
+            toks.extend_from_slice(&ids[at..at + extra]);
+            let dump = std::env::var_os("QUENCH6K_NEM_VC_DUMP").filter(|_| step == 0).map(|d| PathBuf::from(d).join(format!("alone-{j}")));
+            if let Some(d) = &dump {
+                fresh_dump(d)?;
+            }
+            ws.dump = dump;
+            model.verify(&mut [&mut st], &mut ws, &s, &[&toks])?;
+            ws.dump = None;
+            let logits: Vec<u32> = s.download::<f32>(ws.out_logits, toks.len() * v)?.iter().map(|x| x.to_bits()).collect();
+            let keep = 1 + (step * 7 + j) % toks.len();
+            let picks = argmax(&ws, &model, &s, toks.len())?;
+            next = picks[keep - 1];
+            model.commit(&mut [&mut st], &mut ws, &s, &[keep], &[Some(next)], &[2])?;
+            r.push((toks, keep, logits, st.checksums(&s)?));
+        }
+        recs.push(r);
+    }
+    let fresh = |ws: &mut Workspace| -> Result<Vec<State>> {
+        let mut states = Vec::new();
+        for j in 0..seqs {
+            let mut st = State::new(&model, ctx + steps * MAX_VERIFY + 64, kv, &s)?;
+            model.prefill(&mut st, ws, &s, prompt(j))?;
+            let next = argmax(ws, &model, &s, 1)?[0];
+            model.commit(&mut [&mut st], ws, &s, &[0], &[Some(next)], &[0])?;
+            states.push(st);
+        }
+        Ok(states)
+    };
+    // QUENCH6K_NEM_VC_BISECT=1: the first batched step again with the device waited for before each kind
+    // of launch in turn (forward::set_debug_sync), to find a launch that reads its inputs too early.
+    if std::env::var("QUENCH6K_NEM_VC_BISECT").is_ok_and(|v| v == "1") {
+        for bit in 0..10 {
+            let mask = 1u32 << bit;
+            quench6k_engine::nemotron::forward::set_debug_sync(mask);
+            let mut states = fresh(&mut ws)?;
+            let toks: Vec<&[i32]> = recs.iter().map(|r| r[0].0.as_slice()).collect();
+            let mut refs: Vec<&mut State> = states.iter_mut().collect();
+            model.verify(&mut refs, &mut ws, &s, &toks)?;
+            let rows: usize = toks.iter().map(|t| t.len()).sum();
+            let logits: Vec<u32> = s.download::<f32>(ws.out_logits, rows * v)?.iter().map(|x| x.to_bits()).collect();
+            let mut row = 0;
+            let mut diff = 0;
+            for r in &recs {
+                let (t, _, ref_logits, _) = &r[0];
+                for i in 0..t.len() {
+                    diff += (logits[(row + i) * v..(row + i + 1) * v] != ref_logits[i * v..(i + 1) * v]) as usize;
+                }
+                row += t.len();
+            }
+            let keep: Vec<usize> = recs.iter().map(|r| r[0].1).collect();
+            model.commit(&mut refs, &mut ws, &s, &keep, &vec![None; seqs], &vec![0; seqs])?;
+            println!("sync before launch kind {mask}: {diff} of {rows} rows differ");
+        }
+        quench6k_engine::nemotron::forward::set_debug_sync(0);
+    }
+    let mut states = fresh(&mut ws)?;
+    let mut bad = 0;
+    for step in 0..steps {
+        let toks: Vec<&[i32]> = recs.iter().map(|r| r[step].0.as_slice()).collect();
+        let mut refs: Vec<&mut State> = states.iter_mut().collect();
+        let dump = std::env::var_os("QUENCH6K_NEM_VC_DUMP").filter(|_| step == 0).map(|d| PathBuf::from(d).join("batched"));
+        if let Some(d) = &dump {
+            fresh_dump(d)?;
+        }
+        ws.dump = dump;
+        model.verify(&mut refs, &mut ws, &s, &toks)?;
+        ws.dump = None;
+        let rows: usize = toks.iter().map(|t| t.len()).sum();
+        let logits: Vec<u32> = s.download::<f32>(ws.out_logits, rows * v)?.iter().map(|x| x.to_bits()).collect();
+        let picks = argmax(&ws, &model, &s, rows)?;
+        let mut row = 0;
+        let (mut keep, mut next) = (Vec::new(), Vec::new());
+        for (j, r) in recs.iter().enumerate() {
+            let (t, k2, ref_logits, _) = &r[step];
+            for i in 0..t.len() {
+                if logits[(row + i) * v..(row + i + 1) * v] != ref_logits[i * v..(i + 1) * v] {
+                    bad += 1;
+                    eprintln!("step {step} sequence {j} row {i} of {}: logits differ from alone", t.len());
+                }
+            }
+            keep.push(*k2);
+            next.push(Some(picks[row + k2 - 1]));
+            row += t.len();
+        }
+        model.commit(&mut refs, &mut ws, &s, &keep, &next, &vec![2; seqs])?;
+        for (j, st) in refs.iter().enumerate() {
+            if st.checksums(&s)? != recs[j][step].3 {
+                bad += 1;
+                eprintln!("step {step} sequence {j}: states differ from alone after the commit");
+            }
+        }
+    }
+    ensure!(bad == 0, "{bad} mismatches");
+    println!("verify-check: {seqs} sequences x {steps} verification steps (up to {} tokens) bit-identical alone and batched", w + 1);
     Ok(())
 }
