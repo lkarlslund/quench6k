@@ -1229,7 +1229,7 @@ impl<E: SlotEngine> Sched<'_, E> {
             // Nobody decoding (no slice limit): several whole chunks in one call, ending at the same
             // multiples of the chunk size, except a sequence's first chunk (where an engine may keep its
             // lowest snapshot).
-            if limit == usize::MAX && at > 0 && at % chunk == 0 && end == at + chunk {
+            if limit == usize::MAX && at > 0 && at.is_multiple_of(chunk) && end == at + chunk {
                 end = at + (self.e.max_prefill() / chunk).min((len - at) / chunk).max(1) * chunk;
             }
             let last = end == len;
