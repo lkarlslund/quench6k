@@ -3,7 +3,8 @@
 //! (the body's "model"): when another model is loaded, the server switches only once that model has been
 //! idle (no request running) for the settle period; until then the request gets an error (503 with
 //! Retry-After), so two clients asking for different models cannot make it load and unload in turns.
-//! Reads (GET) never load a model.
+//! Reads (GET) never load a model, and do not count as use (an open dashboard does not keep a model
+//! from settling).
 //!
 //! Each model runs as its own `quench6k serve` child process on a local port (ending it frees all of its
 //! GPU memory); requests are passed through to it, streams included.
@@ -403,7 +404,12 @@ async fn pass(State(app): State<Arc<App>>, req: Request) -> Response {
             let msg = format!("{} is answered by a loaded model only, and {what}; model details are at /v1/models", parts.uri.path());
             return error(StatusCode::NOT_FOUND, Some("not_found"), msg, anthropic);
         }
-        return forward(&app, None, parts, bytes, anthropic).await;
+        // Reads are not counted as use: an open dashboard polling /stats must not keep the model from
+        // settling (or from being stopped by hand).
+        let Some(port) = loaded_port(&app).await else {
+            return error(StatusCode::NOT_FOUND, Some("not_found"), "no model is loaded".into(), anthropic);
+        };
+        return proxy(&app, port, None, parts, bytes, anthropic).await;
     }
     let entry = match &named {
         Some(name) => match find(&app, name) {
@@ -421,7 +427,17 @@ async fn forward(app: &Arc<App>, entry: Option<usize>, parts: axum::http::reques
         Ok(p) => p,
         Err(r) => return with_anthropic(r, anthropic),
     };
-    let guard = Running(app.clone());
+    proxy(app, port, Some(Running(app.clone())), parts, bytes, anthropic).await
+}
+
+/// The loaded model's port (none while nothing is loaded, or a model loads).
+async fn loaded_port(app: &App) -> Option<u16> {
+    let sh = app.shared.lock().await;
+    sh.backend.as_ref().and_then(|b| b.status.borrow().as_ref().and_then(|s| s.as_ref().ok().copied()))
+}
+
+/// Passes a request to the model server on `port`; `guard` (a counted request) ends with the response.
+async fn proxy(app: &Arc<App>, port: u16, guard: Option<Running>, parts: axum::http::request::Parts, bytes: axum::body::Bytes, anthropic: bool) -> Response {
     let uri = format!("http://127.0.0.1:{port}{}", parts.uri.path_and_query().map_or("/", |p| p.as_str()));
     let mut out = axum::http::Request::builder().method(parts.method).uri(uri);
     for (k, v) in parts.headers.iter() {
@@ -470,7 +486,7 @@ impl Drop for Running {
 
 struct Tracked<B> {
     inner: B,
-    _guard: Running,
+    _guard: Option<Running>,
 }
 
 impl<B: hyper::body::Body + Unpin> hyper::body::Body for Tracked<B> {
@@ -808,6 +824,45 @@ mod tests {
             assert_eq!(h["model"], "b");
             assert!(h["error"].as_str().unwrap().starts_with("loading b:"), "{h}");
             assert_eq!(call(&app, "/v1/load", r#"{"model": "b"}"#).await.0, StatusCode::ACCEPTED);
+        });
+    }
+
+    #[test]
+    fn reads_do_not_count_as_use() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fake = Router::new()
+                .route("/stats", get(|| async { Json(json!({"ok": true})) }))
+                .route("/v1/x", axum::routing::post(|| async { Json(json!({"ok": true})) }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, fake).await });
+            let app = test_app(vec![named("a")]);
+            let idle = Instant::now() - Duration::from_secs(100);
+            {
+                let mut sh = app.shared.lock().await;
+                sh.backend = Some(backend(0, Some(Ok(port))));
+                sh.active = idle;
+            }
+            let send = |method: Method, path: &str| {
+                let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+                pass(State(app.clone()), req)
+            };
+            let resp = send(Method::GET, "/stats").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(app.shared.lock().await.running, 0);
+            axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(app.shared.lock().await.active, idle, "a read refreshed the idle clock");
+            // Other requests count while they run and refresh the idle clock when they end.
+            let resp = send(Method::POST, "/v1/x").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(app.shared.lock().await.running, 1);
+            axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let sh = app.shared.lock().await;
+            assert_eq!(sh.running, 0);
+            assert!(sh.active > idle);
         });
     }
 

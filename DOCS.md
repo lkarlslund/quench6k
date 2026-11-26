@@ -499,7 +499,8 @@ local port, one at a time; requests (streams included) pass through to it.
   running, for the settle period (default 60 s). Until then the request is rejected with HTTP 503, code
   `model_switch_blocked` (Anthropic paths: `overloaded_error`) and a `Retry-After` header, so clients
   asking for different models cannot make the server load and unload in turns.
-- Reads (`GET`, such as `/`, `/metrics`, `/stats`) go to the loaded model and never load one: with none
+- Reads (`GET`, such as `/`, `/metrics`, `/stats`) go to the loaded model and never load one; they do
+  not count as use, so an open dashboard does not keep a model from settling. With none
   loaded, or with `?model=` naming another model than the loaded one, they get HTTP 404 (what clients
   probing for endpoints such as llama.cpp's `/props` expect from a server without them). Other requests
   without a model go to the loaded model; with none loaded they get HTTP 400 `no_model_loaded`.
