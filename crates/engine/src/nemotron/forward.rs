@@ -92,7 +92,16 @@ pub struct State {
     /// The Mamba block (`nk::mamba_seq_bytes`).
     mamba: DeviceBuffer,
     n_attn: usize,
+    /// The canonical frontier: a multiple of CANON_CHUNK below which every position was computed by an
+    /// aligned prefill chunk of CANON_CHUNK tokens and has not been rewritten since.
+    canon: usize,
+    /// Copies of the Mamba block at canonical boundaries (at most SNAPS: the lowest and the latest).
+    snaps: Vec<(usize, DeviceBuffer)>,
 }
+
+/// Mamba block snapshots a state keeps (the lowest boundary, for a shared system prompt, and the
+/// latest, for the next turn of the conversation).
+const SNAPS: usize = 2;
 
 impl State {
     /// A sequence of up to `capacity` positions: its attention caches are reserved as addresses and mapped
@@ -110,6 +119,8 @@ impl State {
             kv,
             mamba,
             n_attn: model.n_attn,
+            canon: 0,
+            snaps: Vec::new(),
         })
     }
 
@@ -125,7 +136,36 @@ impl State {
 
     /// Device memory the sequence holds now: its Mamba block and the mapped part of its caches.
     pub fn device_bytes(&self) -> usize {
-        self.mamba.bytes() + self.kv.mapped()
+        self.mamba.bytes() * (1 + self.snaps.len()) + self.kv.mapped()
+    }
+
+    /// Device bytes of a state with `positions` positions: its Mamba block, the snapshots it takes on the
+    /// way and the caches.
+    pub fn plan_bytes(cfg: &Config, kv: Kv, positions: usize) -> usize {
+        Self::state_bytes(cfg) * (1 + (positions / CANON_CHUNK).min(SNAPS)) + positions * Self::position_bytes(cfg, kv)
+    }
+
+    /// The canonical frontier (see [`State::rewind`]).
+    pub fn frontier(&self) -> usize {
+        self.canon
+    }
+
+    /// Positions from `pos` on are (about to be) rewritten: lowers the frontier to the boundary at or below
+    /// `pos` and forgets the snapshots above it.
+    fn lower(&mut self, pos: usize) {
+        self.canon = self.canon.min(pos / CANON_CHUNK * CANON_CHUNK);
+        let canon = self.canon;
+        self.snaps.retain(|(b, _)| *b <= canon);
+    }
+
+    /// Drops positions from `pos` on. The recurrent states cannot be rewound: going back resets the
+    /// sequence (decode steps never feed more than they keep, so this only happens on errors).
+    pub fn truncate(&mut self, pos: usize, s: &Stream) -> Result<()> {
+        if pos < self.pos {
+            eprintln!("nemotron: sequence truncated from {} to {pos}: starting over", self.pos);
+            self.reset(s)?;
+        }
+        Ok(())
     }
 
     fn row_bytes(&self) -> usize {
@@ -171,6 +211,7 @@ impl State {
         if positions < self.pos {
             self.reset(s)?;
         }
+        self.lower(positions);
         let keep = positions * self.row_bytes();
         if self.kv.mapped() > keep {
             quench6k_cuda::synchronize()?;
@@ -184,19 +225,65 @@ impl State {
         self.pos = 0;
         self.history.clear();
         self.last_t = 0;
+        self.canon = 0;
+        self.snaps.clear();
         s.memset(self.mamba.addr(), 0, self.mamba.bytes())
     }
 
-    /// Keeps the cached prefix when `prompt` extends the sequence's history (the recurrent states hold
-    /// exactly the history), otherwise starts over; returns the number of prompt tokens already in the
-    /// state. The prompt's last token must still be run for its logits, so a prompt equal to the history
-    /// starts over too.
+    /// Keeps the longest cached prefix of `prompt` that canonical prefill allows and returns its length B
+    /// (0: start over): a multiple of CANON_CHUNK at most the common prefix with the history, below the
+    /// prompt's length (its last token is run again for its logits) and at most the canonical frontier, at
+    /// which the Mamba block is either the live one (the sequence ends there) or a snapshot (restored).
+    /// The caller computes the prompt from B on in chunks ending at multiples of CANON_CHUNK, so every
+    /// position's bits are those of a cold prefill.
     pub fn rewind(&mut self, prompt: &[i32], s: &Stream) -> Result<usize> {
-        let extends = self.history.len() < prompt.len() && prompt.starts_with(&self.history);
-        if !extends {
-            self.reset(s)?;
+        self.lower(self.pos);
+        let common = self.history.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        let limit = common.min(prompt.len().saturating_sub(1)).min(self.canon) / CANON_CHUNK * CANON_CHUNK;
+        let mut b = limit;
+        while b > 0 {
+            if b == self.pos {
+                break;
+            }
+            if let Some((_, snap)) = self.snaps.iter().find(|(at, _)| *at == b) {
+                s.copy_d2d(self.mamba.addr(), snap.addr(), self.mamba.bytes())?;
+                break;
+            }
+            b -= CANON_CHUNK;
         }
-        Ok(self.pos)
+        if b == 0 {
+            self.reset(s)?;
+            return Ok(0);
+        }
+        self.pos = b;
+        self.history.truncate(b);
+        self.last_t = 0;
+        self.lower(b);
+        Ok(b)
+    }
+
+    /// A step wrote positions [start, end): advances the frontier when it was an aligned chunk of
+    /// CANON_CHUNK tokens right at it, and then snapshots the Mamba block (its pending rows committed).
+    fn wrote(&mut self, model: &NemotronModel, ws: &Workspace, start: usize, end: usize, s: &Stream) -> Result<()> {
+        if start != self.canon || !start.is_multiple_of(CANON_CHUNK) || end - start != CANON_CHUNK {
+            return Ok(());
+        }
+        self.canon = end;
+        // The step's descriptor (this sequence alone) is still in ws.seqs.
+        for (slot, w) in model.mamba_weights().enumerate() {
+            nk::mamba_flush(s, ws.seqs, 1, slot, REC_ROWS, w)?;
+        }
+        nk::mamba_set_ctl(s, ws.seqs, 1, 0, false)?;
+        // A free slot, else the highest boundary's (the previous latest; the lowest stays).
+        let buf = if self.snaps.len() < SNAPS {
+            DeviceBuffer::new(self.mamba.bytes())?
+        } else {
+            let i = (0..self.snaps.len()).max_by_key(|&i| self.snaps[i].0).unwrap();
+            self.snaps.swap_remove(i).1
+        };
+        s.copy_d2d(buf.addr(), self.mamba.addr(), self.mamba.bytes())?;
+        self.snaps.push((end, buf));
+        Ok(())
     }
 
     /// Checksums (quench6k_cuda::device_checksum) of the caches of positions < pos and of the Mamba
@@ -538,6 +625,8 @@ impl NemotronModel {
         for (st, t) in states.iter_mut().zip(tokens) {
             ensure!(st.pos + t.len() <= st.capacity, "context full ({} + {} > {})", st.pos, t.len(), st.capacity);
             st.reserve(st.pos + t.len())?;
+            let pos = st.pos;
+            st.lower(pos);
         }
         let groups = states.iter().zip(tokens).map(|(st, t)| (st.pos + t.len()).div_ceil(nk::ATTN_GROUP)).max().unwrap_or(1);
         let part = if small { ws.part(r, groups)? } else { 0 };
@@ -563,6 +652,9 @@ impl NemotronModel {
         // Nothing of this step is pending in the Mamba states (no deferred steps yet).
         nk::mamba_set_ctl(s, ws.seqs, nseq, 0, false)?;
         for (st, t) in states.iter_mut().zip(tokens) {
+            if nseq == 1 {
+                st.wrote(self, ws, st.pos, st.pos + t.len(), s)?;
+            }
             st.pos += t.len();
             st.last_t = t.len();
             st.history.extend_from_slice(t);
@@ -675,5 +767,15 @@ impl NemotronModel {
         linear(s, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false)?;
         nk::relu2(s, ws.big, SH, SH, r, ws.act, SH)?;
         linear(s, ws.act, SH, r, &m.shared_down, ws.mix, D, small, true)
+    }
+}
+
+impl NemotronModel {
+    /// The Mamba layers' parameters in Mamba-layer order.
+    fn mamba_weights(&self) -> impl Iterator<Item = &nk::MambaW> {
+        self.layers.iter().filter_map(|l| match &l.mixer {
+            Mixer::Mamba(m) => Some(&m.w),
+            _ => None,
+        })
     }
 }

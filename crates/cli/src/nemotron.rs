@@ -405,7 +405,13 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, 
         ensure!(ctx + generate + 37 * seqs <= ids.len(), "corpus has {} tokens, {} needed", ids.len(), ctx + generate + 37 * seqs);
         let mut states = Vec::with_capacity(seqs);
         let mut firsts = Vec::with_capacity(seqs);
+        // QUENCH6K_NEM_PROFILE=1: the prefills inside a cudaProfilerStart/Stop range (nsys
+        // --capture-range=cudaProfilerApi).
+        let profile = std::env::var("QUENCH6K_NEM_PROFILE").is_ok_and(|v| v == "1");
         s.synchronize()?;
+        if profile {
+            quench6k_cuda::profiler_start()?;
+        }
         let t0 = Instant::now();
         for j in 0..seqs {
             let mut st = State::new(&model, ctx + generate + 16, kv, &s)?;
@@ -414,6 +420,9 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, 
             states.push(st);
         }
         let prefill_s = t0.elapsed().as_secs_f64();
+        if profile {
+            quench6k_cuda::profiler_stop()?;
+        }
         let mut outs: Vec<Vec<i32>> = firsts.iter().map(|&t| vec![t]).collect();
         let t1 = Instant::now();
         for _ in 1..generate {
