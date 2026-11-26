@@ -34,7 +34,7 @@ agents and chat clients work against it unchanged.
 | **Qwen3.8 Flash-Next** 125B-A6B | NVFP4: [nvidia FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local), [RadixArk](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4), [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) | 262,144 | 530-573 tok/s decode, 12-15K tok/s prefill | 8 slots (two at once: 418 tok/s greedy) |
 | **Inkling 2 Mini** | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | 1,048,576 | ~400 tok/s | 750-770 tok/s |
 | **Hy4-flash** | [Avifenesh/Hy4-flash-NVFP4](https://huggingface.co/Avifenesh/Hy4-flash-NVFP4) | 198,656 | 126 tok/s | 366 tok/s |
-| **Nemotron 3 Super** 120B-A12B and its Danish finetune **Munin 2.0** | NVFP4: [nvidia](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4), [Munin 2.0](https://huggingface.co/danish-foundation-models/munin-2.0-nvfp4) | 262,144 | 104-111 tok/s, 164-236 with MTP drafts | 341-360 tok/s, 424-450 with drafts |
+| **Nemotron 3 Super** 120B-A12B and its Danish finetune **Munin 2.0** | NVFP4: [nvidia](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4), [Munin 2.0](https://huggingface.co/danish-foundation-models/munin-2.0-nvfp4) | 262,144 | 127-131 tok/s, up to 263 with MTP drafts; prefill 4.3-7.7K tok/s | 372-420 tok/s, up to 504 with drafts |
 | **Recursive Flint** 40B-A2.5B | [RecursiveSI/flint-nvfp4-gguf](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf) | 262,144 | 543 tok/s | 1,588 tok/s |
 
 At the card's stock 600 W. Nemotron and Munin: greedy decoding after 512 to 32K tokens of corpus text (`quench6k nemotron bench`). Qwen: one request, sampled, FP8 KV cache, 8K to 256K of context
