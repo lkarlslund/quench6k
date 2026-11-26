@@ -526,10 +526,11 @@ impl Workspace {
                 cap * H * HD * 2,
                 lr * vocab * 4,
                 k::argmax_scratch(lr, vocab),
+                // argmax, log-sum-exp and target logits in one buffer (one download for the drafts).
+                3 * lr * 4,
                 lr * 4,
-                lr * 4,
-                lr * 4,
-                lr * 4,
+                0,
+                0,
                 lr * TOP_K * 4,
                 lr * TOP_K * 4,
                 cap * D * 4,
@@ -615,8 +616,8 @@ impl Workspace {
             argmax_scratch: b[27],
             argmax: b[28],
             targets: b[29],
-            lse: b[30],
-            target: b[31],
+            lse: b[28] + (logit_rows.max(1) * 4) as u64,
+            target: b[28] + (logit_rows.max(1) * 8) as u64,
             top_idx: b[32],
             top_val: b[33],
             hid: b[34],
@@ -1366,8 +1367,12 @@ impl NemotronModel {
         while !active.is_empty() {
             k::argmax(s, ws.out_logits, n_rows, vocab, vocab, ws.argmax_scratch, ws.argmax)?;
             k::row_lse(s, ws.out_logits, n_rows, vocab, vocab, ws.argmax, ws.lse, ws.target)?;
-            let picks = s.download::<i32>(ws.argmax, n_rows)?;
-            let (lse, tgt) = (s.download::<f32>(ws.lse, n_rows)?, s.download::<f32>(ws.target, n_rows)?);
+            // Picks, log-sum-exps and target logits are consecutive (logit_rows each): one download.
+            let lr = ws.logit_rows;
+            let all = s.download::<u32>(ws.argmax, 3 * lr)?;
+            let picks: Vec<i32> = all[..n_rows].iter().map(|&v| v as i32).collect();
+            let lse: Vec<f32> = all[lr..lr + n_rows].iter().map(|&v| f32::from_bits(v)).collect();
+            let tgt: Vec<f32> = all[2 * lr..2 * lr + n_rows].iter().map(|&v| f32::from_bits(v)).collect();
             let mut next_seqs = Vec::new();
             let mut next_active = Vec::new();
             for &(i, row, left) in &active {
