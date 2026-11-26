@@ -70,13 +70,18 @@ pub const F_CONV: u32 = 16;
 pub const F_ROUTE: u32 = 128;
 /// The small steps' attention combine with a CTA per query head ([`nk::set_attn_combine`]).
 pub const F_COMBINE: u32 = 256;
+/// Small steps: the shared expert's up projection and relu² on a side stream, beside the router and the
+/// routed experts (the same kernels; its down projection still accumulates after fc2).
+pub const F_SIDE: u32 = 512;
+/// With F_SIDE: fc1 also on the side stream (first), beside the router.
+pub const F_SIDE_FC1: u32 = 1024;
 /// The block norms load their weights before the dependency wait ([`nk::set_rms_early`]).
 pub const F_RMS: u32 = 2048;
 /// The small steps' attention prefetches key tiles into L2 ahead of its register fetch
 /// ([`nk::set_attn_prefetch`]; QUENCH6K_NEM_ATTN_PF tiles, default 3).
 pub const F_ATTN_PF: u32 = 4096;
 /// The default: every part.
-pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE | F_RMS | F_ATTN_PF;
+pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE | F_SIDE | F_SIDE_FC1 | F_RMS | F_ATTN_PF;
 static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(F_ALL);
 
 /// Switches the optional parts of the step (`F_*` bits; for A/B timings in one process; the CUDA graphs
@@ -518,6 +523,12 @@ pub struct Workspace {
     /// Recorded after the uploads from the MTP pass's and the accepted rows' parts of `pinned`.
     mtp_up: Event,
     acc_up: Event,
+    /// The small steps' side stream (F_SIDE, F_SIDE_Z) and its events: fork and join, and fc1's output
+    /// ready (F_SIDE_FC1).
+    side: Stream,
+    fork: Event,
+    join: Event,
+    lat_ready: Event,
     /// CUDA graphs of small steps (by features, plan and whether the MTP hidden states are kept) and of MTP
     /// passes.
     graphs: HashMap<(u32, Plan, bool), Graph>,
@@ -676,6 +687,10 @@ impl Workspace {
             pinned: PinnedBuffer::new(Self::pinned_layout(cap).5)?,
             mtp_up: Event::new()?,
             acc_up: Event::new()?,
+            side: Stream::new()?,
+            fork: Event::new()?,
+            join: Event::new()?,
+            lat_ready: Event::new()?,
             graphs: HashMap::new(),
             mgraphs: HashMap::new(),
             dump: std::env::var_os("QUENCH6K_NEM_DUMP").map(PathBuf::from),
@@ -1041,6 +1056,21 @@ impl NemotronModel {
     /// MoE mixer: router; routed experts in the latent space (fc1 -> experts -> combine -> fc2); the
     /// shared expert on the full width, added into ws.mix.
     fn moe(&self, ws: &Workspace, s: &Stream, m: &Moe, r: usize, small: bool) -> Result<()> {
+        // The shared expert's up projection and relu² (ws.big, ws.act: no other kernel of the layer touches
+        // them) beside the routed path; its down projection accumulates onto fc2's output after the join.
+        let side = small && feature(F_SIDE) && DEBUG_SYNC.load(std::sync::atomic::Ordering::Relaxed) == 0;
+        let side_fc1 = side && feature(F_SIDE_FC1);
+        if side {
+            ws.fork.record(s)?;
+            ws.side.wait(&ws.fork)?;
+            if side_fc1 {
+                linear(&ws.side, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false)?;
+                ws.lat_ready.record(&ws.side)?;
+            }
+            linear(&ws.side, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false)?;
+            nk::relu2(&ws.side, ws.big, SH, SH, r, ws.act, SH)?;
+            ws.join.record(&ws.side)?;
+        }
         linear(s, ws.xn, D, r, &m.gate, ws.logits, EXPERTS, small, false)?;
         dsync(s, 8)?;
         if feature(F_ROUTE) {
@@ -1048,7 +1078,11 @@ impl NemotronModel {
         } else {
             nk::moe_route(s, ws.logits, EXPERTS, m.bias, self.cfg.routed_scaling, r, ws.sel_e, ws.sel_w)?;
         }
-        linear(s, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false)?;
+        if side_fc1 {
+            s.wait(&ws.lat_ready)?;
+        } else {
+            linear(s, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false)?;
+        }
         dsync(s, 512)?;
         quench6k_cuda::hy4::to_bf16(s, ws.lat, ws.lat_bf, r * LAT)?;
         let ex = &m.experts;
@@ -1078,9 +1112,13 @@ impl NemotronModel {
             }
         }
         linear(s, ws.ex_bf, LAT, r, &m.fc2, ws.mix, D, small, false)?;
-        linear(s, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false)?;
-        dsync(s, 64)?;
-        nk::relu2(s, ws.big, SH, SH, r, ws.act, SH)?;
+        if side {
+            s.wait(&ws.join)?;
+        } else {
+            linear(s, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false)?;
+            dsync(s, 64)?;
+            nk::relu2(s, ws.big, SH, SH, r, ws.act, SH)?;
+        }
         linear(s, ws.act, SH, r, &m.shared_down, ws.mix, D, small, true)
     }
 }
