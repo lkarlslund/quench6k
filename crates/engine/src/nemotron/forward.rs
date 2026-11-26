@@ -68,6 +68,14 @@ impl Kv {
             other => anyhow::bail!("KV cache format {other:?}: bf16 or fp8"),
         }
     }
+
+    /// Bytes of one attention layer's cache row of a position.
+    pub fn row_bytes(self) -> usize {
+        match self {
+            Kv::Bf16 => nk::KV_ROW_BYTES_BF16,
+            Kv::Fp8 => nk::KV_ROW_BYTES_FP8,
+        }
+    }
 }
 
 /// One sequence's caches, recurrent states and token history.
@@ -107,7 +115,7 @@ impl State {
 
     /// Attention cache bytes per position (all attention layers).
     pub fn position_bytes(cfg: &Config, kv: Kv) -> usize {
-        cfg.count(Kind::Attention) * nk::kv_layer_row_bytes(kv == Kv::Fp8)
+        cfg.count(Kind::Attention) * kv.row_bytes()
     }
 
     /// Bytes of a sequence's Mamba block (fixed, whatever its length).
@@ -121,14 +129,14 @@ impl State {
     }
 
     fn row_bytes(&self) -> usize {
-        self.n_attn * nk::kv_layer_row_bytes(self.kv_format == Kv::Fp8)
+        self.n_attn * self.kv_format.row_bytes()
     }
 
     /// Where attention layer `slot`'s rows are in the cache.
     fn kv_rows(&self, slot: usize) -> nk::KvRows {
         let fp8 = self.kv_format == Kv::Fp8;
         nk::KvRows {
-            off: slot * nk::kv_layer_row_bytes(fp8),
+            off: slot * self.kv_format.row_bytes(),
             ld: self.row_bytes(),
             fp8,
         }
@@ -552,6 +560,8 @@ impl NemotronModel {
         };
         let kv: Vec<nk::KvRows> = (0..self.n_attn).map(|slot| states[0].kv_rows(slot)).collect();
         self.enqueue(ws, s, &plan, &kv)?;
+        // Nothing of this step is pending in the Mamba states (no deferred steps yet).
+        nk::mamba_set_ctl(s, ws.seqs, nseq, 0, false)?;
         for (st, t) in states.iter_mut().zip(tokens) {
             st.pos += t.len();
             st.last_t = t.len();
@@ -564,7 +574,7 @@ impl NemotronModel {
         let (r, small, want) = (plan.r, plan.small, plan.want);
         let eps = self.cfg.eps;
         for (i, layer) in self.layers.iter().enumerate() {
-            quench6k_cuda::hy4::rms_rows(s, ws.h, D, layer.norm, D, eps, ws.xn, D, r)?;
+            nk::rms(s, ws.h, D, layer.norm, eps, r, ws.xn, D, false)?;
             match &layer.mixer {
                 Mixer::Mamba(m) => self.mamba(ws, s, m, self.slot[i], plan)?,
                 Mixer::Attn(a) => self.attention(ws, s, a, kv[self.slot[i]], plan)?,
@@ -578,7 +588,7 @@ impl NemotronModel {
         // Final norm of the rows whose logits are wanted (of every row when dumping).
         let xn = match (&ws.dump, want) {
             (Some(dir), _) => {
-                quench6k_cuda::hy4::rms_rows(s, ws.h, D, self.norm_f, D, eps, ws.xn, D, r)?;
+                nk::rms(s, ws.h, D, self.norm_f, eps, r, ws.xn, D, false)?;
                 let b: Vec<u16> = s.download(ws.xn, r * D)?;
                 let v: Vec<f32> = b.iter().map(|&x| f32::from_bits((x as u32) << 16)).collect();
                 append_f32(dir, "final.bin", &v)?;
@@ -586,11 +596,11 @@ impl NemotronModel {
             }
             (None, Logits::None) => return Ok(()),
             (None, Logits::Last) => {
-                quench6k_cuda::hy4::rms_rows(s, ws.h + ((r - 1) * D * 4) as u64, D, self.norm_f, D, eps, ws.xn, D, 1)?;
+                nk::rms(s, ws.h + ((r - 1) * D * 4) as u64, D, self.norm_f, eps, 1, ws.xn, D, false)?;
                 ws.xn
             }
             (None, Logits::All) => {
-                quench6k_cuda::hy4::rms_rows(s, ws.h, D, self.norm_f, D, eps, ws.xn, D, r)?;
+                nk::rms(s, ws.h, D, self.norm_f, eps, r, ws.xn, D, false)?;
                 ws.xn
             }
         };

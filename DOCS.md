@@ -251,16 +251,18 @@ without the MTP layer); the BF16 embedding (1 GiB) stays on the host, memory-map
 uploads its rows. `quench6k nemotron plan --model DIR` prints the memory by part from config.json and
 hf_quant_config.json alone.
 
-The residual stream is F32 (the transformers model keeps it in BF16). Per sequence, the attention layers'
-keys and values are cached in BF16 (8 KiB per position for all 8 layers) or, with `--kv fp8`, as FP8 E4M3
-with a scale per position and KV head (4.1 KiB); the checkpoint's static `k_scale` / `v_scale` (all 1.0)
-are not used. The cache is reserved for the sequence's capacity and mapped as positions are used; the
-Mamba layers' SSM states (F32) and convolution states take 165 MiB, allocated with the sequence. With BF16
-caches, 8 sequences of 262,144 positions take 17.3 GiB. Prefill is chunked at multiples of 2048 positions
-(`CANON_CHUNK`, `NemotronModel::prefill`), and up to 8 sequences of up to 16 tokens each step together
-(`NemotronModel::forward_batch`), every projection of such a step through the GEMV, whose rows do not
-depend on each other. The recurrent states cannot be rewound: a new prompt reuses a sequence only when it
-extends the sequence's history (`State::rewind`), otherwise the sequence starts over.
+The residual stream is F32 (the transformers model keeps it in BF16), and so is the sum of an MoE block's
+routed and shared outputs (BF16 + BF16 there); the block norms read the F32 stream and round once. Per
+sequence, the attention layers' keys and values are cached in BF16 (8 KiB per position for all 8 layers)
+or, with `--kv fp8`, as FP8 E4M3 with a scale per position and KV head (4.1 KiB); the checkpoint's static
+`k_scale` / `v_scale` (all 1.0) are not used. The cache is reserved for the sequence's capacity and mapped
+as positions are used; the Mamba layers' SSM states (F32) and convolution states take 165 MiB, allocated
+with the sequence. With BF16 caches, 8 sequences of 262,144 positions take 17.3 GiB. Prefill is chunked at
+multiples of 2048 positions (`CANON_CHUNK`, `NemotronModel::prefill`), and up to 8 sequences of up to 16
+tokens each step together (`NemotronModel::forward_batch`), every projection of such a step through the
+GEMV, whose rows do not depend on each other. The recurrent states cannot be rewound: a new prompt reuses
+a sequence only when it extends the sequence's history (`State::rewind`), otherwise the sequence starts
+over.
 
 `quench6k nemotron generate` (greedy, `--think on|off|low` for the chat template, `--ids` for token ids),
 `bench` (`--seqs N` decodes N sequences in batched steps) and `score` (teacher-forced distributions,
@@ -268,10 +270,9 @@ oracle.distributions/1) run the model; `--dump-dir DIR` (or `QUENCH6K_NEM_DUMP=D
 states after each layer (`lanes-NN.bin`, F32 [tokens, 4096]) and after the final norm (`final.bin`) for
 comparison with a reference's per-layer dumps.
 
-Not done yet: the Mamba-2, router, expert, relu² and attention kernels are not merged (the engine calls
-placeholders with their API that fail at run time), so the model does not run yet; MTP drafting (the layer
-loads but is not used); CUDA graphs; serving (`quench6k serve` does not detect the model); prefix reuse
-across conversations (Mamba state snapshots).
+Not done yet: the model has not run on a GPU (its kernels have only CPU references so far); MTP drafting
+(the layer loads but is not used, and no step defers its Mamba records); CUDA graphs; serving (`quench6k
+serve` does not detect the model); prefix reuse across conversations (Mamba state snapshots).
 
 ## Server options
 

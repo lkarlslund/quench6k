@@ -17,9 +17,8 @@
 //! The `input_scale` tensors are not used: activations stay BF16 / F32.
 
 pub mod forward;
-mod shim;
-/// The Nemotron-H kernels' launchers (TEMPORARY stand-in until `quench6k_cuda::nemotron` is merged).
-use shim as nk;
+
+use quench6k_cuda::nemotron as nk;
 
 use std::path::Path;
 
