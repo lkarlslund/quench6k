@@ -945,3 +945,182 @@ pub fn attention_prefill(s: &Stream, q: u64, rows: usize, seqs: u64, kv: KvRows,
         ffi::quench6k_nem_attention_prefill(p(q), n(rows), p(seqs), kv.off as i64, kv.ld as i64, kv.fp8 as c_int, pm(out), s.raw())
     )
 }
+
+mod gemm_ext_ffi {
+    use std::ffi::{c_int, c_void};
+
+    use crate::ffi::{Error, Stream};
+
+    unsafe extern "C" {
+        pub fn quench6k_gemm_bf16_f32_ext(
+            fmt: c_int,
+            x: *const c_void,
+            ldx: c_int,
+            w: *const c_void,
+            ldw: c_int,
+            scale: *const f32,
+            y: *mut f32,
+            ldy: c_int,
+            m: c_int,
+            n: c_int,
+            k: c_int,
+            alpha: f32,
+            accumulate: c_int,
+            flags: c_int,
+            stream: Stream,
+        ) -> Error;
+    }
+}
+
+/// Prefill projection Y [m, n] F32 (+)= alpha X [m, k] BF16 . W^T (weight formats BF16, INT8 per 64, FP8
+/// per 128 x 128 block): the tensor-core GEMM of [`crate::kernels::gemm_f32`] (the same bits); `flags` bit 1
+/// takes 64-row tiles when n <= 1024.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_f32_ext(
+    s: &Stream,
+    x: u64,
+    ldx: usize,
+    fmt: crate::kernels::WeightFormat,
+    w: u64,
+    ldw: usize,
+    scale: u64,
+    y: u64,
+    ldy: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    accumulate: bool,
+    flags: u32,
+) -> Result<()> {
+    let err = unsafe {
+        gemm_ext_ffi::quench6k_gemm_bf16_f32_ext(
+            fmt as i32,
+            x as *const std::ffi::c_void,
+            ldx as i32,
+            w as *const std::ffi::c_void,
+            ldw as i32,
+            if scale == 0 { std::ptr::null() } else { scale as *const f32 },
+            y as *mut f32,
+            ldy as i32,
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            accumulate as i32,
+            flags as i32,
+            s.raw(),
+        )
+    };
+    crate::check(err, "gemm_bf16_f32_ext")
+}
+
+mod widen_ffi {
+    use crate::ffi::{Error, Stream};
+
+    unsafe extern "C" {
+        pub fn quench6k_nem_bf16_to_f32(x: *const std::ffi::c_void, n: usize, out: *mut f32, st: Stream) -> Error;
+    }
+}
+
+/// out F32 [n] = x BF16 [n] (exact; n a multiple of 8): embedding rows uploaded as BF16.
+pub fn bf16_to_f32(s: &Stream, x: u64, n: usize, out: u64) -> Result<()> {
+    check(unsafe { widen_ffi::quench6k_nem_bf16_to_f32(x as *const c_void, n, out as *mut f32, s.raw()) }, "nem_bf16_to_f32")
+}
+
+mod expand_ffi {
+    use crate::ffi::{Error, Stream};
+
+    unsafe extern "C" {
+        pub fn quench6k_nem_expand_bf16(
+            fmt: std::ffi::c_int,
+            w: *const std::ffi::c_void,
+            scale: *const f32,
+            n: std::ffi::c_int,
+            k: std::ffi::c_int,
+            out: *mut std::ffi::c_void,
+            st: Stream,
+        ) -> Error;
+    }
+}
+
+/// out BF16 [n, k] = an FP8-block or INT8-group projection's weights as the GEMM stages them (the same
+/// values: running the BF16 GEMM on them gives the 8-bit GEMM's bits). k a multiple of 128.
+pub fn expand_bf16(s: &Stream, fmt: crate::kernels::WeightFormat, w: u64, scale: u64, n: usize, k: usize, out: u64) -> Result<()> {
+    check(
+        unsafe { expand_ffi::quench6k_nem_expand_bf16(fmt as c_int, w as *const c_void, scale as *const f32, n as c_int, k as c_int, out as *mut c_void, s.raw()) },
+        "nem_expand_bf16",
+    )
+}
+
+mod thin_ffi {
+    use super::NvExperts;
+    use crate::ffi::{Error, Stream};
+    use std::ffi::{c_int, c_void};
+
+    unsafe extern "C" {
+        pub fn quench6k_nem_moe_prefill_tile_rows_for(rows: c_int) -> c_int;
+        pub fn quench6k_nem_moe_experts_prefill_tiles(
+            xs: *const c_void,
+            up: NvExperts,
+            down: NvExperts,
+            offsets: *const i32,
+            tile_expert: *const i32,
+            tile_row: *const i32,
+            num_tiles: *const i32,
+            max_tiles: c_int,
+            tile_rows: c_int,
+            act: *mut c_void,
+            y: *mut c_void,
+            st: Stream,
+        ) -> Error;
+    }
+}
+
+/// Tile rows of the prefill expert kernels for a step of `rows` rows: 32 (thin tiles, small steps; at
+/// most [`THIN_MAX_ROWS`] rows) or [`moe_prefill_tile_rows`].
+pub fn moe_prefill_tile_rows_for(rows: usize) -> usize {
+    unsafe { thin_ffi::quench6k_nem_moe_prefill_tile_rows_for(rows.min(i32::MAX as usize) as c_int) as usize }
+}
+
+/// Most step rows that take the thin 32-row tiles (variant nem.thin lowers it): size tile lists for
+/// `THIN_MAX_ROWS * 22 / 32 + 512` tiles.
+pub const THIN_MAX_ROWS: usize = 1024;
+
+/// [`moe_experts_prefill`] after [`moe_plan`] with `tile_rows` = [`moe_prefill_tile_rows_for`] (the same
+/// outputs whatever the tiles).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts_prefill_tiles(
+    s: &Stream,
+    xs: u64,
+    up: &NvExperts,
+    down: &NvExperts,
+    offsets: u64,
+    tile_expert: u64,
+    tile_row: u64,
+    num_tiles: u64,
+    max_tiles: usize,
+    tile_rows: usize,
+    act: u64,
+    y: u64,
+) -> Result<()> {
+    check(
+        unsafe {
+            thin_ffi::quench6k_nem_moe_experts_prefill_tiles(
+                xs as *const c_void,
+                *up,
+                *down,
+                offsets as *const i32,
+                tile_expert as *const i32,
+                tile_row as *const i32,
+                num_tiles as *const i32,
+                max_tiles as c_int,
+                tile_rows as c_int,
+                act as *mut c_void,
+                y as *mut c_void,
+                s.raw(),
+            )
+        },
+        "nem_moe_experts_prefill_tiles",
+    )
+}

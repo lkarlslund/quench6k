@@ -43,10 +43,6 @@ pub const MAX_VERIFY: usize = MAX_DRAFTS + 1;
 /// stay at the step's start and its rows are kept as records, of which [`NemotronModel::commit`] keeps the
 /// accepted ones.
 pub const REC_ROWS: usize = MAX_VERIFY;
-/// Rows per pass of the grouped expert GEMM in large steps (bounds its buffers). A whole canonical chunk:
-/// passes of 512 rows left about 22 rows per expert, a third of the GEMM's 64-row tiles, and took twice
-/// as long.
-const EX_ROWS: usize = CANON_CHUNK;
 /// Positions a sequence's cache mapping grows by at least.
 const RESERVE_STEP: usize = 4096;
 /// Top logits per position kept by teacher-forced scoring.
@@ -364,10 +360,11 @@ impl State {
         Ok(b)
     }
 
-    /// A step wrote positions [start, end): advances the frontier when it was an aligned chunk of
-    /// CANON_CHUNK tokens right at it, and then snapshots the Mamba block (its pending rows committed).
+    /// A step wrote positions [start, end): advances the frontier when it was one or more whole aligned
+    /// chunks of CANON_CHUNK tokens right at it, and then snapshots the Mamba block (its pending rows
+    /// committed).
     fn wrote(&mut self, model: &NemotronModel, ws: &Workspace, start: usize, end: usize, s: &Stream) -> Result<()> {
-        if start != self.canon || !start.is_multiple_of(CANON_CHUNK) || end - start != CANON_CHUNK {
+        if start != self.canon || !start.is_multiple_of(CANON_CHUNK) || end - start == 0 || !(end - start).is_multiple_of(CANON_CHUNK) {
             return Ok(());
         }
         self.canon = end;
@@ -479,8 +476,8 @@ pub struct Workspace {
     lat: u64,
     lat_bf: u64,
     ex_bf: u64,
-    /// Expert pairs (at most EX_ROWS * TOPK): gathered inputs BF16 [pairs, LAT], up output / down output
-    /// F32 [pairs, FF], activation BF16 [pairs, FF], plan buffers.
+    /// Expert pairs (a step's rows times TOPK): gathered inputs BF16 [pairs, LAT], the experts' outputs
+    /// (F32 [pairs, LAT] in small steps, BF16 in large ones), activation BF16 [pairs, FF], plan buffers.
     xs: u64,
     ey: u64,
     eact: u64,
@@ -519,6 +516,8 @@ pub struct Workspace {
     dh: u64,
     mseqs: u64,
     accepted: u64,
+    /// 8-bit projection weights expanded to BF16 for large steps ([`EXPAND_BYTES`]; 0: none).
+    wexp: u64,
     /// An MTP pass's row copies (`nk::copy_rows` pairs): its hidden inputs into `mhid`, with heads each
     /// sequence's last row into `dx`, then copies after the pass (`h_last`).
     mtab: u64,
@@ -549,12 +548,14 @@ const SEQS_BYTES: usize = std::mem::size_of::<nk::Seqs>();
 
 impl Workspace {
     /// Device bytes of the buffers, in the order [`Workspace::new`] allocates them.
-    fn sizes(cfg: &Config, max_t: usize, logit_rows: usize) -> (usize, [usize; 43]) {
+    fn sizes(cfg: &Config, max_t: usize, logit_rows: usize) -> (usize, [usize; 44]) {
         let cap = Self::cap(max_t);
         let lr = logit_rows.max(1);
         let vocab = cfg.vocab;
-        let pairs = cap.clamp(nk::SMALL_ROWS, EX_ROWS) * TOPK;
-        let max_tiles = pairs / nk::moe_prefill_tile_rows().max(1) + EXPERTS;
+        // The grouped expert GEMM takes a whole step in one pass (passes of 512 rows left about 22 rows
+        // per expert and took twice as long as one of 2048).
+        let pairs = cap.max(nk::SMALL_ROWS) * TOPK;
+        let max_tiles = (pairs / nk::moe_prefill_tile_rows().max(1)).max(nk::THIN_MAX_ROWS * TOPK / 32) + EXPERTS;
         (
             max_tiles,
             [
@@ -574,7 +575,7 @@ impl Workspace {
                 cap * LAT * 2,
                 cap * LAT * 2,
                 pairs * LAT * 2,
-                pairs * FF * 4,
+                pairs * LAT * 4,
                 pairs * FF * 2,
                 EXPERTS * 4,
                 (EXPERTS + 1) * 4,
@@ -602,6 +603,7 @@ impl Workspace {
                 SEQS_BYTES,
                 MAX_SEQS * 4,
                 Self::tab_rows(cap) * 16,
+                if max_t >= CANON_CHUNK { EXPAND_BYTES } else { 0 },
             ],
         )
     }
@@ -638,7 +640,7 @@ impl Workspace {
         let (max_tiles, sz) = Self::sizes(&model.cfg, max_t, logit_rows);
         let cap = Self::cap(max_t);
         let mut a = Alloc { buffers: Vec::new(), bytes: 0 };
-        let mut b = [0u64; 43];
+        let mut b = [0u64; 44];
         for (slot, &bytes) in b.iter_mut().zip(&sz) {
             *slot = a.get(bytes)?;
         }
@@ -689,6 +691,7 @@ impl Workspace {
             mseqs: b[40],
             accepted: b[41],
             mtab: b[42],
+            wexp: if sz[43] > 0 { b[43] } else { 0 },
             pinned: PinnedBuffer::new(Self::pinned_layout(cap).5)?,
             mtp_up: Event::new()?,
             acc_up: Event::new()?,
@@ -725,6 +728,28 @@ impl Workspace {
     }
 }
 
+/// Largest 8-bit projection (BF16 bytes) whose weights large steps expand to BF16 before the GEMM: the
+/// out_proj (4096 x 8192); the in_proj (18560 x 4096, 152 MB in BF16, beyond L2) stays on the 8-bit path.
+const EXPAND_BYTES: usize = 64 << 20;
+
+/// Y [m, l.n] F32 (+)= alpha X [m, l.k] BF16 . W^T: the GEMV (per-row arithmetic independent of m) for
+/// small steps and any m up to the GEMV's rows, the tensor-core GEMM otherwise. Steps of at least
+/// nem.expand rows (default 2048; 0: never) expand FP8-block / INT8-group weights of up to EXPAND_BYTES to
+/// BF16 in `wexp` first and run the BF16 GEMM: the values the 8-bit GEMM stages, so the same bits, and
+/// faster (its per-tile dequantization costs more than the expansion).
+#[allow(clippy::too_many_arguments)]
+fn linear_x(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usize, small: bool, accumulate: bool, wexp: u64) -> Result<()> {
+    let gm = k::gemv_max_m();
+    let eight = matches!(l.fmt, WeightFormat::Fp8Block | WeightFormat::Int8Group);
+    let min_rows = quench6k_cuda::variants::get("nem.expand", 2048) as usize;
+    if wexp != 0 && eight && !small && m > gm && min_rows > 0 && m >= min_rows && l.n * l.k * 2 <= EXPAND_BYTES {
+        nk::expand_bf16(s, l.fmt, l.w, l.scale, l.n, l.k, wexp)?;
+        let flags = quench6k_cuda::variants::get("nem.gemm", 2) as u32;
+        return nk::gemm_f32_ext(s, x, ldx, WeightFormat::Bf16, wexp, l.k, 0, y, ldy, m, l.n, l.k, l.alpha, accumulate, flags);
+    }
+    linear(s, x, ldx, m, l, y, ldy, small, accumulate)
+}
+
 /// Rows r0 .. r0 + n of a projection (FP8 block-scaled: r0 a multiple of the 128-row blocks).
 fn rows_of(l: &Linear, r0: usize, n: usize) -> Linear {
     assert!(r0 + n <= l.n);
@@ -755,7 +780,9 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
         }
         Ok(())
     } else {
-        k::gemm_f32(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, l.alpha, accumulate)
+        // 64-row tiles for the narrow router and latent projections (variant nem.gemm=0: off); the same bits.
+        let flags = quench6k_cuda::variants::get("nem.gemm", 2) as u32;
+        nk::gemm_f32_ext(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, l.alpha, accumulate, flags)
     }
 }
 
@@ -920,11 +947,21 @@ impl NemotronModel {
     /// Canonical prefill of `tokens` at state.pos: chunks end at multiples of [`CANON_CHUNK`] (absolute
     /// positions) and at the tokens' end; the last chunk's last logits row lands in ws.out_logits. The
     /// workspace must take chunks of CANON_CHUNK tokens.
+    ///
+    /// A workspace for steps of several chunks takes consecutive whole aligned chunks in one step (up to
+    /// ws.max_t / CANON_CHUNK, variant nem.merge lowers it), except the first chunk of a sequence: the
+    /// same bits (a large step's rows do not depend on its size), the same chunk ends at the frontier's
+    /// lowest boundary and at the prompt's last whole chunk (where the Mamba snapshots are taken), fewer
+    /// passes over the routed experts' weights.
     pub fn prefill(&self, state: &mut State, ws: &mut Workspace, s: &Stream, tokens: &[i32]) -> Result<()> {
         ensure!(ws.max_t >= CANON_CHUNK, "canonical prefill needs chunks of {CANON_CHUNK} tokens (workspace: {})", ws.max_t);
+        let merge = (quench6k_cuda::variants::get("nem.merge", i32::MAX).max(1) as usize).min(ws.max_t / CANON_CHUNK);
         let mut at = 0;
         while at < tokens.len() {
-            let n = (CANON_CHUNK - state.pos % CANON_CHUNK).min(tokens.len() - at);
+            let mut n = (CANON_CHUNK - state.pos % CANON_CHUNK).min(tokens.len() - at);
+            if n == CANON_CHUNK && state.pos > 0 {
+                n = ((tokens.len() - at) / CANON_CHUNK).min(merge) * CANON_CHUNK;
+            }
             let want = if at + n == tokens.len() { Logits::Last } else { Logits::None };
             self.forward(state, ws, s, &tokens[at..at + n], want)?;
             at += n;
@@ -965,8 +1002,8 @@ impl NemotronModel {
         self.step(states, ws, s, tokens, Logits::All, true)
     }
 
-    /// Embedding rows (F32) and the sequence descriptor into the pinned buffer.
-    fn stage(&self, states: &[&mut State], ws: &mut Workspace, tokens: &[&[i32]]) -> Result<()> {
+    /// Embedding rows (F32, or BF16 with `bf16`) and the sequence descriptor into the pinned buffer.
+    fn stage(&self, states: &[&mut State], ws: &mut Workspace, tokens: &[&[i32]], bf16: bool) -> Result<()> {
         let emb_bytes = Workspace::pinned_layout(ws.rows_cap).0;
         let buf = ws.pinned.as_mut_slice();
         let mut j = 0;
@@ -974,10 +1011,14 @@ impl NemotronModel {
             for &tok in toks.iter() {
                 ensure!(tok >= 0 && (tok as usize) < self.cfg.vocab, "token {tok} out of range");
                 let row = self.embed_row(tok as usize);
-                let dst = &mut buf[j * D * 4..(j + 1) * D * 4];
-                for (c, o) in row.chunks_exact(2).zip(dst.chunks_exact_mut(4)) {
-                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
-                    o.copy_from_slice(&v.to_le_bytes());
+                if bf16 {
+                    buf[j * D * 2..(j + 1) * D * 2].copy_from_slice(row);
+                } else {
+                    let dst = &mut buf[j * D * 4..(j + 1) * D * 4];
+                    for (c, o) in row.chunks_exact(2).zip(dst.chunks_exact_mut(4)) {
+                        let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                        o.copy_from_slice(&v.to_le_bytes());
+                    }
                 }
                 j += 1;
             }
@@ -1021,11 +1062,21 @@ impl NemotronModel {
         let part = if small { ws.part(r, groups)? } else { 0 };
         // The pinned buffer may still feed the previous step's uploads.
         s.synchronize()?;
-        self.stage(states, ws, tokens)?;
+        // Large steps upload BF16 embedding rows (half the bytes over the host link) into ws.xn (free until
+        // the first norm) and widen them on the device (exact). Variant nem.emb16=0: F32 rows.
+        let bf16 = !small && quench6k_cuda::variants::get("nem.emb16", 1) != 0;
+        self.stage(states, ws, tokens, bf16)?;
         let emb_bytes = Workspace::pinned_layout(ws.rows_cap).0;
         unsafe {
-            s.copy_h2d(ws.h, ws.pinned.as_ptr(), r * D * 4)?;
+            if bf16 {
+                s.copy_h2d(ws.xn, ws.pinned.as_ptr(), r * D * 2)?;
+            } else {
+                s.copy_h2d(ws.h, ws.pinned.as_ptr(), r * D * 4)?;
+            }
             s.copy_h2d(ws.seqs, ws.pinned.as_ptr().add(emb_bytes), SEQS_BYTES)?;
+        }
+        if bf16 {
+            nk::bf16_to_f32(s, ws.xn, r * D, ws.h)?;
         }
         let plan = Plan {
             r,
@@ -1146,21 +1197,21 @@ impl NemotronModel {
             nk::mamba_gated_norm(s, sc.y, ws.big, INP, r, m.w.norm_w, 1e-5, ws.act)?;
             return linear(s, ws.act, DI, r, &m.out_proj, ws.mix, D, plan.small, false);
         }
-        linear(s, ws.xn, D, r, &m.in_proj, ws.big, INP, plan.small, false)?;
+        linear_x(s, ws.xn, D, r, &m.in_proj, ws.big, INP, plan.small, false, ws.wexp)?;
         dsync(s, 1)?;
         if plan.small && feature(F_CONV) {
             nk::mamba_mixer_small(s, ws.big, INP, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, &ws.mamba, ws.act)?;
         } else {
             nk::mamba_mixer(s, ws.big, INP, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, &ws.mamba, ws.act)?;
         }
-        linear(s, ws.act, DI, r, &m.out_proj, ws.mix, D, plan.small, false)
+        linear_x(s, ws.act, DI, r, &m.out_proj, ws.mix, D, plan.small, false, ws.wexp)
     }
 
     /// Attention mixer: q/k/v; keys and values into the caches; causal GQA attention; o_proj into ws.mix.
     fn attention(&self, ws: &Workspace, s: &Stream, a: &Attn, kv: nk::KvRows, plan: &Plan) -> Result<()> {
         let r = plan.r;
         debug_assert_eq!(kv.fp8, plan.kv_fp8);
-        linear(s, ws.xn, D, r, &a.qkv, ws.big, QKV, plan.small, false)?;
+        linear_x(s, ws.xn, D, r, &a.qkv, ws.big, QKV, plan.small, false, ws.wexp)?;
         dsync(s, 16)?;
         nk::attn_prep(s, ws.big, QKV, 0, H * HD, (H + KVH) * HD, r, plan.seqs, kv, ws.q)?;
         dsync(s, 32)?;
@@ -1169,7 +1220,7 @@ impl NemotronModel {
         } else {
             nk::attention_prefill(s, ws.q, r, plan.seqs, kv, ws.act)?;
         }
-        linear(s, ws.act, H * HD, r, &a.o, ws.mix, D, plan.small, false)
+        linear_x(s, ws.act, H * HD, r, &a.o, ws.mix, D, plan.small, false, ws.wexp)
     }
 
     /// MoE mixer: router; routed experts in the latent space (fc1 -> experts -> combine -> fc2); the
@@ -1200,7 +1251,7 @@ impl NemotronModel {
         if side_fc1 {
             s.wait(&ws.lat_ready)?;
         } else {
-            linear(s, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false)?;
+            linear_x(s, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false, ws.wexp)?;
         }
         dsync(s, 512)?;
         quench6k_cuda::hy4::to_bf16(s, ws.lat, ws.lat_bf, r * LAT)?;
@@ -1217,28 +1268,30 @@ impl NemotronModel {
                 nk::moe_combine(s, ws.ey, 0, at(ws.sel_w, r0, TOPK * 4), n, at(ws.ex_bf, r0, LAT * 2))?;
             }
         } else {
-            // Pairs grouped by expert into the prefill expert kernel's tiles, EX_ROWS rows at a time.
-            let tile = nk::moe_prefill_tile_rows();
-            for r0 in (0..r).step_by(EX_ROWS) {
-                let n = EX_ROWS.min(r - r0);
+            // Pairs grouped by expert into the prefill expert kernel's tiles (thin 32-row tiles for small
+            // steps), the whole step at once.
+            for r0 in (0..r).step_by(ws.rows_cap) {
+                let n = ws.rows_cap.min(r - r0);
+                let tile = nk::moe_prefill_tile_rows_for(n);
+                let tiles = (n * TOPK / tile + EXPERTS).min(ws.max_tiles);
                 let sel_e = at(ws.sel_e, r0, TOPK * 4);
                 s.memset(ws.counts, 0, EXPERTS * 4)?;
                 nk::moe_plan(s, sel_e, n, tile, ws.counts, ws.offsets, ws.cursor, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
                 nk::moe_gather(s, at(ws.lat_bf, r0, LAT * 2), ws.pair_row, n, ws.xs)?;
                 // relu²(up) BF16 in ws.eact, bf16(down) BF16 in ws.ey.
-                nk::moe_experts_prefill(s, ws.xs, &ex.up, &ex.down, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.max_tiles, ws.eact, ws.ey)?;
+                nk::moe_experts_prefill_tiles(s, ws.xs, &ex.up, &ex.down, ws.offsets, ws.tile_expert, ws.tile_row, ws.num_tiles, tiles, tile, ws.eact, ws.ey)?;
                 nk::moe_combine_bf16(s, ws.ey, ws.pair_row, at(ws.sel_w, r0, TOPK * 4), n, at(ws.ex_bf, r0, LAT * 2))?;
             }
         }
-        linear(s, ws.ex_bf, LAT, r, &m.fc2, ws.mix, D, small, false)?;
+        linear_x(s, ws.ex_bf, LAT, r, &m.fc2, ws.mix, D, small, false, ws.wexp)?;
         if side {
             s.wait(&ws.join)?;
         } else {
-            linear(s, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false)?;
+            linear_x(s, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false, ws.wexp)?;
             dsync(s, 64)?;
             nk::relu2(s, ws.big, SH, SH, r, ws.act, SH)?;
         }
-        linear(s, ws.act, SH, r, &m.shared_down, ws.mix, D, small, true)
+        linear_x(s, ws.act, SH, r, &m.shared_down, ws.mix, D, small, true, ws.wexp)
     }
 }
 

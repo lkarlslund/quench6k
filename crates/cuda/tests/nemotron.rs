@@ -842,8 +842,8 @@ fn time_experts() {
         let bytes = distinct as f64 / 16.0 * 2.0 * (MOE_INTER * LATENT) as f64 * (0.5 + 1.0 / 16.0);
         eprintln!("TIME experts small {rows} rows: {us:.1} us/layer ({:.0} GB/s of distinct expert weights)", bytes / us / 1e3);
     }
-    // Prefill path at 2048 tokens.
-    let rows = 2048;
+    // Prefill path at 2048 tokens (QUENCH6K_NEM_TIME_ROWS: another row count).
+    let rows: usize = std::env::var("QUENCH6K_NEM_TIME_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
     let pairs = rows * TOPK;
     let x: Vec<u16> = rng.vec(rows * LATENT, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
     let xb = up(&s, &x);
@@ -880,6 +880,13 @@ fn time_experts() {
     let t_plan2 = time_graph(&s, plan2, 1);
     let t_gemms = time_graph(&s, |st| moe_experts_prefill(st, xs.addr(), &upn, &downn, offsets.addr(), te2.addr(), tr2.addr(), nt.addr(), max2, act.addr(), yb.addr()), 1);
     let t_comb2 = time_graph(&s, |st| moe_combine_bf16(st, yb.addr(), pr.addr(), sw.addr(), rows, out.addr()), 1);
+    // Thin 32-row tiles.
+    let max3 = pairs / 32 + EXPERTS;
+    let (te3, tr3) = (ib(max3), ib(max3));
+    moe_plan(&s, sel.addr(), rows, 32, counts.addr(), offsets.addr(), cursor.addr(), te3.addr(), tr3.addr(), nt.addr(), pr.addr()).unwrap();
+    let t_thin = time_graph(&s, |st| moe_experts_prefill_tiles(st, xs.addr(), &upn, &downn, offsets.addr(), te3.addr(), tr3.addr(), nt.addr(), max3, 32, act.addr(), yb.addr()), 1);
+    eprintln!("TIME experts prefill thin {rows} tokens (tile 32): gemms {t_thin:.0} us/layer ({:.0} TFLOPS)", flops / t_thin / 1e6);
+    let _ = time_graph(&s, plan2, 1);
     eprintln!(
         "TIME experts prefill fused {rows} tokens (tile {tile2}): plan+gather {t_plan2:.0} gemms {t_gemms:.0} combine {t_comb2:.0} = {:.0} us/layer ({:.0} TFLOPS in the GEMMs)",
         t_plan2 + t_gemms + t_comb2,
@@ -1152,6 +1159,14 @@ fn digest() {
     moe_experts_prefill(&s, xs.addr(), &ex.up, &ex.down, offsets.addr(), te2.addr(), tr2.addr(), nt.addr(), max2, act_p.addr(), yb.addr()).unwrap();
     moe_combine_bf16(&s, yb.addr(), pr.addr(), wb.addr(), rows_p, outp.addr()).unwrap();
     eprintln!("digest experts prefill (fused) out {:016x}", digest_of(&bf16s(&s, outp.addr(), rows_p * LATENT)));
+    // Thin 32-row tiles (small steps): the same bits.
+    let max3 = pairs / 32 + EXPERTS;
+    let (te3, tr3) = (ib(max3), ib(max3));
+    moe_plan(&s, eb.addr(), rows_p, 32, counts.addr(), offsets.addr(), cursor.addr(), te3.addr(), tr3.addr(), nt.addr(), pr.addr()).unwrap();
+    moe_gather(&s, xb.addr(), pr.addr(), rows_p, xs.addr()).unwrap();
+    moe_experts_prefill_tiles(&s, xs.addr(), &ex.up, &ex.down, offsets.addr(), te3.addr(), tr3.addr(), nt.addr(), max3, 32, act_p.addr(), yb.addr()).unwrap();
+    moe_combine_bf16(&s, yb.addr(), pr.addr(), wb.addr(), rows_p, outp.addr()).unwrap();
+    eprintln!("digest experts prefill (thin) out {:016x}", digest_of(&bf16s(&s, outp.addr(), rows_p * LATENT)));
 
     // Attention, both formats: prefill of 2100 rows and decode rows.
     for fp8 in [false, true] {
@@ -1162,6 +1177,49 @@ fn digest() {
         let dec = attn_decode(&s, &cache, kv, &q_all, &[5, 1024, 2099]);
         let bytes: Vec<u8> = s.download(cache.addr(), 2100 * kv.ld).unwrap();
         eprintln!("digest attention fp8 {fp8}: cache {:016x} prefill {:016x} decode {:016x}", digest_of(&bytes), digest_of(&full), digest_of(&dec));
+    }
+}
+
+/// Prefill projections: the FP8-block / INT8-group GEMM against expanding the weights to BF16 and running
+/// the BF16 GEMM (bitwise equal outputs; times per call, M = QUENCH6K_NEM_TIME_ROWS or 2048 and 6144).
+#[test]
+#[ignore]
+fn time_dense() {
+    use quench6k_cuda::kernels::{self as kk, WeightFormat};
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(43);
+    let ms: Vec<usize> = match std::env::var("QUENCH6K_NEM_TIME_ROWS").ok().and_then(|v| v.parse().ok()) {
+        Some(m) => vec![m],
+        None => vec![2048, 6144],
+    };
+    for &(n, k) in &[(18560usize, 4096usize), (4096, 8192), (5376, 4096), (4096, 5376), (4096, 1024)] {
+        for fmt in [WeightFormat::Fp8Block, WeightFormat::Int8Group] {
+            // E4M3 codes without NaN (0x7f / 0xff); INT8 any byte.
+            let codes = up(&s, &rand_bytes(&mut rng, n * k, |b| if fmt == WeightFormat::Fp8Block && b & 0x7f == 0x7f { b & 0xf7 } else { b }));
+            let nsc = if fmt == WeightFormat::Fp8Block { n.div_ceil(128) * (k / 128) } else { n * (k / kk::int8_group()) };
+            let sc = up(&s, &rng.vec(nsc, 0.001, 0.01));
+            let wb = DeviceBuffer::new(n * k * 2).unwrap();
+            for &m in &ms {
+                let x: Vec<u16> = rng.vec(m * k, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
+                let xb = up(&s, &x);
+                let (ya, yb) = (DeviceBuffer::new(m * n * 4).unwrap(), DeviceBuffer::new(m * n * 4).unwrap());
+                kk::gemm_f32(&s, xb.addr(), k, fmt, codes.addr(), k, sc.addr(), ya.addr(), n, m, n, k, 0.5, false).unwrap();
+                expand_bf16(&s, fmt, codes.addr(), sc.addr(), n, k, wb.addr()).unwrap();
+                kk::gemm_f32(&s, xb.addr(), k, WeightFormat::Bf16, wb.addr(), k, 0, yb.addr(), n, m, n, k, 0.5, false).unwrap();
+                let (a, b): (Vec<u32>, Vec<u32>) = (s.download(ya.addr(), m * n).unwrap(), s.download(yb.addr(), m * n).unwrap());
+                assert!(a == b, "{fmt:?} M={m} N={n} K={k}: expanded BF16 GEMM differs");
+                let t8 = time_graph(&s, |st| kk::gemm_f32(st, xb.addr(), k, fmt, codes.addr(), k, sc.addr(), ya.addr(), n, m, n, k, 0.5, false), 1);
+                let te = time_graph(&s, |st| expand_bf16(st, fmt, codes.addr(), sc.addr(), n, k, wb.addr()), 1);
+                let tb = time_graph(&s, |st| kk::gemm_f32(st, xb.addr(), k, WeightFormat::Bf16, wb.addr(), k, 0, yb.addr(), n, m, n, k, 0.5, false), 1);
+                let tf = |us: f64| 2.0 * (m * n * k) as f64 / us / 1e6;
+                eprintln!(
+                    "TIME dense {fmt:?} M={m} N={n} K={k}: 8-bit {t8:.0} us ({:.0} TFLOPS), expand {te:.0} + BF16 {tb:.0} ({:.0} TFLOPS) = {:.0} us; bitwise equal",
+                    tf(t8),
+                    tf(tb),
+                    te + tb
+                );
+            }
+        }
     }
 }
 

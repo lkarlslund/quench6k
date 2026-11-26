@@ -15,6 +15,11 @@ use quench6k_engine::nemotron::forward::{CANON_CHUNK, Kv, Logits, MAX_DRAFTS, MA
 
 use super::slots::{After, Draft, Drafter, Drafting, Fed, GpuSampler, Shared, SlotEngine, SlotSampler, StepCandidates};
 
+/// Most tokens of one prefill call (whole canonical chunks while no other request decodes): the
+/// workspace's step size. Larger steps pass over the routed experts' weights less often (8K prompts
+/// +10%, 32K +15% against single chunks).
+const PREFILL_MAX: usize = 4 * CANON_CHUNK;
+
 pub(super) struct Engine<'m> {
     model: &'m NemotronModel,
     s: &'m Stream,
@@ -29,7 +34,7 @@ pub(super) struct Engine<'m> {
 impl<'m> Engine<'m> {
     pub(super) fn new(model: &'m NemotronModel, s: &'m Stream) -> Result<Self> {
         let kv = if quench6k_engine::forward::KV_FP8.load(std::sync::atomic::Ordering::Relaxed) { Kv::Fp8 } else { Kv::Bf16 };
-        let ws = Workspace::new(model, CANON_CHUNK, MAX_SEQS * MAX_VERIFY)?;
+        let ws = Workspace::new(model, PREFILL_MAX, MAX_SEQS * MAX_VERIFY)?;
         let drafts = if model.mtp.is_some() {
             std::env::var("QUENCH6K_NEM_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).min(MAX_DRAFTS)
         } else {
@@ -55,6 +60,11 @@ impl<'m> SlotEngine for Engine<'m> {
     }
     fn chunk(&self) -> usize {
         CANON_CHUNK
+    }
+    fn max_prefill(&self) -> usize {
+        // QUENCH6K_NEM_PREFILL_MAX: fewer tokens per call (whole chunks; for comparisons).
+        let cap = std::env::var("QUENCH6K_NEM_PREFILL_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(PREFILL_MAX);
+        cap.clamp(CANON_CHUNK, PREFILL_MAX)
     }
     fn max_step(&self) -> usize {
         1 + self.drafts
@@ -131,8 +141,12 @@ impl<'m> SlotEngine for Engine<'m> {
             // The logits are about to be overwritten.
             c.borrow_mut().invalidate();
         }
-        // The scheduler's chunks end at multiples of CANON_CHUNK: one canonical chunk per call.
+        // The scheduler's chunks end at multiples of CANON_CHUNK: one canonical chunk per call, or (no
+        // other request decoding) up to PREFILL_MAX tokens of whole chunks: the same bits per row.
         let want = if last { Logits::Last } else { Logits::None };
+        if std::env::var_os("QUENCH6K_NEM_LOG_PREFILL").is_some() {
+            eprintln!("nemotron prefill: {} tokens at {}", tokens.len(), st.pos);
+        }
         self.model.forward(st, &mut self.ws, self.s, tokens, want)?;
         Ok(self.ws.out_logits)
     }

@@ -1047,6 +1047,64 @@ Every new form is checked bit for bit against the launches it replaces (crates/c
 decode_forms_equal); batch-check, verify-check and spec-check passed with graphs (4 sequences).
 Not done in this round: a null arm and clock / temperature logs next to these numbers.
 
+## 2026-11-26: Nemotron-H prefill (same bits)
+
+Starting point (main 4ad46ff, 600 W, `nemotron bench`): prefill 2.9K / 6.2K / 5.8K tok/s at 512 / 8K / 32K.
+nsys census of a 2048-token chunk (316 ms, 303 ms busy): routed-expert GEMMs 143 ms (47%), dense
+projections ~105 ms (in_proj 1.06 ms per layer at 293 TFLOPS, out_proj 0.49 ms at 283; the router GEMM,
+512 outputs on 64 CTAs, 126 us at 68 TFLOPS), Mamba scan 25 ms, elementwise ~15 ms, and a 9.3 ms upload of
+the chunk's F32 embedding rows over the host link.
+
+Speed of light (`sol.py`, 2700 MHz): a token costs 13.7 GFLOP of dense projections and 9.7 GFLOP of routed
+experts; the routed experts' weights are 1.58 GB per layer per step whatever its size (1.0 ms at 1.65
+TB/s), so a 512-token step is memory-bound and a 2048-token one sits at the ridge (248 FLOP/B). Measured
+BF16 `mma.sync` m16n8k16 ceiling on this card: 544 TFLOPS at ~2.75 GHz (FP8 m16n8k32 1085), so the dense
+GEMMs run at 52-56% of it.
+
+Kept (each A/B interleaved in one process, `QUENCH6K_NEM_AB="key=v,..;key=v;.." QUENCH6K_NEM_AB_PREFILL=1`:
+kernel variant sets, prefill only; null arm within 0.2-1.1%; caches, Mamba block and logits bitwise equal
+across all sets; fixture scores bit-identical). The same variable also takes the decode round's feature
+masks (`maskA,maskB`, or `features=MASK` items in a set) for the whole bench:
+- Grouped expert GEMM v3 (`nem.w4v`): 2 CTAs per SM (48 KB), swizzled A stages, weights two k-tiles ahead
+  in registers, the CTA's weight rows bulk-prefetched into L2, m16 blocks past an expert's rows skipped,
+  addresses precomputed (119 regs, no spills). time_experts: 2048 tokens 3027 -> 2625 us/layer, 512 2672
+  -> 2038, 8192 9609 -> 8173. Engine 512 +17.7%, 2K +9.4%, 8K +9.8%.
+- 64-row tiles for the 512/1024-wide projections: 512 +2.3%, 2K/8K +0.5%.
+- BF16 embedding upload for large steps (half of 33.6 MB per 2048 rows over the link): +1.1-2.0%.
+- Several whole aligned chunks per step when the workspace allows (first chunk of a sequence alone, so
+  the Mamba snapshots stay where they were) and the experts over the whole step in one pass: with steps
+  of 8192 tokens (workspace 3.87 GiB) 8K +10.5%, 32K +15.3%.
+- 8-bit weights up to 64 MiB in BF16 expanded once per large step, then the BF16 GEMM (the values the
+  8-bit GEMM stages): out_proj FP8 460 -> 433 us, INT8 535 -> 430; engine 2K +3.4%, 8K/32K +1.7-1.8%.
+
+Dropped: experts with MMA skipping alone (same time: the old kernel was bound by its decode/sync phases,
+not MMAs); v2 without precomputed addresses (the 128-register budget made ptxas rematerialize them, 300
+instructions per k-tile); prefetching the weights of the tile 8-32 rows ahead (-5..-13%); M-tile-fastest
+CTA order for the dense GEMMs (-0.4%); the in_proj expanded in L2-sized column slices (+0.1%).
+
+Result (`nemotron bench`, 600 W, ~2.8 GHz start): workspace of 2048-token steps 3.49K / 7.03K / 6.51K tok/s
+at 512 / 8K / 32K; of 8192-token steps (QUENCH6K_NEM_MAXT=8192) 3.41K / 7.68K / 7.40K.
+
+Second round:
+- Thin expert tiles for steps of up to 1024 rows (`nem.thin`): 32 rows x 128 columns per CTA, 128-wide
+  k-tiles, each warp's lanes decode their weight rows straight into the MMA's B fragments (no weight
+  staging, one barrier per 128 k). time_experts: 256 tokens 1954 -> 1163 us/layer, 512 2047 -> 1236, 1024
+  2239 -> 1852 (2048 stays on 128-row tiles: 2668 vs 2990). Engine 512 +23.1%, 1000 +11.5%.
+- Served: while no request decodes, a prefill call takes several whole chunks (up to 8192 tokens, not a
+  sequence's first), ending at the same multiples; with others decoding one chunk per call as before.
+  Consistency (`--shared-system --between none`, 4 x 3 turns to 12K) 4/4; the alone phase's per-request
+  reuse equals a server without merging.
+- Dropped: the residual add folded into the next norm (-0.1..+0.3%, as levers.md predicts for
+  launch-eliminating fusions under PDL).
+
+After both rounds (`nemotron bench`, 600 W, 2.6-2.8 GHz, 46-55 C): workspace of 2048-token steps 4.11K /
+7.22K / 7.09K / 6.57K tok/s at 512 / 2K / 8K / 32K; of 8192-token steps (as served while nothing else
+decodes) 4.31K / - / 7.73K / 7.43K (from 2.9K / 6.2K / 6.2K / 5.8K). The first prefill of a process can
+read low (one run: 512 tokens at 1.3K).
+
+Left: the expert GEMM at 2048 rows streams its weights at ~0.8 TB/s (half of DRAM) and runs at 189
+TFLOPS; the thin kernel at 256 rows is within ~15% of the weight-streaming floor.
+
 ## 2026-11-26: Nemotron-H decode, work beside the router and the scan (same bits)
 
 Census of main's decode (nsys, tools/census.py, 600 W): 1 sequence at 8K, 9.00 ms per traced step,

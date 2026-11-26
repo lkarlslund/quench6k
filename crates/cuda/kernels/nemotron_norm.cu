@@ -74,3 +74,33 @@ extern "C" cudaError_t quench6k_nem_rms(const float* x, int ldx, const void* w, 
     SQ_RETURN_LAUNCH();
 }
 
+namespace {
+
+__global__ void bf16_to_f32_kernel(const uint4* x, float4* out, size_t n8) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n8) return;
+    const uint4 v = __ldcg(x + i);
+    const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+    float f[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        f[2 * j] = __uint_as_float(w[j] << 16);
+        f[2 * j + 1] = __uint_as_float(w[j] & 0xffff0000u);
+    }
+    out[2 * i] = make_float4(f[0], f[1], f[2], f[3]);
+    out[2 * i + 1] = make_float4(f[4], f[5], f[6], f[7]);
+}
+
+}  // namespace
+
+// out[i] = float(x[i]) for n BF16 values (n a multiple of 8, both 16-byte aligned): prefill embedding rows
+// uploaded as BF16.
+extern "C" cudaError_t quench6k_nem_bf16_to_f32(const void* x, size_t n, float* out, cudaStream_t st) {
+    if (n % 8 != 0) return cudaErrorInvalidValue;
+    const size_t n8 = n / 8;
+    if (n8 == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(bf16_to_f32_kernel, (unsigned)((n8 + 255) / 256), 256, 0, st, static_cast<const uint4*>(x), reinterpret_cast<float4*>(out), n8));
+    SQ_RETURN_LAUNCH();
+}
