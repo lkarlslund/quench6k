@@ -12,6 +12,9 @@
   --json`, 600 W. The corpus is the text of `context.ids` tokenized with Flint's tokenizer (280,513
   tokens); `copied` counts greedy tokens equal to the corpus continuation (the text is tiled, so it is
   128 of 128 once the prompt has repeated).
+- `inkling.jsonl`: quench6k on Inkling 2 Mini, written by `quench6k inkling bench --json` (`mode`
+  `plain` or `dspark`), 600 W; the corpus is the text of `context.ids` tokenized with Inkling's
+  tokenizer (323,064 tokens). `gpu` was sampled with nvidia-smi during the run (same fields as below).
 - `flint-llamacpp.jsonl`: llama.cpp (c7fc50941, `llama-bench -fa 1 -ub 2048`, F16 KV) on the same
   file and machine: `pp<ctx>` for prefill and `tg128 @ d<ctx>` for decode.
 - `kbench.jsonl`: the experiment ledger, one record per kernel configuration measured by `quench6k

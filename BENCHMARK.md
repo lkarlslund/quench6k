@@ -42,6 +42,42 @@ Two concurrent requests (`batch-check`, greedy, the code and multiturn fixtures,
 418 tokens/s together with speculative pair rounds (3.4 tokens per request and round), 276 with
 batched plain steps.
 
+## Inkling 2 Mini
+
+One request, 600 W, greedy, 128 tokens generated after the first N tokens of the Qwen corpus (`bench/context.ids`) tokenized
+with Inkling's tokenizer (`quench6k inkling bench --generate 128`, BF16 caches). Plain decoding, and
+decoding with the checkpoint's DSpark drafter (tokens per step in parentheses). Prefill is the same work
+in both runs.
+
+| Context | Prefill | Decode, plain | Decode, DSpark drafts |
+|---:|---:|---:|---:|
+| 512 | 6,228 | 250.8 | 265.3 (1.76) |
+| 8K | 13,391 | 234.6 | 427.1 (3.85) |
+| 64K | 9,926 | 175.6 | 341.9 (5.29) |
+| 128K | 7,637 | 140.6 | 177.2 (3.10) |
+| 260,000 | 5,210 | 101.0 | 108.2 (2.40) |
+
+Past 512 the corpus repeats, so the 128 tokens continue it exactly in every run. One sequence of
+1,042,346 tokens prefills at 1.7K tokens/s and decodes at 34 tokens/s with 38.9 GiB of caches (450 W).
+Data: `bench/inkling.jsonl` (with the GPU's temperature, clocks and power during each run).
+
+## Several requests at once
+
+Served requests started together, each its own ~1K-token prompt asking for a long answer (320 or 480
+tokens, all reaching max_tokens), greedy, drafts on, 600 W. Decode tokens per second of the steps with
+that many sequences, summed over the requests:
+
+| Model | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| Inkling 2 Mini | 392-404 | - | 617-618 | 749-772 |
+| Hy4-flash | 126 | 170 | 252 | 366 |
+| Recursive Flint | 543-545 | 964-974 | 1,259-1,260 | 1,588-1,589 |
+
+A request's tokens do not depend on which others share its steps: the same prompts give the same text
+alone and eight at once. Details and the before/after of each change: [dev/KBENCH.md](dev/KBENCH.md).
+
+Recursive Flint against llama.cpp, one request by context: [README](README.md#recursive-flint-against-llamacpp).
+
 ## Method
 
 - `quench6k bench`: the prompt is the first N tokens of `bench/context.ids` (the 256K row uses
