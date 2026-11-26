@@ -60,14 +60,17 @@ const GROUP_BUCKET: usize = 4;
 
 /// Optional parts of the step that A/B timings switch at run time ([`set_features`]; all on by default).
 pub const F_GRAPHS: u32 = 1;
+/// The small steps' attention combine with a CTA per query head ([`nk::set_attn_combine`]).
+pub const F_COMBINE: u32 = 256;
 /// The default: every part.
-pub const F_ALL: u32 = F_GRAPHS;
+pub const F_ALL: u32 = F_GRAPHS | F_COMBINE;
 static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(F_ALL);
 
 /// Switches the optional parts of the step (`F_*` bits; for A/B timings in one process; the CUDA graphs
 /// are kept per setting).
 pub fn set_features(mask: u32) {
     FEATURES.store(mask, std::sync::atomic::Ordering::Relaxed);
+    nk::set_attn_combine(mask & F_COMBINE != 0);
 }
 
 fn features() -> u32 {
