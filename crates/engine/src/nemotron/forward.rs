@@ -70,8 +70,23 @@ pub const F_CONV: u32 = 16;
 pub const F_ROUTE: u32 = 128;
 /// The small steps' attention combine with a CTA per query head ([`nk::set_attn_combine`]).
 pub const F_COMBINE: u32 = 256;
+/// Small steps: the shared expert's up projection and relu² on a side stream, beside the router and the
+/// routed experts (the same kernels; its down projection still accumulates after fc2).
+pub const F_SIDE: u32 = 512;
+/// With F_SIDE: fc1 also on the side stream (first), beside the router.
+pub const F_SIDE_FC1: u32 = 1024;
+/// The block norms load their weights before the dependency wait ([`nk::set_rms_early`]).
+pub const F_RMS: u32 = 2048;
+/// The small steps' attention prefetches key tiles into L2 ahead of its register fetch
+/// ([`nk::set_attn_prefetch`]; QUENCH6K_NEM_ATTN_PF tiles, default 3).
+pub const F_ATTN_PF: u32 = 4096;
+/// Small steps' projection forms chosen per Nemotron-H shape and row count ([`tuned_form`]).
+pub const F_FORMS: u32 = 8192;
+/// Small steps' Mamba layers: in_proj's z rows on the side stream after its xBC / dt rows, beside the
+/// convolution and the scan (the same per-output arithmetic).
+pub const F_SIDE_Z: u32 = 16384;
 /// The default: every part.
-pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE;
+pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE | F_SIDE | F_SIDE_FC1 | F_RMS | F_ATTN_PF | F_FORMS | F_SIDE_Z;
 static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(F_ALL);
 
 /// Switches the optional parts of the step (`F_*` bits; for A/B timings in one process; the CUDA graphs
@@ -79,6 +94,9 @@ static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 pub fn set_features(mask: u32) {
     FEATURES.store(mask, std::sync::atomic::Ordering::Relaxed);
     nk::set_attn_combine(mask & F_COMBINE != 0);
+    nk::set_rms_early(mask & F_RMS != 0);
+    let pf = std::env::var("QUENCH6K_NEM_ATTN_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    nk::set_attn_prefetch(if mask & F_ATTN_PF != 0 { pf } else { 0 });
 }
 
 fn features() -> u32 {
@@ -380,6 +398,42 @@ impl State {
             quench6k_cuda::device_checksum(self.mamba.addr(), self.mamba.bytes(), s)?,
         ])
     }
+
+    /// A copy of the sequence's position, history and recurrent state (for benches that decode several
+    /// times from one prefill: [`State::restore`]; the caches below `pos` are not copied, decoding does not
+    /// rewrite them).
+    pub fn save(&self, s: &Stream) -> Result<Saved> {
+        ensure!(self.uncommitted.is_none(), "save with a verification step pending");
+        let mb = self.mamba.bytes();
+        let buf = DeviceBuffer::new(mb + D * 4)?;
+        s.copy_d2d(buf.addr(), self.mamba.addr(), mb)?;
+        s.copy_d2d(buf.addr() + mb as u64, self.h_last.addr(), D * 4)?;
+        Ok(Saved { pos: self.pos, history: self.history.clone(), last_t: self.last_t, canon: self.canon, mtp_pos: self.mtp_pos, buf })
+    }
+
+    /// Back to a [`State::save`] of this sequence.
+    pub fn restore(&mut self, v: &Saved, s: &Stream) -> Result<()> {
+        let mb = self.mamba.bytes();
+        s.copy_d2d(self.mamba.addr(), v.buf.addr(), mb)?;
+        s.copy_d2d(self.h_last.addr(), v.buf.addr() + mb as u64, D * 4)?;
+        self.pos = v.pos;
+        self.history.clone_from(&v.history);
+        self.last_t = v.last_t;
+        self.canon = v.canon;
+        self.mtp_pos = v.mtp_pos;
+        self.uncommitted = None;
+        Ok(())
+    }
+}
+
+/// See [`State::save`].
+pub struct Saved {
+    pos: usize,
+    history: Vec<i32>,
+    last_t: usize,
+    canon: usize,
+    mtp_pos: usize,
+    buf: DeviceBuffer,
 }
 
 struct Alloc {
@@ -474,6 +528,12 @@ pub struct Workspace {
     /// Recorded after the uploads from the MTP pass's and the accepted rows' parts of `pinned`.
     mtp_up: Event,
     acc_up: Event,
+    /// The small steps' side stream (F_SIDE, F_SIDE_Z) and its events: fork and join, and fc1's output
+    /// ready (F_SIDE_FC1).
+    side: Stream,
+    fork: Event,
+    join: Event,
+    lat_ready: Event,
     /// CUDA graphs of small steps (by features, plan and whether the MTP hidden states are kept) and of MTP
     /// passes.
     graphs: HashMap<(u32, Plan, bool), Graph>,
@@ -632,6 +692,10 @@ impl Workspace {
             pinned: PinnedBuffer::new(Self::pinned_layout(cap).5)?,
             mtp_up: Event::new()?,
             acc_up: Event::new()?,
+            side: Stream::new()?,
+            fork: Event::new()?,
+            join: Event::new()?,
+            lat_ready: Event::new()?,
             graphs: HashMap::new(),
             mgraphs: HashMap::new(),
             dump: std::env::var_os("QUENCH6K_NEM_DUMP").map(PathBuf::from),
@@ -661,6 +725,21 @@ impl Workspace {
     }
 }
 
+/// Rows r0 .. r0 + n of a projection (FP8 block-scaled: r0 a multiple of the 128-row blocks).
+fn rows_of(l: &Linear, r0: usize, n: usize) -> Linear {
+    assert!(r0 + n <= l.n);
+    let (w, scale) = match l.fmt {
+        k::WeightFormat::Bf16 => (l.w + (r0 * l.k * 2) as u64, l.scale),
+        k::WeightFormat::Int8Group => (l.w + (r0 * l.k) as u64, l.scale + (r0 * (l.k / k::int8_group()) * 4) as u64),
+        k::WeightFormat::Fp8Block => {
+            assert!(r0.is_multiple_of(128));
+            (l.w + (r0 * l.k) as u64, l.scale + (r0 / 128 * (l.k / 128) * 4) as u64)
+        }
+        f => panic!("rows_of: format {f:?}"),
+    };
+    Linear { w, scale, n, ..*l }
+}
+
 /// Y [m, l.n] F32 (+)= alpha X [m, l.k] BF16 . W^T: the GEMV (per-row arithmetic independent of m) for
 /// small steps and any m up to the GEMV's rows, the tensor-core GEMM otherwise.
 #[allow(clippy::too_many_arguments)]
@@ -680,11 +759,95 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
     }
 }
 
+/// The fastest form of the model's projections at 5 or more rows (Some(None): the shared GEMV), from
+/// cold-weight timings of every form per shape and row count (crates/cuda/tests/nemotron.rs
+/// time_gemv_shapes); None: no entry (the general rule decides). 8-bit matrices (FP8 block-scaled or INT8)
+/// by shape; of the BF16 ones only the router.
+fn tuned_form(l: &Linear, m: usize) -> Option<Option<(usize, usize)>> {
+    // Up to 4 rows the general rule stays: forms with more weight rows per warp measured faster alone but
+    // load less before their dependency wait, and the 1-sequence verification steps (4 rows) got slower.
+    if m <= 4 {
+        return None;
+    }
+    let bf16 = l.fmt == k::WeightFormat::Bf16;
+    let f = match (bf16, l.n, l.k) {
+        // Mamba in_proj
+        (false, 18560, 4096) => match m {
+            5..=8 => Some((4, 4)),
+            _ => return None,
+        },
+        // Mamba out_proj
+        (false, 4096, 8192) => match m {
+            5 | 6 => Some((8, 4)),
+            7 | 8 => Some((4, 4)),
+            _ => return None,
+        },
+        // Attention q/k/v
+        (false, 4608, 4096) => match m {
+            5 => None,
+            6..=8 => Some((8, 4)),
+            17..=24 => Some((16, 4)),
+            _ => return None,
+        },
+        // Attention o_proj
+        (false, 4096, 4096) => match m {
+            5 => None,
+            6..=8 => Some((4, 4)),
+            17..=24 => Some((16, 4)),
+            _ => return None,
+        },
+        // Shared expert up
+        (false, SH, 4096) => match m {
+            5 | 6 => Some((8, 4)),
+            7 | 8 => Some((4, 4)),
+            _ => return None,
+        },
+        // Shared expert down
+        (false, 4096, SH) => match m {
+            5 => None,
+            6..=8 => Some((4, 4)),
+            _ => return None,
+        },
+        // Router (BF16)
+        (true, 512, 4096) => match m {
+            7 | 8 => Some((4, 2)),
+            9..=12 => Some((4, 1)),
+            17.. => Some((8, 1)),
+            _ => None,
+        },
+        // fc1 (latent down)
+        (false, 1024, 4096) => match m {
+            5 | 7..=12 => Some((4, 1)),
+            13..=16 => Some((8, 1)),
+            17..=24 => Some((8, 2)),
+            25.. => Some((4, 4)),
+            _ => None,
+        },
+        // fc2 (latent up)
+        (false, 4096, 1024) => match m {
+            6..=8 => Some((8, 2)),
+            9..=12 => Some((4, 4)),
+            13..=16 => Some((16, 2)),
+            17.. => Some((8, 4)),
+            _ => None,
+        },
+        // lm_head
+        (false, n, 4096) if n >= 65536 && m == 5 => None,
+        _ => return None,
+    };
+    Some(f)
+}
+
 /// The wide GEMV's form (input rows per warp, weight rows per warp) for `m` rows of `l`, where it beats the
 /// shared GEMV's launches of up to 16 rows (each row's bits are the same either way); None keeps those.
 fn wide_form(l: &Linear, m: usize) -> Option<(usize, usize)> {
     if m < 2 || !feature(F_WIDE) {
         return None;
+    }
+    if feature(F_FORMS) {
+        if let Some(f) = tuned_form(l, m) {
+            return f;
+        }
     }
     let size = l.n * l.k;
     let bf16 = l.fmt == k::WeightFormat::Bf16;
@@ -968,6 +1131,21 @@ impl NemotronModel {
     /// out_proj into ws.mix.
     fn mamba(&self, ws: &Workspace, s: &Stream, m: &Mamba, slot: usize, plan: &Plan) -> Result<()> {
         let r = plan.r;
+        if plan.small && feature(F_CONV) && feature(F_SIDE_Z) && DEBUG_SYNC.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            // xBC and dt (in_proj rows DI..) first; then z (rows ..DI, read only by the gated norm) on the side
+            // stream, its weight stream beside the convolution and the scan.
+            linear(s, ws.xn, D, r, &rows_of(&m.in_proj, DI, INP - DI), ws.big + (DI * 4) as u64, INP, true, false)?;
+            ws.fork.record(s)?;
+            ws.side.wait(&ws.fork)?;
+            linear(&ws.side, ws.xn, D, r, &rows_of(&m.in_proj, 0, DI), ws.big, INP, true, false)?;
+            ws.join.record(&ws.side)?;
+            let sc = &ws.mamba;
+            nk::mamba_conv_small(s, ws.big, INP, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, sc.xbc, sc.dt)?;
+            nk::mamba_scan(s, sc.xbc, sc.dt, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, sc.y)?;
+            s.wait(&ws.join)?;
+            nk::mamba_gated_norm(s, sc.y, ws.big, INP, r, m.w.norm_w, 1e-5, ws.act)?;
+            return linear(s, ws.act, DI, r, &m.out_proj, ws.mix, D, plan.small, false);
+        }
         linear(s, ws.xn, D, r, &m.in_proj, ws.big, INP, plan.small, false)?;
         dsync(s, 1)?;
         if plan.small && feature(F_CONV) {
@@ -997,6 +1175,21 @@ impl NemotronModel {
     /// MoE mixer: router; routed experts in the latent space (fc1 -> experts -> combine -> fc2); the
     /// shared expert on the full width, added into ws.mix.
     fn moe(&self, ws: &Workspace, s: &Stream, m: &Moe, r: usize, small: bool) -> Result<()> {
+        // The shared expert's up projection and relu² (ws.big, ws.act: no other kernel of the layer touches
+        // them) beside the routed path; its down projection accumulates onto fc2's output after the join.
+        let side = small && feature(F_SIDE) && DEBUG_SYNC.load(std::sync::atomic::Ordering::Relaxed) == 0;
+        let side_fc1 = side && feature(F_SIDE_FC1);
+        if side {
+            ws.fork.record(s)?;
+            ws.side.wait(&ws.fork)?;
+            if side_fc1 {
+                linear(&ws.side, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false)?;
+                ws.lat_ready.record(&ws.side)?;
+            }
+            linear(&ws.side, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false)?;
+            nk::relu2(&ws.side, ws.big, SH, SH, r, ws.act, SH)?;
+            ws.join.record(&ws.side)?;
+        }
         linear(s, ws.xn, D, r, &m.gate, ws.logits, EXPERTS, small, false)?;
         dsync(s, 8)?;
         if feature(F_ROUTE) {
@@ -1004,7 +1197,11 @@ impl NemotronModel {
         } else {
             nk::moe_route(s, ws.logits, EXPERTS, m.bias, self.cfg.routed_scaling, r, ws.sel_e, ws.sel_w)?;
         }
-        linear(s, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false)?;
+        if side_fc1 {
+            s.wait(&ws.lat_ready)?;
+        } else {
+            linear(s, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false)?;
+        }
         dsync(s, 512)?;
         quench6k_cuda::hy4::to_bf16(s, ws.lat, ws.lat_bf, r * LAT)?;
         let ex = &m.experts;
@@ -1034,9 +1231,13 @@ impl NemotronModel {
             }
         }
         linear(s, ws.ex_bf, LAT, r, &m.fc2, ws.mix, D, small, false)?;
-        linear(s, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false)?;
-        dsync(s, 64)?;
-        nk::relu2(s, ws.big, SH, SH, r, ws.act, SH)?;
+        if side {
+            s.wait(&ws.join)?;
+        } else {
+            linear(s, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false)?;
+            dsync(s, 64)?;
+            nk::relu2(s, ws.big, SH, SH, r, ws.act, SH)?;
+        }
         linear(s, ws.act, SH, r, &m.shared_down, ws.mix, D, small, true)
     }
 }
