@@ -10,11 +10,19 @@ namespace {
 constexpr int RMS_THREADS = 256, RMS_PER = HIDDEN / RMS_THREADS;
 
 template <bool F32OUT>
-__global__ void __launch_bounds__(RMS_THREADS) rms_kernel(const float* x, int ldx, const bf16* w, float eps, void* out, int ldo) {
+__global__ void __launch_bounds__(RMS_THREADS) rms_kernel(const float* x, int ldx, const bf16* w, float eps, void* out, int ldo, int early) {
     pdl_launch_dependents();
-    pdl_wait();
     __shared__ float scratch[32];
     const int r = blockIdx.x, tid = threadIdx.x;
+    // The norm weights (written by no kernel) load before the dependency wait (early), or after it.
+    float wv[RMS_PER];
+    if (early)
+#pragma unroll
+        for (int k = 0; k < RMS_PER; ++k) wv[k] = bf2f(w[k * RMS_THREADS + tid]);
+    pdl_wait();
+    if (!early)
+#pragma unroll
+        for (int k = 0; k < RMS_PER; ++k) wv[k] = bf2f(w[k * RMS_THREADS + tid]);
     float v[RMS_PER];
     float ss = 0.0f;
 #pragma unroll
@@ -27,7 +35,7 @@ __global__ void __launch_bounds__(RMS_THREADS) rms_kernel(const float* x, int ld
 #pragma unroll
     for (int k = 0; k < RMS_PER; ++k) {
         const int c = k * RMS_THREADS + tid;
-        const float o = bf2f(w[c]) * (v[k] * rs);
+        const float o = wv[k] * (v[k] * rs);
         if constexpr (F32OUT) static_cast<float*>(out)[(size_t)r * ldo + c] = o;
         else static_cast<bf16*>(out)[(size_t)r * ldo + c] = f2bf(o);
     }
@@ -51,13 +59,18 @@ extern "C" cudaError_t quench6k_nem_copy_rows(const void* table, int rows, cudaS
     SQ_RETURN_LAUNCH();
 }
 
+// Whether the norm weights load before the dependency wait (1, default) or after it (0): the same bits. For A/B
+// timings.
+static int rms_early = 1;
+extern "C" void quench6k_nem_set_rms_early(int early) { rms_early = early; }
+
 // out[r] = w * (x[r] / sqrt(mean(x[r]²) + eps)) over HIDDEN columns; f32_out: FP32 output, else BF16.
 extern "C" cudaError_t quench6k_nem_rms(const float* x, int ldx, const void* w, float eps, int rows, void* out, int ldo, int f32_out,
                                         cudaStream_t st) {
     if (rows == 0) return cudaSuccess;
     const bf16* wb = static_cast<const bf16*>(w);
-    if (f32_out) SQ_CHECK_LAUNCH(sq_launch(rms_kernel<true>, rows, RMS_THREADS, 0, st, x, ldx, wb, eps, out, ldo));
-    else SQ_CHECK_LAUNCH(sq_launch(rms_kernel<false>, rows, RMS_THREADS, 0, st, x, ldx, wb, eps, out, ldo));
+    if (f32_out) SQ_CHECK_LAUNCH(sq_launch(rms_kernel<true>, rows, RMS_THREADS, 0, st, x, ldx, wb, eps, out, ldo, rms_early));
+    else SQ_CHECK_LAUNCH(sq_launch(rms_kernel<false>, rows, RMS_THREADS, 0, st, x, ldx, wb, eps, out, ldo, rms_early));
     SQ_RETURN_LAUNCH();
 }
 

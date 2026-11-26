@@ -1104,3 +1104,49 @@ read low (one run: 512 tokens at 1.3K).
 
 Left: the expert GEMM at 2048 rows streams its weights at ~0.8 TB/s (half of DRAM) and runs at 189
 TFLOPS; the thin kernel at 256 rows is within ~15% of the weight-streaming floor.
+
+## 2026-11-26: Nemotron-H decode, work beside the router and the scan (same bits)
+
+Census of main's decode (nsys, tools/census.py, 600 W): 1 sequence at 8K, 9.00 ms per traced step,
+DRAM read 72% of peak on average and under 20% for 9% of the step. GEMVs 4.62 ms (at the DRAM rate),
+routed experts 2.14 ms (up 31.3 + down 20.9 us per layer), block norms 0.63 ms (6.7 us each, DRAM 36%),
+attention 0.31 ms (35 us per layer at 8K, DRAM 17%), scan, combine, gated norm, relu², conv, router
+0.10-0.26 ms each. 8 sequences at 32K: 22.0 ms; wide GEMVs 5.93 ms (DRAM 63%), experts 10.5 ms (~87%),
+attention 1.70 ms (189 us per layer, 1.42 TB/s, 83%), scan 1.06 ms, router-side small GEMVs 0.97 ms.
+
+The levers proposed last round, checked first:
+- Attention at 8 x 32K was not 2.96 ms per layer in the engine but 189 us at 83% of DRAM peak (at most
+  ~1% of the step left). An L2 prefetch of key tiles helped where the grid is smaller than the GPU and
+  cost 0.57% at 8 x 32K, so it runs only on small grids.
+- The up / down expert kernels at 1 sequence (ncu on the micro test, 2.81 GHz): 24.9-26.0 us and
+  26.0-26.4 us for 34 MB each, 77-80% of DRAM peak: equal; the census' 31 vs 21 us split is PDL credit
+  (down loads its first weights before its wait). Folding the rounding and grouping launches into the
+  expert kernels: micro 43.0 -> 41.6 us at 1 row, engine +0.17% plain, -0.30% drafted and at 8
+  sequences: dropped.
+- GEMV forms per shape: +1.75% at 8 rows; below 5 rows the isolated winners lost in the engine (fewer
+  weights loaded before the dependency wait), so the table starts at 5 rows.
+- The small latency-bound kernels: instead of fusing them, independent work now runs beside them on a
+  side stream (fork / join events, also inside the CUDA graphs).
+
+Changes (feature bits, `QUENCH6K_NEM_AB` in-process A/B, 3 rounds A B .. B A after a warm-up run of
+each arm, one prefill restored before every run, a null arm in every A/B; median ratio and range;
+600 W, SM clock median 2.6-2.8 GHz, 61-82 °C, throttle reasons power cap only):
+
+| change | 1 seq 8K plain | 1 seq 8K 3 drafts | 8 seq 2K plain | 8 seq 2K 3 drafts |
+|---|---|---|---|---|
+| null arm (typical band) | 0.9999-1.0005 | 0.9988-1.0017 | 0.9995-1.0004 | 0.9980-1.0001 |
+| norm weights before the wait (F_RMS) | +0.59% | +0.36% | +0.19% | |
+| attention L2 prefetch, small grids (F_ATTN_PF) | +0.56% | +0.12% | +0.22% | |
+| shared expert up + relu² beside the router (F_SIDE) | +1.97% | +0.12% | +0.34% | |
+| fc1 beside the router too (F_SIDE_FC1) | +4.57% | +2.71% | | |
+| in_proj's z rows beside conv + scan (F_SIDE_Z) | +1.66% | +0.68% | +2.11% | +0.17% |
+| GEMV forms per shape, 5+ rows (F_FORMS) | 0 | 0 | +1.75% | +0.25% |
+| all against main's path (0x197 vs 0x7f97) | +7.35% (1.0721-1.0756) | +4.11% (1.0313-1.0415) | +6.08% (1.0607-1.0621) | +2.14% (1.0201-1.0218) |
+
+Rates in that last A/B: 119.9 -> 128.7 tok/s, 267.7 -> 278.7, 387.0 -> 410.5, 501.9 -> 512.3. Runs
+that decode after a restore read higher than the plain bench's (fresh prefill before every run: 113.3
+tok/s for main's 1 seq 8K plain against 120.0 here): compare ratios, not these rates with older tables.
+
+Checks: decode_forms_equal (also prefetch distances 0, 1, 3, 5), digests unchanged, batch-check 8 x 12,
+verify 7, spec-check 8 sequences with chat, fixture scores of all 7 fixtures byte-identical to main's
+build (the .json files differ only in their wall-clock seconds).
