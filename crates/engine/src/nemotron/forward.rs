@@ -60,10 +60,12 @@ const GROUP_BUCKET: usize = 4;
 
 /// Optional parts of the step that A/B timings switch at run time ([`set_features`]; all on by default).
 pub const F_GRAPHS: u32 = 1;
+/// The Mamba convolution and its commit in one launch in small steps ([`nk::mamba_conv_small`]).
+pub const F_CONV: u32 = 16;
 /// The small steps' attention combine with a CTA per query head ([`nk::set_attn_combine`]).
 pub const F_COMBINE: u32 = 256;
 /// The default: every part.
-pub const F_ALL: u32 = F_GRAPHS | F_COMBINE;
+pub const F_ALL: u32 = F_GRAPHS | F_CONV | F_COMBINE;
 static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(F_ALL);
 
 /// Switches the optional parts of the step (`F_*` bits; for A/B timings in one process; the CUDA graphs
@@ -935,7 +937,11 @@ impl NemotronModel {
         let r = plan.r;
         linear(s, ws.xn, D, r, &m.in_proj, ws.big, INP, plan.small, false)?;
         dsync(s, 1)?;
-        nk::mamba_mixer(s, ws.big, INP, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, &ws.mamba, ws.act)?;
+        if plan.small && feature(F_CONV) {
+            nk::mamba_mixer_small(s, ws.big, INP, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, &ws.mamba, ws.act)?;
+        } else {
+            nk::mamba_mixer(s, ws.big, INP, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, &ws.mamba, ws.act)?;
+        }
         linear(s, ws.act, DI, r, &m.out_proj, ws.mix, D, plan.small, false)
     }
 
