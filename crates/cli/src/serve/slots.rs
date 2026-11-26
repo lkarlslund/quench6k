@@ -421,6 +421,11 @@ pub(super) trait SlotEngine {
     fn name(&self) -> &'static str;
     /// Tokens per prefill chunk.
     fn chunk(&self) -> usize;
+    /// Most tokens of a prefill call while no request decodes: consecutive whole chunks (not a
+    /// sequence's first) go in one call up to this many (default: one chunk per call).
+    fn max_prefill(&self) -> usize {
+        self.chunk()
+    }
     /// Most tokens of one sequence in a step (the pending token and its drafts).
     fn max_step(&self) -> usize;
     /// Tokens that end a generation besides the request's stop tokens.
@@ -1220,7 +1225,13 @@ impl<E: SlotEngine> Sched<'_, E> {
             }
             // Chunks end at multiples of the chunk size (or the prompt's end) whatever was reused, so a
             // prompt's prefill is the same computation however much of it was cached.
-            let end = ((at / chunk + 1) * chunk).min(len);
+            let mut end = ((at / chunk + 1) * chunk).min(len);
+            // Nobody decoding (no slice limit): several whole chunks in one call, ending at the same
+            // multiples of the chunk size, except a sequence's first chunk (where an engine may keep its
+            // lowest snapshot).
+            if limit == usize::MAX && at > 0 && at % chunk == 0 && end == at + chunk {
+                end = at + (self.e.max_prefill() / chunk).min((len - at) / chunk).max(1) * chunk;
+            }
             let last = end == len;
             let ids = r.job.ids[at..end].to_vec();
             self.with_memory(slot, |e, st| e.reserve(st, end))?;
