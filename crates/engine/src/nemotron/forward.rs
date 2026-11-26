@@ -66,10 +66,12 @@ pub const F_WIDE: u32 = 2;
 pub const F_WIDE_K8: u32 = 4;
 /// The Mamba convolution and its commit in one launch in small steps ([`nk::mamba_conv_small`]).
 pub const F_CONV: u32 = 16;
+/// The router by sorting ([`nk::moe_route_sort`]).
+pub const F_ROUTE: u32 = 128;
 /// The small steps' attention combine with a CTA per query head ([`nk::set_attn_combine`]).
 pub const F_COMBINE: u32 = 256;
 /// The default: every part.
-pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_COMBINE;
+pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE;
 static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(F_ALL);
 
 /// Switches the optional parts of the step (`F_*` bits; for A/B timings in one process; the CUDA graphs
@@ -996,7 +998,11 @@ impl NemotronModel {
     fn moe(&self, ws: &Workspace, s: &Stream, m: &Moe, r: usize, small: bool) -> Result<()> {
         linear(s, ws.xn, D, r, &m.gate, ws.logits, EXPERTS, small, false)?;
         dsync(s, 8)?;
-        nk::moe_route(s, ws.logits, EXPERTS, m.bias, self.cfg.routed_scaling, r, ws.sel_e, ws.sel_w)?;
+        if feature(F_ROUTE) {
+            nk::moe_route_sort(s, ws.logits, EXPERTS, m.bias, self.cfg.routed_scaling, r, ws.sel_e, ws.sel_w)?;
+        } else {
+            nk::moe_route(s, ws.logits, EXPERTS, m.bias, self.cfg.routed_scaling, r, ws.sel_e, ws.sel_w)?;
+        }
         linear(s, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false)?;
         dsync(s, 512)?;
         quench6k_cuda::hy4::to_bf16(s, ws.lat, ws.lat_bf, r * LAT)?;
