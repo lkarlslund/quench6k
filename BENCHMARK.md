@@ -67,20 +67,21 @@ One request, 600 W, greedy, 128 tokens generated after the first N tokens of the
 (`bench/context.ids`) tokenized with Nemotron's tokenizer (`quench6k nemotron bench --generate 128
 --drafts 0 3`, BF16 caches), on Munin 2.0 (NVIDIA's checkpoint has the same layers, formats and
 tokenizer). Plain decoding, and decoding with three drafts of the checkpoint's MTP layer per step
-(tokens per step in parentheses). Prefill is the same work in both runs, in steps of up to 2048 tokens.
+(tokens per step in parentheses). Prefill is the same work in both runs, in steps of up to 2048 tokens;
+the table shows the plain run's.
 
 | Context | Prefill | Decode, plain | Decode, 3 MTP drafts |
 |---:|---:|---:|---:|
-| 512 | TBD | TBD | TBD (TBD) |
-| 8K | TBD | TBD | TBD (TBD) |
-| 32K | TBD | TBD | TBD (TBD) |
+| 512 | 4,959 | 130.1 | 178.7 (2.54) |
+| 8K | 7,153 | 127.8 | 246.5 (3.53) |
+| 32K | 6,765 | 124.3 | 218.9 (3.26) |
 
 Long contexts, one request (each context in a run of its own):
 
 | Context | Prefill | Decode, plain | Decode, 3 MTP drafts |
 |---:|---:|---:|---:|
-| 128K | TBD | TBD | TBD (TBD) |
-| 260,000 | TBD | TBD | TBD (TBD) |
+| 128K | 5,281 | 119.1 | 235.9 (3.63) |
+| 260,000 | 3,977 | 106.9 | 211.6 (3.53) |
 
 Several sequences decoded together (`--seqs N`: N windows of the corpus, each its own prompt of the same
 length, in batched steps; each sequence's tokens are the same as alone). Decode tokens per second summed
@@ -88,16 +89,18 @@ over the sequences; with drafts, tokens per sequence step in parentheses:
 
 | Context | Drafts | 1 | 2 | 4 | 8 |
 |---:|---|---:|---:|---:|---:|
-| 8K | none | TBD | TBD | TBD | TBD |
-| 8K | 3 | TBD (TBD) | TBD (TBD) | TBD (TBD) | TBD (TBD) |
+| 8K | none | 127.8 | 204.9 | 299.4 | 420.6 |
+| 8K | 3 | 246.5 (3.53) | 365.9 (3.48) | 497.0 (3.48) | 521.1 (3.39) |
 
 The server prefills several whole 2048-token chunks in one step (up to 8192 tokens) while no other
-request decodes; measured with such steps (`QUENCH6K_NEM_MAXT=8192`), prefill is TBD / TBD / TBD tokens/s
-at 512 / 8K / 32K.
+request decodes; measured with such steps (`QUENCH6K_NEM_MAXT=8192`), prefill is 7,467 tokens/s at 8K
+and 7,656 at 32K (a 512-token prompt is a single chunk either way).
 
-Past the corpus' first repetition the greedy tokens continue it, so drafts are accepted more often than
-on real prompts. Data: `bench/nemotron.jsonl` (with the GPU's temperature, clocks and power during each
-run).
+The corpus repeats its text after about 1K tokens, so from 8K on the greedy tokens continue it (128 of
+128 at 8K, 100 at 32K) and drafts are accepted far more often than on real text; the served requests
+below (median decode rate per request) are the realistic figure. During the runs the GPU stayed at its
+power cap with no thermal slowdown: SM clock 2.57-2.81 GHz on average, 47-87 °C (the hottest at
+260,000). Data: `bench/nemotron.jsonl` (with the GPU's temperature, clocks and power during each run).
 
 ## Several requests at once
 
