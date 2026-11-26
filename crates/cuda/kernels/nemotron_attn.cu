@@ -7,6 +7,8 @@
 // in base 2, times the key's FP8 scale); P (times the value's FP8 scale) is rounded to BF16 for P.V.
 // Decode computes each group in its own CTA (partials folded by attn_combine_kernel); prefill folds them
 // in the same order inside one CTA. Both use the same tile function and fold, so a row's bits match.
+// Key tiles are fetched into registers one tile ahead (prefill BF16: just before use) and V is read with
+// transposing ldmatrix from its row-major tile.
 
 #include "mma.cuh"
 #include "nemotron.cuh"
@@ -16,16 +18,18 @@ using namespace nem;
 namespace {
 
 constexpr float SCORE_C = 0.08838834764831845f * 1.4426950408889634f;  // 1/sqrt(128) * log2(e)
-constexpr int KLD = HD + 8, VLD = ATTN_TILE + 8;
+constexpr int KLD = HD + 8;
+constexpr int AT_THREADS = 128;
 
 struct KvArgs {
     long long off, ld;
     int fp8;
 };
 
+// A key tile in shared memory: K and V [key][d] BF16 (rows padded), per-key score factor and value scale.
 struct TileSmem {
     __align__(16) bf16 k[ATTN_TILE * KLD];
-    __align__(16) bf16 vt[HD * VLD];
+    __align__(16) bf16 v[ATTN_TILE * KLD];
     float kf[ATTN_TILE], vf[ATTN_TILE];
 };
 
@@ -33,67 +37,86 @@ SQ_DEVICE const unsigned char* kv_row(const Seqs& q, int s, const KvArgs& kv, in
     return reinterpret_cast<const unsigned char*>(q.kv[s]) + (size_t)j * kv.ld + kv.off;
 }
 
-// Tile of keys j0 .. j0 + 63 of KV head g of sequence s into shared memory: K [key][d], V transposed [d][key]
-// (BF16), per-key score factor and value scale; keys past `last` are zeros. Ends with a barrier.
-SQ_DEVICE void load_tile(TileSmem& sm, const Seqs& q, int s, const KvArgs& kv, int g, int j0, int last) {
-    const int tid = threadIdx.x, nt = blockDim.x;
-    if (kv.fp8) {
-        for (int i = tid; i < ATTN_TILE * (HD / 16); i += nt) {
-            const int r = i / (HD / 16), c = (i % (HD / 16)) * 16, j = j0 + r;
-            uint4 kq = make_uint4(0, 0, 0, 0), vq = kq;
-            if (j <= last) {
-                const unsigned char* row = kv_row(q, s, kv, j);
-                kq = __ldcg(reinterpret_cast<const uint4*>(row + g * HD + c));
-                vq = __ldcg(reinterpret_cast<const uint4*>(row + KVH * HD + g * HD + c));
-            }
-            const __nv_fp8x2_storage_t* kb = reinterpret_cast<const __nv_fp8x2_storage_t*>(&kq);
-            const __nv_fp8x2_storage_t* vb = reinterpret_cast<const __nv_fp8x2_storage_t*>(&vq);
-            __align__(16) bf16 ko[16];
+// One thread's share of a key tile's raw cache bytes (128 threads): BF16 16 x 16 bytes (K then V), FP8 8 x 16
+// bytes plus the scales of key tid (threads < 64). Loaded one tile ahead, stored after the previous tile's math.
+template <bool FP8>
+struct TileRegs {
+    uint4 d[FP8 ? 8 : 16];
+    float ks, vs;
+};
+
+// Keys j0 .. j0 + 63 of KV head g of sequence s (keys past `last` read as zeros).
+template <bool FP8>
+SQ_DEVICE void fetch_tile(TileRegs<FP8>& t, const Seqs& q, int s, const KvArgs& kv, int g, int j0, int last) {
+    const int tid = threadIdx.x;
+    constexpr int VPR = FP8 ? HD / 16 : HD / 8;  // 16-byte pieces per key row of K (or V)
+    constexpr int PER = ATTN_TILE * VPR / AT_THREADS;
+    constexpr int EB = FP8 ? 1 : 2;  // bytes per element
 #pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const __half2_raw kh = __nv_cvt_fp8x2_to_halfraw2(kb[e], __NV_E4M3);
-                const __half2_raw vh = __nv_cvt_fp8x2_to_halfraw2(vb[e], __NV_E4M3);
-                const float2 kf2 = __half22float2(*reinterpret_cast<const __half2*>(&kh));
-                const float2 vf2 = __half22float2(*reinterpret_cast<const __half2*>(&vh));
-                ko[2 * e] = f2bf(kf2.x), ko[2 * e + 1] = f2bf(kf2.y);
-                sm.vt[(c + 2 * e) * VLD + r] = f2bf(vf2.x);
-                sm.vt[(c + 2 * e + 1) * VLD + r] = f2bf(vf2.y);
-            }
-            *reinterpret_cast<uint4*>(&sm.k[r * KLD + c]) = reinterpret_cast<const uint4*>(ko)[0];
-            *reinterpret_cast<uint4*>(&sm.k[r * KLD + c + 8]) = reinterpret_cast<const uint4*>(ko)[1];
+    for (int m = 0; m < PER; ++m) {
+        const int i = tid + AT_THREADS * m, r = i / VPR, c = (i % VPR) * (16 / EB), j = j0 + r;
+        uint4 kq = make_uint4(0, 0, 0, 0), vq = kq;
+        if (j <= last) {
+            const unsigned char* row = kv_row(q, s, kv, j);
+            kq = __ldcg(reinterpret_cast<const uint4*>(row + (g * HD + c) * EB));
+            vq = __ldcg(reinterpret_cast<const uint4*>(row + (KVH * HD + g * HD + c) * EB));
         }
-        for (int r = tid; r < ATTN_TILE; r += nt) {
-            const int j = j0 + r;
-            float ks = 0.0f, vs = 0.0f;
-            if (j <= last) {
-                const float* sc = reinterpret_cast<const float*>(kv_row(q, s, kv, j) + 2 * KVH * HD);
-                ks = __ldcg(sc + g);
-                vs = __ldcg(sc + KVH + g);
-            }
-            sm.kf[r] = __fmul_rn(ks, SCORE_C);
-            sm.vf[r] = vs;
-        }
-    } else {
-        for (int i = tid; i < ATTN_TILE * (HD / 8); i += nt) {
-            const int r = i / (HD / 8), c = (i % (HD / 8)) * 8, j = j0 + r;
-            uint4 kq = make_uint4(0, 0, 0, 0), vq = kq;
-            if (j <= last) {
-                const bf16* row = reinterpret_cast<const bf16*>(kv_row(q, s, kv, j));
-                kq = __ldcg(reinterpret_cast<const uint4*>(row + g * HD + c));
-                vq = __ldcg(reinterpret_cast<const uint4*>(row + KVH * HD + g * HD + c));
-            }
-            *reinterpret_cast<uint4*>(&sm.k[r * KLD + c]) = kq;
-            const bf16* vb = reinterpret_cast<const bf16*>(&vq);
-#pragma unroll
-            for (int e = 0; e < 8; ++e) sm.vt[(c + e) * VLD + r] = vb[e];
-        }
-        for (int r = tid; r < ATTN_TILE; r += nt) {
-            const bool ok = j0 + r <= last;
-            sm.kf[r] = ok ? SCORE_C : 0.0f;
-            sm.vf[r] = ok ? 1.0f : 0.0f;
+        t.d[m] = kq;
+        t.d[PER + m] = vq;
+    }
+    if constexpr (FP8) {
+        t.ks = t.vs = 0.0f;
+        if (tid < ATTN_TILE && j0 + tid <= last) {
+            const float* sc = reinterpret_cast<const float*>(kv_row(q, s, kv, j0 + tid) + 2 * KVH * HD);
+            t.ks = __ldcg(sc + g);
+            t.vs = __ldcg(sc + KVH + g);
         }
     }
-    __syncthreads();
+}
+
+// The fetched tile into shared memory (FP8 codes convert exactly to BF16). Callers barrier before (the previous
+// tile's readers) and after.
+template <bool FP8>
+SQ_DEVICE void store_tile(TileSmem& sm, const TileRegs<FP8>& t, int j0, int last) {
+    const int tid = threadIdx.x;
+    constexpr int VPR = FP8 ? HD / 16 : HD / 8;
+    constexpr int PER = ATTN_TILE * VPR / AT_THREADS;
+#pragma unroll
+    for (int m = 0; m < PER; ++m) {
+        const int i = tid + AT_THREADS * m, r = i / VPR;
+        if constexpr (FP8) {
+            const int c = (i % VPR) * 16;
+#pragma unroll
+            for (int part = 0; part < 2; ++part) {
+                const uint4 raw = t.d[part * PER + m];
+                const __nv_fp8x2_storage_t* b = reinterpret_cast<const __nv_fp8x2_storage_t*>(&raw);
+                __align__(16) bf16 o[16];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(b[e], __NV_E4M3);
+                    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+                    o[2 * e] = f2bf(f.x), o[2 * e + 1] = f2bf(f.y);
+                }
+                bf16* dst = (part ? sm.v : sm.k) + r * KLD + c;
+                reinterpret_cast<uint4*>(dst)[0] = reinterpret_cast<const uint4*>(o)[0];
+                reinterpret_cast<uint4*>(dst)[1] = reinterpret_cast<const uint4*>(o)[1];
+            }
+        } else {
+            const int c = (i % VPR) * 8;
+            *reinterpret_cast<uint4*>(sm.k + r * KLD + c) = t.d[m];
+            *reinterpret_cast<uint4*>(sm.v + r * KLD + c) = t.d[PER + m];
+        }
+    }
+    if (tid < ATTN_TILE) {
+        if constexpr (FP8) {
+            sm.kf[tid] = __fmul_rn(t.ks, SCORE_C);
+            sm.vf[tid] = t.vs;
+        } else {
+            const bool ok = j0 + tid <= last;
+            sm.kf[tid] = ok ? SCORE_C : 0.0f;
+            sm.vf[tid] = ok ? 1.0f : 0.0f;
+        }
+    }
 }
 
 // Q fragments (A operand, 16 heads x 128) of row r, KV head g.
@@ -190,13 +213,19 @@ SQ_DEVICE void attn_tile(const TileSmem& sm, const uint32_t (&qa)[HD / 16][4], i
         st.acc[dn][1] = __fmul_rn(st.acc[dn][1], alpha[0]);
         st.acc[dn][2] = __fmul_rn(st.acc[dn][2], alpha[1]);
         st.acc[dn][3] = __fmul_rn(st.acc[dn][3], alpha[1]);
+    }
+    // V fragments by transposing loads of the row-major tile: matrices (keys kk*16 + 8 (m & 1) .., dims of tile
+    // dn + (m >> 1)) give b = {V[k][d], V[k + 1][d]} pairs for keys 16 kk + 2 t4 (+ 8), dim g8.
+#pragma unroll
+    for (int dn = 0; dn < NT; dn += 2)
 #pragma unroll
         for (int kk = 0; kk < ATTN_TILE / 16; ++kk) {
-            const bf16* vp = &sm.vt[(d0 + dn * 8 + g8) * VLD + kk * 16 + t4 * 2];
-            const uint32_t b[2] = {*reinterpret_cast<const uint32_t*>(vp), *reinterpret_cast<const uint32_t*>(vp + 8)};
+            uint32_t b[4];
+            const int m = lane >> 3;
+            ldmatrix_x4_trans(b, &sm.v[(kk * 16 + (m & 1) * 8 + (lane & 7)) * KLD + d0 + (dn + (m >> 1)) * 8]);
             mma_bf16(st.acc[dn], pa[kk], b);
+            mma_bf16(st.acc[dn + 1], pa[kk], b + 2);
         }
-    }
 }
 
 // Fold of a group partial (mg, lg, ag) into the running total (mt, lt, at), the same in both kernels.
@@ -247,7 +276,8 @@ constexpr int PART_FLOATS = QPK * HD + 2 * QPK;  // acc [16][128], m [16], l [16
 
 // Decode: grid (rows, 2, max_groups), 4 warps. Every warp computes the scores of the row's 16 heads; warp w
 // accumulates dims 32 w .. 32 w + 31. Writes the group's partial.
-__global__ void __launch_bounds__(128) attn_decode_kernel(const bf16* qin, const Seqs* sq, KvArgs kv, int max_groups, float* part) {
+template <bool FP8>
+__global__ void __launch_bounds__(AT_THREADS) attn_decode_kernel(const bf16* qin, const Seqs* sq, KvArgs kv, int max_groups, float* part) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ Seqs q;
@@ -264,9 +294,13 @@ __global__ void __launch_bounds__(128) attn_decode_kernel(const bf16* qin, const
     Partial<4> st;
     st.reset();
     const int t_first = gi * GROUP_TILES, t_last = min(gi * GROUP_TILES + GROUP_TILES - 1, pos / ATTN_TILE);
+    TileRegs<FP8> tr;
+    fetch_tile(tr, q, s, kv, g, t_first * ATTN_TILE, pos);
     for (int t = t_first; t <= t_last; ++t) {
         __syncthreads();
-        load_tile(sm, q, s, kv, g, t * ATTN_TILE, pos);
+        store_tile(sm, tr, t * ATTN_TILE, pos);
+        if (t < t_last) fetch_tile(tr, q, s, kv, g, (t + 1) * ATTN_TILE, pos);
+        __syncthreads();
         attn_tile(sm, qa, t * ATTN_TILE, pos, warp * 32, st);
     }
     float* out = part + (((size_t)r * KVH + g) * max_groups + gi) * PART_FLOATS;
@@ -319,6 +353,7 @@ struct PrefillSmem {
     float total[PF_WARPS][HD / 8 * 4][32];
 };
 
+template <bool FP8>
 __global__ void __launch_bounds__(PF_WARPS * 32) attn_prefill_kernel(const bf16* qin, int rows, const Seqs* sq, KvArgs kv, bf16* out) {
     pdl_launch_dependents();
     pdl_wait();
@@ -351,9 +386,16 @@ __global__ void __launch_bounds__(PF_WARPS * 32) attn_prefill_kernel(const bf16*
             if (wseq[v] == su) last = max(last, wpos[v]);
         const bool active = my_s == su;
         const int my_last_tile = active ? pos / ATTN_TILE : -1;
+        // FP8 tiles are fetched one ahead; BF16 ones (twice the registers) just before their store.
+        TileRegs<FP8> tr;
+        if constexpr (FP8) fetch_tile(tr, q, su, kv, g, 0, last);
         for (int t = 0; t <= last / ATTN_TILE; ++t) {
+            if constexpr (!FP8) fetch_tile(tr, q, su, kv, g, t * ATTN_TILE, last);
             __syncthreads();
-            load_tile(sm.tile, q, su, kv, g, t * ATTN_TILE, last);
+            store_tile(sm.tile, tr, t * ATTN_TILE, last);
+            if constexpr (FP8)
+                if (t < last / ATTN_TILE) fetch_tile(tr, q, su, kv, g, (t + 1) * ATTN_TILE, last);
+            __syncthreads();
             if (t > my_last_tile) continue;
             if (t % GROUP_TILES == 0) {
                 if (t > 0) {
@@ -418,8 +460,12 @@ extern "C" cudaError_t quench6k_nem_attention_small(const void* q, int rows, con
     if (rows == 0) return cudaSuccess;
     if (max_groups <= 0) return cudaErrorInvalidValue;
     const KvArgs kv{kv_off, kv_ld, fp8};
-    SQ_CHECK_LAUNCH(sq_launch(attn_decode_kernel, dim3(rows, KVH, max_groups), 128, 0, st, static_cast<const bf16*>(q), static_cast<const Seqs*>(seqs),
-                              kv, max_groups, part));
+    if (fp8)
+        SQ_CHECK_LAUNCH(sq_launch(attn_decode_kernel<true>, dim3(rows, KVH, max_groups), AT_THREADS, 0, st, static_cast<const bf16*>(q),
+                                  static_cast<const Seqs*>(seqs), kv, max_groups, part));
+    else
+        SQ_CHECK_LAUNCH(sq_launch(attn_decode_kernel<false>, dim3(rows, KVH, max_groups), AT_THREADS, 0, st, static_cast<const bf16*>(q),
+                                  static_cast<const Seqs*>(seqs), kv, max_groups, part));
     SQ_CHECK_LAUNCH(sq_launch(attn_combine_kernel, dim3(rows, KVH), HD, 0, st, (const float*)part, static_cast<const Seqs*>(seqs), max_groups,
                               static_cast<bf16*>(out)));
     SQ_RETURN_LAUNCH();
@@ -430,12 +476,16 @@ extern "C" cudaError_t quench6k_nem_attention_prefill(const void* q, int rows, c
     if (rows == 0) return cudaSuccess;
     static bool configured = false;
     if (!configured) {
-        const cudaError_t e = cudaFuncSetAttribute(attn_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(PrefillSmem));
-        if (e != cudaSuccess) return e;
+        SQ_CHECK_LAUNCH(cudaFuncSetAttribute(attn_prefill_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(PrefillSmem)));
+        SQ_CHECK_LAUNCH(cudaFuncSetAttribute(attn_prefill_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(PrefillSmem)));
         configured = true;
     }
     const KvArgs kv{kv_off, kv_ld, fp8};
-    SQ_CHECK_LAUNCH(sq_launch(attn_prefill_kernel, dim3((rows + PF_WARPS - 1) / PF_WARPS, KVH), PF_WARPS * 32, sizeof(PrefillSmem), st,
-                              static_cast<const bf16*>(q), rows, static_cast<const Seqs*>(seqs), kv, static_cast<bf16*>(out)));
+    if (fp8)
+        SQ_CHECK_LAUNCH(sq_launch(attn_prefill_kernel<true>, dim3((rows + PF_WARPS - 1) / PF_WARPS, KVH), PF_WARPS * 32, sizeof(PrefillSmem), st,
+                                  static_cast<const bf16*>(q), rows, static_cast<const Seqs*>(seqs), kv, static_cast<bf16*>(out)));
+    else
+        SQ_CHECK_LAUNCH(sq_launch(attn_prefill_kernel<false>, dim3((rows + PF_WARPS - 1) / PF_WARPS, KVH), PF_WARPS * 32, sizeof(PrefillSmem), st,
+                                  static_cast<const bf16*>(q), rows, static_cast<const Seqs*>(seqs), kv, static_cast<bf16*>(out)));
     SQ_RETURN_LAUNCH();
 }

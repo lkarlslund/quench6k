@@ -3,13 +3,15 @@
 //! canonical boundaries), one shared [`Workspace`]; prompts are prefilled in the scheduler's chunks, which
 //! end at multiples of [`CANON_CHUNK`], and a cached prefix is reused only up to such a boundary
 //! ([`State::rewind`]), so a sequence's bits depend only on its tokens. The decoding sequences step
-//! together through [`NemotronModel::forward_batch`] (each sequence's bits as alone). No drafts yet: the
-//! Mamba states keep only what a step feeds (MTP drafting will defer them).
+//! together through [`NemotronModel::verify`] (each sequence's bits as alone) with the drafts of the
+//! checkpoint's MTP layer ([`NemotronModel::commit`]: the Mamba states keep the accepted rows; the layer
+//! drafts greedily and states each draft's probability, so the scheduler's policy verifies as many as
+//! pay off). Without the MTP layer, plain batched steps.
 
 use anyhow::{Result, anyhow};
 use quench6k_cuda::Stream;
 use quench6k_engine::nemotron::NemotronModel;
-use quench6k_engine::nemotron::forward::{CANON_CHUNK, Kv, Logits, MAX_SEQS, State, Workspace};
+use quench6k_engine::nemotron::forward::{CANON_CHUNK, Kv, Logits, MAX_DRAFTS, MAX_SEQS, MAX_VERIFY, State, Workspace};
 
 use super::slots::{After, Draft, Drafter, Drafting, Fed, GpuSampler, Shared, SlotEngine, SlotSampler, StepCandidates};
 
@@ -18,6 +20,8 @@ pub(super) struct Engine<'m> {
     s: &'m Stream,
     ws: Workspace,
     kv: Kv,
+    /// MTP drafts per pass (0: no MTP layer; QUENCH6K_NEM_DRAFTS, default 4).
+    drafts: usize,
     /// Sampling candidates of the last batched step (variant nemotron.batch_topk, default on).
     cand: Option<Shared>,
 }
@@ -25,15 +29,20 @@ pub(super) struct Engine<'m> {
 impl<'m> Engine<'m> {
     pub(super) fn new(model: &'m NemotronModel, s: &'m Stream) -> Result<Self> {
         let kv = if quench6k_engine::forward::KV_FP8.load(std::sync::atomic::Ordering::Relaxed) { Kv::Fp8 } else { Kv::Bf16 };
-        let ws = Workspace::new(model, CANON_CHUNK, MAX_SEQS)?;
+        let ws = Workspace::new(model, CANON_CHUNK, MAX_SEQS * MAX_VERIFY)?;
+        let drafts = if model.mtp.is_some() {
+            std::env::var("QUENCH6K_NEM_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).min(MAX_DRAFTS)
+        } else {
+            0
+        };
         eprintln!(
             "nemotron worker: workspace {:.2} GiB; {} bytes per position ({kv:?} cache), {:.0} MiB of Mamba state per sequence (and per snapshot)",
             ws.device_bytes as f64 / (1u64 << 30) as f64,
             State::position_bytes(&model.cfg, kv),
             State::state_bytes(&model.cfg) as f64 / (1u64 << 20) as f64
         );
-        let cand = StepCandidates::shared("nemotron", model.cfg.vocab, MAX_SEQS)?;
-        Ok(Self { model, s, ws, kv, cand })
+        let cand = StepCandidates::shared("nemotron", model.cfg.vocab, MAX_SEQS * MAX_VERIFY)?;
+        Ok(Self { model, s, ws, kv, drafts, cand })
     }
 }
 
@@ -48,16 +57,16 @@ impl<'m> SlotEngine for Engine<'m> {
         CANON_CHUNK
     }
     fn max_step(&self) -> usize {
-        1
+        1 + self.drafts
     }
     fn eos(&self) -> &[i32] {
         &self.model.cfg.eos
     }
     fn drafting(&self) -> Drafting {
         Drafting {
-            kind: Drafter::None,
-            drafts: 0,
-            costs: (0.0125, 0.0, 0.0),
+            kind: if self.drafts > 0 { Drafter::Conf } else { Drafter::None },
+            drafts: self.drafts,
+            costs: (0.0095, 0.0025, 0.0012),
             lookup: false,
         }
     }
@@ -127,8 +136,12 @@ impl<'m> SlotEngine for Engine<'m> {
         self.model.forward(st, &mut self.ws, self.s, tokens, want)?;
         Ok(self.ws.out_logits)
     }
-    fn draft(&mut self, _st: &mut State, _token: i32, _row: usize, _room: usize) -> Result<Draft> {
-        Ok(Draft { tokens: Vec::new(), conf: Vec::new(), secs: 0.0 })
+    fn draft(&mut self, st: &mut State, token: i32, _row: usize, room: usize) -> Result<Draft> {
+        // After a prefill (a plain step): the MTP layer at the prompt's last position, then the drafts.
+        let t = std::time::Instant::now();
+        let want = room.min(self.drafts);
+        let d = self.model.commit(&mut [st], &mut self.ws, self.s, &[0], &[Some(token)], &[want])?.pop().unwrap_or_default();
+        Ok(Draft { tokens: d.tokens, conf: d.conf, secs: t.elapsed().as_secs_f64() })
     }
     fn step(
         &mut self,
@@ -142,7 +155,13 @@ impl<'m> SlotEngine for Engine<'m> {
         if let Some(c) = &self.cand {
             c.borrow_mut().invalidate();
         }
-        let run = self.model.forward_batch(states, &mut self.ws, self.s, tokens).and_then(|()| match &self.cand {
+        let verify = self.drafts > 0;
+        let fwd = if verify {
+            self.model.verify(states, &mut self.ws, self.s, tokens)
+        } else {
+            self.model.forward_batch(states, &mut self.ws, self.s, tokens)
+        };
+        let run = fwd.and_then(|()| match &self.cand {
             Some(c) => c.borrow_mut().launch(self.s, self.ws.out_logits, rows),
             None => Ok(()),
         });
@@ -153,14 +172,61 @@ impl<'m> SlotEngine for Engine<'m> {
         // Logits sequence by sequence, row by row.
         let row_bytes = (self.model.cfg.vocab * 4) as u64;
         let mut row = 0;
-        let mut out = Vec::with_capacity(states.len());
+        let mut out: Vec<Result<Option<Draft>>> = Vec::with_capacity(states.len());
+        let (mut keep, mut next, mut want) = (Vec::new(), Vec::new(), Vec::new());
         for (i, st) in states.iter_mut().enumerate() {
             let src = self.ws.out_logits + row as u64 * row_bytes;
             row += tokens[i].len();
-            out.push(after(i, src, Fed { at: at[i], started }).and_then(|v| {
-                st.truncate(at[i] + v.keep, self.s)?;
-                Ok(None)
-            }));
+            match after(i, src, Fed { at: at[i], started }) {
+                Ok(v) => {
+                    keep.push(v.keep);
+                    match v.draft {
+                        Some((tok, _, room)) if verify => {
+                            next.push(Some(tok));
+                            want.push(room.min(self.drafts));
+                        }
+                        _ => {
+                            next.push(None);
+                            want.push(0);
+                        }
+                    }
+                    if !verify && let Err(e) = st.truncate(at[i] + v.keep, self.s) {
+                        out.push(Err(e));
+                        continue;
+                    }
+                    out.push(Ok(None));
+                }
+                Err(e) => {
+                    // The request ends; its sequence keeps the fed token.
+                    keep.push(1);
+                    next.push(None);
+                    want.push(0);
+                    out.push(Err(e));
+                }
+            }
+        }
+        if !verify {
+            return out;
+        }
+        // The verdicts into the Mamba states, then one MTP pass for every sequence that asked for drafts;
+        // its time is shared out evenly.
+        let t = std::time::Instant::now();
+        match self.model.commit(states, &mut self.ws, self.s, &keep, &next, &want) {
+            Ok(drafts) => {
+                let asked = want.iter().filter(|&&w| w > 0).count().max(1);
+                let secs = t.elapsed().as_secs_f64() / asked as f64;
+                for (i, d) in drafts.into_iter().enumerate() {
+                    if want[i] > 0 && out[i].is_ok() {
+                        out[i] = Ok(Some(Draft { tokens: d.tokens, conf: d.conf, secs }));
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                for o in out.iter_mut() {
+                    *o = Err(anyhow!("commit: {msg}"));
+                }
+            }
         }
         out
     }
