@@ -121,6 +121,79 @@ __global__ void __launch_bounds__(CONV_THREADS) mamba_conv_commit_kernel(const f
     }
 }
 
+// Small steps: mamba_conv_kernel and mamba_conv_commit_kernel in one launch. Grid (CONV_DIM / 256, nseq): thread =
+// (channel, sequence) over the sequence's rows in order (the history slides in registers), then the commit;
+// threads c < HEADS also compute dt of head c (the conv kernel's arithmetic) for the output and the records.
+// Every value as the two kernels give it.
+__global__ void __launch_bounds__(CONV_THREADS) mamba_conv_small_kernel(const float* proj, int ld, const Seqs* sq, int layer, int rec_rows,
+                                                                        MambaW w, int defer, bf16* xbc, float* dt) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ Seqs q;
+    __shared__ int ctl[MAX_SEQ][2];
+    load_seqs(q, sq, ctl);
+    const int s = blockIdx.y, c = blockIdx.x * CONV_THREADS + threadIdx.x;
+    if (s >= q.nseq || c >= CONV_DIM) return;
+    const int replay = ctl[s][0], parity = ctl[s][1];
+    const int nrows = q.row0[s + 1] - q.row0[s], rbase = q.row0[s];
+    float eff[3];
+#pragma unroll
+    for (int k = 0; k < 3; ++k) eff[k] = window(q, s, layer, rec_rows, replay, parity, k, c);
+    const float w0 = w.conv_w[c * TAPS], w1 = w.conv_w[c * TAPS + 1], w2 = w.conv_w[c * TAPS + 2], w3 = w.conv_w[c * TAPS + 3];
+    const float b = w.conv_b[c];
+    const float bias = c < HEADS ? w.dt_bias[c] : 0.0f;
+    float h0 = eff[0], h1 = eff[1], h2 = eff[2];
+    // The rows' inputs load before the first store (which the compiler cannot move loads across); rows past
+    // PRE_ROWS (not in decode or verification steps) load as they come.
+    constexpr int PRE_ROWS = 16;
+    float xin[PRE_ROWS], din[PRE_ROWS];
+#pragma unroll
+    for (int i = 0; i < PRE_ROWS; ++i)
+        if (i < nrows) {
+            xin[i] = raw_xbc(proj, ld, rbase + i, c);
+            din[i] = c < HEADS ? rb(__ldcg(proj + (size_t)(rbase + i) * ld + DT_COL + c)) : 0.0f;
+        }
+    auto row = [&](int i, float x, float draw) {
+        const int r = rbase + i;
+        float acc = b;
+        acc = fmaf(w0, h0, acc);
+        acc = fmaf(w1, h1, acc);
+        acc = fmaf(w2, h2, acc);
+        acc = fmaf(w3, x, acc);
+        const bf16 o = f2bf(acc / (1.0f + expf(-acc)));
+        xbc[(size_t)r * CONV_DIM + c] = o;
+        float d = 0.0f;
+        if (c < HEADS) {
+            const float v = draw + bias;
+            const float sp = v <= 20.0f ? log1pf(expf(v)) : v;
+            d = fminf(fmaxf(sp, w.dt_min), w.dt_max);
+            dt[(size_t)r * HEADS + c] = d;
+        }
+        if (defer && i < rec_rows) {
+            unsigned char* rr = rec_row(q, s, layer, rec_rows, parity ^ 1, i);
+            rec_raw(rr)[c] = f2bf(x);
+            rec_conv(rr)[c] = o;
+            if (c < HEADS) rec_dt(rr)[c] = d;
+        }
+        h0 = h1, h1 = h2, h2 = x;
+    };
+#pragma unroll
+    for (int i = 0; i < PRE_ROWS; ++i)
+        if (i < nrows) row(i, xin[i], din[i]);
+    for (int i = PRE_ROWS; i < nrows; ++i)
+        row(i, raw_xbc(proj, ld, rbase + i, c), c < HEADS ? rb(__ldcg(proj + (size_t)(rbase + i) * ld + DT_COL + c)) : 0.0f);
+    float* cs = conv_state(q, s, layer, rec_rows);
+    if (defer) {
+        if (replay > 0)
+#pragma unroll
+            for (int k = 0; k < 3; ++k) cs[(size_t)k * CONV_DIM + c] = eff[k];
+    } else if (replay > 0 || nrows > 0) {
+        cs[c] = h0;
+        cs[(size_t)CONV_DIM + c] = h1;
+        cs[(size_t)2 * CONV_DIM + c] = h2;
+    }
+}
+
 // Selective scan: block = (head h, PB channels) x sequence, warps of SLOTS channels x 128 state entries (lane:
 // n = 4 lane .. 4 lane + 3). Per token and channel: dA = exp(dt A), S = fmaf(S, dA, (B dt) x); y = the
 // warp_sum tree over lanes of the lane partial S0 C0 + S1 C1 + S2 C2 + S3 C3 (fma order), + x D. The same
@@ -319,6 +392,16 @@ extern "C" cudaError_t quench6k_nem_mamba_conv_commit(const float* proj, int ld,
     const dim3 grid(CONV_DIM / CONV_THREADS, nseq);
     SQ_CHECK_LAUNCH(sq_launch(mamba_conv_commit_kernel, grid, CONV_THREADS, 0, st, proj, ld, static_cast<const Seqs*>(seqs), layer, rec_rows,
                               static_cast<const bf16*>(xbc), dt, defer, flush));
+    SQ_RETURN_LAUNCH();
+}
+
+extern "C" cudaError_t quench6k_nem_mamba_conv_small(const float* proj, int ld, const void* seqs, int nseq, int layer, int rec_rows, MambaW w,
+                                                     int defer, void* xbc, float* dt, cudaStream_t st) {
+    if (nseq <= 0) return cudaSuccess;
+    if (nseq > MAX_SEQ || (defer && rec_rows <= 0) || ld < DT_COL + HEADS) return cudaErrorInvalidValue;
+    const dim3 grid(CONV_DIM / CONV_THREADS, nseq);
+    SQ_CHECK_LAUNCH(sq_launch(mamba_conv_small_kernel, grid, CONV_THREADS, 0, st, proj, ld, static_cast<const Seqs*>(seqs), layer, rec_rows, w, defer,
+                              static_cast<bf16*>(xbc), dt));
     SQ_RETURN_LAUNCH();
 }
 

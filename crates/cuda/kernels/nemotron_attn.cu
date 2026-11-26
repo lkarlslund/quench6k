@@ -344,6 +344,44 @@ __global__ void __launch_bounds__(HD) attn_combine_kernel(const float* part, con
     }
 }
 
+// Grid (rows, 2, 16 heads), thread = dim: folds the row's groups in order and normalizes. The partials are
+// loaded CB groups ahead of the fold (the fold's order and arithmetic are those of one load at a time).
+constexpr int CB = 8;
+__global__ void __launch_bounds__(HD) attn_combine_heads_kernel(const float* part, const Seqs* sq, int max_groups, bf16* out) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ Seqs q;
+    load_seqs(q, sq);
+    const int r = blockIdx.x, g = blockIdx.y, h = blockIdx.z, d = threadIdx.x;
+    const int s = seq_of_row(q, r);
+    if (s < 0) return;
+    const int pos = q.start[s] + r - q.row0[s];
+    const int ng = pos / ATTN_GROUP + 1;
+    const float* base = part + ((size_t)r * KVH + g) * max_groups * PART_FLOATS;
+    float mt = __ldcg(base + QPK * HD + h), lt = __ldcg(base + QPK * HD + QPK + h), at = __ldcg(base + h * HD + d);
+    for (int g0 = 1; g0 < ng; g0 += CB) {
+        float pm[CB], pl[CB], pa[CB];
+#pragma unroll
+        for (int i = 0; i < CB; ++i) {
+            if (g0 + i < ng) {
+                const float* p = base + (size_t)(g0 + i) * PART_FLOATS;
+                pm[i] = __ldcg(p + QPK * HD + h);
+                pl[i] = __ldcg(p + QPK * HD + QPK + h);
+                pa[i] = __ldcg(p + h * HD + d);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < CB; ++i) {
+            if (g0 + i < ng) {
+                float a, b;
+                fold_ml(mt, lt, pm[i], pl[i], a, b);
+                at = fold_acc(at, pa[i], a, b);
+            }
+        }
+    }
+    out[(size_t)r * QH * HD + (g * QPK + h) * HD + d] = f2bf(__fdiv_rn(at, lt));
+}
+
 // Prefill: grid (ceil(rows / 4), 2), 4 warps, warp w = row 4 blockIdx.x + w over all 128 dims. Rows of one
 // sequence share the key tiles; groups are folded as they end (the running total in shared memory, each
 // thread its own fragment slots).
@@ -453,6 +491,11 @@ extern "C" cudaError_t quench6k_nem_attn_prep(const float* qkv, int ld, int q_co
     SQ_RETURN_LAUNCH();
 }
 
+// The small steps' combine: a CTA per (row, KV head, query head) with its loads ahead (1, default) or per (row,
+// KV head) (0); the same bits. For A/B timings.
+static int combine_heads = 1;
+extern "C" void quench6k_nem_set_attn_combine(int heads) { combine_heads = heads; }
+
 extern "C" size_t quench6k_nem_attn_part_floats(int rows, int max_groups) { return (size_t)rows * KVH * max_groups * PART_FLOATS; }
 
 extern "C" cudaError_t quench6k_nem_attention_small(const void* q, int rows, const void* seqs, long long kv_off, long long kv_ld, int fp8,
@@ -466,8 +509,12 @@ extern "C" cudaError_t quench6k_nem_attention_small(const void* q, int rows, con
     else
         SQ_CHECK_LAUNCH(sq_launch(attn_decode_kernel<false>, dim3(rows, KVH, max_groups), AT_THREADS, 0, st, static_cast<const bf16*>(q),
                                   static_cast<const Seqs*>(seqs), kv, max_groups, part));
-    SQ_CHECK_LAUNCH(sq_launch(attn_combine_kernel, dim3(rows, KVH), HD, 0, st, (const float*)part, static_cast<const Seqs*>(seqs), max_groups,
-                              static_cast<bf16*>(out)));
+    if (combine_heads)
+        SQ_CHECK_LAUNCH(sq_launch(attn_combine_heads_kernel, dim3(rows, KVH, QPK), HD, 0, st, (const float*)part, static_cast<const Seqs*>(seqs),
+                                  max_groups, static_cast<bf16*>(out)));
+    else
+        SQ_CHECK_LAUNCH(sq_launch(attn_combine_kernel, dim3(rows, KVH), HD, 0, st, (const float*)part, static_cast<const Seqs*>(seqs), max_groups,
+                                  static_cast<bf16*>(out)));
     SQ_RETURN_LAUNCH();
 }
 
