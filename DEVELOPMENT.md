@@ -59,7 +59,7 @@ prints the eager and graph speeds of the batched plain steps.
 The other models are gated against independent PyTorch references on the same checkpoint, in BF16
 (reference A) and FP32 (B), over the oracle conversations re-rendered in the model's chat template and
 tokenizer (built into out/, not committed). For Nemotron-H (Nemotron 3 Super, Munin 2.0;
-`tools/ref/nemotron_ref.py` runs on the CPU, about 1.5 hours for the six short fixtures in BF16):
+`tools/ref/nemotron_ref.py` runs on the CPU, about 10 minutes for the six short fixtures in BF16):
 
 ```
 M=/path/to/munin-2.0-nvfp4
