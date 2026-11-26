@@ -2,8 +2,8 @@
 // a gate (down(relu(up(x))²)) in the 1024-wide latent space, the relu² of BF16 Linear outputs and the
 // weighted combine (see crates/cuda/src/nemotron.rs).
 //
-// Small steps: GEMV-style warp items over (pair, rows) in expert order, so pairs of one expert read its
-// weights from DRAM once. Prefill: pairs grouped by expert into tiles for the shared W4A16 grouped GEMM
+// Small steps: GEMV-style; pairs grouped by expert, so an expert's weights are read once per step.
+// Prefill: pairs grouped by expert into tiles for the shared W4A16 grouped GEMM
 // (moe.cu quench6k_moe_nvfp4_gemm). Each pair's result depends only on its own row and expert.
 
 #include <algorithm>
@@ -96,11 +96,14 @@ __global__ void pair_order_kernel(const int* sel_e, int pairs, int* order) {
     if (p >= pairs) return;
     const int e = es[p];
     int rank = 0;
+    bool first = true;
     for (int q = 0; q < pairs; ++q) {
         const int f = es[q];
         rank += f < e || (f == e && q < p);
+        first = first && !(f == e && q < p);
     }
-    order[rank] = p;
+    // Bit 30: first pair of its expert (the grouped kernels' group starts).
+    order[rank] = p | (first ? 1 << 30 : 0);
 }
 
 // 16 NVFP4 weights (8 code bytes, low nibble first) times 16 activations, times the block scale.
@@ -117,8 +120,54 @@ SQ_DEVICE float fp4_dot16(uint2 codes, uint8_t scale, const float* x) {
     return part * e4m3f(scale);
 }
 
-SQ_DEVICE void bf16x16(const bf16* p, float* out) {
-    const uint4 a = __ldcg(reinterpret_cast<const uint4*>(p)), b = __ldcg(reinterpret_cast<const uint4*>(p) + 1);
+constexpr int EX_WARPS = 8, EX_ROWS = 4, EX_CTAS_PER_SM = 2;
+constexpr int UP_CPL = LATENT / 16 / 32;            // 2 chunks of 16 inputs per lane
+constexpr int DOWN_CHUNKS = MOE_INTER / 16;         // 168
+constexpr int DOWN_CPL = (DOWN_CHUNKS + 31) / 32;   // 6 (the last for lanes < 8)
+
+// Pairs of one expert form a group; a CTA item is (group, tile of 8 warps x R rows). Each warp loads its R
+// weight rows once, the group's activations are staged in shared memory, and every pair of the group is
+// multiplied with the rows in registers. Per pair and row: lane l takes input chunks l + 32 j in order
+// (fp4_dot16 each, summed from 0), then the warp_sum tree; so a pair's result does not depend on which
+// other pairs share its expert or the step.
+constexpr int GMAX = SMALL_ROWS * TOPK;
+
+struct Groups {
+    int pair[GMAX];
+    int start[GMAX + 1];
+    int count;
+};
+
+// The step's groups from the order (bit 30 marks a group's first pair). Ends with a barrier.
+SQ_DEVICE void load_groups(Groups& g, const int* order, int pairs) {
+    __shared__ int wsum[(GMAX + 255) / 256 * 8];  // one per warp of every pass of 256 pairs
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    for (int base = 0; base < pairs; base += blockDim.x) {
+        const int i = base + tid;
+        const int v = i < pairs ? __ldcg(order + i) : 0;
+        if (i < pairs) g.pair[i] = v & 0xffff;
+        const bool f = i < pairs && (v >> 30 & 1);
+        const unsigned m = __ballot_sync(0xffffffff, f);
+        if (lane == 0) wsum[base / 32 + warp] = __popc(m);
+        __syncthreads();
+        if (f) {
+            int pos = __popc(m & ((1u << lane) - 1));
+            for (int w = 0; w < base / 32 + warp; ++w) pos += wsum[w];
+            g.start[pos] = i;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        int n = 0;
+        for (int w = 0; w < (pairs + 31) / 32; ++w) n += wsum[w];
+        g.count = n;
+        g.start[n] = pairs;
+    }
+    __syncthreads();
+}
+
+SQ_DEVICE void bf16x16_s(const bf16* p, float* out) {
+    const uint4 a = reinterpret_cast<const uint4*>(p)[0], b = reinterpret_cast<const uint4*>(p)[1];
     const __nv_bfloat162* pa = reinterpret_cast<const __nv_bfloat162*>(&a);
     const __nv_bfloat162* pb = reinterpret_cast<const __nv_bfloat162*>(&b);
 #pragma unroll
@@ -128,65 +177,91 @@ SQ_DEVICE void bf16x16(const bf16* p, float* out) {
     }
 }
 
-constexpr int EX_WARPS = 8, EX_ROWS = 4;
-constexpr int UP_CPL = LATENT / 16 / 32;            // 2 chunks of 16 inputs per lane
-constexpr int DOWN_CHUNKS = MOE_INTER / 16;         // 168
-constexpr int DOWN_CPL = (DOWN_CHUNKS + 31) / 32;   // 6 (the last for lanes < 8)
-
-// Up + relu²: item = (EX_ROWS rows, pair in expert order); act[pair, n] = bf16(relu(bf16(up · x))²).
-__global__ void __launch_bounds__(EX_WARPS * 32) experts_up_kernel(const bf16* x, const int* sel_e, const int* order, NvExperts up, int pairs,
-                                                                   bf16* act) {
+template <int R>
+__global__ void __launch_bounds__(EX_WARPS * 32) experts_up_grouped(const bf16* x, const int* sel_e, const int* order, NvExperts up, int pairs,
+                                                                    bf16* act) {
+    constexpr int TILE = EX_WARPS * R, TILES = MOE_INTER / TILE;
     pdl_launch_dependents();
     pdl_wait();
-    const int lane = threadIdx.x & 31;
-    const int warps = gridDim.x * EX_WARPS, items = pairs * (MOE_INTER / EX_ROWS);
-    for (int item = blockIdx.x * EX_WARPS + (threadIdx.x >> 5); item < items; item += warps) {
-        const int pair = __ldcg(order + item % pairs), n0 = item / pairs * EX_ROWS;
-        const int t = pair / TOPK, e = __ldcg(sel_e + pair);
+    __shared__ Groups gr;
+    __shared__ __align__(16) bf16 xs[SMALL_ROWS][LATENT];
+    load_groups(gr, order, pairs);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int items = gr.count * TILES;
+    for (int item = blockIdx.x; item < items; item += gridDim.x) {
+        const int k = item / TILES, n0 = (item % TILES) * TILE + warp * R;
+        const int p0 = gr.start[k], np = gr.start[k + 1] - p0;
+        const int e = __ldcg(sel_e + gr.pair[p0]);
         const size_t row0 = (size_t)e * MOE_INTER + n0;
-        uint2 c[EX_ROWS][UP_CPL];
-        uint8_t sc[EX_ROWS][UP_CPL];
+        uint2 c[R][UP_CPL];
+        uint8_t sc[R][UP_CPL];
 #pragma unroll
-        for (int r = 0; r < EX_ROWS; ++r)
+        for (int r = 0; r < R; ++r)
 #pragma unroll
             for (int j = 0; j < UP_CPL; ++j) {
                 const int chunk = lane + 32 * j;
                 c[r][j] = ld_stream_u2(up.codes + (row0 + r) * (LATENT / 2) + chunk * 8);
                 sc[r][j] = up.scales[(row0 + r) * (LATENT / 16) + chunk];
             }
-        float xs[UP_CPL][16];
-#pragma unroll
-        for (int j = 0; j < UP_CPL; ++j) bf16x16(x + (size_t)t * LATENT + (lane + 32 * j) * 16, xs[j]);
+        __syncthreads();
+        for (int i = threadIdx.x; i < np * (LATENT / 8); i += blockDim.x) {
+            const int q = i / (LATENT / 8), o = i % (LATENT / 8);
+            reinterpret_cast<uint4*>(xs[q])[o] = __ldcg(reinterpret_cast<const uint4*>(x + (size_t)(gr.pair[p0 + q] / TOPK) * LATENT) + o);
+        }
+        __syncthreads();
         const float s2 = up.s2[e];
+        for (int q = 0; q < np; ++q) {
+            // Keep the codes packed (decode per pair, not hoisted out of the loop into 16 floats per chunk).
 #pragma unroll
-        for (int r = 0; r < EX_ROWS; ++r) {
-            float acc = 0.0f;
+            for (int r = 0; r < R; ++r)
 #pragma unroll
-            for (int j = 0; j < UP_CPL; ++j) acc += fp4_dot16(c[r][j], sc[r][j], xs[j]);
-            acc = warp_sum(acc);
-            if (lane == 0) {
-                const float v = fmaxf(rb(acc * s2), 0.0f);
-                act[(size_t)pair * MOE_INTER + n0 + r] = f2bf(v * v);
+                for (int j = 0; j < UP_CPL; ++j) asm volatile("" : "+r"(c[r][j].x), "+r"(c[r][j].y));
+            float acc[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < UP_CPL; ++j) {
+                float xv[16];
+                bf16x16_s(&xs[q][(lane + 32 * j) * 16], xv);
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[r] += fp4_dot16(c[r][j], sc[r][j], xv);
+            }
+            const int pair = gr.pair[p0 + q];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float v = warp_sum(acc[r]);
+                if (lane == r) {
+                    const float a = fmaxf(rb(v * s2), 0.0f);
+                    act[(size_t)pair * MOE_INTER + n0 + r] = f2bf(a * a);
+                }
             }
         }
     }
 }
 
-// Down: y[pair, n] = s2[e] * W_e[n] · act[pair] (FP32 [pairs, 1024]).
-__global__ void __launch_bounds__(EX_WARPS * 32) experts_down_kernel(const bf16* act, const int* sel_e, const int* order, NvExperts down, int pairs,
-                                                                     float* y) {
+constexpr int DOWN_PB = 4;  // pairs' activations staged at a time
+
+template <int R>
+__global__ void __launch_bounds__(EX_WARPS * 32) experts_down_grouped(const bf16* act, const int* sel_e, const int* order, NvExperts down, int pairs,
+                                                                      float* y) {
+    constexpr int TILE = EX_WARPS * R, TILES = LATENT / TILE;
     pdl_launch_dependents();
-    pdl_wait();
-    const int lane = threadIdx.x & 31;
-    const int warps = gridDim.x * EX_WARPS, items = pairs * (LATENT / EX_ROWS);
-    for (int item = blockIdx.x * EX_WARPS + (threadIdx.x >> 5); item < items; item += warps) {
-        const int pair = __ldcg(order + item % pairs), n0 = item / pairs * EX_ROWS;
-        const int e = __ldcg(sel_e + pair);
+    __shared__ Groups gr;
+    __shared__ __align__(16) bf16 as[DOWN_PB][MOE_INTER];
+    // The order and the routing come before the up kernel: weights load while it finishes.
+    load_groups(gr, order, pairs);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int items = gr.count * TILES;
+    bool waited = false;
+    for (int item = blockIdx.x; item < items; item += gridDim.x) {
+        const int k = item / TILES, n0 = (item % TILES) * TILE + warp * R;
+        const int p0 = gr.start[k], np = gr.start[k + 1] - p0;
+        const int e = __ldcg(sel_e + gr.pair[p0]);
         const size_t row0 = (size_t)e * LATENT + n0;
-        uint2 c[EX_ROWS][DOWN_CPL];
-        uint8_t sc[EX_ROWS][DOWN_CPL];
+        uint2 c[R][DOWN_CPL];
+        uint8_t sc[R][DOWN_CPL];
 #pragma unroll
-        for (int r = 0; r < EX_ROWS; ++r)
+        for (int r = 0; r < R; ++r)
 #pragma unroll
             for (int j = 0; j < DOWN_CPL; ++j) {
                 const int chunk = lane + 32 * j;
@@ -198,23 +273,46 @@ __global__ void __launch_bounds__(EX_WARPS * 32) experts_down_kernel(const bf16*
                     sc[r][j] = 0;
                 }
             }
-        float acc[EX_ROWS] = {};
-#pragma unroll
-        for (int j = 0; j < DOWN_CPL; ++j) {
-            const int chunk = lane + 32 * j;
-            if (chunk >= DOWN_CHUNKS) continue;
-            float xs[16];
-            bf16x16(act + (size_t)pair * MOE_INTER + chunk * 16, xs);
-#pragma unroll
-            for (int r = 0; r < EX_ROWS; ++r) acc[r] += fp4_dot16(c[r][j], sc[r][j], xs);
+        if (!waited) {
+            pdl_wait();
+            waited = true;
         }
         const float s2 = down.s2[e];
+        for (int b0 = 0; b0 < np; b0 += DOWN_PB) {
+            const int nb = min(DOWN_PB, np - b0);
+            __syncthreads();
+            for (int i = threadIdx.x; i < nb * (MOE_INTER / 8); i += blockDim.x) {
+                const int q = i / (MOE_INTER / 8), o = i % (MOE_INTER / 8);
+                reinterpret_cast<uint4*>(as[q])[o] = __ldcg(reinterpret_cast<const uint4*>(act + (size_t)gr.pair[p0 + b0 + q] * MOE_INTER) + o);
+            }
+            __syncthreads();
+            for (int q = 0; q < nb; ++q) {
 #pragma unroll
-        for (int r = 0; r < EX_ROWS; ++r) {
-            const float v = warp_sum(acc[r]);
-            if (lane == 0) y[(size_t)pair * LATENT + n0 + r] = v * s2;
+                for (int r = 0; r < R; ++r)
+#pragma unroll
+                    for (int j = 0; j < DOWN_CPL; ++j) asm volatile("" : "+r"(c[r][j].x), "+r"(c[r][j].y));
+                float acc[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+#pragma unroll
+                for (int j = 0; j < DOWN_CPL; ++j) {
+                    const int chunk = lane + 32 * j;
+                    if (chunk >= DOWN_CHUNKS) continue;
+                    float xv[16];
+                    bf16x16_s(&as[q][chunk * 16], xv);
+#pragma unroll
+                    for (int r = 0; r < R; ++r) acc[r] += fp4_dot16(c[r][j], sc[r][j], xv);
+                }
+                const int pair = gr.pair[p0 + b0 + q];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const float v = warp_sum(acc[r]);
+                    if (lane == r) y[(size_t)pair * LATENT + n0 + r] = v * s2;
+                }
+            }
         }
     }
+    if (!waited) pdl_wait();
 }
 
 int sm_count() {
@@ -323,13 +421,11 @@ extern "C" cudaError_t quench6k_nem_moe_experts_small(const void* x, const int* 
     if (rows > SMALL_ROWS) return cudaErrorInvalidValue;
     const int pairs = rows * TOPK;
     SQ_CHECK_LAUNCH(sq_launch(pair_order_kernel, 1, (pairs + 31) / 32 * 32, 0, st, sel_e, pairs, order));
-    const int cap = sm_count() * 4;
-    const int up_blocks = std::min(cap, (pairs * (MOE_INTER / EX_ROWS) + EX_WARPS - 1) / EX_WARPS);
-    SQ_CHECK_LAUNCH(sq_launch(experts_up_kernel, up_blocks, EX_WARPS * 32, 0, st, static_cast<const bf16*>(x), sel_e, (const int*)order, up, pairs,
-                              static_cast<bf16*>(act)));
-    const int down_blocks = std::min(cap, (pairs * (LATENT / EX_ROWS) + EX_WARPS - 1) / EX_WARPS);
-    SQ_CHECK_LAUNCH(sq_launch(experts_down_kernel, down_blocks, EX_WARPS * 32, 0, st, static_cast<const bf16*>(act), sel_e, (const int*)order, down,
-                              pairs, y));
+    const int blocks = sm_count() * EX_CTAS_PER_SM;
+    SQ_CHECK_LAUNCH(sq_launch(experts_up_grouped<EX_ROWS>, blocks, EX_WARPS * 32, 0, st, static_cast<const bf16*>(x), sel_e, (const int*)order, up,
+                              pairs, static_cast<bf16*>(act)));
+    SQ_CHECK_LAUNCH(sq_launch(experts_down_grouped<EX_ROWS>, blocks, EX_WARPS * 32, 0, st, (const bf16*)act, sel_e, (const int*)order, down, pairs,
+                              y));
     SQ_RETURN_LAUNCH();
 }
 
