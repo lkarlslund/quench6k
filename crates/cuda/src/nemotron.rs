@@ -873,3 +873,28 @@ mod widen_ffi {
 pub fn bf16_to_f32(s: &Stream, x: u64, n: usize, out: u64) -> Result<()> {
     check(unsafe { widen_ffi::quench6k_nem_bf16_to_f32(x as *const c_void, n, out as *mut f32, s.raw()) }, "nem_bf16_to_f32")
 }
+
+mod expand_ffi {
+    use crate::ffi::{Error, Stream};
+
+    unsafe extern "C" {
+        pub fn quench6k_nem_expand_bf16(
+            fmt: std::ffi::c_int,
+            w: *const std::ffi::c_void,
+            scale: *const f32,
+            n: std::ffi::c_int,
+            k: std::ffi::c_int,
+            out: *mut std::ffi::c_void,
+            st: Stream,
+        ) -> Error;
+    }
+}
+
+/// out BF16 [n, k] = an FP8-block or INT8-group projection's weights as the GEMM stages them (the same
+/// values: running the BF16 GEMM on them gives the 8-bit GEMM's bits). k a multiple of 128.
+pub fn expand_bf16(s: &Stream, fmt: crate::kernels::WeightFormat, w: u64, scale: u64, n: usize, k: usize, out: u64) -> Result<()> {
+    check(
+        unsafe { expand_ffi::quench6k_nem_expand_bf16(fmt as c_int, w as *const c_void, scale as *const f32, n as c_int, k as c_int, out as *mut c_void, s.raw()) },
+        "nem_expand_bf16",
+    )
+}

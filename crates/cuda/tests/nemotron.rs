@@ -1023,3 +1023,46 @@ fn digest() {
         eprintln!("digest attention fp8 {fp8}: cache {:016x} prefill {:016x} decode {:016x}", digest_of(&bytes), digest_of(&full), digest_of(&dec));
     }
 }
+
+/// Prefill projections: the FP8-block / INT8-group GEMM against expanding the weights to BF16 and running
+/// the BF16 GEMM (bitwise equal outputs; times per call, M = QUENCH6K_NEM_TIME_ROWS or 2048 and 6144).
+#[test]
+#[ignore]
+fn time_dense() {
+    use quench6k_cuda::kernels::{self as kk, WeightFormat};
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(43);
+    let ms: Vec<usize> = match std::env::var("QUENCH6K_NEM_TIME_ROWS").ok().and_then(|v| v.parse().ok()) {
+        Some(m) => vec![m],
+        None => vec![2048, 6144],
+    };
+    for &(n, k) in &[(18560usize, 4096usize), (4096, 8192), (5376, 4096), (4096, 5376), (4096, 1024)] {
+        for fmt in [WeightFormat::Fp8Block, WeightFormat::Int8Group] {
+            // E4M3 codes without NaN (0x7f / 0xff); INT8 any byte.
+            let codes = up(&s, &rand_bytes(&mut rng, n * k, |b| if fmt == WeightFormat::Fp8Block && b & 0x7f == 0x7f { b & 0xf7 } else { b }));
+            let nsc = if fmt == WeightFormat::Fp8Block { n.div_ceil(128) * (k / 128) } else { n * (k / kk::int8_group()) };
+            let sc = up(&s, &rng.vec(nsc, 0.001, 0.01));
+            let wb = DeviceBuffer::new(n * k * 2).unwrap();
+            for &m in &ms {
+                let x: Vec<u16> = rng.vec(m * k, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
+                let xb = up(&s, &x);
+                let (ya, yb) = (DeviceBuffer::new(m * n * 4).unwrap(), DeviceBuffer::new(m * n * 4).unwrap());
+                kk::gemm_f32(&s, xb.addr(), k, fmt, codes.addr(), k, sc.addr(), ya.addr(), n, m, n, k, 0.5, false).unwrap();
+                expand_bf16(&s, fmt, codes.addr(), sc.addr(), n, k, wb.addr()).unwrap();
+                kk::gemm_f32(&s, xb.addr(), k, WeightFormat::Bf16, wb.addr(), k, 0, yb.addr(), n, m, n, k, 0.5, false).unwrap();
+                let (a, b): (Vec<u32>, Vec<u32>) = (s.download(ya.addr(), m * n).unwrap(), s.download(yb.addr(), m * n).unwrap());
+                assert!(a == b, "{fmt:?} M={m} N={n} K={k}: expanded BF16 GEMM differs");
+                let t8 = time_graph(&s, |st| kk::gemm_f32(st, xb.addr(), k, fmt, codes.addr(), k, sc.addr(), ya.addr(), n, m, n, k, 0.5, false), 1);
+                let te = time_graph(&s, |st| expand_bf16(st, fmt, codes.addr(), sc.addr(), n, k, wb.addr()), 1);
+                let tb = time_graph(&s, |st| kk::gemm_f32(st, xb.addr(), k, WeightFormat::Bf16, wb.addr(), k, 0, yb.addr(), n, m, n, k, 0.5, false), 1);
+                let tf = |us: f64| 2.0 * (m * n * k) as f64 / us / 1e6;
+                eprintln!(
+                    "TIME dense {fmt:?} M={m} N={n} K={k}: 8-bit {t8:.0} us ({:.0} TFLOPS), expand {te:.0} + BF16 {tb:.0} ({:.0} TFLOPS) = {:.0} us; bitwise equal",
+                    tf(t8),
+                    tf(tb),
+                    te + tb
+                );
+            }
+        }
+    }
+}

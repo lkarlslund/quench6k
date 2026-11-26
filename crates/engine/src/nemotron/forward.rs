@@ -409,6 +409,8 @@ pub struct Workspace {
     dh: u64,
     mseqs: u64,
     accepted: u64,
+    /// 8-bit projection weights expanded to BF16 for large steps ([`EXPAND_BYTES`]; 0: none).
+    wexp: u64,
     /// Embedding rows (F32) and the descriptor of a step, then those of an MTP pass and accepted rows,
     /// staged for upload.
     pinned: PinnedBuffer,
@@ -423,7 +425,7 @@ const SEQS_BYTES: usize = std::mem::size_of::<nk::Seqs>();
 
 impl Workspace {
     /// Device bytes of the buffers, in the order [`Workspace::new`] allocates them.
-    fn sizes(cfg: &Config, max_t: usize, logit_rows: usize) -> (usize, [usize; 42]) {
+    fn sizes(cfg: &Config, max_t: usize, logit_rows: usize) -> (usize, [usize; 43]) {
         let cap = Self::cap(max_t);
         let lr = logit_rows.max(1);
         let vocab = cfg.vocab;
@@ -476,6 +478,7 @@ impl Workspace {
                 MAX_SEQS * D * 4,
                 SEQS_BYTES,
                 MAX_SEQS * 4,
+                if max_t >= CANON_CHUNK { EXPAND_BYTES } else { 0 },
             ],
         )
     }
@@ -506,7 +509,7 @@ impl Workspace {
         let (max_tiles, sz) = Self::sizes(&model.cfg, max_t, logit_rows);
         let cap = Self::cap(max_t);
         let mut a = Alloc { buffers: Vec::new(), bytes: 0 };
-        let mut b = [0u64; 42];
+        let mut b = [0u64; 43];
         for (slot, &bytes) in b.iter_mut().zip(&sz) {
             *slot = a.get(bytes)?;
         }
@@ -556,6 +559,7 @@ impl Workspace {
             dh: b[39],
             mseqs: b[40],
             accepted: b[41],
+            wexp: if sz[42] > 0 { b[42] } else { 0 },
             pinned: PinnedBuffer::new(Self::pinned_layout(cap).4)?,
             dump: std::env::var_os("QUENCH6K_NEM_DUMP").map(PathBuf::from),
             device_bytes: a.bytes,
@@ -574,6 +578,28 @@ impl Workspace {
         }
         Ok(self.part.as_ref().unwrap().addr())
     }
+}
+
+/// Largest 8-bit projection (BF16 bytes) whose weights large steps expand to BF16 before the GEMM: the
+/// out_proj (4096 x 8192); the in_proj (18560 x 4096, 152 MB in BF16, beyond L2) stays on the 8-bit path.
+const EXPAND_BYTES: usize = 64 << 20;
+
+/// Y [m, l.n] F32 (+)= alpha X [m, l.k] BF16 . W^T: the GEMV (per-row arithmetic independent of m) for
+/// small steps and any m up to the GEMV's rows, the tensor-core GEMM otherwise. Steps of at least
+/// nem.expand rows (default 2048; 0: never) expand FP8-block / INT8-group weights of up to EXPAND_BYTES to
+/// BF16 in `wexp` first and run the BF16 GEMM: the values the 8-bit GEMM stages, so the same bits, and
+/// faster (its per-tile dequantization costs more than the expansion).
+#[allow(clippy::too_many_arguments)]
+fn linear_x(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usize, small: bool, accumulate: bool, wexp: u64) -> Result<()> {
+    let gm = k::gemv_max_m();
+    let eight = matches!(l.fmt, WeightFormat::Fp8Block | WeightFormat::Int8Group);
+    let min_rows = quench6k_cuda::variants::get("nem.expand", 2048) as usize;
+    if wexp != 0 && eight && !small && m > gm && min_rows > 0 && m >= min_rows && l.n * l.k * 2 <= EXPAND_BYTES {
+        nk::expand_bf16(s, l.fmt, l.w, l.scale, l.n, l.k, wexp)?;
+        let flags = quench6k_cuda::variants::get("nem.gemm", 2) as u32;
+        return nk::gemm_f32_ext(s, x, ldx, WeightFormat::Bf16, wexp, l.k, 0, y, ldy, m, l.n, l.k, l.alpha, accumulate, flags);
+    }
+    linear(s, x, ldx, m, l, y, ldy, small, accumulate)
 }
 
 /// Y [m, l.n] F32 (+)= alpha X [m, l.k] BF16 . W^T: the GEMV (per-row arithmetic independent of m) for
@@ -862,17 +888,17 @@ impl NemotronModel {
     /// out_proj into ws.mix.
     fn mamba(&self, ws: &Workspace, s: &Stream, m: &Mamba, slot: usize, plan: &Plan) -> Result<()> {
         let r = plan.r;
-        linear(s, ws.xn, D, r, &m.in_proj, ws.big, INP, plan.small, false)?;
+        linear_x(s, ws.xn, D, r, &m.in_proj, ws.big, INP, plan.small, false, ws.wexp)?;
         dsync(s, 1)?;
         nk::mamba_mixer(s, ws.big, INP, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, &ws.mamba, ws.act)?;
-        linear(s, ws.act, DI, r, &m.out_proj, ws.mix, D, plan.small, false)
+        linear_x(s, ws.act, DI, r, &m.out_proj, ws.mix, D, plan.small, false, ws.wexp)
     }
 
     /// Attention mixer: q/k/v; keys and values into the caches; causal GQA attention; o_proj into ws.mix.
     fn attention(&self, ws: &Workspace, s: &Stream, a: &Attn, kv: nk::KvRows, plan: &Plan) -> Result<()> {
         let r = plan.r;
         debug_assert_eq!(kv.fp8, plan.kv_fp8);
-        linear(s, ws.xn, D, r, &a.qkv, ws.big, QKV, plan.small, false)?;
+        linear_x(s, ws.xn, D, r, &a.qkv, ws.big, QKV, plan.small, false, ws.wexp)?;
         dsync(s, 16)?;
         nk::attn_prep(s, ws.big, QKV, 0, H * HD, (H + KVH) * HD, r, plan.seqs, kv, ws.q)?;
         dsync(s, 32)?;
@@ -881,16 +907,16 @@ impl NemotronModel {
         } else {
             nk::attention_prefill(s, ws.q, r, plan.seqs, kv, ws.act)?;
         }
-        linear(s, ws.act, H * HD, r, &a.o, ws.mix, D, plan.small, false)
+        linear_x(s, ws.act, H * HD, r, &a.o, ws.mix, D, plan.small, false, ws.wexp)
     }
 
     /// MoE mixer: router; routed experts in the latent space (fc1 -> experts -> combine -> fc2); the
     /// shared expert on the full width, added into ws.mix.
     fn moe(&self, ws: &Workspace, s: &Stream, m: &Moe, r: usize, small: bool) -> Result<()> {
-        linear(s, ws.xn, D, r, &m.gate, ws.logits, EXPERTS, small, false)?;
+        linear_x(s, ws.xn, D, r, &m.gate, ws.logits, EXPERTS, small, false, ws.wexp)?;
         dsync(s, 8)?;
         nk::moe_route(s, ws.logits, EXPERTS, m.bias, self.cfg.routed_scaling, r, ws.sel_e, ws.sel_w)?;
-        linear(s, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false)?;
+        linear_x(s, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false, ws.wexp)?;
         dsync(s, 512)?;
         quench6k_cuda::hy4::to_bf16(s, ws.lat, ws.lat_bf, r * LAT)?;
         let ex = &m.experts;
@@ -919,11 +945,11 @@ impl NemotronModel {
                 nk::moe_combine_bf16(s, ws.ey, ws.pair_row, at(ws.sel_w, r0, TOPK * 4), n, at(ws.ex_bf, r0, LAT * 2))?;
             }
         }
-        linear(s, ws.ex_bf, LAT, r, &m.fc2, ws.mix, D, small, false)?;
-        linear(s, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false)?;
+        linear_x(s, ws.ex_bf, LAT, r, &m.fc2, ws.mix, D, small, false, ws.wexp)?;
+        linear_x(s, ws.xn, D, r, &m.shared_up, ws.big, SH, small, false, ws.wexp)?;
         dsync(s, 64)?;
         nk::relu2(s, ws.big, SH, SH, r, ws.act, SH)?;
-        linear(s, ws.act, SH, r, &m.shared_down, ws.mix, D, small, true)
+        linear_x(s, ws.act, SH, r, &m.shared_down, ws.mix, D, small, true, ws.wexp)
     }
 }
 
