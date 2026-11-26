@@ -56,3 +56,13 @@ kernels only.
   PyTorch implementation after transformers' `hy_v4_flash`, streaming one layer of weights at a time and
   scoring several fixtures per pass), the Hy4-flash versions of the oracle fixtures, and a per-layer
   comparison of hidden states with the engine's `QUENCH6K_HY4_DUMP` output (see DOCS.md, Hy4-flash).
+- `ref/nemotron_ref.py`, `ref/nemotron_fixtures.py`: the Nemotron-H reference (Nemotron 3 Super, Munin
+  2.0): an independent PyTorch implementation after the checkpoint's `modeling_nemotron_h.py`, on the CPU
+  by default (`--device cuda` later), streaming one layer at a time and dequantizing the checkpoint's own
+  NVFP4 / FP8 / BF16 weights (only the experts the tokens route to). Mamba-2 runs as the plain sequential
+  recurrence with an FP32 state (`--scan fp64` for the floor); `--dtype bf16` rounds where the model does
+  under its CUDA kernels, `--dtype fp32` gives the noise floor; `--fp32 residual` keeps the residual stream
+  in FP32, `--kv-fp8` emulates an FP8 KV cache, `--torch-dt-clamp` the modeling file's torch_forward dt
+  clamp; `--dump-layers` writes the residual stream after chosen layers (`seq<j>/lanes-NN.npy`), and
+  `--prompt TEXT` prints the next-token candidates. The fixtures are the oracle conversations (and a
+  Danish one) in the checkpoint's chat template and tokenizer, written to out/ (see DEVELOPMENT.md).

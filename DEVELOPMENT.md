@@ -56,6 +56,21 @@ decoding token for token; `batch-check` requires the same of batched plain steps
 group rounds (`--seqs N` sequences, fixtures cycled; group rounds of every size from 2 to N), and
 prints the eager and graph speeds of the batched plain steps.
 
+The other models are gated against independent PyTorch references on the same checkpoint, in BF16
+(reference A) and FP32 (B), over the oracle conversations re-rendered in the model's chat template and
+tokenizer (built into out/, not committed). For Nemotron-H (Nemotron 3 Super, Munin 2.0;
+`tools/ref/nemotron_ref.py` runs on the CPU, about 1.5 hours for the six short fixtures in BF16):
+
+```
+M=/path/to/munin-2.0-nvfp4
+python3 -I tools/ref/nemotron_fixtures.py --model $M --qwen $SWIFT --out out/nemotron-fixtures
+python3 -I tools/ref/nemotron_ref.py --model $M --fixture out/nemotron-fixtures/* --out out/nemotron-ref --suffix=-bf16
+python3 -I tools/ref/nemotron_ref.py --model $M --dtype fp32 --fixture out/nemotron-fixtures/* --out out/nemotron-ref --suffix=-fp32
+# copy each <fixture>-bf16/-fp32 pair into its fixture directory as ref-bf16 / ref-fp32, then
+quench6k nemotron score --model $M --fixture out/nemotron-fixtures/* --out out/nemotron-eng
+quench6k gate --fixtures out/nemotron-fixtures --candidates out/nemotron-eng --ref-a ref-bf16 --ref-b ref-fp32
+```
+
 ## Kernel iteration
 
 `quench6k kbench` loads the first few layers only, replays decode steps from a snapshot, checks
