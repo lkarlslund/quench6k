@@ -450,7 +450,10 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, 
     let (model, s) = load(dir)?;
     ensure!(drafts <= MAX_DRAFTS, "--drafts 0 to {MAX_DRAFTS}");
     ensure!(drafts == 0 || model.mtp.is_some(), "--drafts needs the MTP layer");
-    let mut ws = Workspace::new(&model, CANON_CHUNK, seqs * MAX_VERIFY)?;
+    // QUENCH6K_NEM_MAXT: the workspace's step size (a multiple of CANON_CHUNK; prefill merges whole chunks).
+    let max_t = std::env::var("QUENCH6K_NEM_MAXT").ok().and_then(|v| v.parse().ok()).unwrap_or(CANON_CHUNK);
+    let mut ws = Workspace::new(&model, max_t, seqs * MAX_VERIFY)?;
+    println!("workspace: steps of {max_t} tokens, {:.2} GiB", ws.device_bytes as f64 / (1u64 << 30) as f64);
     // QUENCH6K_NEM_AB="key=v,key=v;key=v;..." (an empty entry: defaults): prefill only, the kernel variant
     // sets interleaved (A B B A ...) in one process, QUENCH6K_NEM_AB_ROUNDS rounds (default 3).
     if let Ok(ab) = std::env::var("QUENCH6K_NEM_AB") {
@@ -460,6 +463,7 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, 
             ensure!(ctx <= ids.len(), "corpus has {} tokens", ids.len());
             let mut times = vec![Vec::new(); sets.len()];
             let mut firsts = vec![Vec::new(); sets.len()];
+            let mut sums = std::collections::BTreeSet::new();
             for round in 0..rounds {
                 let order: Vec<usize> = if round % 2 == 0 { (0..sets.len()).collect() } else { (0..sets.len()).rev().collect() };
                 for i in order {
@@ -474,6 +478,10 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, 
                     model.prefill(&mut st, &mut ws, &s, &ids[..ctx])?;
                     let first = argmax(&ws, &model, &s, 1)?[0];
                     times[i].push(t0.elapsed().as_secs_f64());
+                    // Bitwise identity across sets: the caches, the Mamba block and the last logits row.
+                    let [kvs, mamba] = st.checksums(&s)?;
+                    let logits = quench6k_cuda::device_checksum(ws.out_logits, model.cfg.vocab * 4, &s)?;
+                    sums.insert((kvs, mamba, logits));
                     firsts[i].push(first);
                 }
             }
@@ -496,6 +504,7 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, 
                     firsts[i]
                 );
             }
+            println!("ab ctx {ctx:>6}: {} distinct (cache, Mamba block, logits) checksums over all sets", sums.len());
         }
         quench6k_cuda::variants::clear();
         return Ok(());
