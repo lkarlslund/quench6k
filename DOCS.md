@@ -227,6 +227,52 @@ prefill 4.2K instead of 10.7K tokens/s). Check with `filefrag -v FILE | grep -c 
 to rewrite a file uncompressed on btrfs, create the copy with `chattr +m` set before writing to it
 (`cp --reflink=never`), then replace the original.
 
+### Nemotron 3 Super / Munin 2.0
+
+NVIDIA's Nemotron 3 Super 120B-A12B (`nemotron_h`: 88 pre-norm residual blocks, 40 Mamba-2 mixers, 40 MoE
+blocks of 512 relu² experts in a 1024-wide latent space plus a shared expert, 8 attention layers with 32
+query and 2 key/value heads and no positional encoding; one MTP layer) loads from ModelOpt
+MIXED_PRECISION exports:
+
+| Checkpoint | |
+|---|---|
+| [nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4) | NVIDIA's release: NVFP4 routed experts, FP8 or BF16 elsewhere, BF16 MTP layer (80 GB) |
+| [danish-foundation-models/munin-2.0-nvfp4](https://huggingface.co/danish-foundation-models/munin-2.0-nvfp4) | Munin 2.0, a finetune quantized with the same layer map |
+
+Each projection keeps the format its tensors have: the routed experts NVFP4 as stored (stacked per
+layer); FP8 E4M3 projections with one scale per tensor as FP8 (the scale in every 128 x 128 block of the
+block-scaled FP8 format, so the values are the checkpoint's); an NVFP4 dense projection (one shared
+expert) as BF16 code x block scale, which is exact, with the global scale on the output; BF16
+projections quantized at load to INT8 with a scale per 64 weights (`QUENCH6K_NEM_INT8`: name fragments,
+`all` (default) or `none`; the routers stay BF16). The MTP layer's BF16 experts are quantized to NVFP4 at
+load (`QUENCH6K_NEM_MTP=0` does not load the layer). The activations stay BF16 (matmul inputs) and F32;
+the checkpoint's `input_scale` tensors are not used. About 67.8 GiB of weights go to the GPU (66.2 GiB
+without the MTP layer); the BF16 embedding (1 GiB) stays on the host, memory-mapped, and each step
+uploads its rows. `quench6k nemotron plan --model DIR` prints the memory by part from config.json and
+hf_quant_config.json alone.
+
+The residual stream is F32 (the transformers model keeps it in BF16). Per sequence, the attention layers'
+keys and values are cached in BF16 (8 KiB per position for all 8 layers) or, with `--kv fp8`, as FP8 E4M3
+with a scale per position and KV head (4.1 KiB); the checkpoint's static `k_scale` / `v_scale` (all 1.0)
+are not used. The cache is reserved for the sequence's capacity and mapped as positions are used; the
+Mamba layers' SSM states (F32) and convolution states take 165 MiB, allocated with the sequence. With BF16
+caches, 8 sequences of 262,144 positions take 17.3 GiB. Prefill is chunked at multiples of 2048 positions
+(`CANON_CHUNK`, `NemotronModel::prefill`), and up to 8 sequences of up to 16 tokens each step together
+(`NemotronModel::forward_batch`), every projection of such a step through the GEMV, whose rows do not
+depend on each other. The recurrent states cannot be rewound: a new prompt reuses a sequence only when it
+extends the sequence's history (`State::rewind`), otherwise the sequence starts over.
+
+`quench6k nemotron generate` (greedy, `--think on|off|low` for the chat template, `--ids` for token ids),
+`bench` (`--seqs N` decodes N sequences in batched steps) and `score` (teacher-forced distributions,
+oracle.distributions/1) run the model; `--dump-dir DIR` (or `QUENCH6K_NEM_DUMP=DIR`) appends the hidden
+states after each layer (`lanes-NN.bin`, F32 [tokens, 4096]) and after the final norm (`final.bin`) for
+comparison with a reference's per-layer dumps.
+
+Not done yet: the Mamba-2, router, expert, relu² and attention kernels are not merged (the engine calls
+placeholders with their API that fail at run time), so the model does not run yet; MTP drafting (the layer
+loads but is not used); CUDA graphs; serving (`quench6k serve` does not detect the model); prefix reuse
+across conversations (Mamba state snapshots).
+
 ## Server options
 
 | Option | Default | |
