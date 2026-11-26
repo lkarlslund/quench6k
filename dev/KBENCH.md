@@ -1150,3 +1150,28 @@ tok/s for main's 1 seq 8K plain against 120.0 here): compare ratios, not these r
 Checks: decode_forms_equal (also prefetch distances 0, 1, 3, 5), digests unchanged, batch-check 8 x 12,
 verify 7, spec-check 8 sequences with chat, fixture scores of all 7 fixtures byte-identical to main's
 build (the .json files differ only in their wall-clock seconds).
+
+## 2026-11-26: Nemotron-H decode, L2 prefetch beside the attention (dropped)
+
+The last lever of the previous round: while a small step's attention runs (latency-bound, little DRAM
+traffic), request weights read soon after into L2 on the side stream (a 64-CTA kernel of one warp each
+issuing `cp.async.bulk.prefetch.L2` in 64 KiB pieces, forked after the qkv projection, joined by the next
+MoE layer's side-stream work). Three feature bits: o_proj's weights (16 MiB), plus the next MoE layer's
+router and fc1 (8 MiB), plus its fc2 and shared expert down (25 MiB). The kernel's SASS has the UBLKPF.L2
+and no other memory traffic (28 registers; the range table indexed at run time sits in local memory).
+
+In-process A/B (`QUENCH6K_NEM_AB`, warm-up run per arm, null arm; 600 W, SM clock median 2.81 GHz,
+49-68 °C, throttle reasons power cap / idle only), median ratio against main's path:
+
+| arm | 1 seq 8K plain (2 rounds, 64 tokens) | 1 seq 8K 3 drafts | 1 seq 32K plain (3 rounds, 96 tokens) |
+|---|---|---|---|
+| null | 0.9818 (0.971-0.992) | 1.0011 (1.0006-1.0016) | 0.9998 (0.9995-1.0008) |
+| o_proj | 0.9835 | 0.9953 (0.9935-0.9971) | 0.9970 (0.9970-0.9979) |
+| + router, fc1 | 0.9945 | 0.9921 (0.9884-0.9959) | 0.9913 (0.9909-0.9921) |
+| + fc2, shared down | 0.9824 | 0.9800 (0.9765-0.9835) | |
+
+Slower the more it prefetches. The GEMVs already load their first weights before the PDL wait, so the
+attention's idle DRAM time is partly used, and the requests then compete with the attention's cache reads
+and those early loads (levers.md: next-layer prefetch <= 1%). Not measured at 8 sequences (it lost at one).
+The Mamba scan was not tried: in small steps in_proj's z rows already stream beside the convolution and
+scan (F_SIDE_Z).
