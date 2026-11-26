@@ -260,9 +260,12 @@ as positions are used; the Mamba layers' SSM states (F32) and convolution states
 with the sequence. With BF16 caches, 8 sequences of 262,144 positions take 17.3 GiB. Prefill is chunked at
 multiples of 2048 positions (`CANON_CHUNK`, `NemotronModel::prefill`), and up to 8 sequences of up to 16
 tokens each step together (`NemotronModel::forward_batch`), every projection of such a step through the
-GEMV, whose rows do not depend on each other. The recurrent states cannot be rewound: a new prompt reuses
-a sequence only when it extends the sequence's history (`State::rewind`), otherwise the sequence starts
-over.
+GEMV, whose rows do not depend on each other. The recurrent states cannot be rewound, so prefill is
+canonical as for Inkling 2: each whole aligned chunk advances the sequence's canonical frontier and
+snapshots its Mamba states (165 MiB; a sequence keeps the lowest and the latest), and `State::rewind`
+reuses a cached prefix only up to a multiple of 2048 at most the common prefix and the frontier, restoring
+the snapshot there. A turn thus recomputes up to 2047 cached prompt tokens plus the previous reply, and
+its results depend only on its tokens.
 
 `quench6k nemotron generate` (greedy, `--think on|off|low` for the chat template, `--ids` for token ids),
 `bench` (`--seqs N` decodes N sequences in batched steps) and `score` (teacher-forced distributions,
@@ -270,9 +273,11 @@ oracle.distributions/1) run the model; `--dump-dir DIR` (or `QUENCH6K_NEM_DUMP=D
 states after each layer (`lanes-NN.bin`, F32 [tokens, 4096]) and after the final norm (`final.bin`) for
 comparison with a reference's per-layer dumps.
 
-Not done yet: the model has not run on a GPU (its kernels have only CPU references so far); MTP drafting
-(the layer loads but is not used, and no step defers its Mamba records); CUDA graphs; serving (`quench6k
-serve` does not detect the model); prefix reuse across conversations (Mamba state snapshots).
+`quench6k serve --model DIR` detects the model and serves up to `--slots` requests at once in the slot
+scheduler (canonical prefill and prefix reuse as above, batched decoding, tool calls and reasoning through
+the chat template, `--kv bf16|fp8`); steering, adapters, vision, edits and stored contexts are not
+available for it. Not done yet: MTP drafting (the layer loads but is not used, and no step defers its
+Mamba records, so the server drafts nothing, not even prompt lookups); CUDA graphs.
 
 ## Server options
 

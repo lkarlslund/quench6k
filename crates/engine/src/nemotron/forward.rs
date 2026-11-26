@@ -37,8 +37,10 @@ pub const CANON_CHUNK: usize = 2048;
 /// Rows of a speculative (deferred) step the Mamba state records (0: no speculative steps yet; MTP
 /// drafting will set it).
 pub const REC_ROWS: usize = 0;
-/// Rows per pass of the grouped expert GEMM in large steps (bounds its buffers).
-const EX_ROWS: usize = 512;
+/// Rows per pass of the grouped expert GEMM in large steps (bounds its buffers). A whole canonical chunk:
+/// passes of 512 rows left about 22 rows per expert, a third of the GEMM's 64-row tiles, and took twice
+/// as long.
+const EX_ROWS: usize = CANON_CHUNK;
 /// Positions a sequence's cache mapping grows by at least.
 const RESERVE_STEP: usize = 4096;
 /// Top logits per position kept by teacher-forced scoring.
