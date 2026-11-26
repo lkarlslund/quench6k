@@ -17,6 +17,9 @@ pub struct Chat {
     /// Inkling 2's message tokens (`<|message_model|>`, `<|content_thinking|>`, ...): decoded output is
     /// rewritten to `<think>` / `<tool_call>` text (see [`InkState`]).
     pub inkling: bool,
+    /// Nemotron-H (`nemotron_h` in config.json): the template takes enable_thinking, low_effort and
+    /// truncate_history_thinking (see [`nemotron_vars`]).
+    pub nemotron: bool,
     /// Encodings of `<|im_start|>`-delimited prompt segments (see [`Chat::encode`]) and their total
     /// text bytes.
     segments: std::sync::Mutex<(std::collections::HashMap<String, Vec<i32>>, usize)>,
@@ -89,6 +92,16 @@ impl Chat {
                 },
             );
         }
+        let nemotron = std::fs::read(model_dir.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .is_some_and(|v| v.get("model_type").and_then(Value::as_str) == Some("nemotron_h"));
+        if nemotron {
+            // transformers renders chat templates with trim_blocks and lstrip_blocks; the Nemotron-H template
+            // relies on them (block tags without `-`).
+            env.set_trim_blocks(true);
+            env.set_lstrip_blocks(true);
+        }
         env.add_template_owned("chat", source)?;
         let mut stop_tokens = Vec::new();
         if let Ok(text) = std::fs::read_to_string(model_dir.join("generation_config.json")) {
@@ -112,6 +125,7 @@ impl Chat {
         Ok(Self {
             hy4,
             inkling,
+            nemotron,
             tokenizer,
             env,
             stop_tokens,
@@ -172,6 +186,8 @@ impl Chat {
             if let Some(e) = effort {
                 ctx.insert("reasoning_effort".into(), Value::String(e.into()));
             }
+        } else if self.nemotron {
+            ctx.extend(nemotron_vars(enable_thinking, reasoning_effort));
         } else {
             if let Some(e) = enable_thinking {
                 ctx.insert("enable_thinking".into(), Value::Bool(e));
@@ -382,6 +398,23 @@ impl Chat {
     }
 }
 
+/// Template variables of the Nemotron-H chat template: thinking off for `enable_thinking: false` or effort
+/// "none"; effort "low" or "minimal" sets `low_effort` (the template appends "{reasoning effort: low}" to the
+/// last user turn); other efforts keep the template's defaults (thinking on). QUENCH6K_NEM_TRUNCATE_THINKING=1
+/// sets `truncate_history_thinking` (earlier turns' reasoning dropped).
+pub fn nemotron_vars(enable_thinking: Option<bool>, reasoning_effort: Option<&str>) -> serde_json::Map<String, Value> {
+    let mut v = serde_json::Map::new();
+    let off = enable_thinking == Some(false) || matches!(reasoning_effort, Some("none" | "no_think"));
+    v.insert("enable_thinking".into(), Value::Bool(!off));
+    if !off && matches!(reasoning_effort, Some("low" | "minimal")) {
+        v.insert("low_effort".into(), Value::Bool(true));
+    }
+    if std::env::var("QUENCH6K_NEM_TRUNCATE_THINKING").is_ok_and(|x| x == "1") {
+        v.insert("truncate_history_thinking".into(), Value::Bool(true));
+    }
+    v
+}
+
 /// Hy4-flash output with its tags in the plain spelling the server parses: `<think>`, `<tool_call>`,
 /// `<arg_key>`, `<arg_value>` (the `<tool_calls>` wrapper is dropped).
 pub fn hy4_plain_tags(text: &str) -> String {
@@ -547,6 +580,53 @@ mod tests {
             chat.decode(&ids, true).unwrap()
         );
     }
+    #[test]
+    fn nemotron_template_vars() {
+        let on = nemotron_vars(None, None);
+        assert_eq!(on.get("enable_thinking"), Some(&Value::Bool(true)));
+        assert!(on.get("low_effort").is_none());
+        assert_eq!(nemotron_vars(Some(false), None).get("enable_thinking"), Some(&Value::Bool(false)));
+        assert_eq!(nemotron_vars(None, Some("none")).get("enable_thinking"), Some(&Value::Bool(false)));
+        assert_eq!(nemotron_vars(None, Some("low")).get("low_effort"), Some(&Value::Bool(true)));
+        assert!(nemotron_vars(None, Some("high")).get("low_effort").is_none());
+    }
+
+    /// The Nemotron-H template renders conversations with tool calls in the form the server parses, with
+    /// thinking on, off and at low effort.
+    #[test]
+    fn nemotron_template_renders() {
+        let Some(dir) = test_model("QUENCH6K_TEST_NEMOTRON") else {
+            return;
+        };
+        let chat = Chat::load(&dir, None).unwrap();
+        assert!(chat.nemotron && !chat.hy4 && !chat.inkling);
+        let msgs = serde_json::json!([
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Weather in Aarhus?"},
+            {"role": "assistant", "content": "", "reasoning_content": "Use the tool.",
+             "tool_calls": [{"type": "function", "function": {"name": "weather", "arguments": "{\"city\": \"Aarhus\"}"}}]},
+            {"role": "tool", "content": "12 C"},
+            {"role": "user", "content": "Thanks"}
+        ]);
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "weather", "description": "Weather now",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]);
+        let text = chat.render(&msgs, Some(&tools), None, None).unwrap();
+        assert!(text.starts_with("<|im_start|>system\nBe brief.\n\n# Tools"), "{text}");
+        assert!(text.contains("<tool_call>\n<function=weather>\n<parameter=city>\nAarhus\n</parameter>\n</function>\n</tool_call>\n<|im_end|>"), "{text}");
+        assert!(text.contains("<think>\nUse the tool.\n</think>"), "{text}");
+        assert!(text.contains("<|im_start|>user\n<tool_response>\n12 C\n</tool_response>\n<|im_end|>"), "{text}");
+        assert!(text.ends_with("<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"), "{text}");
+        let off = chat.render(&msgs, None, Some(false), None).unwrap();
+        assert!(off.ends_with("<|im_start|>assistant\n<think></think>"), "{off}");
+        let low = chat.render(&msgs, None, None, Some("low")).unwrap();
+        assert!(low.contains("Thanks\n\n{reasoning effort: low}<|im_end|>"), "{low}");
+        let ids = chat.encode(&text).unwrap();
+        assert_eq!(chat.decode(&ids, false).unwrap(), text);
+        for t in ["<|im_end|>"] {
+            assert!(chat.stop_tokens.contains(&chat.token_id(t).unwrap()), "{t} stops generation");
+        }
+    }
+
     /// Inkling's message tokens decode to the plain tags, and streaming yields the same text.
     #[test]
     fn inkling_output_maps_to_plain_tags() {

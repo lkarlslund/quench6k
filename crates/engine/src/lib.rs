@@ -14,6 +14,7 @@ pub mod inkling;
 pub mod inspect;
 pub mod loader;
 pub mod model;
+pub mod nemotron;
 pub mod oracle;
 pub mod profile;
 pub mod session;

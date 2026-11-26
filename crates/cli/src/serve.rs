@@ -29,6 +29,7 @@ mod fit;
 mod flint;
 mod hy4;
 mod inkling;
+mod nemotron;
 mod slots;
 
 pub struct ServeOptions {
@@ -457,9 +458,10 @@ pub fn run(opts: ServeOptions) -> Result<()> {
     let steering = steer.steering.is_some();
     let hy4 = quench6k_engine::hy4::Hy4Model::is_hy4(&opts.model);
     let inkling = quench6k_engine::inkling::InklingModel::is_inkling(&opts.model);
-    // Flint, Hy4-flash and Inkling 2 run in the slot scheduler (serve/slots.rs) over their own engines,
-    // without the session's features (steering, adapters, vision, edits, stored contexts).
-    let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model) || hy4 || inkling;
+    let nemotron = quench6k_engine::nemotron::NemotronModel::is_nemotron(&opts.model);
+    // Flint, Hy4-flash, Inkling 2 and Nemotron-H run in the slot scheduler (serve/slots.rs) over their own
+    // engines, without the session's features (steering, adapters, vision, edits, stored contexts).
+    let flint = quench6k_engine::flint::FlintModel::is_flint(&opts.model) || hy4 || inkling || nemotron;
     anyhow::ensure!(
         !(flint && steering),
         "steering packs are not supported for this model"
@@ -508,7 +510,15 @@ pub fn run(opts: ServeOptions) -> Result<()> {
                 }
             };
             let first = ready.is_some();
-            let run = if inkling {
+            let run = if nemotron {
+                crate::nemotron::load(&model_dir).and_then(|(model, stream)| {
+                    let engine = nemotron::Engine::new(&model, &stream);
+                    let exit = serve_slots(engine, &mut cfg, first, |c| started(&mut ready, c), &jobs_rx, &metrics, &mut waiting);
+                    drop(model);
+                    drop(stream);
+                    exit
+                })
+            } else if inkling {
                 crate::inkling::load(&model_dir).and_then(|(model, stream)| {
                     let engine = inkling::Engine::new(&model, &stream);
                     let exit = serve_slots(engine, &mut cfg, first, |c| started(&mut ready, c), &jobs_rx, &metrics, &mut waiting);

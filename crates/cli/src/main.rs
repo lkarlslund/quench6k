@@ -5,6 +5,7 @@ mod flint;
 mod hy4;
 mod inkling;
 mod inkling_batch;
+mod nemotron;
 mod gpumon;
 mod kbench;
 mod longctx;
@@ -539,6 +540,9 @@ enum Command {
     /// Inkling 2 (inkling2_loop) commands.
     #[command(subcommand)]
     Inkling(inkling::InklingCmd),
+    /// Nemotron-H (nemotron_h: Nemotron 3 Super, Munin 2.0) commands.
+    #[command(subcommand)]
+    Nemotron(nemotron::NemotronCmd),
     /// Inkling 2, Hy4-flash or Flint at the far end of their context without prefilling it: sequences
     /// placed at high positions (zeroed caches), decode steps alone and batched compared bitwise, step
     /// time against position.
@@ -966,6 +970,7 @@ fn main() -> Result<()> {
         Command::Flint(cmd) => flint::run(cmd)?,
         Command::Hy4(cmd) => hy4::run(cmd)?,
         Command::Inkling(cmd) => inkling::run(cmd)?,
+        Command::Nemotron(cmd) => nemotron::run(cmd)?,
         Command::LongctxCheck { model, context, seqs, steps, positions } => longctx::run(&model, context, &seqs, steps, &positions)?,
         Command::Gate {
             fixtures,
