@@ -80,11 +80,13 @@ pub const F_RMS: u32 = 2048;
 /// The small steps' attention prefetches key tiles into L2 ahead of its register fetch
 /// ([`nk::set_attn_prefetch`]; QUENCH6K_NEM_ATTN_PF tiles, default 3).
 pub const F_ATTN_PF: u32 = 4096;
+/// Small steps' projection forms chosen per Nemotron-H shape and row count ([`tuned_form`]).
+pub const F_FORMS: u32 = 8192;
 /// Small steps' Mamba layers: in_proj's z rows on the side stream after its xBC / dt rows, beside the
 /// convolution and the scan (the same per-output arithmetic).
 pub const F_SIDE_Z: u32 = 16384;
 /// The default: every part.
-pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE | F_SIDE | F_SIDE_FC1 | F_RMS | F_ATTN_PF | F_SIDE_Z;
+pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE | F_SIDE | F_SIDE_FC1 | F_RMS | F_ATTN_PF | F_FORMS | F_SIDE_Z;
 static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(F_ALL);
 
 /// Switches the optional parts of the step (`F_*` bits; for A/B timings in one process; the CUDA graphs
@@ -757,11 +759,95 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
     }
 }
 
+/// The fastest form of the model's projections at 5 or more rows (Some(None): the shared GEMV), from
+/// cold-weight timings of every form per shape and row count (crates/cuda/tests/nemotron.rs
+/// time_gemv_shapes); None: no entry (the general rule decides). 8-bit matrices (FP8 block-scaled or INT8)
+/// by shape; of the BF16 ones only the router.
+fn tuned_form(l: &Linear, m: usize) -> Option<Option<(usize, usize)>> {
+    // Up to 4 rows the general rule stays: forms with more weight rows per warp measured faster alone but
+    // load less before their dependency wait, and the 1-sequence verification steps (4 rows) got slower.
+    if m <= 4 {
+        return None;
+    }
+    let bf16 = l.fmt == k::WeightFormat::Bf16;
+    let f = match (bf16, l.n, l.k) {
+        // Mamba in_proj
+        (false, 18560, 4096) => match m {
+            5..=8 => Some((4, 4)),
+            _ => return None,
+        },
+        // Mamba out_proj
+        (false, 4096, 8192) => match m {
+            5 | 6 => Some((8, 4)),
+            7 | 8 => Some((4, 4)),
+            _ => return None,
+        },
+        // Attention q/k/v
+        (false, 4608, 4096) => match m {
+            5 => None,
+            6..=8 => Some((8, 4)),
+            17..=24 => Some((16, 4)),
+            _ => return None,
+        },
+        // Attention o_proj
+        (false, 4096, 4096) => match m {
+            5 => None,
+            6..=8 => Some((4, 4)),
+            17..=24 => Some((16, 4)),
+            _ => return None,
+        },
+        // Shared expert up
+        (false, SH, 4096) => match m {
+            5 | 6 => Some((8, 4)),
+            7 | 8 => Some((4, 4)),
+            _ => return None,
+        },
+        // Shared expert down
+        (false, 4096, SH) => match m {
+            5 => None,
+            6..=8 => Some((4, 4)),
+            _ => return None,
+        },
+        // Router (BF16)
+        (true, 512, 4096) => match m {
+            7 | 8 => Some((4, 2)),
+            9..=12 => Some((4, 1)),
+            17.. => Some((8, 1)),
+            _ => None,
+        },
+        // fc1 (latent down)
+        (false, 1024, 4096) => match m {
+            5 | 7..=12 => Some((4, 1)),
+            13..=16 => Some((8, 1)),
+            17..=24 => Some((8, 2)),
+            25.. => Some((4, 4)),
+            _ => None,
+        },
+        // fc2 (latent up)
+        (false, 4096, 1024) => match m {
+            6..=8 => Some((8, 2)),
+            9..=12 => Some((4, 4)),
+            13..=16 => Some((16, 2)),
+            17.. => Some((8, 4)),
+            _ => None,
+        },
+        // lm_head
+        (false, n, 4096) if n >= 65536 && m == 5 => None,
+        _ => return None,
+    };
+    Some(f)
+}
+
 /// The wide GEMV's form (input rows per warp, weight rows per warp) for `m` rows of `l`, where it beats the
 /// shared GEMV's launches of up to 16 rows (each row's bits are the same either way); None keeps those.
 fn wide_form(l: &Linear, m: usize) -> Option<(usize, usize)> {
     if m < 2 || !feature(F_WIDE) {
         return None;
+    }
+    if feature(F_FORMS) {
+        if let Some(f) = tuned_form(l, m) {
+            return f;
+        }
     }
     let size = l.n * l.k;
     let bf16 = l.fmt == k::WeightFormat::Bf16;
