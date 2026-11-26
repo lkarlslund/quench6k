@@ -74,6 +74,21 @@ SQ_DEVICE void fetch_tile(TileRegs<FP8>& t, const Seqs& q, int s, const KvArgs& 
     }
 }
 
+// L2 prefetch of a key tile's cache lines (K, V and, FP8, the scales) of KV head g: issued a few tiles ahead
+// of the register fetch, so that one reads from L2. Changes no value.
+template <bool FP8>
+SQ_DEVICE void prefetch_tile(const Seqs& q, int s, const KvArgs& kv, int g, int j0, int last) {
+    constexpr int SEG = FP8 ? 3 : 4;  // 128-byte lines per key
+    for (int i = threadIdx.x; i < ATTN_TILE * SEG; i += AT_THREADS) {
+        const int j = j0 + i / SEG, part = i % SEG;
+        if (j > last) break;
+        size_t off;
+        if constexpr (FP8) off = part == 0 ? g * HD : part == 1 ? KVH * HD + g * HD : 2 * KVH * HD;
+        else off = (part < 2 ? g * HD : KVH * HD + g * HD) * 2 + (part & 1) * 128;
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(kv_row(q, s, kv, j) + off));
+    }
+}
+
 // The fetched tile into shared memory (FP8 codes convert exactly to BF16). Callers barrier before (the previous
 // tile's readers) and after.
 template <bool FP8>
@@ -276,8 +291,10 @@ constexpr int PART_FLOATS = QPK * HD + 2 * QPK;  // acc [16][128], m [16], l [16
 
 // Decode: grid (rows, 2, max_groups), 4 warps. Every warp computes the scores of the row's 16 heads; warp w
 // accumulates dims 32 w .. 32 w + 31. Writes the group's partial.
+// pf > 0: tile t + 1 + pf is prefetched into L2 while tile t is computed (and the first pf tiles after the first
+// at the start).
 template <bool FP8>
-__global__ void __launch_bounds__(AT_THREADS) attn_decode_kernel(const bf16* qin, const Seqs* sq, KvArgs kv, int max_groups, float* part) {
+__global__ void __launch_bounds__(AT_THREADS) attn_decode_kernel(const bf16* qin, const Seqs* sq, KvArgs kv, int max_groups, float* part, int pf) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ Seqs q;
@@ -296,10 +313,12 @@ __global__ void __launch_bounds__(AT_THREADS) attn_decode_kernel(const bf16* qin
     const int t_first = gi * GROUP_TILES, t_last = min(gi * GROUP_TILES + GROUP_TILES - 1, pos / ATTN_TILE);
     TileRegs<FP8> tr;
     fetch_tile(tr, q, s, kv, g, t_first * ATTN_TILE, pos);
+    for (int t = t_first + 1; t <= min(t_first + pf, t_last); ++t) prefetch_tile<FP8>(q, s, kv, g, t * ATTN_TILE, pos);
     for (int t = t_first; t <= t_last; ++t) {
         __syncthreads();
         store_tile(sm, tr, t * ATTN_TILE, pos);
         if (t < t_last) fetch_tile(tr, q, s, kv, g, (t + 1) * ATTN_TILE, pos);
+        if (pf > 0 && t + 1 + pf <= t_last) prefetch_tile<FP8>(q, s, kv, g, (t + 1 + pf) * ATTN_TILE, pos);
         __syncthreads();
         attn_tile(sm, qa, t * ATTN_TILE, pos, warp * 32, st);
     }
@@ -496,6 +515,12 @@ extern "C" cudaError_t quench6k_nem_attn_prep(const float* qkv, int ld, int q_co
 static int combine_heads = 1;
 extern "C" void quench6k_nem_set_attn_combine(int heads) { combine_heads = heads; }
 
+// Key tiles the small steps' attention prefetches into L2 ahead of its register fetch (0: none), when its grid
+// fits on the SMs at once (each CTA's serial tile chain then sets the time; with more CTAs than SMs the
+// prefetches measured slower); the same bits.
+static int attn_prefetch = 3;
+extern "C" void quench6k_nem_set_attn_prefetch(int tiles) { attn_prefetch = tiles; }
+
 extern "C" size_t quench6k_nem_attn_part_floats(int rows, int max_groups) { return (size_t)rows * KVH * max_groups * PART_FLOATS; }
 
 extern "C" cudaError_t quench6k_nem_attention_small(const void* q, int rows, const void* seqs, long long kv_off, long long kv_ld, int fp8,
@@ -503,12 +528,19 @@ extern "C" cudaError_t quench6k_nem_attention_small(const void* q, int rows, con
     if (rows == 0) return cudaSuccess;
     if (max_groups <= 0) return cudaErrorInvalidValue;
     const KvArgs kv{kv_off, kv_ld, fp8};
+    static int sms = 0;
+    if (sms == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    }
+    const int pf = rows * KVH * max_groups <= sms ? attn_prefetch : 0;
     if (fp8)
         SQ_CHECK_LAUNCH(sq_launch(attn_decode_kernel<true>, dim3(rows, KVH, max_groups), AT_THREADS, 0, st, static_cast<const bf16*>(q),
-                                  static_cast<const Seqs*>(seqs), kv, max_groups, part));
+                                  static_cast<const Seqs*>(seqs), kv, max_groups, part, pf));
     else
         SQ_CHECK_LAUNCH(sq_launch(attn_decode_kernel<false>, dim3(rows, KVH, max_groups), AT_THREADS, 0, st, static_cast<const bf16*>(q),
-                                  static_cast<const Seqs*>(seqs), kv, max_groups, part));
+                                  static_cast<const Seqs*>(seqs), kv, max_groups, part, pf));
     if (combine_heads)
         SQ_CHECK_LAUNCH(sq_launch(attn_combine_heads_kernel, dim3(rows, KVH, QPK), HD, 0, st, (const float*)part, static_cast<const Seqs*>(seqs),
                                   max_groups, static_cast<bf16*>(out)));

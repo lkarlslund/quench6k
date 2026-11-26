@@ -377,6 +377,7 @@ mod ffi {
         ) -> Error;
         pub fn quench6k_nem_set_attn_combine(heads: c_int);
         pub fn quench6k_nem_set_rms_early(early: c_int);
+        pub fn quench6k_nem_set_attn_prefetch(tiles: c_int);
         pub fn quench6k_nem_attn_part_floats(rows: c_int, max_groups: c_int) -> usize;
         pub fn quench6k_nem_attention_small(
             q: *const c_void,
@@ -891,6 +892,12 @@ pub fn attn_prep(s: &Stream, qkv: u64, ld: usize, q_col: usize, k_col: usize, v_
 /// head (false); the same bits (A/B timings; process-wide).
 pub fn set_attn_combine(heads: bool) {
     unsafe { ffi::quench6k_nem_set_attn_combine(heads as c_int) }
+}
+
+/// [`attention_small`]: key tiles prefetched into L2 ahead of the register fetch (0: none; default 3); the same
+/// bits (A/B timings; process-wide).
+pub fn set_attn_prefetch(tiles: usize) {
+    unsafe { ffi::quench6k_nem_set_attn_prefetch(tiles as c_int) }
 }
 
 /// [`rms`]: the norm weights load before the dependency wait (true, default) or after it; the same bits (A/B

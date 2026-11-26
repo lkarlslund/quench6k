@@ -935,6 +935,58 @@ fn time_attention() {
     }
 }
 
+/// Decode attention in the engine's cache layout (9 layers' rows per position): 1 and 8 sequences at 8K and
+/// 32K positions, by L2 prefetch distance.
+#[test]
+#[ignore]
+fn time_attention_decode() {
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(44);
+    const LAYERS_PER_ROW: usize = 9;
+    for fp8 in [false, true] {
+        let row = if fp8 { KV_ROW_BYTES_FP8 } else { KV_ROW_BYTES_BF16 };
+        let kv = KvRows { off: 4 * row, ld: LAYERS_PER_ROW * row, fp8 };
+        let ctx_max = 32768usize;
+        // Random bytes (FP8: no NaN codes; BF16: some NaNs, the speed is the same), one 64 MiB piece copied over.
+        let piece = up(&s, &rand_bytes(&mut rng, 64 << 20, |b| if fp8 { b & 0x77 } else { b & 0x7f }));
+        let bytes = ctx_max * LAYERS_PER_ROW * row;
+        let caches: Vec<DeviceBuffer> = (0..8)
+            .map(|_| {
+                let c = DeviceBuffer::new(bytes).unwrap();
+                for o in (0..bytes).step_by(64 << 20) {
+                    s.copy_d2d(c.addr() + o as u64, piece.addr(), (64usize << 20).min(bytes - o)).unwrap();
+                }
+                c
+            })
+            .collect();
+        for nseq in [1usize, 8] {
+            for ctx in [8192usize, 32768] {
+                let mut q = Seqs::default();
+                for (i, c) in caches.iter().take(nseq).enumerate() {
+                    q.kv[i] = c.addr();
+                    q.start[i] = (ctx - 1) as i32;
+                    q.row0[i + 1] = i as i32 + 1;
+                }
+                q.nseq = nseq as i32;
+                let qb = seqs_buf(&s, &q);
+                let qv: Vec<u16> = rng.vec(nseq * QH * HD, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
+                let qd = up(&s, &qv);
+                let groups = ctx / ATTN_GROUP;
+                let part = DeviceBuffer::new(attn_part_floats(nseq, groups) * 4).unwrap();
+                let out = DeviceBuffer::new(nseq * QH * HD * 2).unwrap();
+                let mut line = format!("TIME attention decode fp8 {fp8}, {nseq} seq at {ctx}:");
+                for pf in [0usize, 1, 2, 3, 4, 6] {
+                    set_attn_prefetch(pf);
+                    let us = time_graph(&s, |st| attention_small(st, qd.addr(), nseq, qb.addr(), kv, groups, part.addr(), out.addr()), 1);
+                    line += &format!(" pf {pf} {us:.1} us ({:.0} GB/s);", (nseq * ctx * 2 * KVH * HD * if fp8 { 1 } else { 2 }) as f64 / us / 1e3);
+                }
+                set_attn_prefetch(3);
+                eprintln!("{line}");
+            }
+        }
+    }
+}
+
 /// The engine's projection shapes (rows x columns, stored format) through the shared GEMV and every wide
 /// form, at 1, 2, 4 and 8 input rows, weights rotated through 1 GiB (beyond L2).
 #[test]
@@ -1231,6 +1283,12 @@ fn decode_forms_equal() {
         set_attn_combine(true);
         let new = attn_decode(&s, &cache, kv, &q_all, &pos);
         assert!(old.iter().zip(&new).all(|(a, b)| a.to_bits() == b.to_bits()), "attention combine fp8 {fp8}");
+        for pf in [0usize, 1, 5] {
+            set_attn_prefetch(pf);
+            let other = attn_decode(&s, &cache, kv, &q_all, &pos);
+            assert!(other.iter().zip(&new).all(|(a, b)| a.to_bits() == b.to_bits()), "attention prefetch {pf} fp8 {fp8}");
+        }
+        set_attn_prefetch(3);
         let full = attn_prefill(&s, &cache, kv, &q_all, 0, len);
         for (i, &p) in pos.iter().enumerate() {
             let a = &new[i * QH * HD..(i + 1) * QH * HD];
@@ -1238,6 +1296,6 @@ fn decode_forms_equal() {
             assert!(a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()), "attention decode vs prefill fp8 {fp8} position {p}");
         }
     }
-    eprintln!("attention combine per query head: equal (and decode rows equal prefill rows)");
+    eprintln!("attention combine per query head, L2 prefetch distances: equal (and decode rows equal prefill rows)");
 }
 

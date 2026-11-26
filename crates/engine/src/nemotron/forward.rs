@@ -72,8 +72,11 @@ pub const F_ROUTE: u32 = 128;
 pub const F_COMBINE: u32 = 256;
 /// The block norms load their weights before the dependency wait ([`nk::set_rms_early`]).
 pub const F_RMS: u32 = 2048;
+/// The small steps' attention prefetches key tiles into L2 ahead of its register fetch
+/// ([`nk::set_attn_prefetch`]; QUENCH6K_NEM_ATTN_PF tiles, default 3).
+pub const F_ATTN_PF: u32 = 4096;
 /// The default: every part.
-pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE | F_RMS;
+pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE | F_RMS | F_ATTN_PF;
 static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(F_ALL);
 
 /// Switches the optional parts of the step (`F_*` bits; for A/B timings in one process; the CUDA graphs
@@ -82,6 +85,8 @@ pub fn set_features(mask: u32) {
     FEATURES.store(mask, std::sync::atomic::Ordering::Relaxed);
     nk::set_attn_combine(mask & F_COMBINE != 0);
     nk::set_rms_early(mask & F_RMS != 0);
+    let pf = std::env::var("QUENCH6K_NEM_ATTN_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    nk::set_attn_prefetch(if mask & F_ATTN_PF != 0 { pf } else { 0 });
 }
 
 fn features() -> u32 {
