@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, ensure};
 use clap::Subcommand;
 use quench6k_cuda::kernels as k;
-use quench6k_engine::nemotron::forward::{CANON_CHUNK, Kv, Logits, MAX_SEQS, State, TOP_K, Workspace};
+use quench6k_engine::nemotron::forward::{CANON_CHUNK, Kv, Logits, MAX_DRAFTS, MAX_SEQS, MAX_VERIFY, State, TOP_K, Workspace};
 use quench6k_engine::nemotron::{Config, NemotronModel, WeightPlan};
 
 use crate::chat::Chat;
@@ -118,8 +118,34 @@ pub enum NemotronCmd {
         /// Attention cache: bf16, or fp8 (a scale per position and KV head).
         #[arg(long, default_value = "bf16")]
         kv: String,
+        /// Drafted greedy decoding with this many MTP drafts per step (0: plain).
+        #[arg(long, default_value_t = 0)]
+        drafts: usize,
         #[arg(long)]
         json: Option<PathBuf>,
+    },
+    /// Drafted decoding: greedy output with MTP drafts (alone and N sequences in batched verification
+    /// steps) must equal plain greedy output; reports acceptance and decode speed.
+    SpecCheck {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        /// Prompt length of the first sequence (the others are shorter by 37 tokens each).
+        #[arg(long, default_value_t = 1000)]
+        ctx: usize,
+        #[arg(long, default_value_t = 4)]
+        seqs: usize,
+        /// Tokens generated per sequence.
+        #[arg(long, default_value_t = 64)]
+        n: usize,
+        #[arg(long, default_value_t = 3)]
+        drafts: usize,
+        /// Use chat prompts (the corpus windows as user messages, thinking on) instead of raw corpus text.
+        #[arg(long)]
+        chat: bool,
+        #[arg(long, default_value = "bf16")]
+        kv: String,
     },
 }
 
@@ -183,8 +209,19 @@ pub fn run(cmd: NemotronCmd) -> Result<()> {
             generate,
             seqs,
             kv,
+            drafts,
             json,
-        } => bench(&model, &text, &ctx, generate, seqs, Kv::parse(&kv)?, json.as_deref()),
+        } => bench(&model, &text, &ctx, generate, seqs, Kv::parse(&kv)?, drafts, json.as_deref()),
+        NemotronCmd::SpecCheck {
+            model,
+            text,
+            ctx,
+            seqs,
+            n,
+            drafts,
+            chat,
+            kv,
+        } => spec_check(&model, &text, ctx, seqs, n, drafts, chat, Kv::parse(&kv)?),
     }
 }
 
@@ -393,13 +430,16 @@ fn score(model: &NemotronModel, s: &quench6k_cuda::Stream, fixture: &Path, out: 
     Ok(())
 }
 
-fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, kv: Kv, json: Option<&Path>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, kv: Kv, drafts: usize, json: Option<&Path>) -> Result<()> {
     ensure!((1..=MAX_SEQS).contains(&seqs), "--seqs 1 to {MAX_SEQS}");
     ensure!(generate >= 2, "--generate at least 2");
     let chat = Chat::load(dir, None)?;
     let ids = chat.encode(&std::fs::read_to_string(text)?)?;
     let (model, s) = load(dir)?;
-    let mut ws = Workspace::new(&model, CANON_CHUNK, seqs)?;
+    ensure!(drafts <= MAX_DRAFTS, "--drafts 0 to {MAX_DRAFTS}");
+    ensure!(drafts == 0 || model.mtp.is_some(), "--drafts needs the MTP layer");
+    let mut ws = Workspace::new(&model, CANON_CHUNK, seqs * MAX_VERIFY)?;
     for &ctx in ctxs {
         // Sequence j reads the corpus from token 37 j on (different prompts of the same length).
         ensure!(ctx + generate + 37 * seqs <= ids.len(), "corpus has {} tokens, {} needed", ids.len(), ctx + generate + 37 * seqs);
@@ -425,7 +465,14 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, 
         }
         let mut outs: Vec<Vec<i32>> = firsts.iter().map(|&t| vec![t]).collect();
         let t1 = Instant::now();
-        for _ in 1..generate {
+        let mut steps = generate - 1;
+        if drafts > 0 {
+            let mut refs: Vec<&mut State> = states.iter_mut().collect();
+            let r = decode_drafted(&model, &mut refs, &mut ws, &s, &firsts, generate, drafts, &|_| false)?;
+            outs = r.tokens;
+            steps = r.steps;
+        }
+        for _ in 1..if drafts > 0 { 0 } else { generate } {
             let toks: Vec<[i32; 1]> = outs.iter().map(|o| [*o.last().unwrap()]).collect();
             let tok_refs: Vec<&[i32]> = toks.iter().map(|t| t.as_slice()).collect();
             let mut refs: Vec<&mut State> = states.iter_mut().collect();
@@ -443,13 +490,14 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, 
         let copied = outs[0].iter().zip(&ids[ctx..]).filter(|(a, b)| a == b).count();
         let pf = (ctx * seqs) as f64 / prefill_s;
         let tg = ((generate - 1) * seqs) as f64 / decode_s;
+        let per_step = (generate - 1) as f64 / steps.max(1) as f64;
         println!(
-            "ctx {ctx:>6} x {seqs}: prefill {pf:>7.0} tok/s ({prefill_s:.2}s), decode {tg:>6.1} tok/s; corpus continuation {copied}/{generate}; {:?}",
+            "ctx {ctx:>6} x {seqs}: prefill {pf:>7.0} tok/s ({prefill_s:.2}s), decode {tg:>6.1} tok/s ({per_step:.2} tokens/step); corpus continuation {copied}/{generate}; {:?}",
             chat.decode(&outs[0][..outs[0].len().min(24)], false)?
         );
         if let Some(path) = json {
             use std::io::Write;
-            let rec = serde_json::json!({"engine": "quench6k", "model": "nemotron-h", "kv": format!("{kv:?}").to_lowercase(), "seqs": seqs, "ctx": ctx,
+            let rec = serde_json::json!({"engine": "quench6k", "model": "nemotron-h", "kv": format!("{kv:?}").to_lowercase(), "drafts": drafts, "tokens_per_step": (per_step * 100.0).round() / 100.0, "seqs": seqs, "ctx": ctx,
                 "generate": generate, "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0,
                 "copied": copied});
             writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path)?, "{rec}")?;
@@ -513,5 +561,177 @@ fn batch_check(dir: &Path, text: &Path, ctx: usize, seqs: usize, steps: usize, k
     }
     ensure!(mismatches == 0, "{mismatches} of {} step rows differ", seqs * steps);
     println!("batch-check: {seqs} sequences x {steps} steps bit-identical alone and batched");
+    Ok(())
+}
+
+/// Drafted greedy decoding of several sequences in lockstep.
+pub(crate) struct Drafted {
+    pub tokens: Vec<Vec<i32>>,
+    /// Verification steps (the most any sequence took).
+    pub steps: usize,
+    /// Drafts verified and accepted, over all sequences.
+    pub drafted: usize,
+    pub accepted: usize,
+}
+
+/// Greedy decoding with up to `drafts` MTP drafts per step of `states` (prefilled; `first[i]` chosen after
+/// their prompts), in batched verification steps until each has `n` tokens or stopped (`stop`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_drafted(
+    model: &NemotronModel,
+    states: &mut [&mut State],
+    ws: &mut Workspace,
+    s: &quench6k_cuda::Stream,
+    first: &[i32],
+    n: usize,
+    drafts: usize,
+    stop: &dyn Fn(i32) -> bool,
+) -> Result<Drafted> {
+    let m = states.len();
+    let vocab = model.cfg.vocab;
+    let mut out: Vec<Vec<i32>> = first.iter().map(|&t| vec![t]).collect();
+    let mut done: Vec<bool> = first.iter().map(|&t| stop(t) || n <= 1).collect();
+    let room = |o: &Vec<i32>| n.saturating_sub(o.len() + 1).min(drafts);
+    let want: Vec<usize> = (0..m).map(|i| if done[i] { 0 } else { room(&out[i]) }).collect();
+    let next: Vec<Option<i32>> = (0..m).map(|i| (!done[i]).then_some(first[i])).collect();
+    let mut cur = model.commit(states, ws, s, &vec![0; m], &next, &want)?;
+    let (mut steps, mut drafted, mut accepted) = (0, 0, 0);
+    while done.iter().any(|d| !d) {
+        let active: Vec<usize> = (0..m).filter(|&i| !done[i]).collect();
+        let toks: Vec<Vec<i32>> = active
+            .iter()
+            .map(|&i| {
+                let mut t = vec![*out[i].last().unwrap()];
+                let k = cur[i].tokens.len().min(room(&out[i]));
+                t.extend_from_slice(&cur[i].tokens[..k]);
+                t
+            })
+            .collect();
+        let refs: Vec<&[i32]> = toks.iter().map(|t| t.as_slice()).collect();
+        let mut sub: Vec<&mut State> = states.iter_mut().enumerate().filter(|(i, _)| !done[*i]).map(|(_, st)| &mut **st).collect();
+        model.verify(&mut sub, ws, s, &refs)?;
+        steps += 1;
+        let rows: usize = toks.iter().map(|t| t.len()).sum();
+        k::argmax(s, ws.out_logits, rows, vocab, vocab, ws.argmax_scratch, ws.argmax)?;
+        let picks = s.download::<i32>(ws.argmax, rows)?;
+        let mut row = 0;
+        let (mut keep, mut nexts, mut wants) = (Vec::new(), Vec::new(), Vec::new());
+        for (a, &i) in active.iter().enumerate() {
+            let t = &toks[a];
+            drafted += t.len() - 1;
+            let mut j = 0;
+            loop {
+                let tok = picks[row + j];
+                out[i].push(tok);
+                if stop(tok) || out[i].len() >= n {
+                    done[i] = true;
+                }
+                if !done[i] && j + 1 < t.len() && tok == t[j + 1] {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            accepted += j;
+            row += t.len();
+            keep.push(j + 1);
+            nexts.push((!done[i]).then(|| *out[i].last().unwrap()));
+            wants.push(if done[i] { 0 } else { room(&out[i]) });
+        }
+        let d = model.commit(&mut sub, ws, s, &keep, &nexts, &wants)?;
+        for (a, &i) in active.iter().enumerate() {
+            cur[i] = d[a].clone();
+        }
+    }
+    Ok(Drafted { tokens: out, steps, drafted, accepted })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spec_check(dir: &Path, text: &Path, ctx: usize, seqs: usize, n: usize, drafts: usize, chat_prompts: bool, kv: Kv) -> Result<()> {
+    ensure!((1..=MAX_SEQS).contains(&seqs) && (1..=MAX_DRAFTS).contains(&drafts), "--seqs 1 to {MAX_SEQS}, --drafts 1 to {MAX_DRAFTS}");
+    let chat = Chat::load(dir, None)?;
+    let corpus = std::fs::read_to_string(text)?;
+    let ids = chat.encode(&corpus)?;
+    ensure!(ids.len() >= ctx + 64 * seqs, "corpus too short");
+    let prompts: Vec<Vec<i32>> = (0..seqs)
+        .map(|j| {
+            let window = &ids[64 * j..64 * j + ctx - 37 * j];
+            if chat_prompts {
+                let text = chat.decode(window, true)?;
+                let msg = format!("Summarize the following text in a few sentences.\n\n{text}");
+                chat.encode(&chat.render(&serde_json::json!([{"role": "user", "content": msg}]), None, None, None)?)
+            } else {
+                Ok(window.to_vec())
+            }
+        })
+        .collect::<Result<_>>()?;
+    let (model, s) = load(dir)?;
+    ensure!(model.mtp.is_some(), "the checkpoint's MTP layer is not loaded");
+    let mut ws = Workspace::new(&model, CANON_CHUNK, seqs * MAX_VERIFY)?;
+    let stop = |t: i32| model.cfg.eos.contains(&t);
+    let cap = ctx + n + 64 + 2048;
+    let prefill = |ws: &mut Workspace, p: &[i32]| -> Result<(State, i32)> {
+        let mut st = State::new(&model, cap.max(p.len() + n + 16), kv, &s)?;
+        model.prefill(&mut st, ws, &s, p)?;
+        let first = argmax(ws, &model, &s, 1)?[0];
+        Ok((st, first))
+    };
+    // Plain greedy, each sequence alone.
+    let mut plain = Vec::new();
+    let mut plain_s = 0.0;
+    for p in &prompts {
+        let (mut st, first) = prefill(&mut ws, p)?;
+        let mut out = vec![first];
+        let t0 = Instant::now();
+        while out.len() < n && !stop(*out.last().unwrap()) {
+            model.forward(&mut st, &mut ws, &s, &[*out.last().unwrap()], Logits::Last)?;
+            out.push(argmax(&ws, &model, &s, 1)?[0]);
+        }
+        plain_s += t0.elapsed().as_secs_f64();
+        plain.push(out);
+    }
+    let plain_tokens: usize = plain.iter().map(|o| o.len() - 1).sum();
+    println!("plain greedy alone: {:.1} tok/s", plain_tokens as f64 / plain_s);
+    let mut failures = 0;
+    // Drafted: each sequence alone, then all in batched verification steps.
+    for batched in [false, true] {
+        let groups: Vec<Vec<usize>> = if batched { vec![(0..seqs).collect()] } else { (0..seqs).map(|i| vec![i]).collect() };
+        let (mut secs, mut steps, mut drafted, mut accepted, mut tokens) = (0.0, 0, 0, 0, 0);
+        for g in &groups {
+            let mut sts = Vec::new();
+            let mut firsts = Vec::new();
+            for &i in g {
+                let (st, f) = prefill(&mut ws, &prompts[i])?;
+                sts.push(st);
+                firsts.push(f);
+            }
+            let mut refs: Vec<&mut State> = sts.iter_mut().collect();
+            s.synchronize()?;
+            let t0 = Instant::now();
+            let r = decode_drafted(&model, &mut refs, &mut ws, &s, &firsts, n, drafts, &stop)?;
+            secs += t0.elapsed().as_secs_f64();
+            steps += r.steps;
+            drafted += r.drafted;
+            accepted += r.accepted;
+            for (k2, &i) in g.iter().enumerate() {
+                tokens += r.tokens[k2].len() - 1;
+                if r.tokens[k2] != plain[i] {
+                    failures += 1;
+                    let at = r.tokens[k2].iter().zip(&plain[i]).take_while(|(a, b)| a == b).count();
+                    eprintln!("sequence {i} ({}): drafted output differs from plain greedy at token {at}", if batched { "batched" } else { "alone" });
+                }
+            }
+        }
+        println!(
+            "drafted {}: {:.1} tok/s, {:.2} tokens per sequence step, acceptance {:.1}% ({accepted} of {drafted} drafts), {} steps",
+            if batched { format!("{seqs} batched") } else { "alone".into() },
+            tokens as f64 / secs,
+            tokens as f64 / (steps as f64 * if batched { seqs as f64 } else { 1.0 }).max(1.0),
+            100.0 * accepted as f64 / drafted.max(1) as f64,
+            steps
+        );
+    }
+    ensure!(failures == 0, "{failures} drafted outputs differ from plain greedy");
+    println!("spec-check: drafted greedy output equals plain greedy for {seqs} sequences, alone and batched");
     Ok(())
 }

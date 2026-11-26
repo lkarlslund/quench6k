@@ -186,6 +186,11 @@ impl Config {
         })
     }
 
+    /// Whether the MTP layer is loaded (the config has one; QUENCH6K_NEM_MTP=0 leaves it out).
+    pub fn mtp_on(&self) -> bool {
+        !self.mtp_kinds.is_empty() && std::env::var("QUENCH6K_NEM_MTP").map_or(true, |v| v != "0")
+    }
+
     pub fn count(&self, k: Kind) -> usize {
         self.kinds.iter().filter(|&&x| x == k).count()
     }
@@ -230,12 +235,10 @@ pub struct Attn {
     pub o: Linear,
 }
 
-/// A layer's routed experts: NVFP4 stacks per projection and, for the grouped GEMM of large steps,
-/// per-expert (codes, scales) pointer tables (u64 [EXPERTS] each) of up and down.
+/// A layer's routed experts: NVFP4 stacks per projection, contiguous over the experts.
 pub struct RoutedExperts {
     pub up: nk::NvExperts,
     pub down: nk::NvExperts,
-    pub tables: [(u64, u64); 2],
 }
 
 pub struct Moe {
@@ -505,9 +508,7 @@ impl<'a> Loader<'a> {
 
     /// The model's layers, final norm, LM head and MTP layer.
     fn parts(&mut self, cfg: &Config, t0: std::time::Instant) -> Result<Parts> {
-        let mtp_on = !cfg.mtp_kinds.is_empty()
-            && self.ckpt.tensors.contains_key("mtp.layers.0.eh_proj.weight")
-            && std::env::var("QUENCH6K_NEM_MTP").map_or(true, |v| v != "0");
+        let mtp_on = cfg.mtp_on() && self.ckpt.tensors.contains_key("mtp.layers.0.eh_proj.weight");
         let mut layers = Vec::with_capacity(cfg.kinds.len());
         for (i, &kind) in cfg.kinds.iter().enumerate() {
             layers.push(self.layer(&format!("backbone.layers.{i}"), kind, cfg.dt_limit)?);
@@ -896,15 +897,8 @@ impl<'a> Loader<'a> {
         self.routed(up, down)
     }
 
-    /// The per-expert pointer tables of `up` and `down` (grouped GEMM of large steps).
     fn routed(&mut self, up: nk::NvExperts, down: nk::NvExperts) -> Result<RoutedExperts> {
-        let mut tables = [(0, 0); 2];
-        for (slot, (e, n, k)) in [(up, FF, LAT), (down, LAT, FF)].into_iter().enumerate() {
-            let c: Vec<u64> = (0..EXPERTS).map(|x| e.codes + (x * n * k / 2) as u64).collect();
-            let sc: Vec<u64> = (0..EXPERTS).map(|x| e.scales + (x * n * k / 16) as u64).collect();
-            tables[slot] = (self.upload_slice(&c)?, self.upload_slice(&sc)?);
-        }
-        Ok(RoutedExperts { up, down, tables })
+        Ok(RoutedExperts { up, down })
     }
 
     /// BF16 routed experts (the MTP layer's) NVFP4-quantized at load into the layout of
@@ -1000,8 +994,8 @@ impl WeightPlan {
 
     pub fn compute(cfg: &Config, stored: &dyn Fn(&str) -> Stored) -> Self {
         let lin = |module: &str, n: usize, k: usize| linear_bytes(kept(stored(module), &format!("{module}.weight"), k), n, k);
-        // Codes, scales, s2 and the two pointer tables of up and down.
-        let ex_nvfp4 = EXPERTS * 2 * (FF * LAT / 2 + FF * LAT / 16 + 4 + 16);
+        // Codes, scales and s2 of up and down.
+        let ex_nvfp4 = EXPERTS * 2 * (FF * LAT / 2 + FF * LAT / 16 + 4);
         let mut p = Self::default();
         let layer = |p: &mut Self, pre: &str, kind: Kind, mtp: bool| {
             let m = |x: &str| format!("{pre}.mixer.{x}");
@@ -1106,7 +1100,7 @@ mod tests {
         let g = quench6k_cuda::kernels::int8_group();
         let i8b = |n: usize, k: usize| n * k + n * (k / g) * 4;
         assert_eq!(p.lm_head, i8b(131072, D));
-        assert_eq!(p.experts, 40 * EXPERTS * 2 * (FF * LAT / 2 + FF * LAT / 16 + 4 + 16));
+        assert_eq!(p.experts, 40 * EXPERTS * 2 * (FF * LAT / 2 + FF * LAT / 16 + 4));
         assert_eq!(p.mamba, 40 * (i8b(INP, D) + i8b(D, DI) + (CONV * CONVK + CONV + 3 * MH + DI) * 4));
         // FP8 stays 8-bit with a block scale table.
         let f = WeightPlan::compute(&c, &|m: &str| if m.ends_with("in_proj") { Stored::Fp8 } else { Stored::Bf16 });
