@@ -253,31 +253,42 @@ hf_quant_config.json alone.
 
 The residual stream is F32 (the transformers model keeps it in BF16), and so is the sum of an MoE block's
 routed and shared outputs (BF16 + BF16 there); the block norms read the F32 stream and round once. Per
-sequence, the attention layers' keys and values are cached in BF16 (8 KiB per position for all 8 layers)
-or, with `--kv fp8`, as FP8 E4M3 with a scale per position and KV head (4.1 KiB); the checkpoint's static
-`k_scale` / `v_scale` (all 1.0) are not used. The cache is reserved for the sequence's capacity and mapped
-as positions are used; the Mamba layers' SSM states (F32) and convolution states take 165 MiB, allocated
-with the sequence. With BF16 caches, 8 sequences of 262,144 positions take 17.3 GiB. Prefill is chunked at
-multiples of 2048 positions (`CANON_CHUNK`, `NemotronModel::prefill`), and up to 8 sequences of up to 16
-tokens each step together (`NemotronModel::forward_batch`), every projection of such a step through the
+sequence, the attention layers' keys and values are cached in BF16 (9 KiB per position for the 8 attention
+layers and the MTP layer) or, with `--kv fp8`, as FP8 E4M3 with a scale per position and KV head (4.6
+KiB); the checkpoint's static `k_scale` / `v_scale` (all 1.0) are not used. The cache is reserved for the
+sequence's capacity and mapped as positions are used; the Mamba layers' SSM states (F32), convolution
+states and the records of a verification step take 190 MiB, allocated with the sequence. With BF16 caches,
+8 sequences of 262,144 positions take 19.5 GiB (plus up to two state snapshots each). Prefill is chunked
+at multiples of 2048 positions (`CANON_CHUNK`, `NemotronModel::prefill`), and up to 8 sequences of up to
+16 tokens each step together (`NemotronModel::forward_batch`), every projection of such a step through the
 GEMV, whose rows do not depend on each other. The recurrent states cannot be rewound, so prefill is
 canonical as for Inkling 2: each whole aligned chunk advances the sequence's canonical frontier and
-snapshots its Mamba states (165 MiB; a sequence keeps the lowest and the latest), and `State::rewind`
+snapshots its Mamba states (190 MiB; a sequence keeps the lowest and the latest), and `State::rewind`
 reuses a cached prefix only up to a multiple of 2048 at most the common prefix and the frontier, restoring
 the snapshot there. A turn thus recomputes up to 2047 cached prompt tokens plus the previous reply, and
 its results depend only on its tokens.
 
 `quench6k nemotron generate` (greedy, `--think on|off|low` for the chat template, `--ids` for token ids),
-`bench` (`--seqs N` decodes N sequences in batched steps) and `score` (teacher-forced distributions,
+`bench` (`--seqs N` decodes N sequences in batched steps, `--drafts K` with MTP drafts) and `score` (teacher-forced distributions,
 oracle.distributions/1) run the model; `--dump-dir DIR` (or `QUENCH6K_NEM_DUMP=DIR`) appends the hidden
 states after each layer (`lanes-NN.bin`, F32 [tokens, 4096]) and after the final norm (`final.bin`) for
 comparison with a reference's per-layer dumps.
 
+The MTP layer drafts (`QUENCH6K_NEM_DRAFTS`, default 4 per pass; `QUENCH6K_NEM_MTP=0` does not load it).
+Every step keeps the layer up to date: its input at position q is the main model's final-norm output at q
+(F32) and the embedding of the token at q + 1, through enorm / hnorm, eh_proj, an attention block with its
+own cache row and an MoE block; a draft is the LM head's argmax after final_layernorm, and further drafts
+feed the layer's own normed output back (`QUENCH6K_NEM_MTP_H=pre` feeds the unnormed residual instead: 19%
+acceptance against 57%). Verification steps (`NemotronModel::verify`) leave the Mamba states at the step's
+start and record its rows; `NemotronModel::commit` keeps the accepted rows (the kernels replay them first
+in the next step) and drafts from the next token, with each draft's probability for the draft policy. A
+verified row's logits are bit-identical to a plain step's, so drafted greedy output equals plain greedy
+output (`quench6k nemotron spec-check`), alone or batched (`batch-check --verify W`).
+
 `quench6k serve --model DIR` detects the model and serves up to `--slots` requests at once in the slot
-scheduler (canonical prefill and prefix reuse as above, batched decoding, tool calls and reasoning through
-the chat template, `--kv bf16|fp8`); steering, adapters, vision, edits and stored contexts are not
-available for it. Not done yet: MTP drafting (the layer loads but is not used, and no step defers its
-Mamba records, so the server drafts nothing, not even prompt lookups); CUDA graphs.
+scheduler (canonical prefill and prefix reuse as above, batched decoding with MTP drafts, tool calls and
+reasoning through the chat template, `--kv bf16|fp8`); steering, adapters, vision, edits and stored
+contexts are not available for it. Not done yet: CUDA graphs.
 
 ## Server options
 
