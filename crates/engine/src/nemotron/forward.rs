@@ -80,8 +80,11 @@ pub const F_RMS: u32 = 2048;
 /// The small steps' attention prefetches key tiles into L2 ahead of its register fetch
 /// ([`nk::set_attn_prefetch`]; QUENCH6K_NEM_ATTN_PF tiles, default 3).
 pub const F_ATTN_PF: u32 = 4096;
+/// Small steps' Mamba layers: in_proj's z rows on the side stream after its xBC / dt rows, beside the
+/// convolution and the scan (the same per-output arithmetic).
+pub const F_SIDE_Z: u32 = 16384;
 /// The default: every part.
-pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE | F_SIDE | F_SIDE_FC1 | F_RMS | F_ATTN_PF;
+pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE | F_SIDE | F_SIDE_FC1 | F_RMS | F_ATTN_PF | F_SIDE_Z;
 static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(F_ALL);
 
 /// Switches the optional parts of the step (`F_*` bits; for A/B timings in one process; the CUDA graphs
@@ -720,6 +723,21 @@ impl Workspace {
     }
 }
 
+/// Rows r0 .. r0 + n of a projection (FP8 block-scaled: r0 a multiple of the 128-row blocks).
+fn rows_of(l: &Linear, r0: usize, n: usize) -> Linear {
+    assert!(r0 + n <= l.n);
+    let (w, scale) = match l.fmt {
+        k::WeightFormat::Bf16 => (l.w + (r0 * l.k * 2) as u64, l.scale),
+        k::WeightFormat::Int8Group => (l.w + (r0 * l.k) as u64, l.scale + (r0 * (l.k / k::int8_group()) * 4) as u64),
+        k::WeightFormat::Fp8Block => {
+            assert!(r0.is_multiple_of(128));
+            (l.w + (r0 * l.k) as u64, l.scale + (r0 / 128 * (l.k / 128) * 4) as u64)
+        }
+        f => panic!("rows_of: format {f:?}"),
+    };
+    Linear { w, scale, n, ..*l }
+}
+
 /// Y [m, l.n] F32 (+)= alpha X [m, l.k] BF16 . W^T: the GEMV (per-row arithmetic independent of m) for
 /// small steps and any m up to the GEMV's rows, the tensor-core GEMM otherwise.
 #[allow(clippy::too_many_arguments)]
@@ -1027,6 +1045,21 @@ impl NemotronModel {
     /// out_proj into ws.mix.
     fn mamba(&self, ws: &Workspace, s: &Stream, m: &Mamba, slot: usize, plan: &Plan) -> Result<()> {
         let r = plan.r;
+        if plan.small && feature(F_CONV) && feature(F_SIDE_Z) && DEBUG_SYNC.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            // xBC and dt (in_proj rows DI..) first; then z (rows ..DI, read only by the gated norm) on the side
+            // stream, its weight stream beside the convolution and the scan.
+            linear(s, ws.xn, D, r, &rows_of(&m.in_proj, DI, INP - DI), ws.big + (DI * 4) as u64, INP, true, false)?;
+            ws.fork.record(s)?;
+            ws.side.wait(&ws.fork)?;
+            linear(&ws.side, ws.xn, D, r, &rows_of(&m.in_proj, 0, DI), ws.big, INP, true, false)?;
+            ws.join.record(&ws.side)?;
+            let sc = &ws.mamba;
+            nk::mamba_conv_small(s, ws.big, INP, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, sc.xbc, sc.dt)?;
+            nk::mamba_scan(s, sc.xbc, sc.dt, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, sc.y)?;
+            s.wait(&ws.join)?;
+            nk::mamba_gated_norm(s, sc.y, ws.big, INP, r, m.w.norm_w, 1e-5, ws.act)?;
+            return linear(s, ws.act, DI, r, &m.out_proj, ws.mix, D, plan.small, false);
+        }
         linear(s, ws.xn, D, r, &m.in_proj, ws.big, INP, plan.small, false)?;
         dsync(s, 1)?;
         if plan.small && feature(F_CONV) {
