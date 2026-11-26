@@ -459,6 +459,62 @@ fn moe_experts_vs_reference() {
     assert!(worst < 2e-2);
 }
 
+/// PDL ordering of the small-step expert chain: routing (moe_route) -> grouping -> up -> down, with many pairs per
+/// expert (22 of 24 favoured experts per row, 16 rows), many steps enqueued back to back without host
+/// synchronization; each step must equal the same step run alone (synchronized). A kernel that reads the
+/// routing or the grouping before its dependency wait sees an earlier step's values here.
+#[test]
+#[ignore]
+fn moe_experts_pdl_chain() {
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(71);
+    let h_up = NvExpertsHost::random(&mut rng, TEST_EXPERTS, MOE_INTER, LATENT);
+    let h_down = NvExpertsHost::random(&mut rng, TEST_EXPERTS, LATENT, MOE_INTER);
+    let ex = experts_gpu(&s, &h_up, &h_down);
+    let rows = 16;
+    let steps = 24;
+    let pairs = rows * TOPK;
+    let mut bias = vec![-10.0f32; EXPERTS];
+    for b in bias.iter_mut().take(24) {
+        *b = 10.0;
+    }
+    let bb = up(&s, &bias);
+    let logits: Vec<DeviceBuffer> = (0..steps).map(|_| up(&s, &rng.vec(rows * EXPERTS, -4.0, 4.0))).collect();
+    let xs: Vec<DeviceBuffer> = (0..steps)
+        .map(|_| up(&s, &rng.vec(rows * LATENT, -1.0, 1.0).into_iter().map(bf16::from_f32).collect::<Vec<u16>>()))
+        .collect();
+    let (sel_e, sel_w, order, act) = (
+        DeviceBuffer::new(pairs * 4).unwrap(),
+        DeviceBuffer::new(pairs * 4).unwrap(),
+        DeviceBuffer::new(pairs * 4).unwrap(),
+        DeviceBuffer::new(pairs * MOE_INTER * 2).unwrap(),
+    );
+    let ys: Vec<DeviceBuffer> = (0..steps).map(|_| DeviceBuffer::new(pairs * LATENT * 4).unwrap()).collect();
+    let step = |i: usize| {
+        moe_route(&s, logits[i].addr(), EXPERTS, bb.addr(), 5.0, rows, sel_e.addr(), sel_w.addr()).unwrap();
+        moe_experts_small(&s, xs[i].addr(), sel_e.addr(), &ex.up, &ex.down, rows, order.addr(), act.addr(), ys[i].addr()).unwrap();
+    };
+    // Reference: one step at a time.
+    let mut want = Vec::new();
+    for i in 0..steps {
+        step(i);
+        s.synchronize().unwrap();
+        want.push(f32s(&s, ys[i].addr(), pairs * LATENT));
+    }
+    for round in 0..5 {
+        for y in &ys {
+            s.memset(y.addr(), 0, pairs * LATENT * 4).unwrap();
+        }
+        for i in 0..steps {
+            step(i);
+        }
+        s.synchronize().unwrap();
+        let bad = (0..steps).filter(|&i| f32s(&s, ys[i].addr(), pairs * LATENT) != want[i]).count();
+        eprintln!("experts PDL chain round {round}: {bad} of {steps} steps differ from the synchronized run");
+        assert_eq!(bad, 0, "experts chain reads stale routing / grouping");
+    }
+}
+
 // ---- Attention -------------------------------------------------------------------------------------
 
 /// One attention layer's cache (one sequence, `len` positions) filled by attn_prep from random q/k/v,

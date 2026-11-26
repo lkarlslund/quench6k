@@ -183,8 +183,11 @@ template <int R>
 __global__ void __launch_bounds__(EX_WARPS * 32) experts_up_grouped(const bf16* x, const int* sel_e, const int* order, NvExperts up, int pairs,
                                                                     bf16* act) {
     constexpr int TILE = EX_WARPS * R, TILES = MOE_INTER / TILE;
-    pdl_launch_dependents();
+    // Wait first, then let the down kernel start: it reads the routing and the grouping before its own wait,
+    // which is safe only once every CTA of this kernel has passed its wait (the grouping kernel, and through
+    // it the routing, complete).
     pdl_wait();
+    pdl_launch_dependents();
     __shared__ Groups gr;
     __shared__ __align__(16) bf16 xs[SMALL_ROWS][LATENT];
     load_groups(gr, order, pairs);
@@ -250,7 +253,8 @@ __global__ void __launch_bounds__(EX_WARPS * 32) experts_down_grouped(const bf16
     pdl_launch_dependents();
     __shared__ Groups gr;
     __shared__ __align__(16) bf16 as[DOWN_PB][MOE_INTER];
-    // The order and the routing come before the up kernel: weights load while it finishes.
+    // The order and the routing are complete once this kernel starts (experts_up_grouped triggers it only after
+    // its own wait), so the grouping and the first weights load while the up kernel finishes.
     load_groups(gr, order, pairs);
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int items = gr.count * TILES;
