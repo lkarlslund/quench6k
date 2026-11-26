@@ -17,11 +17,12 @@
 //! kernel row-wise too, so a sequence gets the same bits alone or batched; larger steps (one sequence)
 //! use the tensor-core GEMM and the grouped expert GEMM.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Result, ensure};
 use quench6k_cuda::kernels as k;
-use quench6k_cuda::{DeviceBuffer, PinnedBuffer, Stream, VmBuffer};
+use quench6k_cuda::{DeviceBuffer, Event, Graph, PinnedBuffer, Stream, VmBuffer};
 
 use super::*;
 
@@ -46,6 +47,58 @@ pub const REC_ROWS: usize = MAX_VERIFY;
 const RESERVE_STEP: usize = 4096;
 /// Top logits per position kept by teacher-forced scoring.
 pub const TOP_K: usize = 32;
+/// Most CUDA graphs of steps (and of MTP passes) a workspace keeps.
+const MAX_GRAPHS: usize = 256;
+/// The small steps' attention grid and partials are sized for position groups rounded up to a multiple of
+/// this (blocks of groups past a row's position exit at once): a step's CUDA graph serves
+/// GROUP_BUCKET * ATTN_GROUP positions of growth.
+const GROUP_BUCKET: usize = 4;
+
+/// Optional parts of the step that A/B timings switch at run time ([`set_features`]; all on by default).
+pub const F_GRAPHS: u32 = 1;
+/// Projections of several rows in small steps through the wide GEMV forms ([`wide_form`]).
+pub const F_WIDE: u32 = 2;
+/// Also the matrices with 8192 columns at 5 to 8 rows.
+pub const F_WIDE_K8: u32 = 4;
+/// The Mamba convolution and its commit in one launch in small steps ([`nk::mamba_conv_small`]).
+pub const F_CONV: u32 = 16;
+/// The router by sorting ([`nk::moe_route_sort`]).
+pub const F_ROUTE: u32 = 128;
+/// The small steps' attention combine with a CTA per query head ([`nk::set_attn_combine`]).
+pub const F_COMBINE: u32 = 256;
+/// The default: every part.
+pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE;
+static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(F_ALL);
+
+/// Switches the optional parts of the step (`F_*` bits; for A/B timings in one process; the CUDA graphs
+/// are kept per setting).
+pub fn set_features(mask: u32) {
+    FEATURES.store(mask, std::sync::atomic::Ordering::Relaxed);
+    nk::set_attn_combine(mask & F_COMBINE != 0);
+}
+
+fn features() -> u32 {
+    FEATURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn feature(bit: u32) -> bool {
+    features() & bit != 0
+}
+
+/// Small steps and MTP passes run as CUDA graphs captured once per shape (QUENCH6K_NEM_GRAPHS=0: eager;
+/// never while dumping or with debug waits).
+fn graphs_enabled(ws: &Workspace) -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QUENCH6K_NEM_GRAPHS").map_or(true, |v| v != "0"))
+        && feature(F_GRAPHS)
+        && ws.dump.is_none()
+        && DEBUG_SYNC.load(std::sync::atomic::Ordering::Relaxed) == 0
+}
+
+/// Position groups of the small steps' attention for rows up to position `end` - 1, bucketed.
+fn group_bucket(end: usize) -> usize {
+    end.div_ceil(nk::ATTN_GROUP).div_ceil(GROUP_BUCKET) * GROUP_BUCKET
+}
 
 /// Which positions' logits a forward pass produces.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -411,9 +464,19 @@ pub struct Workspace {
     accepted: u64,
     /// 8-bit projection weights expanded to BF16 for large steps ([`EXPAND_BYTES`]; 0: none).
     wexp: u64,
-    /// Embedding rows (F32) and the descriptor of a step, then those of an MTP pass and accepted rows,
-    /// staged for upload.
+    /// An MTP pass's row copies (`nk::copy_rows` pairs): its hidden inputs into `mhid`, with heads each
+    /// sequence's last row into `dx`, then copies after the pass (`h_last`).
+    mtab: u64,
+    /// Embedding rows (F32) and the descriptor of a step, then those of an MTP pass, its row copies and
+    /// accepted rows, staged for upload.
     pinned: PinnedBuffer,
+    /// Recorded after the uploads from the MTP pass's and the accepted rows' parts of `pinned`.
+    mtp_up: Event,
+    acc_up: Event,
+    /// CUDA graphs of small steps (by features, plan and whether the MTP hidden states are kept) and of MTP
+    /// passes.
+    graphs: HashMap<(u32, Plan, bool), Graph>,
+    mgraphs: HashMap<MtpKey, Graph>,
     /// Debugging: hidden states after each layer appended to `lanes-NN.bin` (F32 [rows, D]) and the final
     /// norm's output to `final.bin` (QUENCH6K_NEM_DUMP or set by the caller).
     pub dump: Option<PathBuf>,
@@ -425,7 +488,7 @@ const SEQS_BYTES: usize = std::mem::size_of::<nk::Seqs>();
 
 impl Workspace {
     /// Device bytes of the buffers, in the order [`Workspace::new`] allocates them.
-    fn sizes(cfg: &Config, max_t: usize, logit_rows: usize) -> (usize, [usize; 43]) {
+    fn sizes(cfg: &Config, max_t: usize, logit_rows: usize) -> (usize, [usize; 44]) {
         let cap = Self::cap(max_t);
         let lr = logit_rows.max(1);
         let vocab = cfg.vocab;
@@ -464,10 +527,11 @@ impl Workspace {
                 cap * H * HD * 2,
                 lr * vocab * 4,
                 k::argmax_scratch(lr, vocab),
+                // argmax, log-sum-exp and target logits in one buffer (one download for the drafts).
+                3 * lr * 4,
                 lr * 4,
-                lr * 4,
-                lr * 4,
-                lr * 4,
+                0,
+                0,
                 lr * TOP_K * 4,
                 lr * TOP_K * 4,
                 cap * D * 4,
@@ -478,6 +542,7 @@ impl Workspace {
                 MAX_SEQS * D * 4,
                 SEQS_BYTES,
                 MAX_SEQS * 4,
+                Self::tab_rows(cap) * 16,
                 if max_t >= CANON_CHUNK { EXPAND_BYTES } else { 0 },
             ],
         )
@@ -488,14 +553,20 @@ impl Workspace {
         max_t.max(MAX_SEQS * MAX_STEP) + MAX_SEQS
     }
 
+    /// Entries of an MTP pass's row copy table: hidden inputs, heads' last rows, copies after the pass.
+    fn tab_rows(cap: usize) -> usize {
+        cap + 2 * MAX_SEQS
+    }
+
     /// Byte offsets in the pinned buffer: a step's descriptor, an MTP pass's embeddings, its descriptor,
-    /// accepted rows; total.
-    fn pinned_layout(cap: usize) -> (usize, usize, usize, usize, usize) {
+    /// accepted rows, the MTP pass's row copy table; total.
+    fn pinned_layout(cap: usize) -> (usize, usize, usize, usize, usize, usize) {
         let seqs = cap * D * 4;
         let memb = seqs + SEQS_BYTES.next_multiple_of(256);
         let mseqs = memb + cap * D * 4;
         let acc = mseqs + SEQS_BYTES.next_multiple_of(256);
-        (seqs, memb, mseqs, acc, acc + MAX_SEQS * 4)
+        let tab = acc + (MAX_SEQS * 4).next_multiple_of(256);
+        (seqs, memb, mseqs, acc, tab, tab + Self::tab_rows(cap) * 16)
     }
 
     /// Device bytes a workspace for steps of `max_t` tokens and `logit_rows` logits rows takes (without
@@ -509,7 +580,7 @@ impl Workspace {
         let (max_tiles, sz) = Self::sizes(&model.cfg, max_t, logit_rows);
         let cap = Self::cap(max_t);
         let mut a = Alloc { buffers: Vec::new(), bytes: 0 };
-        let mut b = [0u64; 43];
+        let mut b = [0u64; 44];
         for (slot, &bytes) in b.iter_mut().zip(&sz) {
             *slot = a.get(bytes)?;
         }
@@ -547,8 +618,8 @@ impl Workspace {
             argmax_scratch: b[27],
             argmax: b[28],
             targets: b[29],
-            lse: b[30],
-            target: b[31],
+            lse: b[28] + (logit_rows.max(1) * 4) as u64,
+            target: b[28] + (logit_rows.max(1) * 8) as u64,
             top_idx: b[32],
             top_val: b[33],
             hid: b[34],
@@ -559,12 +630,23 @@ impl Workspace {
             dh: b[39],
             mseqs: b[40],
             accepted: b[41],
-            wexp: if sz[42] > 0 { b[42] } else { 0 },
-            pinned: PinnedBuffer::new(Self::pinned_layout(cap).4)?,
+            mtab: b[42],
+            wexp: if sz[43] > 0 { b[43] } else { 0 },
+            pinned: PinnedBuffer::new(Self::pinned_layout(cap).5)?,
+            mtp_up: Event::new()?,
+            acc_up: Event::new()?,
+            graphs: HashMap::new(),
+            mgraphs: HashMap::new(),
             dump: std::env::var_os("QUENCH6K_NEM_DUMP").map(PathBuf::from),
             device_bytes: a.bytes,
             _alloc: a,
         })
+    }
+
+    /// Drops the captured CUDA graphs (captured again as steps need them).
+    pub fn clear_graphs(&mut self) {
+        self.graphs.clear();
+        self.mgraphs.clear();
     }
 
     /// The small steps' attention partials for `rows` rows below `groups` position groups.
@@ -573,6 +655,8 @@ impl Workspace {
         if self.part.as_ref().is_none_or(|p| p.bytes() < bytes) {
             // Room for twice the groups: fewer reallocations as sequences grow.
             let grown = nk::attn_part_floats(MAX_SEQS * MAX_STEP, groups * 2) * 4;
+            // Graphs captured with the old buffer go with it.
+            self.clear_graphs();
             self.part = None;
             self.part = Some(DeviceBuffer::new(grown.max(bytes).max(256))?);
         }
@@ -608,6 +692,9 @@ fn linear_x(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: u
 fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usize, small: bool, accumulate: bool) -> Result<()> {
     let gm = k::gemv_max_m();
     if m <= gm || small {
+        if let Some((mt, r)) = wide_form(l, m) {
+            return nk::gemv_wide(s, m, mt, r, x, ldx, l.fmt, l.w, l.scale, y, ldy, l.n, l.k, l.alpha, accumulate);
+        }
         for r0 in (0..m).step_by(gm) {
             let rows = gm.min(m - r0);
             k::gemv(s, rows, x + (r0 * ldx * 2) as u64, ldx, l.fmt, l.w, l.scale, y + (r0 * ldy * 4) as u64, ldy, 0, l.n, l.k, 1, l.alpha, accumulate)?;
@@ -617,6 +704,29 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
         // 64-row tiles for the narrow router and latent projections (variant nem.gemm=0: off); the same bits.
         let flags = quench6k_cuda::variants::get("nem.gemm", 2) as u32;
         nk::gemm_f32_ext(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, l.alpha, accumulate, flags)
+    }
+}
+
+/// The wide GEMV's form (input rows per warp, weight rows per warp) for `m` rows of `l`, where it beats the
+/// shared GEMV's launches of up to 16 rows (each row's bits are the same either way); None keeps those.
+fn wide_form(l: &Linear, m: usize) -> Option<(usize, usize)> {
+    if m < 2 || !feature(F_WIDE) {
+        return None;
+    }
+    let size = l.n * l.k;
+    let bf16 = l.fmt == k::WeightFormat::Bf16;
+    match m {
+        2 if size >= 8 << 20 => Some((2, 2)),
+        3..=4 if bf16 && size >= 12 << 20 => Some((4, 1)),
+        3..=4 if !bf16 && size >= 8 << 20 => Some((4, if l.k >= 8192 { 1 } else { 2 })),
+        5..=8 if bf16 && l.n >= 1024 && (3072..8192).contains(&l.k) => Some((8, 1)),
+        5..=8 if !bf16 && l.k >= 8192 && !feature(F_WIDE_K8) => None,
+        5..=8 if !bf16 && size >= 12 << 20 => Some((8, 4)),
+        5..=8 if !bf16 && size >= 8 << 20 => Some((8, 2)),
+        // (The BF16 16 x 4 form spills registers.)
+        9.. if !bf16 && size >= 12 << 20 && (m.is_multiple_of(16) || m % 16 > 8) => Some((16, 4)),
+        9.. if size >= 4 << 20 => Some((8, 4)),
+        _ => None,
     }
 }
 
@@ -644,13 +754,14 @@ fn dsync(s: &Stream, bit: u32) -> Result<()> {
     Ok(())
 }
 
-/// What the enqueued work of a step depends on besides device data.
-#[derive(Clone, Copy)]
+/// What the enqueued work of a step depends on besides device data (a step's CUDA graph is keyed by it).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Plan {
     r: usize,
     nseq: usize,
     small: bool,
-    /// Position groups of the small steps' attention: ceil((last position + 1) / ATTN_GROUP) over rows.
+    /// Position groups of the small steps' attention: ceil((last position + 1) / ATTN_GROUP) over rows,
+    /// bucketed ([`group_bucket`]).
     groups: usize,
     /// Partials of the small steps' attention.
     part: u64,
@@ -784,7 +895,7 @@ impl NemotronModel {
             let pos = st.pos;
             st.lower(pos);
         }
-        let groups = states.iter().zip(tokens).map(|(st, t)| (st.pos + t.len()).div_ceil(nk::ATTN_GROUP)).max().unwrap_or(1);
+        let groups = states.iter().zip(tokens).map(|(st, t)| group_bucket(st.pos + t.len())).max().unwrap_or(1);
         let part = if small { ws.part(r, groups)? } else { 0 };
         // The pinned buffer may still feed the previous step's uploads.
         s.synchronize()?;
@@ -816,16 +927,22 @@ impl NemotronModel {
             defer,
         };
         let kv: Vec<nk::KvRows> = (0..self.n_attn).map(|slot| states[0].kv_rows(slot)).collect();
-        self.enqueue(ws, s, &plan, &kv)?;
-        if !defer {
-            // Nothing of this step is pending in the Mamba states.
-            nk::mamba_set_ctl(s, ws.seqs, nseq, 0, false)?;
-        }
-        if states.iter().any(|st| st.mtp) {
-            self.mtp_hidden(ws, s, r)?;
-            if !defer {
-                self.mtp_catch_up(states, ws, s, tokens)?;
+        let mtp = states.iter().any(|st| st.mtp);
+        if small && graphs_enabled(ws) {
+            let key = (features(), plan, mtp);
+            if !ws.graphs.contains_key(&key) {
+                if ws.graphs.len() >= MAX_GRAPHS {
+                    ws.graphs.clear();
+                }
+                let g = Graph::capture(s, |s| self.step_body(ws, s, &plan, &kv, mtp))?;
+                ws.graphs.insert(key, g);
             }
+            ws.graphs[&key].launch(s)?;
+        } else {
+            self.step_body(ws, s, &plan, &kv, mtp)?;
+        }
+        if mtp && !defer {
+            self.mtp_catch_up(states, ws, s, tokens)?;
         }
         for (st, t) in states.iter_mut().zip(tokens) {
             if defer {
@@ -836,6 +953,20 @@ impl NemotronModel {
             st.pos += t.len();
             st.last_t = t.len();
             st.history.extend_from_slice(t);
+        }
+        Ok(())
+    }
+
+    /// A step's work on the device after its uploads: the layers and logits, the Mamba states' control
+    /// (plain steps) and the MTP layer's hidden inputs.
+    fn step_body(&self, ws: &Workspace, s: &Stream, plan: &Plan, kv: &[nk::KvRows], mtp: bool) -> Result<()> {
+        self.enqueue(ws, s, plan, kv)?;
+        if !plan.defer {
+            // Nothing of this step is pending in the Mamba states.
+            nk::mamba_set_ctl(s, plan.seqs, plan.nseq, 0, false)?;
+        }
+        if mtp {
+            self.mtp_hidden(ws, s, plan.r)?;
         }
         Ok(())
     }
@@ -890,7 +1021,11 @@ impl NemotronModel {
         let r = plan.r;
         linear_x(s, ws.xn, D, r, &m.in_proj, ws.big, INP, plan.small, false, ws.wexp)?;
         dsync(s, 1)?;
-        nk::mamba_mixer(s, ws.big, INP, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, &ws.mamba, ws.act)?;
+        if plan.small && feature(F_CONV) {
+            nk::mamba_mixer_small(s, ws.big, INP, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, &ws.mamba, ws.act)?;
+        } else {
+            nk::mamba_mixer(s, ws.big, INP, r, plan.seqs, plan.nseq, slot, REC_ROWS, &m.w, plan.defer, &ws.mamba, ws.act)?;
+        }
         linear_x(s, ws.act, DI, r, &m.out_proj, ws.mix, D, plan.small, false, ws.wexp)
     }
 
@@ -915,7 +1050,11 @@ impl NemotronModel {
     fn moe(&self, ws: &Workspace, s: &Stream, m: &Moe, r: usize, small: bool) -> Result<()> {
         linear_x(s, ws.xn, D, r, &m.gate, ws.logits, EXPERTS, small, false, ws.wexp)?;
         dsync(s, 8)?;
-        nk::moe_route(s, ws.logits, EXPERTS, m.bias, self.cfg.routed_scaling, r, ws.sel_e, ws.sel_w)?;
+        if feature(F_ROUTE) {
+            nk::moe_route_sort(s, ws.logits, EXPERTS, m.bias, self.cfg.routed_scaling, r, ws.sel_e, ws.sel_w)?;
+        } else {
+            nk::moe_route(s, ws.logits, EXPERTS, m.bias, self.cfg.routed_scaling, r, ws.sel_e, ws.sel_w)?;
+        }
         linear_x(s, ws.xn, D, r, &m.fc1, ws.lat, LAT, small, false, ws.wexp)?;
         dsync(s, 512)?;
         quench6k_cuda::hy4::to_bf16(s, ws.lat, ws.lat_bf, r * LAT)?;
@@ -981,6 +1120,9 @@ struct MtpSeq {
     next: Vec<i32>,
 }
 
+/// An MTP pass's CUDA graph key: the features, its plan and whether it computes the heads.
+type MtpKey = (u32, Plan, bool);
+
 /// Drafts of a sequence and the MTP layer's stated probability of each.
 #[derive(Clone, Debug, Default)]
 pub struct Drafts {
@@ -1002,6 +1144,7 @@ impl NemotronModel {
     /// token is known (from mtp_pos to the step's last but one), then h_last = the step's last row.
     fn mtp_catch_up(&self, states: &mut [&mut State], ws: &mut Workspace, s: &Stream, tokens: &[&[i32]]) -> Result<()> {
         let mut seqs = Vec::new();
+        let mut after = Vec::new();
         let mut off = 0;
         for (i, (st, t)) in states.iter().zip(tokens).enumerate() {
             let (a, n) = (st.pos, t.len());
@@ -1019,42 +1162,46 @@ impl NemotronModel {
                 if !m.next.is_empty() {
                     seqs.push(m);
                 }
+                after.push((st.h_last.addr(), ws.hid + ((off + n - 1) * D * 4) as u64));
             }
             off += n;
         }
-        if !seqs.is_empty() {
-            self.mtp_pass(states, ws, s, &seqs, false)?;
-        }
-        let mut off = 0;
+        self.mtp_pass(states, ws, s, &seqs, false, &after)?;
         for (st, t) in states.iter_mut().zip(tokens) {
-            let n = t.len();
             if st.mtp {
-                s.copy_d2d(st.h_last.addr(), ws.hid + ((off + n - 1) * D * 4) as u64, D * 4)?;
-                st.mtp_pos = st.pos + n - 1;
+                st.mtp_pos = st.pos + t.len() - 1;
             }
-            off += n;
         }
         Ok(())
     }
 
     /// One pass of the MTP layer over `seqs` (each sequence's rows contiguous, in position order): writes
     /// its cache rows; with `heads`, each sequence's last row's logits into ws.out_logits (row j for
-    /// seqs[j]) and the next draft's hidden input into ws.dh row j.
-    fn mtp_pass(&self, states: &[&mut State], ws: &mut Workspace, s: &Stream, seqs: &[MtpSeq], heads: bool) -> Result<()> {
-        let mtp = self.mtp.as_ref().expect("MTP layer");
+    /// seqs[j]) and the next draft's hidden input into ws.dh row j. Then the row copies `after`
+    /// ((destination, source) of D floats; the pass reads its hidden inputs before them).
+    fn mtp_pass(&self, states: &[&mut State], ws: &mut Workspace, s: &Stream, seqs: &[MtpSeq], heads: bool, after: &[(u64, u64)]) -> Result<()> {
+        if seqs.is_empty() {
+            for &(dst, src) in after {
+                s.copy_d2d(dst, src, D * 4)?;
+            }
+            return Ok(());
+        }
         let nseq = seqs.len();
         let n: usize = seqs.iter().map(|m| m.next.len()).sum();
-        ensure!(n <= ws.rows_cap && nseq <= MAX_SEQS, "MTP pass of {n} rows");
+        ensure!(n <= ws.rows_cap && nseq <= MAX_SEQS && after.len() <= MAX_SEQS, "MTP pass of {n} rows");
         let small = seqs.iter().all(|m| m.next.len() <= SMALL);
         ensure!(small || nseq == 1, "MTP pass of several sequences with more than {SMALL} rows");
-        let groups = seqs.iter().map(|m| (m.start + m.next.len()).div_ceil(nk::ATTN_GROUP)).max().unwrap_or(1);
+        let groups = seqs.iter().map(|m| group_bucket(m.start + m.next.len())).max().unwrap_or(1);
         let part = if small { ws.part(n, groups)? } else { 0 };
-        // The pinned staging area of passes may still feed the previous pass's upload.
-        s.synchronize()?;
-        let (_, memb_at, mseqs_at, _, _) = Workspace::pinned_layout(ws.rows_cap);
-        let mut d = nk::Seqs::default();
+        // The staging area may still feed the previous pass's uploads.
+        ws.mtp_up.synchronize()?;
+        let (_, memb_at, mseqs_at, _, tab_at, _) = Workspace::pinned_layout(ws.rows_cap);
+        let heads_at = n;
+        let after_at = n + if heads { nseq } else { 0 };
+        let mut tab: Vec<u64> = Vec::with_capacity(2 * (after_at + after.len()));
         {
             let buf = ws.pinned.as_mut_slice();
+            let mut d = nk::Seqs::default();
             let mut j = 0;
             for (si, m) in seqs.iter().enumerate() {
                 let st = &states[m.st];
@@ -1062,6 +1209,12 @@ impl NemotronModel {
                 d.kv[si] = st.kv.addr();
                 d.start[si] = m.start as i32;
                 d.row0[si] = j as i32;
+                for &(addr, rows) in &m.hid {
+                    for i in 0..rows {
+                        tab.push(ws.mhid + ((tab.len() / 2) * D * 4) as u64);
+                        tab.push(addr + (i * D * 4) as u64);
+                    }
+                }
                 for &tok in &m.next {
                     ensure!(tok >= 0 && (tok as usize) < self.cfg.vocab, "token {tok} out of range");
                     let row = self.embed_row(tok as usize);
@@ -1072,27 +1225,32 @@ impl NemotronModel {
                     }
                     j += 1;
                 }
+                ensure!(tab.len() / 2 == j, "MTP pass: {} hidden rows for {j} tokens", tab.len() / 2);
             }
             d.row0[nseq] = j as i32;
             d.nseq = nseq as i32;
             buf[mseqs_at..mseqs_at + SEQS_BYTES].copy_from_slice(d.as_bytes());
+            if heads {
+                for si in 0..nseq {
+                    let last = d.row0[si + 1] as usize - 1;
+                    tab.push(ws.dx + (si * D * 4) as u64);
+                    tab.push(ws.h + (last * D * 4) as u64);
+                }
+            }
+            for &(dst, src) in after {
+                tab.push(dst);
+                tab.push(src);
+            }
+            for (i, v) in tab.iter().enumerate() {
+                buf[tab_at + i * 8..tab_at + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            }
         }
         unsafe {
             s.copy_h2d(ws.memb, ws.pinned.as_ptr().add(memb_at), n * D * 4)?;
             s.copy_h2d(ws.mseqs, ws.pinned.as_ptr().add(mseqs_at), SEQS_BYTES)?;
+            s.copy_h2d(ws.mtab, ws.pinned.as_ptr().add(tab_at), tab.len() * 8)?;
         }
-        let mut j = 0;
-        for m in seqs {
-            for &(addr, rows) in &m.hid {
-                s.copy_d2d(ws.mhid + (j * D * 4) as u64, addr, rows * D * 4)?;
-                j += rows;
-            }
-        }
-        ensure!(j == n, "MTP pass: {j} hidden rows for {n} tokens");
-        let eps = self.cfg.eps;
-        nk::rms(s, ws.memb, D, mtp.enorm, eps, n, ws.cat, 2 * D, false)?;
-        nk::rms(s, ws.mhid, D, mtp.hnorm, eps, n, ws.cat + (D * 2) as u64, 2 * D, false)?;
-        linear(s, ws.cat, 2 * D, n, &mtp.eh, ws.h, D, small, false)?;
+        ws.mtp_up.record(s)?;
         let plan = Plan {
             r: n,
             nseq,
@@ -1105,10 +1263,40 @@ impl NemotronModel {
             defer: false,
         };
         let kv = states[seqs[0].st].kv_rows(self.n_attn);
+        if small && graphs_enabled(ws) {
+            let key = (features(), plan, heads);
+            if !ws.mgraphs.contains_key(&key) {
+                if ws.mgraphs.len() >= MAX_GRAPHS {
+                    ws.mgraphs.clear();
+                }
+                let g = Graph::capture(s, |s| self.mtp_body(ws, s, &plan, kv, heads))?;
+                ws.mgraphs.insert(key, g);
+            }
+            ws.mgraphs[&key].launch(s)?;
+        } else {
+            self.mtp_body(ws, s, &plan, kv, heads)?;
+        }
+        debug_assert_eq!(heads_at + if heads { nseq } else { 0 }, after_at);
+        if !after.is_empty() {
+            nk::copy_rows(s, ws.mtab + (after_at * 16) as u64, after.len())?;
+        }
+        Ok(())
+    }
+
+    /// An MTP pass's work on the device after its uploads (see [`NemotronModel::mtp_pass`]).
+    fn mtp_body(&self, ws: &Workspace, s: &Stream, plan: &Plan, kv: nk::KvRows, heads: bool) -> Result<()> {
+        let mtp = self.mtp.as_ref().expect("MTP layer");
+        let (n, nseq, small) = (plan.r, plan.nseq, plan.small);
+        let eps = self.cfg.eps;
+        // The hidden inputs into ws.mhid.
+        nk::copy_rows(s, ws.mtab, n)?;
+        nk::rms(s, ws.memb, D, mtp.enorm, eps, n, ws.cat, 2 * D, false)?;
+        nk::rms(s, ws.mhid, D, mtp.hnorm, eps, n, ws.cat + (D * 2) as u64, 2 * D, false)?;
+        linear(s, ws.cat, 2 * D, n, &mtp.eh, ws.h, D, small, false)?;
         for layer in &mtp.layers {
             nk::rms(s, ws.h, D, layer.norm, eps, n, ws.xn, D, false)?;
             match &layer.mixer {
-                Mixer::Attn(a) => self.attention(ws, s, a, kv, &plan)?,
+                Mixer::Attn(a) => self.attention(ws, s, a, kv, plan)?,
                 Mixer::Moe(m) => self.moe(ws, s, m, n, small)?,
                 Mixer::Mamba(_) => anyhow::bail!("MTP layers have no Mamba mixer"),
             }
@@ -1117,10 +1305,8 @@ impl NemotronModel {
         if !heads {
             return Ok(());
         }
-        for (si, _) in seqs.iter().enumerate() {
-            let last = d.row0[si + 1] as usize - 1;
-            s.copy_d2d(ws.dx + (si * D * 4) as u64, ws.h + (last * D * 4) as u64, D * 4)?;
-        }
+        // Each sequence's last row into ws.dx.
+        nk::copy_rows(s, ws.mtab + (n * 16) as u64, nseq)?;
         nk::rms(s, ws.dx, D, mtp.final_norm, eps, nseq, ws.xn, D, false)?;
         linear(s, ws.xn, D, nseq, &self.lm_head, ws.out_logits, self.cfg.vocab, true, false)?;
         if mtp_post() {
@@ -1161,12 +1347,14 @@ impl NemotronModel {
         if deferred {
             ensure!(fed.iter().all(Option::is_some), "commit: a step mixing verified and plain sequences");
             let at = Workspace::pinned_layout(ws.rows_cap).3;
-            s.synchronize()?;
+            // The accepted rows' staging area may still feed the previous commit's upload.
+            ws.acc_up.synchronize()?;
             let buf = &mut ws.pinned.as_mut_slice()[at..at + nseq * 4];
             for (i, a) in acc.iter().enumerate() {
                 buf[i * 4..i * 4 + 4].copy_from_slice(&a.to_le_bytes());
             }
             unsafe { s.copy_h2d(ws.accepted, ws.pinned.as_ptr().add(at), nseq * 4)? };
+            ws.acc_up.record(s)?;
             nk::mamba_set_ctl(s, ws.seqs, nseq, ws.accepted, true)?;
         }
         let mut out = vec![Drafts::default(); nseq];
@@ -1176,6 +1364,8 @@ impl NemotronModel {
         // The MTP layer up to each sequence's last kept position (and the next token's row, which drafts).
         let mut seqs = Vec::new();
         let mut drafting = Vec::new();
+        // h_last updates, after the pass (which may read the previous h_last).
+        let mut after = Vec::new();
         for (i, st) in states.iter_mut().enumerate() {
             if !st.mtp {
                 continue;
@@ -1188,6 +1378,8 @@ impl NemotronModel {
                 st.mtp_pos = a;
             }
             let mut m = MtpSeq { st: i, start: st.mtp_pos, hid: Vec::new(), next: Vec::new() };
+            // The hidden state at pos - 1 (h_last's value once this commit is done).
+            let mut last = st.h_last.addr();
             if kept > 0 {
                 if st.mtp_pos + 1 == a {
                     m.hid.push((st.h_last.addr(), 1));
@@ -1199,13 +1391,14 @@ impl NemotronModel {
                     m.hid.push((rows, kept - 1));
                     m.next.extend_from_slice(&st.history[a + 1..a + kept]);
                 }
-                s.copy_d2d(st.h_last.addr(), rows + ((kept - 1) * D * 4) as u64, D * 4)?;
+                last = rows + ((kept - 1) * D * 4) as u64;
+                after.push((st.h_last.addr(), last));
                 st.mtp_pos = a + kept - 1;
             }
             if let Some(tok) = next[i]
                 && st.mtp_pos + 1 == st.pos
             {
-                m.hid.push((st.h_last.addr(), 1));
+                m.hid.push((last, 1));
                 m.next.push(tok);
                 st.mtp_pos = st.pos;
                 let w = want[i].min(MAX_DRAFTS).min(st.capacity.saturating_sub(st.pos + 1));
@@ -1218,11 +1411,8 @@ impl NemotronModel {
                 seqs.push(m);
             }
         }
-        if seqs.is_empty() {
-            return Ok(out);
-        }
         let vocab = self.cfg.vocab;
-        self.mtp_pass(states, ws, s, &seqs, !drafting.is_empty())?;
+        self.mtp_pass(states, ws, s, &seqs, !drafting.is_empty(), &after)?;
         // Drafts: from the drafting sequences' last rows of that pass, then one row each per further draft
         // (the previous draft's MTP output as the hidden input, the draft as the token).
         let mut active: Vec<(usize, usize, usize)> = drafting;
@@ -1230,8 +1420,12 @@ impl NemotronModel {
         while !active.is_empty() {
             k::argmax(s, ws.out_logits, n_rows, vocab, vocab, ws.argmax_scratch, ws.argmax)?;
             k::row_lse(s, ws.out_logits, n_rows, vocab, vocab, ws.argmax, ws.lse, ws.target)?;
-            let picks = s.download::<i32>(ws.argmax, n_rows)?;
-            let (lse, tgt) = (s.download::<f32>(ws.lse, n_rows)?, s.download::<f32>(ws.target, n_rows)?);
+            // Picks, log-sum-exps and target logits are consecutive (logit_rows each): one download.
+            let lr = ws.logit_rows;
+            let all = s.download::<u32>(ws.argmax, 3 * lr)?;
+            let picks: Vec<i32> = all[..n_rows].iter().map(|&v| v as i32).collect();
+            let lse: Vec<f32> = all[lr..lr + n_rows].iter().map(|&v| f32::from_bits(v)).collect();
+            let tgt: Vec<f32> = all[2 * lr..2 * lr + n_rows].iter().map(|&v| f32::from_bits(v)).collect();
             let mut next_seqs = Vec::new();
             let mut next_active = Vec::new();
             for &(i, row, left) in &active {
@@ -1248,7 +1442,7 @@ impl NemotronModel {
                 break;
             }
             // The pass copies its hidden inputs (rows of ws.dh) before it rewrites ws.dh.
-            self.mtp_pass(states, ws, s, &next_seqs, true)?;
+            self.mtp_pass(states, ws, s, &next_seqs, true, &[])?;
             n_rows = next_seqs.len();
             active = next_active;
         }

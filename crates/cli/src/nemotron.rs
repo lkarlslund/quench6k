@@ -117,14 +117,15 @@ pub enum NemotronCmd {
         ctx: Vec<usize>,
         #[arg(long, default_value_t = 64)]
         generate: usize,
-        #[arg(long, default_value_t = 1)]
-        seqs: usize,
+        /// Sequences decoded together (several values: each in turn).
+        #[arg(long, num_args = 1.., default_values_t = [1usize])]
+        seqs: Vec<usize>,
         /// Attention cache: bf16, or fp8 (a scale per position and KV head).
         #[arg(long, default_value = "bf16")]
         kv: String,
-        /// Drafted greedy decoding with this many MTP drafts per step (0: plain).
-        #[arg(long, default_value_t = 0)]
-        drafts: usize,
+        /// Drafted greedy decoding with this many MTP drafts per step (0: plain; several values: each in turn).
+        #[arg(long, num_args = 1.., default_values_t = [0usize])]
+        drafts: Vec<usize>,
         #[arg(long)]
         json: Option<PathBuf>,
     },
@@ -222,7 +223,20 @@ pub fn run(cmd: NemotronCmd) -> Result<()> {
             kv,
             drafts,
             json,
-        } => bench(&model, &text, &ctx, generate, seqs, Kv::parse(&kv)?, drafts, json.as_deref()),
+        } => {
+            let kv = Kv::parse(&kv)?;
+            let (m, s) = load(&model)?;
+            // QUENCH6K_NEM_MAXT: the workspace's step size (a multiple of CANON_CHUNK; prefill merges whole chunks).
+            let max_t = std::env::var("QUENCH6K_NEM_MAXT").ok().and_then(|v| v.parse().ok()).unwrap_or(CANON_CHUNK);
+            let mut ws = Workspace::new(&m, max_t, seqs.iter().max().copied().unwrap_or(1) * MAX_VERIFY)?;
+            println!("workspace: steps of {max_t} tokens, {:.2} GiB", ws.device_bytes as f64 / (1u64 << 30) as f64);
+            for &n in &seqs {
+                for &d in &drafts {
+                    bench(&m, &s, &mut ws, &model, &text, &ctx, generate, n, kv, d, json.as_deref())?;
+                }
+            }
+            Ok(())
+        }
         NemotronCmd::SpecCheck {
             model,
             text,
@@ -442,137 +456,255 @@ fn score(model: &NemotronModel, s: &quench6k_cuda::Stream, fixture: &Path, out: 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, kv: Kv, drafts: usize, json: Option<&Path>) -> Result<()> {
+fn bench(
+    model: &NemotronModel,
+    s: &quench6k_cuda::Stream,
+    ws: &mut Workspace,
+    dir: &Path,
+    text: &Path,
+    ctxs: &[usize],
+    generate: usize,
+    seqs: usize,
+    kv: Kv,
+    drafts: usize,
+    json: Option<&Path>,
+) -> Result<()> {
     ensure!((1..=MAX_SEQS).contains(&seqs), "--seqs 1 to {MAX_SEQS}");
     ensure!(generate >= 2, "--generate at least 2");
     let chat = Chat::load(dir, None)?;
     let ids = chat.encode(&std::fs::read_to_string(text)?)?;
-    let (model, s) = load(dir)?;
     ensure!(drafts <= MAX_DRAFTS, "--drafts 0 to {MAX_DRAFTS}");
     ensure!(drafts == 0 || model.mtp.is_some(), "--drafts needs the MTP layer");
-    // QUENCH6K_NEM_MAXT: the workspace's step size (a multiple of CANON_CHUNK; prefill merges whole chunks).
-    let max_t = std::env::var("QUENCH6K_NEM_MAXT").ok().and_then(|v| v.parse().ok()).unwrap_or(CANON_CHUNK);
-    let mut ws = Workspace::new(&model, max_t, seqs * MAX_VERIFY)?;
-    println!("workspace: steps of {max_t} tokens, {:.2} GiB", ws.device_bytes as f64 / (1u64 << 30) as f64);
-    // QUENCH6K_NEM_AB="key=v,key=v;key=v;..." (an empty entry: defaults): prefill only, the kernel variant
-    // sets interleaved (A B B A ...) in one process, QUENCH6K_NEM_AB_ROUNDS rounds (default 3).
-    if let Ok(ab) = std::env::var("QUENCH6K_NEM_AB") {
-        let sets: Vec<&str> = ab.split(';').collect();
-        let rounds: usize = std::env::var("QUENCH6K_NEM_AB_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-        for &ctx in ctxs {
-            ensure!(ctx <= ids.len(), "corpus has {} tokens", ids.len());
-            let mut times = vec![Vec::new(); sets.len()];
-            let mut firsts = vec![Vec::new(); sets.len()];
-            let mut sums = std::collections::BTreeSet::new();
-            for round in 0..rounds {
-                let order: Vec<usize> = if round % 2 == 0 { (0..sets.len()).collect() } else { (0..sets.len()).rev().collect() };
-                for i in order {
-                    quench6k_cuda::variants::clear();
-                    for pair in sets[i].split(',').filter(|x| !x.is_empty()) {
-                        let (key, v) = pair.split_once('=').context("variant key=value")?;
-                        quench6k_cuda::variants::set(key, v.parse()?);
-                    }
-                    let mut st = State::new(&model, ctx + 16, kv, &s)?;
-                    s.synchronize()?;
-                    let t0 = Instant::now();
-                    model.prefill(&mut st, &mut ws, &s, &ids[..ctx])?;
-                    let first = argmax(&ws, &model, &s, 1)?[0];
-                    times[i].push(t0.elapsed().as_secs_f64());
-                    // Bitwise identity across sets: the caches, the Mamba block and the last logits row.
-                    let [kvs, mamba] = st.checksums(&s)?;
-                    let logits = quench6k_cuda::device_checksum(ws.out_logits, model.cfg.vocab * 4, &s)?;
-                    sums.insert((kvs, mamba, logits));
-                    firsts[i].push(first);
-                }
-            }
-            let med = |v: &[f64]| {
-                let mut v = v.to_vec();
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                v[v.len() / 2]
-            };
-            let base = med(&times[0]);
-            for (i, set) in sets.iter().enumerate() {
-                let m = med(&times[i]);
-                let (lo, hi) = times[i].iter().fold((f64::MAX, 0f64), |(a, b), &t| (a.min(t), b.max(t)));
-                println!(
-                    "ab ctx {ctx:>6} [{set}]: prefill {:>7.0} tok/s (median {:.1} ms, {:.1}..{:.1}), {:+.1}% vs first; first tokens {:?}",
-                    ctx as f64 / m,
-                    m * 1e3,
-                    lo * 1e3,
-                    hi * 1e3,
-                    (base / m - 1.0) * 100.0,
-                    firsts[i]
-                );
-            }
-            println!("ab ctx {ctx:>6}: {} distinct (cache, Mamba block, logits) checksums over all sets", sums.len());
-        }
-        quench6k_cuda::variants::clear();
-        return Ok(());
+    // QUENCH6K_NEM_AB: settings timed interleaved in this process, A B B A per round (QUENCH6K_NEM_AB_ROUNDS
+    // rounds, default 2; a setting's first run includes its graph captures: compare medians); every
+    // setting's tokens must equal the first's. Either feature masks "A,B,.." (forward::set_features,
+    // decimal or 0x hex), or sets "item,item;item;..": an item `features=MASK` (or a bare mask) or a
+    // kernel variant `key=value` (the variants of each set replace all others; an empty set: defaults).
+    // CUDA graphs are kept per feature mask, not per variant: variants that change small-step launches
+    // need F_GRAPHS off. QUENCH6K_NEM_AB_PREFILL=1: prefills only, with the caches, Mamba block and last
+    // logits row compared bitwise across the settings.
+    let ab = ab_settings()?;
+    if std::env::var("QUENCH6K_NEM_AB_PREFILL").is_ok_and(|v| v == "1") {
+        return ab_prefill(model, s, ws, &ids, ctxs, kv, &ab);
     }
+    let rounds: usize = std::env::var("QUENCH6K_NEM_AB_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let order: Vec<usize> = if ab.len() > 1 {
+        let fwd: Vec<usize> = (0..ab.len()).collect();
+        (0..rounds).flat_map(|_| fwd.iter().copied().chain(fwd.iter().rev().copied())).collect()
+    } else {
+        vec![0]
+    };
+    let mut differ = 0;
     for &ctx in ctxs {
         // Sequence j reads the corpus from token 37 j on (different prompts of the same length).
         ensure!(ctx + generate + 37 * seqs <= ids.len(), "corpus has {} tokens, {} needed", ids.len(), ctx + generate + 37 * seqs);
-        let mut states = Vec::with_capacity(seqs);
-        let mut firsts = Vec::with_capacity(seqs);
-        // QUENCH6K_NEM_PROFILE=1: the prefills inside a cudaProfilerStart/Stop range (nsys
-        // --capture-range=cudaProfilerApi).
-        let profile = std::env::var("QUENCH6K_NEM_PROFILE").is_ok_and(|v| v == "1");
-        s.synchronize()?;
-        if profile {
-            quench6k_cuda::profiler_start()?;
-        }
-        let t0 = Instant::now();
-        for j in 0..seqs {
-            let mut st = State::new(&model, ctx + generate + 16, kv, &s)?;
-            model.prefill(&mut st, &mut ws, &s, &ids[37 * j..37 * j + ctx])?;
-            firsts.push(argmax(&ws, &model, &s, 1)?[0]);
-            states.push(st);
-        }
-        let prefill_s = t0.elapsed().as_secs_f64();
-        if profile {
-            quench6k_cuda::profiler_stop()?;
-        }
-        let mut outs: Vec<Vec<i32>> = firsts.iter().map(|&t| vec![t]).collect();
-        let t1 = Instant::now();
-        let mut steps = generate - 1;
-        if drafts > 0 {
-            let mut refs: Vec<&mut State> = states.iter_mut().collect();
-            let r = decode_drafted(&model, &mut refs, &mut ws, &s, &firsts, generate, drafts, &|_| false)?;
-            outs = r.tokens;
-            steps = r.steps;
-        }
-        for _ in 1..if drafts > 0 { 0 } else { generate } {
-            let toks: Vec<[i32; 1]> = outs.iter().map(|o| [*o.last().unwrap()]).collect();
-            let tok_refs: Vec<&[i32]> = toks.iter().map(|t| t.as_slice()).collect();
-            let mut refs: Vec<&mut State> = states.iter_mut().collect();
-            if seqs == 1 {
-                model.forward(refs[0], &mut ws, &s, tok_refs[0], Logits::Last)?;
-            } else {
-                model.forward_batch(&mut refs, &mut ws, &s, &tok_refs)?;
+        let mut reference: Option<Vec<Vec<i32>>> = None;
+        let mut rates: Vec<Vec<f64>> = vec![Vec::new(); ab.len().max(1)];
+        for &vi in &order {
+            if ab.len() > 1 {
+                ab[vi].apply()?;
             }
-            let picks = argmax(&ws, &model, &s, seqs)?;
-            for (o, p) in outs.iter_mut().zip(picks) {
-                o.push(p);
+            let mut states = Vec::with_capacity(seqs);
+            let mut firsts = Vec::with_capacity(seqs);
+            // QUENCH6K_NEM_PROFILE=1: the prefills inside a cudaProfilerStart/Stop range (nsys
+            // --capture-range=cudaProfilerApi); =decode: the plain decode steps after the first 8.
+            let profile = std::env::var("QUENCH6K_NEM_PROFILE").is_ok_and(|v| v == "1");
+            let profile_decode = std::env::var("QUENCH6K_NEM_PROFILE").is_ok_and(|v| v == "decode");
+            s.synchronize()?;
+            if profile {
+                quench6k_cuda::profiler_start()?;
+            }
+            let t0 = Instant::now();
+            for j in 0..seqs {
+                let mut st = State::new(model, ctx + generate + 16, kv, s)?;
+                model.prefill(&mut st, ws, s, &ids[37 * j..37 * j + ctx])?;
+                firsts.push(argmax(ws, model, s, 1)?[0]);
+                states.push(st);
+            }
+            let prefill_s = t0.elapsed().as_secs_f64();
+            if profile {
+                quench6k_cuda::profiler_stop()?;
+            }
+            let mut outs: Vec<Vec<i32>> = firsts.iter().map(|&t| vec![t]).collect();
+            let t1 = Instant::now();
+            let mut steps = generate - 1;
+            if drafts > 0 {
+                let mut refs: Vec<&mut State> = states.iter_mut().collect();
+                let r = decode_drafted(model, &mut refs, ws, s, &firsts, generate, drafts, &|_| false)?;
+                outs = r.tokens;
+                steps = r.steps;
+            }
+            for i in 1..if drafts > 0 { 0 } else { generate } {
+                if profile_decode && i == 9 {
+                    s.synchronize()?;
+                    quench6k_cuda::profiler_start()?;
+                    eprintln!("profiling decode steps 9 to {}: {} steps", generate - 1, generate - 9);
+                }
+                let toks: Vec<[i32; 1]> = outs.iter().map(|o| [*o.last().unwrap()]).collect();
+                let tok_refs: Vec<&[i32]> = toks.iter().map(|t| t.as_slice()).collect();
+                let mut refs: Vec<&mut State> = states.iter_mut().collect();
+                if seqs == 1 {
+                    model.forward(refs[0], ws, s, tok_refs[0], Logits::Last)?;
+                } else {
+                    model.forward_batch(&mut refs, ws, s, &tok_refs)?;
+                }
+                let picks = argmax(ws, model, s, seqs)?;
+                for (o, p) in outs.iter_mut().zip(picks) {
+                    o.push(p);
+                }
+            }
+            let decode_s = t1.elapsed().as_secs_f64();
+            if profile_decode && drafts == 0 && generate > 9 {
+                quench6k_cuda::profiler_stop()?;
+            }
+            let copied = outs[0].iter().zip(&ids[ctx..]).filter(|(a, b)| a == b).count();
+            let pf = (ctx * seqs) as f64 / prefill_s;
+            let tg = ((generate - 1) * seqs) as f64 / decode_s;
+            let per_step = (generate - 1) as f64 / steps.max(1) as f64;
+            let label = if ab.len() > 1 { format!(" [{}]", ab[vi].label) } else { String::new() };
+            println!(
+                "ctx {ctx:>6} x {seqs}{label}: prefill {pf:>7.0} tok/s ({prefill_s:.2}s), decode {tg:>6.1} tok/s ({per_step:.2} tokens/step); corpus continuation {copied}/{generate}; {:?}",
+                chat.decode(&outs[0][..outs[0].len().min(24)], false)?
+            );
+            rates[vi].push(tg);
+            match &reference {
+                None => reference = Some(outs.clone()),
+                Some(r) if *r != outs => {
+                    differ += 1;
+                    eprintln!("ctx {ctx}{label}: tokens differ from the first variant's");
+                }
+                _ => {}
+            }
+            if let Some(path) = json {
+                use std::io::Write;
+                let rec = serde_json::json!({"engine": "quench6k", "model": "nemotron-h", "kv": format!("{kv:?}").to_lowercase(), "drafts": drafts, "tokens_per_step": (per_step * 100.0).round() / 100.0, "seqs": seqs, "ctx": ctx,
+                    "generate": generate, "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0,
+                    "copied": copied, "variant": ab.get(vi).map(|a| a.label.clone())});
+                writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path)?, "{rec}")?;
             }
         }
-        let decode_s = t1.elapsed().as_secs_f64();
-        let copied = outs[0].iter().zip(&ids[ctx..]).filter(|(a, b)| a == b).count();
-        let pf = (ctx * seqs) as f64 / prefill_s;
-        let tg = ((generate - 1) * seqs) as f64 / decode_s;
-        let per_step = (generate - 1) as f64 / steps.max(1) as f64;
-        println!(
-            "ctx {ctx:>6} x {seqs}: prefill {pf:>7.0} tok/s ({prefill_s:.2}s), decode {tg:>6.1} tok/s ({per_step:.2} tokens/step); corpus continuation {copied}/{generate}; {:?}",
-            chat.decode(&outs[0][..outs[0].len().min(24)], false)?
-        );
-        if let Some(path) = json {
-            use std::io::Write;
-            let rec = serde_json::json!({"engine": "quench6k", "model": "nemotron-h", "kv": format!("{kv:?}").to_lowercase(), "drafts": drafts, "tokens_per_step": (per_step * 100.0).round() / 100.0, "seqs": seqs, "ctx": ctx,
-                "generate": generate, "prefill_tok_s": (pf * 10.0).round() / 10.0, "decode_tok_s": (tg * 10.0).round() / 10.0,
-                "copied": copied});
-            writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path)?, "{rec}")?;
+        if ab.len() > 1 {
+            for (vi, r) in rates.iter().enumerate() {
+                let mut v = r.clone();
+                v.sort_by(f64::total_cmp);
+                println!("ctx {ctx:>6} x {seqs} [{}]: decode median {:.1} tok/s, range {:.1}-{:.1}", ab[vi].label, v[v.len() / 2], v[0], v[v.len() - 1]);
+            }
         }
     }
+    if ab.len() > 1 {
+        AbSetting::default().apply()?;
+    }
+    ensure!(differ == 0, "{differ} runs' tokens differ from the first variant's");
     Ok(())
+}
+
+/// One setting of a QUENCH6K_NEM_AB comparison: a feature mask and kernel variants.
+struct AbSetting {
+    label: String,
+    features: u32,
+    variants: Vec<(String, i32)>,
+}
+
+impl Default for AbSetting {
+    fn default() -> Self {
+        Self { label: String::new(), features: quench6k_engine::nemotron::forward::F_ALL, variants: Vec::new() }
+    }
+}
+
+impl AbSetting {
+    fn apply(&self) -> Result<()> {
+        quench6k_engine::nemotron::forward::set_features(self.features);
+        quench6k_cuda::variants::clear();
+        for (k, v) in &self.variants {
+            quench6k_cuda::variants::set(k, *v);
+        }
+        Ok(())
+    }
+}
+
+/// The settings of QUENCH6K_NEM_AB (see [`bench`]); empty when unset.
+fn ab_settings() -> Result<Vec<AbSetting>> {
+    let Ok(spec) = std::env::var("QUENCH6K_NEM_AB") else { return Ok(Vec::new()) };
+    let mask = |v: &str| -> Result<u32> {
+        let v = v.trim();
+        Ok(if let Some(h) = v.strip_prefix("0x") { u32::from_str_radix(h, 16)? } else { v.parse::<u32>()? })
+    };
+    if !spec.contains(';') && !spec.contains('=') {
+        return spec
+            .split(',')
+            .map(|x| Ok(AbSetting { label: format!("{:#x}", mask(x)?), features: mask(x)?, variants: Vec::new() }))
+            .collect::<Result<_>>()
+            .context("QUENCH6K_NEM_AB");
+    }
+    spec.split(';')
+        .map(|set| {
+            let mut a = AbSetting { label: set.to_string(), ..Default::default() };
+            for item in set.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                match item.split_once('=') {
+                    Some(("features", v)) => a.features = mask(v)?,
+                    Some((k, v)) => a.variants.push((k.to_string(), v.trim().parse()?)),
+                    None => a.features = mask(item)?,
+                }
+            }
+            Ok(a)
+        })
+        .collect::<Result<_>>()
+        .context("QUENCH6K_NEM_AB")
+}
+
+/// QUENCH6K_NEM_AB_PREFILL=1: prefills of each context under each setting, interleaved A B B A
+/// (QUENCH6K_NEM_AB_ROUNDS rounds, default 3); per setting the median and range, and the number of
+/// distinct (caches, Mamba block, last logits row) checksums over all settings (1: bitwise equal).
+fn ab_prefill(model: &NemotronModel, s: &quench6k_cuda::Stream, ws: &mut Workspace, ids: &[i32], ctxs: &[usize], kv: Kv, ab: &[AbSetting]) -> Result<()> {
+    let sets: Vec<&AbSetting> = if ab.is_empty() { Vec::new() } else { ab.iter().collect() };
+    let default = AbSetting::default();
+    let sets = if sets.is_empty() { vec![&default] } else { sets };
+    let rounds: usize = std::env::var("QUENCH6K_NEM_AB_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    for &ctx in ctxs {
+        ensure!(ctx <= ids.len(), "corpus has {} tokens", ids.len());
+        let mut times = vec![Vec::new(); sets.len()];
+        let mut firsts = vec![Vec::new(); sets.len()];
+        let mut sums = std::collections::BTreeSet::new();
+        for round in 0..rounds {
+            let order: Vec<usize> = if round % 2 == 0 { (0..sets.len()).collect() } else { (0..sets.len()).rev().collect() };
+            for i in order {
+                sets[i].apply()?;
+                let mut st = State::new(model, ctx + 16, kv, s)?;
+                s.synchronize()?;
+                let t0 = Instant::now();
+                model.prefill(&mut st, ws, s, &ids[..ctx])?;
+                let first = argmax(ws, model, s, 1)?[0];
+                times[i].push(t0.elapsed().as_secs_f64());
+                // Bitwise identity across sets: the caches, the Mamba block and the last logits row.
+                let [kvs, mamba] = st.checksums(s)?;
+                let logits = quench6k_cuda::device_checksum(ws.out_logits, model.cfg.vocab * 4, s)?;
+                sums.insert((kvs, mamba, logits));
+                firsts[i].push(first);
+            }
+        }
+        let med = |v: &[f64]| {
+            let mut v = v.to_vec();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let base = med(&times[0]);
+        for (i, set) in sets.iter().enumerate() {
+            let m = med(&times[i]);
+            let (lo, hi) = times[i].iter().fold((f64::MAX, 0f64), |(a, b), &t| (a.min(t), b.max(t)));
+            println!(
+                "ab ctx {ctx:>6} [{}]: prefill {:>7.0} tok/s (median {:.1} ms, {:.1}..{:.1}), {:+.1}% vs first; first tokens {:?}",
+                set.label,
+                ctx as f64 / m,
+                m * 1e3,
+                lo * 1e3,
+                hi * 1e3,
+                (base / m - 1.0) * 100.0,
+                firsts[i]
+            );
+        }
+        println!("ab ctx {ctx:>6}: {} distinct (cache, Mamba block, logits) checksums over all sets", sums.len());
+    }
+    default.apply()
 }
 
 fn batch_check(dir: &Path, text: &Path, ctx: usize, seqs: usize, steps: usize, kv: Kv) -> Result<()> {

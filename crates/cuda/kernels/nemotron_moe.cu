@@ -85,6 +85,76 @@ __global__ void __launch_bounds__(EXPERTS) moe_route_kernel(const float* logits,
     }
 }
 
+// The router by sorting: the same choice (the 22 largest score + bias, ties: lower expert), order and weights as
+// moe_route_kernel. Each warp sorts its 32 experts (bitonic over lanes, best first), the 16 lists are merged
+// pairwise keeping the best 32, and the 22 chosen are sorted by expert.
+SQ_DEVICE bool route_better(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }
+
+// Bitonic step with partner lane ^ j: keeps the better of the pair in the lane whose order says so.
+SQ_DEVICE void route_cx(float& v, int& i, float& sc, int j, bool best_first) {
+    const int lane = threadIdx.x & 31;
+    const float ov = __shfl_xor_sync(0xffffffff, v, j);
+    const int oi = __shfl_xor_sync(0xffffffff, i, j);
+    const float os = __shfl_xor_sync(0xffffffff, sc, j);
+    const bool keep_better = ((lane & j) == 0) == best_first;
+    const bool other_better = route_better(ov, oi, v, i);
+    if (keep_better == other_better) v = ov, i = oi, sc = os;
+}
+
+__global__ void __launch_bounds__(EXPERTS) moe_route_sort_kernel(const float* logits, int ld, const float* bias, float scaling, int* sel_e,
+                                                                 float* sel_w) {
+    pdl_launch_dependents();
+    pdl_wait();
+    __shared__ float lv[EXPERTS / 32][32], ls[EXPERTS / 32][32];
+    __shared__ int li[EXPERTS / 32][32];
+    const int t = blockIdx.x, e = threadIdx.x, lane = e & 31, warp = e >> 5;
+    float sc = 1.0f / (1.0f + expf(-__ldcg(logits + (size_t)t * ld + e)));
+    float v = sc + bias[e];
+    if (!(v == v)) v = -INFINITY;
+    int i = e;
+    // Sort the warp's 32 (best first).
+#pragma unroll
+    for (int k = 2; k <= 32; k <<= 1)
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) route_cx(v, i, sc, j, (lane & k) == 0);
+    lv[warp][lane] = v, li[warp][lane] = i, ls[warp][lane] = sc;
+    // Merge lists pairwise: warp w takes list w and list w + step (reversed), keeps the better of each pair
+    // (a bitonic sequence holding the best 32 of both), then sorts it.
+    for (int step = 1; step < EXPERTS / 32; step <<= 1) {
+        __syncthreads();
+        if (warp % (2 * step) == 0) {
+            const float ov = lv[warp + step][31 - lane];
+            const int oi = li[warp + step][31 - lane];
+            const float os = ls[warp + step][31 - lane];
+            if (route_better(ov, oi, v, i)) v = ov, i = oi, sc = os;
+#pragma unroll
+            for (int j = 16; j > 0; j >>= 1) route_cx(v, i, sc, j, true);
+            lv[warp][lane] = v, li[warp][lane] = i, ls[warp][lane] = sc;
+        }
+    }
+    if (warp != 0) return;
+    // The best 22 (lanes 0..21) by ascending expert.
+    int key = lane < TOPK ? i : EXPERTS + lane;
+    float w = lane < TOPK ? sc : 0.0f;
+#pragma unroll
+    for (int k = 2; k <= 32; k <<= 1)
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            const int ok = __shfl_xor_sync(0xffffffff, key, j);
+            const float ow = __shfl_xor_sync(0xffffffff, w, j);
+            const bool keep_low = ((lane & j) == 0) == ((lane & k) == 0);
+            if (keep_low == (ok < key)) key = ok, w = ow;
+        }
+    // The weights' sum in ascending expert order, as moe_route_kernel adds them.
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) sum += __shfl_sync(0xffffffff, w, k);
+    if (lane < TOPK) {
+        sel_e[(size_t)t * TOPK + lane] = key;
+        sel_w[(size_t)t * TOPK + lane] = w / (sum + 1e-20f) * scaling;
+    }
+}
+
 // ---- Small-step experts ------------------------------------------------------------------------------
 
 // Order of a small step's pairs by expert (ties by pair): order[rank] = pair. One block, a thread per pair.
@@ -930,6 +1000,14 @@ extern "C" cudaError_t quench6k_nem_moe_route(const float* logits, int ld, const
                                               cudaStream_t st) {
     if (rows == 0) return cudaSuccess;
     SQ_CHECK_LAUNCH(sq_launch(moe_route_kernel, rows, EXPERTS, 0, st, logits, ld, bias, scaling, sel_e, sel_w));
+    SQ_RETURN_LAUNCH();
+}
+
+// quench6k_nem_moe_route by sorting (the same outputs).
+extern "C" cudaError_t quench6k_nem_moe_route_sort(const float* logits, int ld, const float* bias, float scaling, int rows, int* sel_e, float* sel_w,
+                                                   cudaStream_t st) {
+    if (rows == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(moe_route_sort_kernel, rows, EXPERTS, 0, st, logits, ld, bias, scaling, sel_e, sel_w));
     SQ_RETURN_LAUNCH();
 }
 

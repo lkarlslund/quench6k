@@ -1006,6 +1006,47 @@ once, drafts on and off, greedy and sampled (temperature 0.8, seeded), for all t
 `consistency --shared-system --between none` (4 conversations, 2 turns, greedy and sampled) 4/4 at
 --slots 1 and 4 for Inkling 2, Hy4-flash and Flint.
 
+## 2026-11-26: Nemotron-H decode, graphs and small-step forms (same bits)
+
+Where a plain step goes (nsys, `QUENCH6K_NEM_PROFILE=decode` puts bench decode steps 9.. in the
+capture range, tools/census.py, 31 steps at 8K, 600 W):
+
+| | 1 sequence | 8 sequences |
+|---|---|---|
+| step (first start to last end) | 9.29 ms, busy 9.23, 966 kernels | 22.2 ms, busy 21.8 |
+| GEMVs (305) | 4.69 ms, ~7.6 GB: at the DRAM rate | 7.42 ms: the same bytes, ALU-bound at 8 rows |
+| routed experts (up + down, 41 layers) | 2.16 ms, 2.8 GB (1.29 TB/s) | 10.6 ms, at 84-91% of DRAM read |
+| block norms (94) | 0.64 ms, 6.8 us each | 0.60 ms |
+| router (41) | 0.31 ms, 7.5 us each | 0.30 ms |
+| Mamba conv, commit, scan, gated norm (40) | 0.60 ms | 1.87 ms (scan 1.24) |
+| attention decode + combine (9) | 0.42 ms | 0.65 ms |
+
+Speed of light (tools/sol.py of the sm120-cuda skill, 1.65 TB/s): a plain step of one sequence reads
+about 11.0 GB (dense projections 7.3 GiB, 22 of 512 experts per MoE layer 2.6 GiB, Mamba state read and
+written 0.3 GiB, cache), 6.7 ms or 150 tok/s; 113.5 tok/s after the changes below is 76% of it. Eight
+sequences read about 29 GB with independently routed tokens (about 150 distinct experts per layer),
+17.8 ms or 450 tok/s; 377 tok/s is 82%. The GPU was idle 0.6% of a plain step, so graphs could only win
+the drafted path's host turnarounds.
+
+Changes (each a feature bit, `forward::set_features`; `QUENCH6K_NEM_AB=maskA,maskB` times masks
+A B B A in one bench process, and the tokens of every arm must be equal; medians, 600 W):
+
+| change | 1 seq 8K plain | 1 seq 8K 3 drafts | 8 seq 2K plain | 8 seq 2K 3 drafts |
+|---|---|---|---|---|
+| CUDA graphs (steps and MTP passes) | 109.1 -> 110.5 | 242.4 -> 246.7 | 355.7 -> 358.3 | 439.0 -> 437.6 (captures in every run) |
+| Mamba conv + commit in one launch | 110.5 -> 111.5 | 246.7 -> 248.9 | 358.3 -> 364.2 | |
+| wide GEMV (INT8G added), 2-64 rows | | | 358.3 -> 367.5 | 437.6 -> 487.1 |
+| attention combine per query head | 110.0 -> 110.9 (32K: 105.6 -> 109.5) | 252.3 -> 254.3 | | |
+| router by sorting | 110.9 -> 113.5 | 254.3 -> 258.0 | 373.4 -> 377.0 | 491.4 -> 494.9 |
+
+Dropped on measurement: the residual add in the next block norm's launch (fewer launches): first -1.4%
+(its stores came before its loads), then +0.4% / +0.2%, within noise; the routed experts' next item's
+weights loaded during an item (up kernel 0%, down -0.8% at 1 sequence, -1.1% at 8).
+
+Every new form is checked bit for bit against the launches it replaces (crates/cuda/tests/nemotron.rs
+decode_forms_equal); batch-check, verify-check and spec-check passed with graphs (4 sequences).
+Not done in this round: a null arm and clock / temperature logs next to these numbers.
+
 ## 2026-11-26: Nemotron-H prefill (same bits)
 
 Starting point (main 4ad46ff, 600 W, `nemotron bench`): prefill 2.9K / 6.2K / 5.8K tok/s at 512 / 8K / 32K.
@@ -1020,8 +1061,10 @@ TB/s), so a 512-token step is memory-bound and a 2048-token one sits at the ridg
 BF16 `mma.sync` m16n8k16 ceiling on this card: 544 TFLOPS at ~2.75 GHz (FP8 m16n8k32 1085), so the dense
 GEMMs run at 52-56% of it.
 
-Kept (each A/B interleaved in one process with `QUENCH6K_NEM_AB`, null arm within 0.2-1.1%; caches, Mamba
-block and logits bitwise equal across all sets; fixture scores bit-identical):
+Kept (each A/B interleaved in one process, `QUENCH6K_NEM_AB="key=v,..;key=v;.." QUENCH6K_NEM_AB_PREFILL=1`:
+kernel variant sets, prefill only; null arm within 0.2-1.1%; caches, Mamba block and logits bitwise equal
+across all sets; fixture scores bit-identical). The same variable also takes the decode round's feature
+masks (`maskA,maskB`, or `features=MASK` items in a set) for the whole bench:
 - Grouped expert GEMM v3 (`nem.w4v`): 2 CTAs per SM (48 KB), swizzled A stages, weights two k-tiles ahead
   in registers, the CTA's weight rows bulk-prefetched into L2, m16 blocks past an expert's rows skipped,
   addresses precomputed (119 regs, no spills). time_experts: 2048 tokens 3027 -> 2625 us/layer, 512 2672

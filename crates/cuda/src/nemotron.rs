@@ -199,6 +199,24 @@ mod ffi {
             f32_out: c_int,
             st: Stream,
         ) -> Error;
+        pub fn quench6k_nem_copy_rows(table: *const c_void, rows: c_int, st: Stream) -> Error;
+        pub fn quench6k_nem_gemv_wide(
+            fmt: c_int,
+            m: c_int,
+            mt: c_int,
+            r: c_int,
+            x: *const c_void,
+            ldx: c_int,
+            w: *const c_void,
+            scale: *const f32,
+            y: *mut f32,
+            ldy: c_int,
+            n: c_int,
+            k: c_int,
+            alpha: f32,
+            accumulate: c_int,
+            st: Stream,
+        ) -> Error;
         pub fn quench6k_nem_mamba_conv(
             proj: *const f32,
             ld: c_int,
@@ -224,6 +242,19 @@ mod ffi {
             dt: *const f32,
             defer: c_int,
             flush: c_int,
+            st: Stream,
+        ) -> Error;
+        pub fn quench6k_nem_mamba_conv_small(
+            proj: *const f32,
+            ld: c_int,
+            seqs: *const c_void,
+            nseq: c_int,
+            layer: c_int,
+            rec_rows: c_int,
+            w: MambaW,
+            defer: c_int,
+            xbc: *mut c_void,
+            dt: *mut f32,
             st: Stream,
         ) -> Error;
         pub fn quench6k_nem_mamba_scan(
@@ -253,6 +284,16 @@ mod ffi {
         pub fn quench6k_nem_mamba_set_ctl(seqs: *const c_void, nseq: c_int, accepted: *const i32, deferred: c_int, st: Stream) -> Error;
 
         pub fn quench6k_nem_moe_route(
+            logits: *const f32,
+            ld: c_int,
+            bias: *const f32,
+            scaling: f32,
+            rows: c_int,
+            sel_e: *mut i32,
+            sel_w: *mut f32,
+            st: Stream,
+        ) -> Error;
+        pub fn quench6k_nem_moe_route_sort(
             logits: *const f32,
             ld: c_int,
             bias: *const f32,
@@ -334,6 +375,7 @@ mod ffi {
             q: *mut c_void,
             st: Stream,
         ) -> Error;
+        pub fn quench6k_nem_set_attn_combine(heads: c_int);
         pub fn quench6k_nem_attn_part_floats(rows: c_int, max_groups: c_int) -> usize;
         pub fn quench6k_nem_attention_small(
             q: *const c_void,
@@ -405,6 +447,57 @@ pub fn rms(s: &Stream, x: u64, ldx: usize, w: u64, eps: f32, rows: usize, out: u
     go!(
         "nem_rms",
         ffi::quench6k_nem_rms(f(x), n(ldx), p(w), eps, n(rows), pm(out), n(ldo), f32_out as c_int, s.raw())
+    )
+}
+
+/// `rows` copies of [`HIDDEN`] FP32 values: `table` (device memory) holds u64 address pairs (destination,
+/// source) per row, 16-byte aligned. Copies whose addresses vary from step to step inside a CUDA graph.
+pub fn copy_rows(s: &Stream, table: u64, rows: usize) -> Result<()> {
+    go!("nem_copy_rows", ffi::quench6k_nem_copy_rows(p(table), n(rows), s.raw()))
+}
+
+/// Y [m, n] F32 (+)= alpha X [m, k] BF16 . W^T for any number of rows `m`, each row bitwise as
+/// [`crate::kernels::gemv`] computes it alone (no K split, the same output factor and accumulation): warps
+/// of `r` weight rows and `mt` input rows, (mt, r) in {16 x 4, 16 x 2, 8 x 4, 8 x 2, 8 x 1, 4 x 4, 4 x 2,
+/// 4 x 1, 2 x 4, 2 x 2}; the CTAs of one weight tile run together, so the weights stream from DRAM about
+/// once. Formats BF16, Int8Group and Fp8Block.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_wide(
+    s: &Stream,
+    m: usize,
+    mt: usize,
+    r: usize,
+    x: u64,
+    ldx: usize,
+    fmt: crate::kernels::WeightFormat,
+    w: u64,
+    scale: u64,
+    y: u64,
+    ldy: usize,
+    nn: usize,
+    k: usize,
+    alpha: f32,
+    accumulate: bool,
+) -> Result<()> {
+    go!(
+        "nem_gemv_wide",
+        ffi::quench6k_nem_gemv_wide(
+            fmt as c_int,
+            n(m),
+            n(mt),
+            n(r),
+            p(x),
+            n(ldx),
+            p(w),
+            f(scale),
+            fm(y),
+            n(ldy),
+            n(nn),
+            n(k),
+            alpha,
+            accumulate as c_int,
+            s.raw()
+        )
     )
 }
 
@@ -556,6 +649,38 @@ pub fn mamba_mixer(
     mamba_gated_norm(s, scratch.y, proj, ld, rows, w.norm_w, 1e-5, out)
 }
 
+/// [`mamba_conv`] and [`mamba_conv_commit`] in one launch for steps whose sequences have a few rows each
+/// (a thread per channel and sequence walks the sequence's rows; at most `rec_rows` rows per sequence with
+/// `defer`): the same outputs and state bits. `nseq` sizes the grid as elsewhere.
+#[allow(clippy::too_many_arguments)]
+pub fn mamba_conv_small(s: &Stream, proj: u64, ld: usize, seqs: u64, nseq: usize, layer: usize, rec_rows: usize, w: &MambaW, defer: bool, xbc: u64, dt: u64) -> Result<()> {
+    go!(
+        "nem_mamba_conv_small",
+        ffi::quench6k_nem_mamba_conv_small(f(proj), n(ld), p(seqs), n(nseq), n(layer), n(rec_rows), *w, defer as c_int, pm(xbc), fm(dt), s.raw())
+    )
+}
+
+/// [`mamba_mixer`] for small steps ([`mamba_conv_small`] in place of the two conv launches).
+#[allow(clippy::too_many_arguments)]
+pub fn mamba_mixer_small(
+    s: &Stream,
+    proj: u64,
+    ld: usize,
+    rows: usize,
+    seqs: u64,
+    nseq: usize,
+    layer: usize,
+    rec_rows: usize,
+    w: &MambaW,
+    defer: bool,
+    scratch: &MambaScratch,
+    out: u64,
+) -> Result<()> {
+    mamba_conv_small(s, proj, ld, seqs, nseq, layer, rec_rows, w, defer, scratch.xbc, scratch.dt)?;
+    mamba_scan(s, scratch.xbc, scratch.dt, rows, seqs, nseq, layer, rec_rows, w, defer, scratch.y)?;
+    mamba_gated_norm(s, scratch.y, proj, ld, rows, w.norm_w, 1e-5, out)
+}
+
 /// Commits layer `layer`'s pending records of every sequence in `seqs` (rows ignored: no new rows).
 /// Run for every Mamba layer, then `mamba_set_ctl(.., deferred = false)`.
 pub fn mamba_flush(s: &Stream, seqs: u64, nseq: usize, layer: usize, rec_rows: usize, w: &MambaW) -> Result<()> {
@@ -591,6 +716,15 @@ pub fn moe_route(s: &Stream, logits: u64, ld: usize, bias: u64, scaling: f32, ro
     go!(
         "nem_moe_route",
         ffi::quench6k_nem_moe_route(f(logits), n(ld), f(bias), scaling, n(rows), im(sel_e), fm(sel_w), s.raw())
+    )
+}
+
+/// [`moe_route`] by sorting (warp-wise bitonic sorts merged pairwise): the same choices, order and weights.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_route_sort(s: &Stream, logits: u64, ld: usize, bias: u64, scaling: f32, rows: usize, sel_e: u64, sel_w: u64) -> Result<()> {
+    go!(
+        "nem_moe_route_sort",
+        ffi::quench6k_nem_moe_route_sort(f(logits), n(ld), f(bias), scaling, n(rows), im(sel_e), fm(sel_w), s.raw())
     )
 }
 
@@ -750,6 +884,12 @@ pub fn attn_prep(s: &Stream, qkv: u64, ld: usize, q_col: usize, k_col: usize, v_
             s.raw()
         )
     )
+}
+
+/// [`attention_small`]'s combine launch: a CTA per query head with its loads ahead (true, default) or per KV
+/// head (false); the same bits (A/B timings; process-wide).
+pub fn set_attn_combine(heads: bool) {
+    unsafe { ffi::quench6k_nem_set_attn_combine(heads as c_int) }
 }
 
 /// Floats of [`attention_small`]'s partial results for `rows` rows whose positions are below

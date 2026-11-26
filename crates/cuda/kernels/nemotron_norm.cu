@@ -33,7 +33,23 @@ __global__ void __launch_bounds__(RMS_THREADS) rms_kernel(const float* x, int ld
     }
 }
 
+// Row copies: table[2 i] = destination, table[2 i + 1] = source of HIDDEN floats; one block per row.
+__global__ void __launch_bounds__(RMS_THREADS) copy_rows_kernel(const unsigned long long* table) {
+    pdl_launch_dependents();
+    pdl_wait();
+    const float4* src = reinterpret_cast<const float4*>(__ldcg(table + 2 * blockIdx.x + 1));
+    float4* dst = reinterpret_cast<float4*>(__ldcg(table + 2 * blockIdx.x));
+    for (int i = threadIdx.x; i < HIDDEN / 4; i += RMS_THREADS) dst[i] = __ldcg(src + i);
+}
+
 }  // namespace
+
+// rows copies of HIDDEN floats from table[2 i + 1] to table[2 i] (device addresses, u64 pairs in device memory).
+extern "C" cudaError_t quench6k_nem_copy_rows(const void* table, int rows, cudaStream_t st) {
+    if (rows == 0) return cudaSuccess;
+    SQ_CHECK_LAUNCH(sq_launch(copy_rows_kernel, rows, RMS_THREADS, 0, st, static_cast<const unsigned long long*>(table)));
+    SQ_RETURN_LAUNCH();
+}
 
 // out[r] = w * (x[r] / sqrt(mean(x[r]²) + eps)) over HIDDEN columns; f32_out: FP32 output, else BF16.
 extern "C" cudaError_t quench6k_nem_rms(const float* x, int ldx, const void* w, float eps, int rows, void* out, int ldo, int f32_out,

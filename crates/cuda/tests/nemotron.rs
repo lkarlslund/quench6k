@@ -104,6 +104,11 @@ fn layer_off() -> usize {
 
 /// One Mamba step of several sequences (rows per sequence from `projs`), returns each sequence's out rows.
 fn mamba_step(s: &Stream, w: &MambaGpu, blocks: &[&DeviceBuffer], projs: &[&[f32]], defer: bool) -> Vec<Vec<f32>> {
+    mamba_step_with(s, w, blocks, projs, defer, false)
+}
+
+/// [`mamba_step`], with `small` through [`mamba_mixer_small`].
+fn mamba_step_with(s: &Stream, w: &MambaGpu, blocks: &[&DeviceBuffer], projs: &[&[f32]], defer: bool, small: bool) -> Vec<Vec<f32>> {
     let mut q = Seqs::default();
     let mut rows = 0;
     let mut host = Vec::new();
@@ -129,7 +134,11 @@ fn mamba_step(s: &Stream, w: &MambaGpu, blocks: &[&DeviceBuffer], projs: &[&[f32
     );
     let scratch = MambaScratch { xbc: xbc.addr(), dt: dt.addr(), y: y.addr() };
     let out = DeviceBuffer::new(r * INNER * 2).unwrap();
-    mamba_mixer(s, proj.addr(), LD, rows, qb.addr(), projs.len(), LAYER, REC, &w.w, defer, &scratch, out.addr()).unwrap();
+    if small {
+        mamba_mixer_small(s, proj.addr(), LD, rows, qb.addr(), projs.len(), LAYER, REC, &w.w, defer, &scratch, out.addr()).unwrap();
+    } else {
+        mamba_mixer(s, proj.addr(), LD, rows, qb.addr(), projs.len(), LAYER, REC, &w.w, defer, &scratch, out.addr()).unwrap();
+    }
     s.synchronize().unwrap();
     let all = bf16s(s, out.addr(), rows * INNER);
     let mut res = Vec::new();
@@ -1081,3 +1090,132 @@ fn time_dense() {
         }
     }
 }
+
+/// The small steps' alternative launches give the bits of the ones they replace: the router by sorting
+/// (ties, NaN logits), the wide GEMV (every form and format, output factor, accumulation, 2 to 64 rows),
+/// the Mamba convolution and its commit in one launch (plain, deferred and replaying steps of several
+/// sequences), the attention combine per query head (and decode rows against prefill rows).
+#[test]
+#[ignore]
+fn decode_forms_equal() {
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(77);
+    // Router: random rows, rows of few distinct values (ties), a row with NaN logits.
+    let rows = 40;
+    let mut logits = rng.vec(rows * EXPERTS, -5.0, 5.0);
+    for r in 20..36 {
+        for e in 0..EXPERTS {
+            logits[r * EXPERTS + e] = (logits[r * EXPERTS + e] * 2.0).round() / 2.0;
+        }
+    }
+    for e in (0..EXPERTS).step_by(3) {
+        logits[37 * EXPERTS + e] = f32::NAN;
+    }
+    let mut bias = rng.vec(EXPERTS, -0.05, 0.05);
+    for b in bias.iter_mut().skip(100).take(200) {
+        *b = 0.0;
+    }
+    let (lb, bb) = (up(&s, &logits), up(&s, &bias));
+    let buf = || DeviceBuffer::new(rows * TOPK * 4).unwrap();
+    let (e1, w1, e2, w2) = (buf(), buf(), buf(), buf());
+    moe_route(&s, lb.addr(), EXPERTS, bb.addr(), 5.0, rows, e1.addr(), w1.addr()).unwrap();
+    moe_route_sort(&s, lb.addr(), EXPERTS, bb.addr(), 5.0, rows, e2.addr(), w2.addr()).unwrap();
+    assert_eq!(s.download::<i32>(e1.addr(), rows * TOPK).unwrap(), s.download::<i32>(e2.addr(), rows * TOPK).unwrap(), "router experts");
+    assert_eq!(s.download::<u32>(w1.addr(), rows * TOPK).unwrap(), s.download::<u32>(w2.addr(), rows * TOPK).unwrap(), "router weights");
+    eprintln!("router by sorting: equal");
+
+    // Wide GEMV against the shared GEMV.
+    use kernels::WeightFormat as F;
+    let (n, k) = (1000usize, 1536usize);
+    let wbf: Vec<u16> = rng.vec(n * k, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
+    let wq: Vec<u8> = (0..n * k).map(|_| (rng.next_u64() % 255) as u8).collect();
+    let i8s = rng.vec(n * (k / kernels::int8_group()), 0.001, 0.02);
+    let w8: Vec<u8> = (0..n * k).map(|_| (rng.next_u64() % 256) as u8 & 0xF7).collect();
+    let fbs = rng.vec(n.div_ceil(128) * (k / 128), 0.5, 2.0);
+    let mats = [
+        (F::Bf16, up(&s, &wbf), None),
+        (F::Int8Group, up(&s, &wq), Some(up(&s, &i8s))),
+        (F::Fp8Block, up(&s, &w8), Some(up(&s, &fbs))),
+    ];
+    let mmax = 64;
+    let x: Vec<u16> = rng.vec(mmax * k, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
+    let xb = up(&s, &x);
+    let y0 = rng.vec(mmax * n, -1.0, 1.0);
+    let forms = [(16usize, 4usize), (16, 2), (8, 4), (8, 2), (8, 1), (4, 4), (4, 2), (4, 1), (2, 4), (2, 2)];
+    for (fmt, w, sc) in &mats {
+        let sc = sc.as_ref().map_or(0, |b| b.addr());
+        for m in [2usize, 3, 4, 5, 6, 7, 8, 9, 16, 17, 25, 32, 40, 57, 64] {
+            for (alpha, acc) in [(1.0f32, false), (0.37, true)] {
+                let ya = up(&s, &y0);
+                for r0 in (0..m).step_by(16) {
+                    let rows = 16.min(m - r0);
+                    kernels::gemv(&s, rows, xb.addr() + (r0 * k * 2) as u64, k, *fmt, w.addr(), sc, ya.addr() + (r0 * n * 4) as u64, n, 0, n, k, 1, alpha, acc)
+                        .unwrap();
+                }
+                let want = s.download::<u32>(ya.addr(), m * n).unwrap();
+                for &(mt, r) in &forms {
+                    let yb = up(&s, &y0);
+                    gemv_wide(&s, m, mt, r, xb.addr(), k, *fmt, w.addr(), sc, yb.addr(), n, n, k, alpha, acc).unwrap();
+                    assert!(s.download::<u32>(yb.addr(), m * n).unwrap() == want, "wide GEMV {fmt:?} m {m} form {mt}x{r} alpha {alpha} acc {acc}");
+                }
+            }
+        }
+    }
+    eprintln!("wide GEMV: equal");
+
+    // Mamba convolution and commit in one launch.
+    let p = MambaParams::random(&mut rng);
+    let w = mamba_weights(&s, &p);
+    let (a1, b1, a2, b2) = (new_block(), new_block(), new_block(), new_block());
+    type Step = (Vec<f32>, Vec<f32>, bool, Option<[i32; 2]>);
+    let mut steps: Vec<Step> = Vec::new();
+    for _ in 0..3 {
+        steps.push((random_proj(&mut rng, 1), random_proj(&mut rng, 2), false, None));
+    }
+    steps.push((random_proj(&mut rng, 4), random_proj(&mut rng, 5), true, Some([2, 5])));
+    steps.push((random_proj(&mut rng, 3), random_proj(&mut rng, 1), true, Some([3, 1])));
+    steps.push((random_proj(&mut rng, 1), random_proj(&mut rng, 1), false, None));
+    for (i, (x, y, defer, acc)) in steps.iter().enumerate() {
+        let o1 = mamba_step_with(&s, &w, &[&a1, &b1], &[x, y], *defer, false);
+        let o2 = mamba_step_with(&s, &w, &[&a2, &b2], &[x, y], *defer, true);
+        assert!(o1 == o2, "mamba step {i}: outputs");
+        let rows = [x.len() / PROJ, y.len() / PROJ];
+        match acc {
+            Some(a) => {
+                set_ctl(&s, &[&a1, &b1], &rows, a, true);
+                set_ctl(&s, &[&a2, &b2], &rows, a, true);
+            }
+            None => {
+                set_ctl(&s, &[&a1, &b1], &rows, &[0, 0], false);
+                set_ctl(&s, &[&a2, &b2], &rows, &[0, 0], false);
+            }
+        }
+        for (u, v) in [(&a1, &a2), (&b1, &b2)] {
+            let bytes = mamba_seq_bytes(LAYERS, REC);
+            assert!(s.download::<u8>(u.addr(), bytes).unwrap() == s.download::<u8>(v.addr(), bytes).unwrap(), "mamba step {i}: state blocks");
+        }
+    }
+    eprintln!("Mamba convolution and commit in one launch: equal");
+
+    // The attention combine with a CTA per query head, and decode rows against prefill rows.
+    for fp8 in [false, true] {
+        let mut qkv = Vec::new();
+        let len = 9000;
+        let (cache, kv, qout) = attn_fill(&s, &mut rng, len, fp8, &mut qkv);
+        let q_all: Vec<u16> = s.download(qout.addr(), len * QH * HD).unwrap();
+        let pos = [5usize, 1023, 1024, 4100, 8191, 8999];
+        set_attn_combine(false);
+        let old = attn_decode(&s, &cache, kv, &q_all, &pos);
+        set_attn_combine(true);
+        let new = attn_decode(&s, &cache, kv, &q_all, &pos);
+        assert!(old.iter().zip(&new).all(|(a, b)| a.to_bits() == b.to_bits()), "attention combine fp8 {fp8}");
+        let full = attn_prefill(&s, &cache, kv, &q_all, 0, len);
+        for (i, &p) in pos.iter().enumerate() {
+            let a = &new[i * QH * HD..(i + 1) * QH * HD];
+            let b = &full[p * QH * HD..(p + 1) * QH * HD];
+            assert!(a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()), "attention decode vs prefill fp8 {fp8} position {p}");
+        }
+    }
+    eprintln!("attention combine per query head: equal (and decode rows equal prefill rows)");
+}
+
