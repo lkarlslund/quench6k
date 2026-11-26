@@ -1,5 +1,6 @@
-//! Launchers for the Nemotron-H kernels (`kernels/nemotron*.cu`): the Mamba-2 mixer, the latent MoE
-//! (sigmoid router, NVFP4 relu² experts) and the GQA attention over an FP8 cache. Pointers are raw
+//! Launchers for the Nemotron-H kernels (`kernels/nemotron*.cu`): the block RMSNorm over the FP32
+//! residual, the Mamba-2 mixer, the latent MoE (sigmoid router, NVFP4 relu² experts) and the GQA
+//! attention over a BF16 or FP8 cache. CPU references: [`reference`]. Pointers are raw
 //! device addresses (0 for an absent optional input); every launch is asynchronous on the given stream.
 //!
 //! # Conventions
@@ -38,6 +39,8 @@ use std::ffi::{c_int, c_void};
 use anyhow::Result;
 
 use crate::{Stream, check};
+
+pub mod reference;
 
 /// Most sequences in one step's descriptor.
 pub const MAX_SEQ: usize = 16;
@@ -185,6 +188,17 @@ mod ffi {
 
     unsafe extern "C" {
         pub fn quench6k_nem_seqs_bytes() -> usize;
+        pub fn quench6k_nem_rms(
+            x: *const f32,
+            ldx: c_int,
+            w: *const c_void,
+            eps: f32,
+            rows: c_int,
+            out: *mut c_void,
+            ldo: c_int,
+            f32_out: c_int,
+            st: Stream,
+        ) -> Error;
         pub fn quench6k_nem_mamba_conv(
             proj: *const f32,
             ld: c_int,
@@ -364,6 +378,19 @@ pub fn check_layout() -> Result<()> {
     let b = unsafe { ffi::quench6k_nem_seqs_bytes() };
     anyhow::ensure!(b == std::mem::size_of::<Seqs>(), "nemotron: sequence descriptor layout mismatch ({b} bytes)");
     Ok(())
+}
+
+// ---- Block norms -----------------------------------------------------------------------------------
+
+/// RMSNorm of `rows` FP32 residual rows ([`HIDDEN`] wide, stride `ldx`) with the BF16 weight `w` [4096]:
+/// `out = w * (x * (1 / sqrt(mean(x²) + eps)))`, all FP32 (fixed-order sum), rounded once to BF16
+/// (`f32_out` = false) or written as FP32. eps: 1e-5. One CTA per row (rows independent).
+#[allow(clippy::too_many_arguments)]
+pub fn rms(s: &Stream, x: u64, ldx: usize, w: u64, eps: f32, rows: usize, out: u64, ldo: usize, f32_out: bool) -> Result<()> {
+    go!(
+        "nem_rms",
+        ffi::quench6k_nem_rms(f(x), n(ldx), p(w), eps, n(rows), pm(out), n(ldo), f32_out as c_int, s.raw())
+    )
 }
 
 // ---- Mamba-2 ---------------------------------------------------------------------------------------
