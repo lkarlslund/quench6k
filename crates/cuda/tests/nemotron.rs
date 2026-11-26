@@ -833,8 +833,8 @@ fn time_experts() {
         let bytes = distinct as f64 / 16.0 * 2.0 * (MOE_INTER * LATENT) as f64 * (0.5 + 1.0 / 16.0);
         eprintln!("TIME experts small {rows} rows: {us:.1} us/layer ({:.0} GB/s of distinct expert weights)", bytes / us / 1e3);
     }
-    // Prefill path at 2048 tokens.
-    let rows = 2048;
+    // Prefill path at 2048 tokens (QUENCH6K_NEM_TIME_ROWS: another row count).
+    let rows: usize = std::env::var("QUENCH6K_NEM_TIME_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
     let pairs = rows * TOPK;
     let x: Vec<u16> = rng.vec(rows * LATENT, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
     let xb = up(&s, &x);
