@@ -693,8 +693,8 @@ impl NemotronModel {
         self.step(states, ws, s, tokens, Logits::All, true)
     }
 
-    /// Embedding rows (F32) and the sequence descriptor into the pinned buffer.
-    fn stage(&self, states: &[&mut State], ws: &mut Workspace, tokens: &[&[i32]]) -> Result<()> {
+    /// Embedding rows (F32, or BF16 with `bf16`) and the sequence descriptor into the pinned buffer.
+    fn stage(&self, states: &[&mut State], ws: &mut Workspace, tokens: &[&[i32]], bf16: bool) -> Result<()> {
         let emb_bytes = Workspace::pinned_layout(ws.rows_cap).0;
         let buf = ws.pinned.as_mut_slice();
         let mut j = 0;
@@ -702,10 +702,14 @@ impl NemotronModel {
             for &tok in toks.iter() {
                 ensure!(tok >= 0 && (tok as usize) < self.cfg.vocab, "token {tok} out of range");
                 let row = self.embed_row(tok as usize);
-                let dst = &mut buf[j * D * 4..(j + 1) * D * 4];
-                for (c, o) in row.chunks_exact(2).zip(dst.chunks_exact_mut(4)) {
-                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
-                    o.copy_from_slice(&v.to_le_bytes());
+                if bf16 {
+                    buf[j * D * 2..(j + 1) * D * 2].copy_from_slice(row);
+                } else {
+                    let dst = &mut buf[j * D * 4..(j + 1) * D * 4];
+                    for (c, o) in row.chunks_exact(2).zip(dst.chunks_exact_mut(4)) {
+                        let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                        o.copy_from_slice(&v.to_le_bytes());
+                    }
                 }
                 j += 1;
             }
@@ -749,11 +753,21 @@ impl NemotronModel {
         let part = if small { ws.part(r, groups)? } else { 0 };
         // The pinned buffer may still feed the previous step's uploads.
         s.synchronize()?;
-        self.stage(states, ws, tokens)?;
+        // Large steps upload BF16 embedding rows (half the bytes over the host link) into ws.xn (free until
+        // the first norm) and widen them on the device (exact). Variant nem.emb16=0: F32 rows.
+        let bf16 = !small && quench6k_cuda::variants::get("nem.emb16", 1) != 0;
+        self.stage(states, ws, tokens, bf16)?;
         let emb_bytes = Workspace::pinned_layout(ws.rows_cap).0;
         unsafe {
-            s.copy_h2d(ws.h, ws.pinned.as_ptr(), r * D * 4)?;
+            if bf16 {
+                s.copy_h2d(ws.xn, ws.pinned.as_ptr(), r * D * 2)?;
+            } else {
+                s.copy_h2d(ws.h, ws.pinned.as_ptr(), r * D * 4)?;
+            }
             s.copy_h2d(ws.seqs, ws.pinned.as_ptr().add(emb_bytes), SEQS_BYTES)?;
+        }
+        if bf16 {
+            nk::bf16_to_f32(s, ws.xn, r * D, ws.h)?;
         }
         let plan = Plan {
             r,

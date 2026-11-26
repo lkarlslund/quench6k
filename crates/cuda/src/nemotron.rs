@@ -861,3 +861,15 @@ pub fn gemm_f32_ext(
     crate::check(err, "gemm_bf16_f32_ext")
 }
 
+mod widen_ffi {
+    use crate::ffi::{Error, Stream};
+
+    unsafe extern "C" {
+        pub fn quench6k_nem_bf16_to_f32(x: *const std::ffi::c_void, n: usize, out: *mut f32, st: Stream) -> Error;
+    }
+}
+
+/// out F32 [n] = x BF16 [n] (exact; n a multiple of 8): embedding rows uploaded as BF16.
+pub fn bf16_to_f32(s: &Stream, x: u64, n: usize, out: u64) -> Result<()> {
+    check(unsafe { widen_ffi::quench6k_nem_bf16_to_f32(x as *const c_void, n, out as *mut f32, s.raw()) }, "nem_bf16_to_f32")
+}
