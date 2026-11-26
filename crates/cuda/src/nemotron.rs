@@ -376,6 +376,7 @@ mod ffi {
             st: Stream,
         ) -> Error;
         pub fn quench6k_nem_set_attn_combine(heads: c_int);
+        pub fn quench6k_nem_set_rms_early(early: c_int);
         pub fn quench6k_nem_attn_part_floats(rows: c_int, max_groups: c_int) -> usize;
         pub fn quench6k_nem_attention_small(
             q: *const c_void,
@@ -890,6 +891,12 @@ pub fn attn_prep(s: &Stream, qkv: u64, ld: usize, q_col: usize, k_col: usize, v_
 /// head (false); the same bits (A/B timings; process-wide).
 pub fn set_attn_combine(heads: bool) {
     unsafe { ffi::quench6k_nem_set_attn_combine(heads as c_int) }
+}
+
+/// [`rms`]: the norm weights load before the dependency wait (true, default) or after it; the same bits (A/B
+/// timings; process-wide).
+pub fn set_rms_early(early: bool) {
+    unsafe { ffi::quench6k_nem_set_rms_early(early as c_int) }
 }
 
 /// Floats of [`attention_small`]'s partial results for `rows` rows whose positions are below

@@ -70,8 +70,10 @@ pub const F_CONV: u32 = 16;
 pub const F_ROUTE: u32 = 128;
 /// The small steps' attention combine with a CTA per query head ([`nk::set_attn_combine`]).
 pub const F_COMBINE: u32 = 256;
+/// The block norms load their weights before the dependency wait ([`nk::set_rms_early`]).
+pub const F_RMS: u32 = 2048;
 /// The default: every part.
-pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE;
+pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_ROUTE | F_COMBINE | F_RMS;
 static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(F_ALL);
 
 /// Switches the optional parts of the step (`F_*` bits; for A/B timings in one process; the CUDA graphs
@@ -79,6 +81,7 @@ static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 pub fn set_features(mask: u32) {
     FEATURES.store(mask, std::sync::atomic::Ordering::Relaxed);
     nk::set_attn_combine(mask & F_COMBINE != 0);
+    nk::set_rms_early(mask & F_RMS != 0);
 }
 
 fn features() -> u32 {
