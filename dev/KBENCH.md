@@ -1175,3 +1175,64 @@ attention's idle DRAM time is partly used, and the requests then compete with th
 and those early loads (levers.md: next-layer prefetch <= 1%). Not measured at 8 sequences (it lost at one).
 The Mamba scan was not tried: in small steps in_proj's z rows already stream beside the convolution and
 scan (F_SIDE_Z).
+## 2026-11-26: Nemotron-H prefill GEMMs, larger and deeper tiles per shape (same bits)
+
+Starting point: the dense projections ran gemm.cu's BF16 kernel (128 x 128 at 2 CTAs per SM, or 256 x 128
+with many tiles; 64-row tiles for N <= 1024) at 52-56% of the 544 TFLOPS `mma.sync` ceiling. Two causes
+measured: wave quantization (out_proj at 2048 rows: 512 tiles on 376 slots, 1.36 waves) and L2 traffic
+per MMA (a 256 x 128 tile needs ~6.2 TB/s of L2 reads at full rate, about the card's L2 hit bandwidth).
+Under load the GPU sits at the 600 W cap: SM clock 2.35-2.6 GHz in full waves (ceiling there ~460-510
+TFLOPS), so energy per MMA (bytes moved) counts as much as issue efficiency.
+
+New kernel (kernels/nemotron_dense.cu, `nem.dense`): gemm.cu's arithmetic per output (the same BF16
+operands, m16n8k16 MMAs in ascending k from zero, the same epilogue, also with accumulation) in 17 tile
+variants: 256 x 192 / 192 x 256 (8 warps of 128 x 48 / 96 x 64, 3 stages, 255 registers, no spills),
+256 x 128 and 128 x 256 with 4 stages, 6-stage 64- and 128-row tiles for small steps, 64 x 64 tiles for
+the router. 8-bit weights are staged raw by cp.async (with each row's scale) and converted into the B
+fragments by the warps (no register staging, no store phase after the MMAs). A table per projection
+shape, weight format and row count (256 / 512 / 1024 / 1536 / 2048 / 4096 / 6144 / 8192, a step takes
+the next larger entry) picks the variant, or gemm.cu's launch where no variant was 1% faster.
+`dense_gemm_equal` (GPU suite) checks every variant and the table against gemm.cu's launch bitwise for
+every prefill shape and format at 256 to 8192 rows, with and without accumulation.
+
+Micro timings (interleaved A B .. B A, 3 copies of the weights rotated so they come from DRAM, median
+of 3-7 rounds, null arm 0.997-1.003; 600 W, SM clock 2.15-2.83 GHz, mean 2.6, 57-75 C), table's
+choice against gemm.cu's launch (ratios from the sweep that chose them; the engine A/B below is the
+independent check; INT8 at 512 rows 1.70-1.96):
+
+| rows | out_proj | sh_up | sh_down | qkv | o | fc1 | fc2 | router | in_proj FP8 / INT8 |
+|---|---|---|---|---|---|---|---|---|---|
+| 512 (FP8) | 1.68 | 1.54 | 1.76 | 1.52 | 1.70 | 1.55 | 1.66 | 1.72 | 1.06 / 1.22 |
+| 2048 (BF16 expanded) | 1.16 | 1.09 | 1.17 | 1.10 | 1.14 | 1.04 | 1.05 | 1.62 | 1.00 / 1.02 |
+| 8192 (BF16 expanded) | 1.08 | 1.15 | 1.09 | 1.04 | 1.08 | 1.35 | 1.06 | 1.04 | 1.01 / 1.04 |
+
+The 256 x 192 tile reaches 360-395 TFLOPS in full waves (out_proj at 2048 rows: 409 us, one wave of 176
+tiles); gemm.cu's 315-320.
+
+Engine (`QUENCH6K_NEM_AB="nem.dense=0;nem.dense=-1;nem.dense=0" QUENCH6K_NEM_AB_PREFILL=1`, 1 sequence,
+3 rounds; the third arm is the null arm; caches, Mamba block and logits bitwise equal across arms):
+
+| workspace | 512 | 8K | 32K |
+|---|---|---|---|
+| 2048-token steps | 4446 -> 5171 tok/s, +16.3% (null +0.2%) | 7159 -> 7311, +2.1% (null +0.4%) | 6441 -> 6614, +2.7% (null +1.2%) |
+| 8192-token steps (served) | - | 7693 -> 7910, +2.8% (null +0.3%) | 7220 -> 7421, +2.8% (null +0.8%) |
+
+(512 / 8K at 2.58-2.67 GHz, 598 W, 40-58 C; 32K at 2.43-2.83 GHz, 600 W, 56-77 C; the 8192-step run at
+2.03-2.63 GHz, 588 W, 57-81 C; throttle reasons power cap only.)
+
+Checks: dense_gemm_equal (3000 launches), the GPU suite, fixture scores of all 7 fixtures at chunks of
+512 and 2048 byte-identical to main's build (the .json files differ only in their wall-clock seconds).
+gemm.cu is unchanged: the other engines run what they ran.
+
+Dropped or neutral:
+- The in_proj (8-bit, 152 MB as BF16, so not expanded; ~40% of the dense time) gains little: B fragments
+  converted per warp repeat the conversion in every warp row (4x for 256 x 128), and under the power cap
+  that costs: 256 x 128 0.95x, 256 x 192 0.975x of gemm.cu's register-staged FP8 tile at 2048 rows, equal
+  or +1-4% at 8192. BF16 weights in the same 256 x 192 tile run 1029 us vs 1071 at 2048 rows: a
+  convert-once staging (raw stages, one cooperative conversion per tile) is worth at most ~4% there.
+- 8-bit tiles instead of the per-step BF16 expansion from 2048 rows: out_proj FP8 428 vs 27 + 409 us at
+  2048 (equal), 1892 vs 42 + 1714 at 8192: the expansion stays.
+- 12 warps of 64 x 64 (256 x 192, 168 registers): 0.54-0.72x; 128 x 192 at 2 CTAs per SM spills.
+
+Left: the in_proj's convert-once staging; at the power cap, fewer bytes per MMA (larger tiles need more
+registers than 8 warps have; clusters cannot share operand tiles without multicast).

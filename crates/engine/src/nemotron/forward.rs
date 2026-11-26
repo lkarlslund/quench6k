@@ -744,8 +744,8 @@ fn linear_x(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: u
     let min_rows = quench6k_cuda::variants::get("nem.expand", 2048) as usize;
     if wexp != 0 && eight && !small && m > gm && min_rows > 0 && m >= min_rows && l.n * l.k * 2 <= EXPAND_BYTES {
         nk::expand_bf16(s, l.fmt, l.w, l.scale, l.n, l.k, wexp)?;
-        let flags = quench6k_cuda::variants::get("nem.gemm", 2) as u32;
-        return nk::gemm_f32_ext(s, x, ldx, WeightFormat::Bf16, wexp, l.k, 0, y, ldy, m, l.n, l.k, l.alpha, accumulate, flags);
+        let bf = Linear { w: wexp, scale: 0, fmt: WeightFormat::Bf16, ..*l };
+        return gemm(s, x, ldx, m, &bf, y, ldy, accumulate);
     }
     linear(s, x, ldx, m, l, y, ldy, small, accumulate)
 }
@@ -780,10 +780,21 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
         }
         Ok(())
     } else {
-        // 64-row tiles for the narrow router and latent projections (variant nem.gemm=0: off); the same bits.
-        let flags = quench6k_cuda::variants::get("nem.gemm", 2) as u32;
-        nk::gemm_f32_ext(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, l.alpha, accumulate, flags)
+        gemm(s, x, ldx, m, l, y, ldy, accumulate)
     }
+}
+
+/// The tensor-core GEMM of a prefill projection (the same bits whichever launch): Nemotron's tile table
+/// (kernels/nemotron_dense.cu; variant nem.dense=-1, the default; > 0 a fixed tile) or gemm.cu's launch
+/// (nem.dense=0, with 64-row tiles for the narrow router and latent projections unless nem.gemm=0).
+#[allow(clippy::too_many_arguments)]
+fn gemm(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usize, accumulate: bool) -> Result<()> {
+    let v = quench6k_cuda::variants::get("nem.dense", -1);
+    if v == 0 {
+        let flags = quench6k_cuda::variants::get("nem.gemm", 2) as u32;
+        return nk::gemm_f32_ext(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, l.alpha, accumulate, flags);
+    }
+    nk::gemm_dense(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, l.alpha, accumulate, v)
 }
 
 /// The fastest form of the model's projections at 5 or more rows (Some(None): the shared GEMV), from

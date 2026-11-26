@@ -1015,6 +1015,95 @@ pub fn gemm_f32_ext(
     crate::check(err, "gemm_bf16_f32_ext")
 }
 
+mod dense_ffi {
+    use std::ffi::{c_int, c_void};
+
+    use crate::ffi::{Error, Stream};
+
+    unsafe extern "C" {
+        pub fn quench6k_nem_gemm(
+            fmt: c_int,
+            x: *const c_void,
+            ldx: c_int,
+            w: *const c_void,
+            ldw: c_int,
+            scale: *const f32,
+            y: *mut f32,
+            ldy: c_int,
+            m: c_int,
+            n: c_int,
+            k: c_int,
+            alpha: f32,
+            accumulate: c_int,
+            variant: c_int,
+            stream: Stream,
+        ) -> Error;
+    }
+}
+
+/// Tile variants of [`gemm_dense`] (1 ..= DENSE_VARIANTS).
+pub const DENSE_VARIANTS: i32 = 17;
+
+/// Prefill projection Y [m, n] F32 (+)= alpha X [m, k] BF16 . W^T (weight formats BF16, INT8 per 64, FP8 per
+/// 128 x 128 block) with larger or deeper CTA tiles (kernels/nemotron_dense.cu): `variant` -1 takes the tile
+/// measured fastest for the model's shape and row count, 0 the launch of [`gemm_f32_ext`] (flags 2), 1 ..=
+/// [`DENSE_VARIANTS`] a fixed tile. Every variant gives [`gemm_f32_ext`]'s bits (the same MMAs per output in
+/// the same k order). k a multiple of 128 for 8-bit weights.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_dense(
+    s: &Stream,
+    x: u64,
+    ldx: usize,
+    fmt: crate::kernels::WeightFormat,
+    w: u64,
+    ldw: usize,
+    scale: u64,
+    y: u64,
+    ldy: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    accumulate: bool,
+    variant: i32,
+) -> Result<()> {
+    let err = unsafe {
+        dense_ffi::quench6k_nem_gemm(
+            fmt as i32,
+            x as *const c_void,
+            ldx as i32,
+            w as *const c_void,
+            ldw as i32,
+            if scale == 0 { std::ptr::null() } else { scale as *const f32 },
+            y as *mut f32,
+            ldy as i32,
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            accumulate as i32,
+            variant,
+            s.raw(),
+        )
+    };
+    crate::check(err, "nem_gemm")
+}
+
+mod diff_ffi {
+    use crate::ffi::{Error, Stream};
+
+    unsafe extern "C" {
+        pub fn quench6k_nem_count_diff(a: *const std::ffi::c_void, b: *const std::ffi::c_void, n: usize, out: *mut u64, st: Stream) -> Error;
+    }
+}
+
+/// Tests: the number of 32-bit words at which `words` words at `a` and `b` differ.
+pub fn count_diff(s: &Stream, a: u64, b: u64, words: usize) -> Result<u64> {
+    let out = crate::DeviceBuffer::new(8)?;
+    check(unsafe { diff_ffi::quench6k_nem_count_diff(a as *const c_void, b as *const c_void, words, out.addr() as *mut u64, s.raw()) }, "nem_count_diff")?;
+    Ok(s.download::<u64>(out.addr(), 1)?[0])
+}
+
 mod widen_ffi {
     use crate::ffi::{Error, Stream};
 
