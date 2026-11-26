@@ -935,6 +935,86 @@ fn time_attention() {
     }
 }
 
+/// The engine's projection shapes (rows x columns, stored format) through the shared GEMV and every wide
+/// form, at 1, 2, 4 and 8 input rows, weights rotated through 1 GiB (beyond L2).
+#[test]
+#[ignore]
+fn time_gemv_shapes() {
+    use kernels::WeightFormat as F;
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(45);
+    const POOL: usize = 1 << 30;
+    let pool = DeviceBuffer::new(POOL).unwrap();
+    let piece = up(&s, &rand_bytes(&mut rng, 64 << 20, |b| b & 0xF7));
+    for o in (0..POOL).step_by(64 << 20) {
+        s.copy_d2d(pool.addr() + o as u64, piece.addr(), 64 << 20).unwrap();
+    }
+    const SPOOL: usize = 128 << 20;
+    let spool = up(&s, &rng.vec(SPOOL / 4, 0.001, 0.02));
+    let x: Vec<u16> = rng.vec(64 * 8192, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
+    let xb = up(&s, &x);
+    let y = DeviceBuffer::new(64 * 131072 * 4).unwrap();
+    let shapes: [(&str, usize, usize, F); 10] = [
+        ("in_proj", 18560, 4096, F::Fp8Block),
+        ("out_proj", 4096, 8192, F::Fp8Block),
+        ("qkv", 4608, 4096, F::Int8Group),
+        ("o_proj", 4096, 4096, F::Int8Group),
+        ("shared_up", 5376, 4096, F::Fp8Block),
+        ("shared_down", 4096, 5376, F::Fp8Block),
+        ("gate", 512, 4096, F::Bf16),
+        ("fc1", 1024, 4096, F::Int8Group),
+        ("fc2", 4096, 1024, F::Int8Group),
+        ("lm_head", 131072, 4096, F::Int8Group),
+    ];
+    let forms = [(16usize, 4usize), (16, 2), (8, 4), (8, 2), (8, 1), (4, 4), (4, 2), (4, 1), (2, 4), (2, 2)];
+    for (name, n, k, fmt) in shapes {
+        let wb = n * k * if fmt == F::Bf16 { 2 } else { 1 };
+        let sb = match fmt {
+            F::Fp8Block => n.div_ceil(128) * (k / 128) * 4,
+            F::Int8Group => n * (k / kernels::int8_group()) * 4,
+            _ => 0,
+        };
+        let calls = (POOL / 2 / wb).clamp(4, 64);
+        let wa = |j: usize| pool.addr() + ((j * wb) % (POOL - wb) / 256 * 256) as u64;
+        let sa = |j: usize| if sb == 0 { 0 } else { spool.addr() + ((j * sb) % (SPOOL - sb) / 256 * 256) as u64 };
+        // QUENCH6K_TEST_MS: the row counts (comma-separated; default 1,2,4,8).
+        let ms: Vec<usize> = std::env::var("QUENCH6K_TEST_MS").map_or(vec![1, 2, 4, 8], |v| v.split(',').map(|x| x.trim().parse().unwrap()).collect());
+        for &m in &ms {
+            let us = time_graph(
+                &s,
+                |st| {
+                    for j in 0..calls {
+                        for r0 in (0..m).step_by(16) {
+                            let rows = 16.min(m - r0);
+                            kernels::gemv(st, rows, xb.addr() + (r0 * k * 2) as u64, k, fmt, wa(j), sa(j), y.addr() + (r0 * n * 4) as u64, n, 0, n, k, 1, 1.0, false)?;
+                        }
+                    }
+                    Ok(())
+                },
+                calls,
+            );
+            let mut line = format!("TIME gemv {name} {n}x{k} {fmt:?} m {m}: shared {us:.1} us ({:.0} GB/s)", (wb + sb) as f64 / us / 1e3);
+            for &(mt, r) in &forms {
+                if mt > 2 * m.max(1) || m < 2 || (fmt == F::Bf16 && mt * r > 32) {
+                    continue;
+                }
+                let us = time_graph(
+                    &s,
+                    |st| {
+                        for j in 0..calls {
+                            gemv_wide(st, m, mt, r, xb.addr(), k, fmt, wa(j), sa(j), y.addr(), n, n, k, 1.0, false)?;
+                        }
+                        Ok(())
+                    },
+                    calls,
+                );
+                line += &format!("; {mt}x{r} {us:.1} ({:.0})", (wb + sb) as f64 / us / 1e3);
+            }
+            eprintln!("{line}");
+        }
+    }
+}
+
 // ---- Output digest (bit-identity of optimizations) ---------------------------------------------------
 
 fn fnv(h: &mut u64, bytes: &[u8]) {
