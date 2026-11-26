@@ -451,6 +451,55 @@ fn bench(dir: &Path, text: &Path, ctxs: &[usize], generate: usize, seqs: usize, 
     ensure!(drafts <= MAX_DRAFTS, "--drafts 0 to {MAX_DRAFTS}");
     ensure!(drafts == 0 || model.mtp.is_some(), "--drafts needs the MTP layer");
     let mut ws = Workspace::new(&model, CANON_CHUNK, seqs * MAX_VERIFY)?;
+    // QUENCH6K_NEM_AB="key=v,key=v;key=v;..." (an empty entry: defaults): prefill only, the kernel variant
+    // sets interleaved (A B B A ...) in one process, QUENCH6K_NEM_AB_ROUNDS rounds (default 3).
+    if let Ok(ab) = std::env::var("QUENCH6K_NEM_AB") {
+        let sets: Vec<&str> = ab.split(';').collect();
+        let rounds: usize = std::env::var("QUENCH6K_NEM_AB_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        for &ctx in ctxs {
+            ensure!(ctx <= ids.len(), "corpus has {} tokens", ids.len());
+            let mut times = vec![Vec::new(); sets.len()];
+            let mut firsts = vec![Vec::new(); sets.len()];
+            for round in 0..rounds {
+                let order: Vec<usize> = if round % 2 == 0 { (0..sets.len()).collect() } else { (0..sets.len()).rev().collect() };
+                for i in order {
+                    quench6k_cuda::variants::clear();
+                    for pair in sets[i].split(',').filter(|x| !x.is_empty()) {
+                        let (key, v) = pair.split_once('=').context("variant key=value")?;
+                        quench6k_cuda::variants::set(key, v.parse()?);
+                    }
+                    let mut st = State::new(&model, ctx + 16, kv, &s)?;
+                    s.synchronize()?;
+                    let t0 = Instant::now();
+                    model.prefill(&mut st, &mut ws, &s, &ids[..ctx])?;
+                    let first = argmax(&ws, &model, &s, 1)?[0];
+                    times[i].push(t0.elapsed().as_secs_f64());
+                    firsts[i].push(first);
+                }
+            }
+            let med = |v: &[f64]| {
+                let mut v = v.to_vec();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let base = med(&times[0]);
+            for (i, set) in sets.iter().enumerate() {
+                let m = med(&times[i]);
+                let (lo, hi) = times[i].iter().fold((f64::MAX, 0f64), |(a, b), &t| (a.min(t), b.max(t)));
+                println!(
+                    "ab ctx {ctx:>6} [{set}]: prefill {:>7.0} tok/s (median {:.1} ms, {:.1}..{:.1}), {:+.1}% vs first; first tokens {:?}",
+                    ctx as f64 / m,
+                    m * 1e3,
+                    lo * 1e3,
+                    hi * 1e3,
+                    (base / m - 1.0) * 100.0,
+                    firsts[i]
+                );
+            }
+        }
+        quench6k_cuda::variants::clear();
+        return Ok(());
+    }
     for &ctx in ctxs {
         // Sequence j reads the corpus from token 37 j on (different prompts of the same length).
         ensure!(ctx + generate + 37 * seqs <= ids.len(), "corpus has {} tokens, {} needed", ids.len(), ctx + generate + 37 * seqs);
