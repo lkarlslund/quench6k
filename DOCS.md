@@ -266,15 +266,23 @@ canonical as for Inkling 2: each whole aligned chunk advances the sequence's can
 snapshots its Mamba states (190 MiB; a sequence keeps the lowest and the latest), and `State::rewind`
 reuses a cached prefix only up to a multiple of 2048 at most the common prefix and the frontier, restoring
 the snapshot there. A turn thus recomputes up to 2047 cached prompt tokens plus the previous reply, and
-its results depend only on its tokens.
+its results depend only on its tokens. A prefill step may take several whole aligned chunks (not a
+sequence's first, so the snapshots stay where they were): the workspace's step size sets how many
+(`QUENCH6K_NEM_MAXT` for the commands, default 2048; the server's is 8192, used while no other request
+decodes, one chunk per call while others do), and a row's bits are the same either way. Steps of up to
+16 tokens per sequence (decode and verification) run as CUDA graphs captured per shape
+(`QUENCH6K_NEM_GRAPHS=0`: eagerly).
 
 `quench6k nemotron generate` (greedy, `--think on|off|low` for the chat template, `--ids` for token ids),
-`bench` (`--seqs N` decodes N sequences in batched steps, `--drafts K` with MTP drafts) and `score` (teacher-forced distributions,
+`bench` (`--seqs N` decodes N sequences in batched steps, `--drafts K` with MTP drafts, `--json FILE`
+one record per context, sequence count and draft count with the GPU's clocks, temperature and power:
+[bench/README.md](bench/README.md)) and `score` (teacher-forced distributions,
 oracle.distributions/1) run the model; `--dump-dir DIR` (or `QUENCH6K_NEM_DUMP=DIR`) appends the hidden
 states after each layer (`lanes-NN.bin`, F32 [tokens, 4096]) and after the final norm (`final.bin`) for
 comparison with a reference's per-layer dumps.
 
-The MTP layer drafts (`QUENCH6K_NEM_DRAFTS`, default 4 per pass; `QUENCH6K_NEM_MTP=0` does not load it).
+The MTP layer drafts (in the server up to `QUENCH6K_NEM_DRAFTS` per pass, default 4, at most 7; the
+server's `--drafts` does not apply; `QUENCH6K_NEM_MTP=0` does not load the layer).
 Every step keeps the layer up to date: its input at position q is the main model's final-norm output at q
 (F32) and the embedding of the token at q + 1, through enorm / hnorm, eh_proj, an attention block with its
 own cache row and an MoE block; a draft is the LM head's argmax after final_layernorm, and further drafts
@@ -288,7 +296,16 @@ output (`quench6k nemotron spec-check`), alone or batched (`batch-check --verify
 `quench6k serve --model DIR` detects the model and serves up to `--slots` requests at once in the slot
 scheduler (canonical prefill and prefix reuse as above, batched decoding with MTP drafts, tool calls and
 reasoning through the chat template, `--kv bf16|fp8`); steering, adapters, vision, edits and stored
-contexts are not available for it. Not done yet: CUDA graphs.
+contexts are not available for it. The chat template's `truncate_history_thinking` (earlier turns'
+reasoning left out of the prompt) is off unless `QUENCH6K_NEM_TRUNCATE_THINKING=1`, so a conversation's
+prompt continues the previous one and its cached prefix is reused.
+
+`nemotron bench` compares settings in one process with `QUENCH6K_NEM_AB`: feature masks (`maskA,maskB`;
+the optional parts of a step, `forward::F_*`, all on by default) or sets of items separated by `;` (an item
+`features=MASK` or a kernel variant `key=value`, e.g. `nem.thin=0`), timed A B .. B A for
+`QUENCH6K_NEM_AB_ROUNDS` rounds (default 2) after a warm-up run of each, decoding from one restored prefill;
+every setting's tokens must equal the first's. `QUENCH6K_NEM_AB_PREFILL=1` times prefills only and
+compares their caches, Mamba states and last logits bitwise. Development notes: [dev/KBENCH.md](dev/KBENCH.md).
 
 ## Server options
 
@@ -333,7 +350,7 @@ requests, counting what idle slots hold as free. Otherwise it waits for a runnin
 so a newer request never cuts a running one short. A request alone always starts. A completion longer
 than its plan grows into free memory; only if none is left does it fail.
 
-### Slots for Inkling 2, Hy4-flash and Flint
+### Slots for Inkling 2, Hy4-flash, Flint and Nemotron-H
 
 These models run in a scheduler of their own over their engines (`crates/cli/src/serve/slots.rs`), with
 the same policies:
@@ -369,8 +386,9 @@ the same policies:
   fit alone (memory taken since) fails at once, and a request that runs out of memory with nothing
   else holding it fails, both with the positions one sequence fits on the device. Cancellation, stop
   tokens and budgets are per request, and an error in one slot resets only that slot.
-- All three engines run one batched step (`forward_batch`) for the decoding sequences (and Inkling's
-  and Hy4-flash's drafters one pass, `draft_batch`), with growable states: a sequence's full-length
+- The engines run one batched step (`forward_batch`; Nemotron-H's `verify`) for the decoding sequences
+  (and Inkling's and Hy4-flash's drafters one pass, `draft_batch`; Nemotron-H's MTP layer one pass,
+  `commit`), with growable states: a sequence's full-length
   caches are mapped as it grows, so slots share the device memory by their actual lengths.
   - Hy4-flash: about 17 KB per position plus about 150 MB per sequence. With the weights and an
     eight-slot workspace loaded, about 4.5 GB remain on a 96 GB card: some 200K positions for one
@@ -381,6 +399,9 @@ the same policies:
     conversation's tokens, not on what was cached.
   - Flint: 28 KB per position (BF16 caches; about half with `--kv fp8`) plus the sliding rings (up to
     560 MB per sequence).
+  - Nemotron-H: 9 KiB per position (BF16 caches; 4.6 KiB with `--kv fp8`) plus 190 MiB of Mamba states
+    per sequence and up to two snapshots of them. Prompts prefill canonically as for Inkling 2; while no
+    other request decodes, a prefill call takes up to four whole chunks (8192 tokens).
 
 ## HTTP API
 
@@ -692,4 +713,16 @@ the inspector's edits.
 | `QUENCH6K_INK_DRAFTS=N` | Inkling 2, `quench6k inkling ... --draft`: verify N drafts per step instead of choosing the count |
 | `QUENCH6K_INK_DUMP=DIR`, `QUENCH6K_INK_DUMP_DRAFT=DIR`, `QUENCH6K_INK_TIMING=1` | Inkling 2 debugging: the stream after each layer visit, the drafter's inputs and outputs, per-step timings |
 | `QUENCH6K_INK_PROFILE_STEPS=N`, `QUENCH6K_INK_PROFILE_WIDTH=W`, `QUENCH6K_INK_CONF_LOG=FILE` | Inkling 2 profiling (`inkling bench`): N decode steps of W tokens in a profiler capture range; (`inkling generate --draft`) each judged draft's position, stated probability and outcome |
+| `QUENCH6K_NEM_INT8=LIST` | Nemotron-H: BF16 projections quantized to INT8 (a scale per 64 weights) at load, as name fragments (`all`, the default, or `none`; the routers stay BF16) |
+| `QUENCH6K_NEM_MTP=0` | Nemotron-H: do not load the MTP layer (no drafts) |
+| `QUENCH6K_NEM_DRAFTS=N` | Nemotron-H server: most MTP drafts per pass (default 4, at most 7) |
+| `QUENCH6K_NEM_MTP_H=pre` | Nemotron-H: feed the MTP layer the last layer's output instead of the final norm's (lower acceptance) |
+| `QUENCH6K_NEM_GRAPHS=0` | Nemotron-H: run small steps and MTP passes eagerly instead of as CUDA graphs |
+| `QUENCH6K_NEM_TRUNCATE_THINKING=1` | Nemotron-H: the chat template drops earlier turns' reasoning (`truncate_history_thinking`) |
+| `QUENCH6K_NEM_PREFILL_MAX=N` | Nemotron-H server: at most N tokens per prefill call (whole 2048-token chunks; default 8192) |
+| `QUENCH6K_NEM_MAXT=N` | Nemotron-H `bench`: the workspace's step size (a multiple of 2048; default 2048) |
+| `QUENCH6K_NEM_AB=SETS`, `QUENCH6K_NEM_AB_ROUNDS=N`, `QUENCH6K_NEM_AB_PREFILL=1`, `QUENCH6K_NEM_ATTN_PF=N` | Nemotron-H `bench`: settings compared in one process (see [Nemotron 3 Super](#nemotron-3-super--munin-20)); with the attention prefetch feature on, N key tiles ahead (default 3) |
+| `QUENCH6K_NEM_DUMP=DIR`, `QUENCH6K_NEM_LOG_PREFILL=1`, `QUENCH6K_NEM_PROFILE=1\|decode` | Nemotron-H debugging: hidden states after each layer; the server logs each prefill call's tokens and position; `bench` puts its prefills (or decode steps 9 on) in a profiler capture range |
+| `QUENCH6K_NEM_VC_DUMP=DIR`, `QUENCH6K_NEM_VC_BISECT=1` | Nemotron-H `batch-check --verify`: the first step's per-layer states alone and batched; the first batched step again with a device wait before each kind of launch in turn |
+| `QUENCH6K_NEM_TIME_ROWS=N` | Nemotron-H kernel tests (`time_experts`, `time_dense`): the prefill rows timed |
 | `QUENCH6K_PDL=0` | Launch kernels without programmatic dependent launch (checks whether a result depends on PDL ordering) |
