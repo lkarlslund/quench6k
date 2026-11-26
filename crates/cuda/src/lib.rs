@@ -1247,6 +1247,7 @@ pub mod flint;
 pub mod hy4;
 pub mod inkling;
 pub mod kernels;
+pub mod nemotron;
 
 /// Runtime kernel variants (dev/KBENCH.md): tuning keys that kernel launchers read when they launch
 /// (for CUDA graphs: at capture). Unset keys keep the engine's normal behaviour.
