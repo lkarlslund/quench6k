@@ -14,3 +14,7 @@ Each `.bin` holds little-endian arrays for `positions` P and `top_k` K, in this 
 The fixtures were generated with llama.cpp from the
 `swift-1.5-qwen3.8-flash-next-nvfp4.gguf` conversion of
 `ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4`.
+
+The models other than Qwen3.8 use these conversations re-rendered in their own chat templates and
+tokenizers (`tools/ref/*_fixtures.py`, built into out/), with references from the independent PyTorch
+implementations in `tools/ref` (`hy4_ref.py`, `inkling_ref.py`, `nemotron_ref.py`) in the same format.
