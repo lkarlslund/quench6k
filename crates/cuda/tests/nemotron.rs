@@ -1357,3 +1357,61 @@ fn decode_forms_equal() {
     eprintln!("attention combine per query head, L2 prefetch distances: equal (and decode rows equal prefill rows)");
 }
 
+
+/// The prefill GEMM's tile variants and its shape table (kernels/nemotron_dense.cu) give gemm.cu's bits
+/// (quench6k_gemm_bf16_f32_ext with 64-row narrow tiles, as main's prefill launches it) for every prefill
+/// projection shape, weight format and row count, with and without accumulation.
+#[test]
+#[ignore]
+fn dense_gemm_equal() {
+    use quench6k_cuda::kernels::{self as kk, WeightFormat};
+    let s = Stream::new().unwrap();
+    let mut rng = Rng::new(47);
+    const MMAX: usize = 8192;
+    let shapes = [(18560usize, 4096usize), (4096, 8192), (5376, 4096), (4096, 5376), (4608, 4096), (4096, 4096), (1024, 4096), (4096, 1024), (512, 4096)];
+    let kmax = shapes.iter().map(|p| p.1).max().unwrap();
+    let nmax = shapes.iter().map(|p| p.0).max().unwrap();
+    let x: Vec<u16> = rng.vec(MMAX * kmax, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
+    let xb = up(&s, &x);
+    let y0 = up(&s, &rng.vec(MMAX * nmax, -4.0, 4.0));
+    let (ya, yb) = (DeviceBuffer::new(MMAX * nmax * 4).unwrap(), DeviceBuffer::new(MMAX * nmax * 4).unwrap());
+    let mut checked = 0;
+    for &(n, k) in &shapes {
+        for fmt in [WeightFormat::Bf16, WeightFormat::Fp8Block, WeightFormat::Int8Group] {
+            if n == 512 && fmt != WeightFormat::Bf16 {
+                continue;
+            }
+            let (w, sc) = match fmt {
+                WeightFormat::Bf16 => {
+                    let w: Vec<u16> = rng.vec(n * k, -0.05, 0.05).into_iter().map(bf16::from_f32).collect();
+                    (up(&s, &w), None)
+                }
+                _ => {
+                    // E4M3 codes without NaN (0x7f / 0xff); INT8 any byte.
+                    let fp8 = fmt == WeightFormat::Fp8Block;
+                    let codes = up(&s, &rand_bytes(&mut rng, n * k, |b| if fp8 && b & 0x7f == 0x7f { b & 0xf7 } else { b }));
+                    let nsc = if fp8 { n.div_ceil(128) * (k / 128) } else { n * (k / kk::int8_group()) };
+                    (codes, Some(up(&s, &rng.vec(nsc, 0.001, 0.01))))
+                }
+            };
+            let sca = sc.as_ref().map_or(0, |b| b.addr());
+            for &m in &[256usize, 512, 1000, 1536, 2048, 3000, 4096, 6144, 8192] {
+                // Every tile at a few row counts (a partial last tile among them), the table at all.
+                let variants: Vec<i32> =
+                    if [512, 1000, 2048].contains(&m) { std::iter::once(-1).chain(1..=DENSE_VARIANTS).collect() } else { vec![-1] };
+                for acc in [false, true] {
+                    s.copy_d2d(ya.addr(), y0.addr(), m * n * 4).unwrap();
+                    gemm_f32_ext(&s, xb.addr(), k, fmt, w.addr(), k, sca, ya.addr(), n, m, n, k, 0.5, acc, 2).unwrap();
+                    for &v in &variants {
+                        s.copy_d2d(yb.addr(), y0.addr(), m * n * 4).unwrap();
+                        gemm_dense(&s, xb.addr(), k, fmt, w.addr(), k, sca, yb.addr(), n, m, n, k, 0.5, acc, v).unwrap();
+                        let d = count_diff(&s, ya.addr(), yb.addr(), m * n).unwrap();
+                        assert_eq!(d, 0, "{fmt:?} M={m} N={n} K={k} accumulate {acc} variant {v}: {d} outputs differ");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("dense GEMM: {checked} launches bitwise equal to gemm.cu's");
+}
