@@ -791,3 +791,73 @@ pub fn attention_prefill(s: &Stream, q: u64, rows: usize, seqs: u64, kv: KvRows,
         ffi::quench6k_nem_attention_prefill(p(q), n(rows), p(seqs), kv.off as i64, kv.ld as i64, kv.fp8 as c_int, pm(out), s.raw())
     )
 }
+
+mod gemm_ext_ffi {
+    use std::ffi::{c_int, c_void};
+
+    use crate::ffi::{Error, Stream};
+
+    unsafe extern "C" {
+        pub fn quench6k_gemm_bf16_f32_ext(
+            fmt: c_int,
+            x: *const c_void,
+            ldx: c_int,
+            w: *const c_void,
+            ldw: c_int,
+            scale: *const f32,
+            y: *mut f32,
+            ldy: c_int,
+            m: c_int,
+            n: c_int,
+            k: c_int,
+            alpha: f32,
+            accumulate: c_int,
+            flags: c_int,
+            stream: Stream,
+        ) -> Error;
+    }
+}
+
+/// Prefill projection Y [m, n] F32 (+)= alpha X [m, k] BF16 . W^T (weight formats BF16, INT8 per 64, FP8
+/// per 128 x 128 block): the tensor-core GEMM of [`crate::kernels::gemm_f32`] (the same bits); `flags` bit 1
+/// takes 64-row tiles when n <= 1024.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_f32_ext(
+    s: &Stream,
+    x: u64,
+    ldx: usize,
+    fmt: crate::kernels::WeightFormat,
+    w: u64,
+    ldw: usize,
+    scale: u64,
+    y: u64,
+    ldy: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    accumulate: bool,
+    flags: u32,
+) -> Result<()> {
+    let err = unsafe {
+        gemm_ext_ffi::quench6k_gemm_bf16_f32_ext(
+            fmt as i32,
+            x as *const std::ffi::c_void,
+            ldx as i32,
+            w as *const std::ffi::c_void,
+            ldw as i32,
+            if scale == 0 { std::ptr::null() } else { scale as *const f32 },
+            y as *mut f32,
+            ldy as i32,
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            accumulate as i32,
+            flags as i32,
+            s.raw(),
+        )
+    };
+    crate::check(err, "gemm_bf16_f32_ext")
+}
+

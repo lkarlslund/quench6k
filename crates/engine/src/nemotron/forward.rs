@@ -589,7 +589,9 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
         }
         Ok(())
     } else {
-        k::gemm_f32(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, l.alpha, accumulate)
+        // 64-row tiles for the narrow router and latent projections (variant nem.gemm=0: off); the same bits.
+        let flags = quench6k_cuda::variants::get("nem.gemm", 2) as u32;
+        nk::gemm_f32_ext(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, l.alpha, accumulate, flags)
     }
 }
 

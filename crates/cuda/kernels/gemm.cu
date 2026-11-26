@@ -56,7 +56,7 @@ struct BatchArgs {
 // BMT x BNT: CTA tile, 128 x 128 (warps 2 x 4 of 64 x 32), 256 x 128 (warps 4 x 2 of 64 x 64: each
 // staged weight tile serves twice the rows, fewer fragment loads per MMA) or 128 x 256.
 template <typename OutT, int WF, bool MIX = false, int STAGES = 3, int BNT = 128, int BMT = 128>
-__global__ void __launch_bounds__(THREADS, BMT == 128 && BNT == 128 ? 2 : 1) gemm_kernel(const __nv_bfloat16* __restrict__ X, int ldx,
+__global__ void __launch_bounds__(THREADS, BMT * BNT <= 128 * 128 ? 2 : 1) gemm_kernel(const __nv_bfloat16* __restrict__ X, int ldx,
                                                        const void* __restrict__ Wv, int ldw,
                                                        const float* __restrict__ row_scale, OutT* Y, int ldy,
                                                        int M, int N, int K, float alpha, bool accumulate,
@@ -73,7 +73,7 @@ __global__ void __launch_bounds__(THREADS, BMT == 128 && BNT == 128 ? 2 : 1) gem
     const uint8_t* W8 = static_cast<const uint8_t*>(Wv);
     extern __shared__ __align__(16) unsigned char gemm_smem[];
     auto sA = reinterpret_cast<__nv_bfloat16 (*)[BMT * BK]>(gemm_smem);
-    static_assert((!MIX || (size_t)4 * 64 * 33 * 4 <= (size_t)STAGES * (BMT + BNT) * BK * 2) && ((BNT == 128 && BMT == 128) || (!MIX && (WF == 0 || WF == 3 || WF == 5) && BNT * BMT == 128 * 256)), "unsupported tile");
+    static_assert((!MIX || (size_t)4 * 64 * 33 * 4 <= (size_t)STAGES * (BMT + BNT) * BK * 2) && ((BNT == 128 && BMT == 128) || (!MIX && (WF == 0 || WF == 3 || WF == 5) && (BNT * BMT == 128 * 256 || (BMT == 64 && BNT == 128)))), "unsupported tile");
     constexpr int WM = BMT / 64, WN = 8 / WM, WTN = BNT / WN;  // warp grid; warp tile 64 x WTN
     auto sB = reinterpret_cast<__nv_bfloat16 (*)[BNT * BK]>(gemm_smem + (size_t)STAGES * BMT * BK * 2);
 
@@ -561,5 +561,35 @@ extern "C" cudaError_t quench6k_gemm_bf16_batched(const void* X, int ldx, size_t
     SQ_CHECK_LAUNCH(sq_launch(gemm_kernel<__nv_bfloat16, 0>, grid, THREADS, GEMM_SMEM, stream, static_cast<const __nv_bfloat16*>(X), ldx, W,
                               ldw, (const float*)nullptr, static_cast<__nv_bfloat16*>(Y), ldy, M, N, K, 1.0f, false, MixArgs{},
                               (float*)nullptr, BatchArgs{xs, ws, ys}));
+    SQ_RETURN_LAUNCH();
+}
+
+// Nemotron-H prefill projections: Y[M, N] (= or +=) alpha X . W^T like quench6k_gemm_bf16_f32 (fmt 0, 3 or 5;
+// the same per-output MMA sequence, so the same bits); flags bit 1: 64-row tiles when N <= 1024 (twice the
+// CTAs for the narrow router and latent projections).
+extern "C" cudaError_t quench6k_gemm_bf16_f32_ext(int fmt, const void* X, int ldx, const void* W, int ldw, const float* scale, float* Y,
+                                                int ldy, int M, int N, int K, float alpha, int accumulate, int flags, cudaStream_t stream) {
+    if (K % BK != 0 || ldx % 8 != 0 || ldw % 16 != 0 || (fmt != 0 && fmt != 3 && fmt != 5)) return cudaErrorInvalidValue;
+    if (M == 0 || N == 0) return cudaSuccess;
+    if (!((flags & 2) && N <= 1024)) return quench6k_gemm_bf16_f32(fmt, X, ldx, W, ldw, scale, Y, ldy, M, N, K, alpha, accumulate, stream);
+    constexpr size_t smem = gemm_smem_bytes(3, 64, 128);
+    static bool configured = false;
+    if (!configured) {
+        for (const void* kern : {(const void*)gemm_kernel<float, 0, false, 3, 128, 64>, (const void*)gemm_kernel<float, 3, false, 3, 128, 64>,
+                                 (const void*)gemm_kernel<float, 5, false, 3, 128, 64>}) {
+            const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+            if (e != cudaSuccess) return e;
+        }
+        configured = true;
+    }
+    const dim3 grid((N + BN - 1) / BN, (M + 63) / 64);
+    const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(X);
+    const float* sc = fmt == 3 || fmt == 5 ? scale : nullptr;
+    auto go = [&](auto kern) {
+        return sq_launch(kern, grid, THREADS, smem, stream, x, ldx, W, ldw, sc, Y, ldy, M, N, K, alpha, accumulate != 0, MixArgs{}, (float*)nullptr, BatchArgs{});
+    };
+    if (fmt == 0) SQ_CHECK_LAUNCH(go(gemm_kernel<float, 0, false, 3, 128, 64>));
+    else if (fmt == 3) SQ_CHECK_LAUNCH(go(gemm_kernel<float, 3, false, 3, 128, 64>));
+    else SQ_CHECK_LAUNCH(go(gemm_kernel<float, 5, false, 3, 128, 64>));
     SQ_RETURN_LAUNCH();
 }
