@@ -42,10 +42,6 @@ pub const MAX_VERIFY: usize = MAX_DRAFTS + 1;
 /// stay at the step's start and its rows are kept as records, of which [`NemotronModel::commit`] keeps the
 /// accepted ones.
 pub const REC_ROWS: usize = MAX_VERIFY;
-/// Rows per pass of the grouped expert GEMM in large steps (bounds its buffers). A whole canonical chunk:
-/// passes of 512 rows left about 22 rows per expert, a third of the GEMM's 64-row tiles, and took twice
-/// as long.
-const EX_ROWS: usize = CANON_CHUNK;
 /// Positions a sequence's cache mapping grows by at least.
 const RESERVE_STEP: usize = 4096;
 /// Top logits per position kept by teacher-forced scoring.
@@ -293,10 +289,11 @@ impl State {
         Ok(b)
     }
 
-    /// A step wrote positions [start, end): advances the frontier when it was an aligned chunk of
-    /// CANON_CHUNK tokens right at it, and then snapshots the Mamba block (its pending rows committed).
+    /// A step wrote positions [start, end): advances the frontier when it was one or more whole aligned
+    /// chunks of CANON_CHUNK tokens right at it, and then snapshots the Mamba block (its pending rows
+    /// committed).
     fn wrote(&mut self, model: &NemotronModel, ws: &Workspace, start: usize, end: usize, s: &Stream) -> Result<()> {
-        if start != self.canon || !start.is_multiple_of(CANON_CHUNK) || end - start != CANON_CHUNK {
+        if start != self.canon || !start.is_multiple_of(CANON_CHUNK) || end - start == 0 || !(end - start).is_multiple_of(CANON_CHUNK) {
             return Ok(());
         }
         self.canon = end;
@@ -372,8 +369,8 @@ pub struct Workspace {
     lat: u64,
     lat_bf: u64,
     ex_bf: u64,
-    /// Expert pairs (at most EX_ROWS * TOPK): gathered inputs BF16 [pairs, LAT], up output / down output
-    /// F32 [pairs, FF], activation BF16 [pairs, FF], plan buffers.
+    /// Expert pairs (a step's rows times TOPK): gathered inputs BF16 [pairs, LAT], the experts' outputs
+    /// (F32 [pairs, LAT] in small steps, BF16 in large ones), activation BF16 [pairs, FF], plan buffers.
     xs: u64,
     ey: u64,
     eact: u64,
@@ -430,7 +427,9 @@ impl Workspace {
         let cap = Self::cap(max_t);
         let lr = logit_rows.max(1);
         let vocab = cfg.vocab;
-        let pairs = cap.clamp(nk::SMALL_ROWS, EX_ROWS) * TOPK;
+        // The grouped expert GEMM takes a whole step in one pass (passes of 512 rows left about 22 rows
+        // per expert and took twice as long as one of 2048).
+        let pairs = cap.max(nk::SMALL_ROWS) * TOPK;
         let max_tiles = pairs / nk::moe_prefill_tile_rows().max(1) + EXPERTS;
         (
             max_tiles,
@@ -451,7 +450,7 @@ impl Workspace {
                 cap * LAT * 2,
                 cap * LAT * 2,
                 pairs * LAT * 2,
-                pairs * FF * 4,
+                pairs * LAT * 4,
                 pairs * FF * 2,
                 EXPERTS * 4,
                 (EXPERTS + 1) * 4,
@@ -648,11 +647,21 @@ impl NemotronModel {
     /// Canonical prefill of `tokens` at state.pos: chunks end at multiples of [`CANON_CHUNK`] (absolute
     /// positions) and at the tokens' end; the last chunk's last logits row lands in ws.out_logits. The
     /// workspace must take chunks of CANON_CHUNK tokens.
+    ///
+    /// A workspace for steps of several chunks takes consecutive whole aligned chunks in one step (up to
+    /// ws.max_t / CANON_CHUNK, variant nem.merge lowers it), except the first chunk of a sequence: the
+    /// same bits (a large step's rows do not depend on its size), the same chunk ends at the frontier's
+    /// lowest boundary and at the prompt's last whole chunk (where the Mamba snapshots are taken), fewer
+    /// passes over the routed experts' weights.
     pub fn prefill(&self, state: &mut State, ws: &mut Workspace, s: &Stream, tokens: &[i32]) -> Result<()> {
         ensure!(ws.max_t >= CANON_CHUNK, "canonical prefill needs chunks of {CANON_CHUNK} tokens (workspace: {})", ws.max_t);
+        let merge = (quench6k_cuda::variants::get("nem.merge", i32::MAX).max(1) as usize).min(ws.max_t / CANON_CHUNK);
         let mut at = 0;
         while at < tokens.len() {
-            let n = (CANON_CHUNK - state.pos % CANON_CHUNK).min(tokens.len() - at);
+            let mut n = (CANON_CHUNK - state.pos % CANON_CHUNK).min(tokens.len() - at);
+            if n == CANON_CHUNK && state.pos > 0 {
+                n = ((tokens.len() - at) / CANON_CHUNK).min(merge) * CANON_CHUNK;
+            }
             let want = if at + n == tokens.len() { Logits::Last } else { Logits::None };
             self.forward(state, ws, s, &tokens[at..at + n], want)?;
             at += n;
@@ -897,10 +906,10 @@ impl NemotronModel {
                 nk::moe_combine(s, ws.ey, 0, at(ws.sel_w, r0, TOPK * 4), n, at(ws.ex_bf, r0, LAT * 2))?;
             }
         } else {
-            // Pairs grouped by expert into the prefill expert kernel's tiles, EX_ROWS rows at a time.
+            // Pairs grouped by expert into the prefill expert kernel's tiles, the whole step at once.
             let tile = nk::moe_prefill_tile_rows();
-            for r0 in (0..r).step_by(EX_ROWS) {
-                let n = EX_ROWS.min(r - r0);
+            for r0 in (0..r).step_by(ws.rows_cap) {
+                let n = ws.rows_cap.min(r - r0);
                 let sel_e = at(ws.sel_e, r0, TOPK * 4);
                 s.memset(ws.counts, 0, EXPERTS * 4)?;
                 nk::moe_plan(s, sel_e, n, tile, ws.counts, ws.offsets, ws.cursor, ws.tile_expert, ws.tile_row, ws.num_tiles, ws.pair_row)?;
