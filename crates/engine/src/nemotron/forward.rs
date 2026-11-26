@@ -60,12 +60,16 @@ const GROUP_BUCKET: usize = 4;
 
 /// Optional parts of the step that A/B timings switch at run time ([`set_features`]; all on by default).
 pub const F_GRAPHS: u32 = 1;
+/// Projections of several rows in small steps through the wide GEMV forms ([`wide_form`]).
+pub const F_WIDE: u32 = 2;
+/// Also the matrices with 8192 columns at 5 to 8 rows.
+pub const F_WIDE_K8: u32 = 4;
 /// The Mamba convolution and its commit in one launch in small steps ([`nk::mamba_conv_small`]).
 pub const F_CONV: u32 = 16;
 /// The small steps' attention combine with a CTA per query head ([`nk::set_attn_combine`]).
 pub const F_COMBINE: u32 = 256;
 /// The default: every part.
-pub const F_ALL: u32 = F_GRAPHS | F_CONV | F_COMBINE;
+pub const F_ALL: u32 = F_GRAPHS | F_WIDE | F_WIDE_K8 | F_CONV | F_COMBINE;
 static FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(F_ALL);
 
 /// Switches the optional parts of the step (`F_*` bits; for A/B timings in one process; the CUDA graphs
@@ -660,6 +664,9 @@ impl Workspace {
 fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usize, small: bool, accumulate: bool) -> Result<()> {
     let gm = k::gemv_max_m();
     if m <= gm || small {
+        if let Some((mt, r)) = wide_form(l, m) {
+            return nk::gemv_wide(s, m, mt, r, x, ldx, l.fmt, l.w, l.scale, y, ldy, l.n, l.k, l.alpha, accumulate);
+        }
         for r0 in (0..m).step_by(gm) {
             let rows = gm.min(m - r0);
             k::gemv(s, rows, x + (r0 * ldx * 2) as u64, ldx, l.fmt, l.w, l.scale, y + (r0 * ldy * 4) as u64, ldy, 0, l.n, l.k, 1, l.alpha, accumulate)?;
@@ -667,6 +674,29 @@ fn linear(s: &Stream, x: u64, ldx: usize, m: usize, l: &Linear, y: u64, ldy: usi
         Ok(())
     } else {
         k::gemm_f32(s, x, ldx, l.fmt, l.w, l.k, l.scale, y, ldy, m, l.n, l.k, l.alpha, accumulate)
+    }
+}
+
+/// The wide GEMV's form (input rows per warp, weight rows per warp) for `m` rows of `l`, where it beats the
+/// shared GEMV's launches of up to 16 rows (each row's bits are the same either way); None keeps those.
+fn wide_form(l: &Linear, m: usize) -> Option<(usize, usize)> {
+    if m < 2 || !feature(F_WIDE) {
+        return None;
+    }
+    let size = l.n * l.k;
+    let bf16 = l.fmt == k::WeightFormat::Bf16;
+    match m {
+        2 if size >= 8 << 20 => Some((2, 2)),
+        3..=4 if bf16 && size >= 12 << 20 => Some((4, 1)),
+        3..=4 if !bf16 && size >= 8 << 20 => Some((4, if l.k >= 8192 { 1 } else { 2 })),
+        5..=8 if bf16 && l.n >= 1024 && (3072..8192).contains(&l.k) => Some((8, 1)),
+        5..=8 if !bf16 && l.k >= 8192 && !feature(F_WIDE_K8) => None,
+        5..=8 if !bf16 && size >= 12 << 20 => Some((8, 4)),
+        5..=8 if !bf16 && size >= 8 << 20 => Some((8, 2)),
+        // (The BF16 16 x 4 form spills registers.)
+        9.. if !bf16 && size >= 12 << 20 && (m.is_multiple_of(16) || m % 16 > 8) => Some((16, 4)),
+        9.. if size >= 4 << 20 => Some((8, 4)),
+        _ => None,
     }
 }
 
